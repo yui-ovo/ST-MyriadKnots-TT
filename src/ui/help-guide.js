@@ -5,7 +5,8 @@ const GUIDE_SECTIONS = [
     title: '快速上手',
     open: true,
     paragraphs: [
-      '使用前先安装白鳥数据后端 ST-BaiNiaoData，它是酒馆服务端插件，与千千结前端扩展不同。Luker 可用后台的服务端插件管理安装；原生酒馆默认应有根目录 plugins/ST-BaiNiaoData/index.mjs，压缩包不要多套一层文件夹，后端不要装进 public/scripts/extensions/third-party。后端仓库：https://github.com/atonal519/ST-BaiNiaoData。',
+      'TT 适配试用版：TauriTavern 2.2.0 使用应用自带的本地文件存储，不需要安装白鳥服务端后端或修改 config.yaml。记忆随 TT 数据目录保存，请使用 TT 完整数据导出备份。普通 SillyTavern / Luker 仍需要白鳥服务端后端。尚未完成 iOS 真机验收。',
+      '以下服务端安装说明仅适用于 SillyTavern / Luker。使用前先安装白鳥数据后端 ST-BaiNiaoData，它是酒馆服务端插件，与千千结前端扩展不同。Luker 可用后台的服务端插件管理安装；原生酒馆默认应有根目录 plugins/ST-BaiNiaoData/index.mjs，压缩包不要多套一层文件夹，后端不要装进 public/scripts/extensions/third-party。后端仓库：https://github.com/atonal519/ST-BaiNiaoData。',
       '在实际运行的酒馆根目录 config.yaml 中检查 enableServerPlugins: true；已有该键就修改原值，不要重复追加。默认 serverPluginsPath 是 ./plugins，改过则按配置路径安装；enableServerPluginsAutoUpdate 只控制自动更新，不是加载条件。安装或改配置后完整重启酒馆服务，再刷新网页；只刷新网页或切换插件开关不会加载后端。遇到后端 404 先看下面的“排障手册”，不要删除记忆来修安装。',
       '先到“设置 → 通用设置 → API 配置”。分析 API 用于双丝网人物状态分析；摘要 API 负责逐楼摘要和千人人物资料整理；召回 API 负责 LLM 召回选材。摘要默认跟随分析，召回默认跟随摘要，也可各自选择共享预设。不同预设仍可能共用同一账号的并发额度。在 API 配置页里，保存设置不发请求；“测试连接”或“拉取模型”会发出请求。',
       '新聊天正常对话即可逐步建立记忆，不需要先打开千千结面板。旧聊天可到“设置 → 记忆管理”手动补齐；空聊天还没有可保存的记忆属于正常情况。',

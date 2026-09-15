@@ -1,1 +1,1 @@
-{"display_name":"千千结","loading_order":999,"js":"dist/qqj-app.js?v=20260916.234-0616f8f0008c0a54","generate_interceptor":"qqj_v3_recall_interceptor","version":"0.2.3","description":"千千结长期记忆工具"}
+{"display_name":"千千结 · TT 适配试用版","loading_order":999,"js":"dist/qqj-app.js?v=20260916.235-a5d3c6deeaf4701e","generate_interceptor":"qqj_v3_recall_interceptor","version":"0.2.3","description":"千千结长期记忆工具；TT 2.2.0 本地存储适配 tt.1，未完成 iOS 真机验收"}

@@ -1,3 +1,26 @@
+# 千千结 · TauriTavern 适配试用版
+
+面向 **iOS / TauriTavern 2.2.0** 的个人适配，基于 [atonal519/ST-MyriadKnots](https://github.com/atonal519/ST-MyriadKnots)。原插件与界面归原作者，本分叉仅增加 TT 存储适配。**已完成代码与自动化测试，尚未完成 iPhone 真机验收。**
+
+## 在 iPhone 安装
+
+1. 如果已经安装原版千千结，先禁用原版，避免两份插件同时运行。
+2. 打开 TT → 扩展 → 安装扩展，粘贴以下仓库地址：
+
+   `https://github.com/yui-ovo/ST-MyriadKnots-TT`
+
+3. 安装完成后重启 TT，确认扩展列表显示「千千结 · TT 适配试用版」。
+4. 打开一个测试用的单人聊天，在千千结设置中配置分析 API 和摘要 API，再启用插件。
+5. 先测试几轮对话、摘要和召回，然后完全退出并重新打开 TT，确认记忆仍然存在，再用于长档。
+
+**TT 不需要安装 ST-BaiNiaoData 服务端插件，不需要运行 npm，也不需要修改 config.yaml 或重装 TT。** 模型分析/摘要仍然需要你自己的模型 API。
+
+记忆保存在 TT 的数据目录中，备份时请使用 TT 的完整数据导出。已有 SillyTavern / Luker 后端记忆不会自动迁移过来。回退时禁用本适配版即可；不要同时启用原版和适配版，也不要把「完全重构」当作安装修复。
+
+详细实现、验证结果与限制见 [TT 适配说明](docs/tauritavern.md)。下面保留原作者的功能说明；涉及服务端安装的段落只适用于 SillyTavern / Luker。
+
+---
+
 # Myriad Knots（千千结）
 
 `ST-MyriadKnots` 是 SillyTavern 的长期记忆扩展，界面中文名为“千千结”。项目仓库：[github.com/atonal519/ST-MyriadKnots](https://github.com/atonal519/ST-MyriadKnots)。
