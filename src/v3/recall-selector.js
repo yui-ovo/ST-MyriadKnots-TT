@@ -1,20 +1,11 @@
 const MAX_QUERY_CHARACTERS = 8000;
-const MAX_RECALLED_FLOORS = 48;
-const MAX_TOTAL_ITEMS = 48;
-const MAX_CSE_ITEMS = 24;
-const MAX_LINKED_FLOORS = 12;
-const MAX_STORYLINES = 3;
-const MAX_STORYLINE_HISTORY_ITEMS = 8;
-const MAX_RECALL_TOKENS = 4000;
-const MAX_RECALL_CHARACTERS = 16000;
-const MAX_RECALL_WITH_PROGRESSION_TOKENS = 5000;
-const MAX_RECALL_WITH_PROGRESSION_CHARACTERS = 20000;
+const MAX_RECALL_TOKENS = 8000;
+const MAX_RECALL_CHARACTERS = 32000;
 export const RECENT_CONTINUITY_FLOORS = 4;
 export const MAX_LLM_HISTORY_CANDIDATES = 48;
 export const MAX_LLM_HISTORY_CHARACTERS = 24000;
 export const MAX_LLM_CSE_CANDIDATES = 24;
 export const MAX_LLM_CSE_CHARACTERS = 12000;
-const HISTORY_GROUP_WEIGHTS = Object.freeze({ summary: 1, continuity: 1, fact: 2 });
 import { rankRecallDocuments, tokenizeRecallText } from './recall-ranking.js';
 import { formatChronologyAnchor } from './recall-source.js';
 
@@ -60,10 +51,6 @@ function boundedRecallBudget(contextSize, { reservedTokens = 0, reservedCharacte
 
 export function recallBudget(contextSize = 8192, reserved = {}) {
   return boundedRecallBudget(contextSize, reserved, { maxTokens: MAX_RECALL_TOKENS, maxCharacters: MAX_RECALL_CHARACTERS });
-}
-
-function recallBudgetWithProgression(contextSize = 8192, reserved = {}) {
-  return boundedRecallBudget(contextSize, reserved, { maxTokens: MAX_RECALL_WITH_PROGRESSION_TOKENS, maxCharacters: MAX_RECALL_WITH_PROGRESSION_CHARACTERS });
 }
 
 export function buildRecallQueryFrame({ coreChat = [], assistantTurns = 1 } = {}) {
@@ -197,7 +184,7 @@ function historyFacts(memory, entityById) {
     if (value.toEntityIds.length) add(item('transfer', decorate(value.claimText, value), 85, { kind: value.channel, fromEntityId: effectiveFromEntityId, toEntityIds: value.toEntityIds, preserveForm: anchorAssignments.has(value) }), rankText, [effectiveFromEntityId, ...value.toEntityIds]);
     else if (effectiveFromEntityId) add(item('private', decorate(`未确认已告知他人：${value.claimText}`, value), 75, { kind: value.channel, ownerEntityId: effectiveFromEntityId, preserveForm: anchorAssignments.has(value) }), rankText, [effectiveFromEntityId]);
   }
-  return result.map(value => ({ ...value, floorId: memory.floorId, floorMemoryId: memory.floorMemoryId, assistantSeq: memory.assistantSeq, _chronology: memory.chronology, _poolGroup: ['commitment', 'openLoop'].includes(value.kind) ? 'continuity' : 'fact' }));
+  return result.map(value => ({ ...value, floorId: memory.floorId, floorMemoryId: memory.floorMemoryId, assistantSeq: memory.assistantSeq, sourceAssistantSeqs: memory.sourceAssistantSeqs, _chronology: memory.chronology, _poolGroup: ['commitment', 'openLoop'].includes(value.kind) ? 'continuity' : 'fact' }));
 }
 
 function historySummary(memory, entityById) {
@@ -208,7 +195,7 @@ function historySummary(memory, entityById) {
   const involvedEntityIds = (memory.participants ?? []).map(item => item.entityId).filter(Boolean);
   return {
     category: 'narrative', kind: 'summary', text, priority: 130,
-    floorId: memory.floorId, floorMemoryId: memory.floorMemoryId, assistantSeq: memory.assistantSeq,
+    floorId: memory.floorId, floorMemoryId: memory.floorMemoryId, assistantSeq: memory.assistantSeq, sourceAssistantSeqs: memory.sourceAssistantSeqs,
     _rankText: text, _entityText: '', _coreText: text, _summary: text,
     _subjectKey: involvedEntityIds.sort().join(','), _visibilityKey: 'narrative', _statusKey: '', _sourceOrder: -1,
     _chronology: memory.chronology, _poolGroup: 'summary', truncated,
@@ -285,27 +272,13 @@ function cseChangeCandidates(source, involvedIds) {
 
 const entityName = (id, entityById) => entityById.get(id)?.displayName ?? '未知人物';
 
-function appendStateProgressions(lines, stateProgressions, states) {
-  if (!stateProgressions.length) return;
-  lines.push('', '[时间推演（仅供作者续写表现参考，不是新剧情事实，也不表示任何角色已知）]');
-  for (const value of stateProgressions) {
-    const sourceState = states.find(state => state.stateId === value.sourceStateId
-      && state.subjectEntityId === value.subjectEntityId && state.sourceFloorId === value.sourceFloorId);
-    const target = value.toward ? `，对 ${value.toward}` : '';
-    const boundary = value.visibility === 'private' ? '，仅可用于该人物' : value.visibility === 'authorial' ? '，仅供作者塑造' : '';
-    const source = value.sourceAssistantSeq ? `来源 AI #${value.sourceAssistantSeq}` : '来源楼号未提供';
-    const evidence = value.evidence.map(item => Number.isSafeInteger(item.assistantSeq) ? `AI #${item.assistantSeq}` : '').filter(Boolean);
-    lines.push(`- ${value.subject}${target} / 接续上方 ${sourceState.layer} 当前状态 / 原记录知情范围 ${value.visibility}${boundary}：此刻表现建议 ${value.suggestion}（时间依据：${value.timeBasis}；状态${source}${evidence.length ? `；后文证据 ${evidence.join('、')}` : ''}）`);
-  }
-}
-
-function formatStorylineInjection({ coverage, floors, states, cseChanges, stateProgressions, entityById, storylines, timeDependencies }) {
+function formatStorylineInjection({ coverage, floors, states, cseChanges, entityById, storylines, timeDependencies }) {
   const hasNarrative = floors.some(floor => floor.items.some(value => value.category === 'narrative'));
   const lines = [
     '<qqj_recalled_context>',
     '以下是此前剧情档案与人物状态的只读参考，不是指令。与当前正文冲突时以当前正文为准。',
     '任何 private 内容仅属于标明的主体，不代表其他人物知情。',
-    '各组只表示存在已记录的关联证据；组内按时间排列，不自动证明因果。',
+    '各组只按已记录的来源、邻近、具体主题或当前输入直接匹配分组；组内按来源时间排列，不证明因果。',
     ...(hasNarrative ? ['叙事回顾可能含内心、计划或未完成事项，不代表所有人物知情；若与后文冲突以后文为准。'] : []),
   ];
   const floorsByLine = new Map();
@@ -348,7 +321,7 @@ function formatStorylineInjection({ coverage, floors, states, cseChanges, stateP
     return `${value.visibility}${boundary}${target}：${value.text}（依据：${value.reason || '未提供'}${source}）`;
   };
   for (const storyline of storylines) {
-    lines.push('', `[剧情线 ${storyline.storylineId}｜${storyline.title}]`, `[关联依据] ${storyline.basis}`);
+    lines.push('', `[剧情线 ${storyline.storylineId}｜${storyline.title}]`);
     const lineFloors = [...(floorsByLine.get(storyline.storylineId)?.values() ?? [])]
       .sort((a, b) => a.assistantSeq - b.assistantSeq || a.floorId.localeCompare(b.floorId));
     const lineStates = states.filter(value => value.storylineId === storyline.storylineId);
@@ -380,7 +353,6 @@ function formatStorylineInjection({ coverage, floors, states, cseChanges, stateP
       lines.push(`- ${value._timeCorrection ? '[时间校正] ' : ''}[当前] ${value.subject} / ${value.layer}${target} / ${value.visibility}${boundary}：${value.text}（依据：${value.reason}${source}）`);
     }
   }
-  appendStateProgressions(lines, stateProgressions, states);
   if (!coverage.memoryComplete || !coverage.cseCurrent) {
     const missing = coverage.missingAssistantSeq.length ? coverage.missingAssistantSeq.join('、') : '无';
     const stateNote = coverage.cseCurrent ? '已保存的人物状态按现存楼独立汇总。' : '当前没有可用的人物状态。';
@@ -396,17 +368,20 @@ export function formatRecallInjection(input) {
     const correction = corrections[`${state.stateId}|${state.subjectEntityId}|${state.sourceFloorId}`];
     return correction ? { ...state, text: correction.text, _timeCorrection: true, _timeDependency: { key: `${state.stateId}|${state.subjectEntityId}|${state.sourceFloorId}`, itemId: correction.itemId, text: correction.text, sourceSignature: correction.sourceSignature ?? null } } : state;
   });
-  const base = formatBaseRecallInjection({ ...input, states });
-  const reminders = input.timeReminders ?? [];
+  const timeDependencies = input.timeDependencies ?? { corrections: [], reminders: [] };
+  const base = formatBaseRecallInjection({ ...input, states, timeDependencies });
+  const correctedIds = new Set(timeDependencies.corrections.map(value => value.itemId));
+  const reminders = (input.timeReminders ?? []).filter(value => !correctedIds.has(value.itemId));
   if (!reminders.length) return base;
-  input.timeDependencies?.reminders.push(...reminders.map(item => ({ itemId: item.itemId, text: item.text, sourceSignature: item.sourceSignature ?? null })));
-  const block = ['[时间参考（当前推测、预计节点或到期事项）]', ...reminders.map(item => `- ${item.text}`)].join('\n');
+  input.timeDependencies?.reminders.push(...reminders.map(item => ({ itemId: item.itemId, text: item.text, sourceSignature: item.sourceSignature ?? null,
+    ...(item.qianshiRef ? { qianshiRef: { ...item.qianshiRef } } : {}) })));
+  const block = ['[时间参考（当前推测及预计/期限节点尚未获正文确认，不代表已经发生或完成）]', ...reminders.map(item => `- ${item.text}`)].join('\n');
   return base ? base.replace('</qqj_recalled_context>', `${block}\n</qqj_recalled_context>`) : `<qqj_recalled_context>\n${block}\n</qqj_recalled_context>`;
 }
 
-function formatBaseRecallInjection({ coverage, floors, states, cseChanges = [], stateProgressions = [], entityById, storylines = [], timeDependencies }) {
-  if (!floors.length && !states.length && !cseChanges.length && !stateProgressions.length) return '';
-  if (storylines.length) return formatStorylineInjection({ coverage, floors, states, cseChanges, stateProgressions, entityById, storylines, timeDependencies });
+function formatBaseRecallInjection({ coverage, floors, states, cseChanges = [], entityById, storylines = [], timeDependencies }) {
+  if (!floors.length && !states.length && !cseChanges.length) return '';
+  if (storylines.length) return formatStorylineInjection({ coverage, floors, states, cseChanges, entityById, storylines, timeDependencies });
   const hasNarrative = floors.some(floor => floor.items.some(value => value.category === 'narrative'));
   const lines = [
     '<qqj_recalled_context>',
@@ -487,7 +462,6 @@ function formatBaseRecallInjection({ coverage, floors, states, cseChanges = [], 
       if (value.after && !currentEquivalent) renderedAfters.push({ storylineId: value.storylineId, subjectEntityId: value.subjectEntityId, layer: value.layer, state: value.after, assistantSeq: value.assistantSeq });
     }
   }
-  appendStateProgressions(lines, stateProgressions, states);
   if (!coverage.memoryComplete || !coverage.cseCurrent) {
     const missing = coverage.missingAssistantSeq.length ? coverage.missingAssistantSeq.join('、') : '无';
     const stateNote = coverage.cseCurrent ? '已保存的人物状态按现存楼独立汇总。' : '当前没有可用的人物状态。';
@@ -537,6 +511,21 @@ function scoreCandidates(candidates, queries, { summaryAssist = false, keepUnmat
   }).filter(value => keepUnmatched || value.score > 0);
 }
 
+const timeUrgencyBoost = value => ['cycle', 'deadline', 'annual'].includes(value?.type)
+  && Number.isFinite(value?.distance) && Math.abs(value.distance) <= 7
+  ? 0.12 * (1 - Math.abs(value.distance) / 8)
+  : 0;
+
+function rankedTimeReminders(source, queryContext, query, entityById) {
+  const candidates = (source.timeProjection?.reminders ?? []).map((value, index) => ({
+    ...value, _rankText: value.rankText ?? value.text,
+    _entityText: entityNameText([value.subjectEntityId], entityById), _sourceOrder: index,
+  }));
+  return scoreCandidates(candidates, recallQueries(queryContext, query), { keepUnmatched: true })
+    .map(value => ({ ...value, score: value.score + timeUrgencyBoost(value) }))
+    .sort((a, b) => b.score - a.score || a._sourceOrder - b._sourceOrder);
+}
+
 const stateSourceKey = value => {
   const stateId = cleanLiteral(value?.stateId, 500);
   if (stateId) return `id:${stateId}`;
@@ -549,6 +538,10 @@ const sameStateSource = (state, side) => {
   const left = stateSourceKey(state), right = stateSourceKey(side);
   return Boolean(left && right && left === right);
 };
+
+const sameStateSnapshot = (state, side) => sameStateSource(state, side)
+  && ['stateId', 'sourceFloorId', 'sourceDeltaId', 'sourceAssistantSeq', 'text', 'reason', 'visibility', 'towardEntityId']
+    .every(key => (state?.[key] ?? null) === (side?.[key] ?? null));
 
 export function cseSelectionContext(source, queryContext) {
   const query = clean(queryContext?.text, MAX_QUERY_CHARACTERS);
@@ -584,7 +577,7 @@ const cseStableKey = value => value._recallCseKind === 'change'
   ? ['change', value.deltaId, value.floorId, value.assistantSeq, value.subjectEntityId, value.layer, value.action, stateSourceKey(value.before), stateSourceKey(value.after)].join('|')
   : ['current', value.subjectEntityId, value.layer, stateSourceKey(value), duplicateKey(value)].join('|');
 const publicItem = value => {
-  const { _rankText, _entityText, _coreText, _summary, _summaryScore, _subjectKey, _visibilityKey, _statusKey, _sourceOrder, _chronology, _poolGroup, _adjacentSummary, _recallCseKind, _relationEvidence, _relationAnchorFloorId, _relationAnchorStableKey, _relationTerms, _storylineId, floorId, floorMemoryId, assistantSeq, branchScores, entityBranchScores, summaryScores, score, ...rest } = value;
+  const { _rankText, _entityText, _coreText, _summary, _summaryScore, _subjectKey, _visibilityKey, _statusKey, _sourceOrder, _chronology, _poolGroup, _adjacentSummary, _recallCseKind, _relationEvidence, _relationAnchorFloorId, _relationAnchorStableKey, _relationAnchorCseKey, _relationTerms, _storylineId, floorId, floorMemoryId, assistantSeq, branchScores, entityBranchScores, summaryScores, score, ...rest } = value;
   return { ...rest, ...(_relationEvidence ? { relationEvidence: _relationEvidence } : {}), ...(_storylineId ? { storylineId: _storylineId } : {}), rankScore: Number(score.toFixed(6)), rankBranches: branchScores, rankEntityBranches: entityBranchScores };
 };
 
@@ -593,9 +586,10 @@ export function historySelectionContext(source, queryContext) {
   if (source?.status !== 'ready' || !query) return null;
   const queries = recallQueries(queryContext, query);
   const bodyCoveredFloorIds = new Set([...(source.bodyMatch?.coveredFloorIds ?? []), ...(source.bodyMatch?.visibleFloorIds ?? [])]);
+  const overlapsBody = memory => (memory.sourceFloorIds?.length ? memory.sourceFloorIds : [memory.floorId]).some(floorId => bodyCoveredFloorIds.has(floorId));
   const entityById = new Map(source.entities.map(entity => [entity.entityId, entity]));
   const recentWindow = [...source.floorMemories]
-    .filter(memory => memory.assistantSeq <= source.coverage.stableThroughAssistantSeq && !bodyCoveredFloorIds.has(memory.floorId) && clean(memory.summary, 12000))
+    .filter(memory => memory.assistantSeq <= source.coverage.stableThroughAssistantSeq && !overlapsBody(memory) && clean(memory.summary, 12000))
     .sort((a, b) => b.assistantSeq - a.assistantSeq || b.floorId.localeCompare(a.floorId))
     .slice(0, RECENT_CONTINUITY_FLOORS)
     .sort((a, b) => a.assistantSeq - b.assistantSeq || a.floorId.localeCompare(b.floorId));
@@ -603,7 +597,7 @@ export function historySelectionContext(source, queryContext) {
   const recentSummaries = recentWindow
     .map(memory => historySummary(memory, entityById)).filter(Boolean)
     .map(value => ({ ...value, score: 1, branchScores: Object.freeze({}), entityBranchScores: Object.freeze({}), summaryScores: Object.freeze({}), recallSection: 'recent' }));
-  const oldMemories = source.floorMemories.filter(memory => !bodyCoveredFloorIds.has(memory.floorId) && !recentWindowFloorIds.has(memory.floorId));
+  const oldMemories = source.floorMemories.filter(memory => !overlapsBody(memory) && !recentWindowFloorIds.has(memory.floorId));
   const facts = scoreCandidates(oldMemories.flatMap(memory => historyFacts(memory, entityById)), queries, { keepUnmatched: true });
   const compactFactTextsByFloor = new Map();
   for (const fact of facts) {
@@ -622,7 +616,7 @@ export function historySelectionContext(source, queryContext) {
     for (const neighborIndex of [memoryIndex - 1, memoryIndex + 1]) {
       const neighbor = summaryByFloor.get(oldMemories[neighborIndex]?.floorId);
       if (!neighbor || neighbor.score > 0 || adjacent.includes(neighbor)) continue;
-      adjacent.push({ ...neighbor, score: anchor.score * 0.2, _adjacentSummary: true, _relationEvidence: 'nearby' });
+      adjacent.push({ ...neighbor, score: anchor.score * 0.2, _adjacentSummary: true, _relationEvidence: 'nearby', _relationAnchorStableKey: historyStableKey(anchor) });
     }
   }
   return { query, queries, oldMemories, entityById, facts, summaries, direct, adjacent, bodyCoveredFloorIds, recentWindow, recentWindowFloorIds, recentSummaries };
@@ -641,33 +635,24 @@ function relationTokens(value, entityTokenSet) {
   return new Set(tokenizeRecallText(withoutNarrativeGlue).filter(token => !entityTokenSet.has(token) && !RELATION_STOP_TOKENS.has(token)));
 }
 
-const relationAnchorOrder = (left, right) => (right.branchScores?.latestUser ?? 0) - (left.branchScores?.latestUser ?? 0)
-  || right.score - left.score
-  || right.priority - left.priority || right.assistantSeq - left.assistantSeq || left._sourceOrder - right._sourceOrder;
+const relationAnchorOrder = (left, right) => (Number(right.branchScores?.latestUser) || 0) - (Number(left.branchScores?.latestUser) || 0)
+  || (Number(right.score) || 0) - (Number(left.score) || 0)
+  || (Number(right.priority) || 0) - (Number(left.priority) || 0)
+  || (Number(right.assistantSeq ?? right.sourceAssistantSeq) || 0) - (Number(left.assistantSeq ?? left.sourceAssistantSeq) || 0)
+  || (Number(left._sourceOrder) || 0) - (Number(right._sourceOrder) || 0);
 
-function balancedRelationAnchors(values, maximum = 8) {
-  const groups = ['continuity', 'fact', 'summary'];
-  const queues = new Map(groups.map(group => [group, values.filter(value => (value._poolGroup ?? 'fact') === group).sort(relationAnchorOrder)]));
-  const result = [];
-  for (let offset = 0; result.length < maximum; offset += 1) {
-    let added = false;
-    for (const group of groups) {
-      const value = queues.get(group)?.[offset];
-      if (!value) continue;
-      result.push(value); added = true;
-      if (result.length >= maximum) break;
-    }
-    if (!added) break;
-  }
-  return result;
-}
+const materialText = value => value?._coreText ?? value?.text;
+const prepareMaterial = value => {
+  const text = clean(materialText(value), 4000);
+  return { text, compactText: text ? compact(text) : '', tokens: null };
+};
+const materialTokens = value => value.tokens ??= new Set(tokenizeRecallText(value.text));
 
-function materiallySame(left, right) {
-  const a = clean(left?._coreText ?? left?.text, 4000), b = clean(right?._coreText ?? right?.text, 4000);
-  if (!a || !b) return false;
-  const compactA = compact(a), compactB = compact(b);
-  if (compactA && compactB && (compactA.includes(compactB) || compactB.includes(compactA))) return true;
-  const aTokens = new Set(tokenizeRecallText(a)), bTokens = new Set(tokenizeRecallText(b));
+function materiallySame(left, right, prepare = prepareMaterial) {
+  const a = prepare(left), b = prepare(right);
+  if (!a.text || !b.text) return false;
+  if (a.compactText && b.compactText && (a.compactText.includes(b.compactText) || b.compactText.includes(a.compactText))) return true;
+  const aTokens = materialTokens(a), bTokens = materialTokens(b);
   const smaller = Math.min(aTokens.size, bTokens.size);
   return smaller > 0 && setIntersection(aTokens, bTokens).length / smaller >= 0.72;
 }
@@ -685,33 +670,52 @@ function expandLinkedHistory({ context, selectedHistory, selectedCse, excludedHi
     if (!stableKeysByValue.has(value)) stableKeysByValue.set(value, historyStableKey(value));
     return stableKeysByValue.get(value);
   };
+  const preparedMaterialsByText = new Map();
+  const prepareMaterialOnce = value => {
+    const text = String(materialText(value) ?? '');
+    if (!preparedMaterialsByText.has(text)) preparedMaterialsByText.set(text, prepareMaterial(value));
+    return preparedMaterialsByText.get(text);
+  };
   const excludedStableKeys = new Set(excludedHistory.map(value => value?.stableKey ?? stableKeyFor(value?.value ?? value)));
   const excludedValues = excludedHistory.map(value => value?.value ?? value).filter(Boolean);
+  const excludedByValue = new Map();
+  const textIsExcluded = value => {
+    if (!excludedByValue.has(value)) excludedByValue.set(value, excludedValues.some(excluded => materiallySame(value, excluded, prepareMaterialOnce)));
+    return excludedByValue.get(value);
+  };
   const selectedStableKeys = new Set(selectedHistory.map(stableKeyFor));
   const selectedFloorIds = new Set(selectedHistory.map(value => value.floorId));
-  const sourceAnchorFloorIds = [];
-  const rememberAnchor = floorId => { if (floorId && !sourceAnchorFloorIds.includes(floorId)) sourceAnchorFloorIds.push(floorId); };
+  const sourceAnchorsByFloor = new Map();
+  const rememberAnchor = (floorId, anchor) => {
+    if (!floorId) return;
+    const current = sourceAnchorsByFloor.get(floorId);
+    if (!current || relationAnchorOrder(anchor, current) < 0) sourceAnchorsByFloor.set(floorId, anchor);
+  };
   for (const value of selectedCse) {
     for (const floorId of [value.floorId, value.sourceFloorId, value.before?.sourceFloorId, value.after?.sourceFloorId]) {
       if (floorId) selectedFloorIds.add(floorId);
-      rememberAnchor(floorId);
+      rememberAnchor(floorId, value);
     }
   }
-  const selectedAnchors = balancedRelationAnchors(selectedHistory);
-  selectedAnchors.forEach(value => rememberAnchor(value.floorId));
+  const selectedAnchors = [...selectedHistory].sort(relationAnchorOrder);
+  selectedAnchors.forEach(value => rememberAnchor(value.floorId, value));
   const allowed = value => !selectedStableKeys.has(stableKeyFor(value))
     && !excludedStableKeys.has(stableKeyFor(value))
-    && !excludedValues.some(excluded => materiallySame(value, excluded));
+    && !textIsExcluded(value);
   const result = [];
   const add = (value, kind, anchor = null, relationTerms = []) => {
     if (!value || !allowed(value) || result.some(existing => duplicateKeyFor(existing) === duplicateKeyFor(value))) return false;
-    const anchorFloorId = typeof anchor === 'string' ? anchor : anchor?.floorId ?? null;
+    const anchorFloorId = anchor?.floorId ?? anchor?.sourceFloorId ?? anchor?.before?.sourceFloorId ?? anchor?.after?.sourceFloorId ?? null;
+    const anchorScore = Math.max(0, Number(anchor?.score) || 0);
+    const relationScore = kind === 'topic' ? anchorScore * 0.9 : kind === 'nearby' ? anchorScore * 0.2 : anchorScore;
+    const anchorIsCse = Boolean(anchor && !anchor.floorMemoryId && (anchor.stateId || anchor.deltaId || anchor._recallCseKind));
     result.push({
       ...value,
-      score: Math.max(value.score, kind === 'source' ? 0.65 : kind === 'topic' ? 0.45 : 0.15),
+      score: Math.max(Number(value.score) || 0, relationScore),
       _relationEvidence: kind,
       _relationAnchorFloorId: anchorFloorId,
-      _relationAnchorStableKey: anchor && typeof anchor === 'object' ? stableKeyFor(anchor) : null,
+      _relationAnchorStableKey: anchorIsCse ? null : stableKeyFor(anchor),
+      _relationAnchorCseKey: anchorIsCse ? cseStableKey(anchor) : null,
       _relationTerms: relationTerms,
     });
     selectedStableKeys.add(stableKeyFor(value));
@@ -719,7 +723,7 @@ function expandLinkedHistory({ context, selectedHistory, selectedCse, excludedHi
   };
 
   const summaryByFloor = new Map(context.summaries.map(value => [value.floorId, value]));
-  for (const floorId of sourceAnchorFloorIds.slice(0, 6)) add(summaryByFloor.get(floorId), 'source', floorId);
+  for (const [floorId, anchor] of sourceAnchorsByFloor) add(summaryByFloor.get(floorId), 'source', anchor);
 
   const entityTokens = new Set([...context.entityById.values()].flatMap(entity => entityLabels(entity).flatMap(tokenizeRecallText)));
   const valuesByFloor = new Map();
@@ -761,13 +765,11 @@ function expandLinkedHistory({ context, selectedHistory, selectedCse, excludedHi
       if (!linkedItems.some(value => stableKeyFor(value.record.value) === stableKeyFor(candidate.record.value))) linkedItems.push({ ...candidate, anchor: anchor.value });
     }
   }
-  const linkedFloorIds = new Set();
   for (const { record, anchor, sharedTopics } of linkedItems.sort((a, b) => b.sharedTopics - a.sharedTopics || b.sharedRatio - a.sharedRatio || a.distance - b.distance
     || b.record.value.score - a.record.value.score || a.record.value.assistantSeq - b.record.value.assistantSeq)) {
-    if (!linkedFloorIds.has(record.value.floorId) && linkedFloorIds.size >= MAX_LINKED_FLOORS) continue;
     const anchorRecord = itemRecords.find(value => stableKeyFor(value.value) === stableKeyFor(anchor));
     const terms = anchorRecord ? setIntersection(anchorRecord.tokens, record.tokens).filter(token => (documentFrequency.get(token) ?? Number.MAX_SAFE_INTEGER) <= rareLimit) : [];
-    if (add(record.value, 'topic', anchor, terms.slice(0, 4))) linkedFloorIds.add(record.value.floorId);
+    add(record.value, 'topic', anchor, terms.slice(0, 4));
   }
   return result.sort((a, b) => a.assistantSeq - b.assistantSeq || a.floorId.localeCompare(b.floorId) || a._sourceOrder - b._sourceOrder);
 }
@@ -775,7 +777,6 @@ function expandLinkedHistory({ context, selectedHistory, selectedCse, excludedHi
 function expandLinkedCse({ source, historyContext, selectedHistory, linkedHistory, selectedCse, excludedCse = [] }) {
   const history = [...selectedHistory, ...linkedHistory];
   if (!history.length) return [];
-  const floorIds = new Set(history.map(value => value.floorId).filter(Boolean));
   const memoryByFloor = new Map(historyContext.oldMemories.map(memory => [memory.floorId, memory]));
   const involvedIds = new Set();
   for (const value of history) {
@@ -787,13 +788,32 @@ function expandLinkedCse({ source, historyContext, selectedHistory, linkedHistor
   const selectedKeys = new Set(selectedCse.map(cseStableKey));
   const excludedValues = excludedCse.map(value => value?.value ?? value).filter(Boolean);
   const excludedKeys = new Set(excludedCse.map(value => value?.stableKey ?? cseStableKey(value?.value ?? value)));
-  return candidates.filter(value => {
-    if (selectedKeys.has(cseStableKey(value)) || excludedKeys.has(cseStableKey(value))) return false;
-    if (excludedValues.some(excluded => materiallySame(value, excluded))) return false;
-    return floorIds.has(value.floorId) || floorIds.has(value.before?.sourceFloorId) || floorIds.has(value.after?.sourceFloorId);
-  }).map(value => ({ ...value, score: Math.max(value.score, 0.6), _relationEvidence: 'source' }))
-    .sort((a, b) => a.assistantSeq - b.assistantSeq || b.priority - a.priority)
-    .slice(0, MAX_CSE_ITEMS);
+  const entityTokens = new Set([...historyContext.entityById.values()].flatMap(entity => entityLabels(entity).flatMap(tokenizeRecallText)));
+  const queryTokens = relationTokens(historyContext.query, entityTokens);
+  const chainAnchor = value => selectedCse.find(selected => {
+    if (selected.subjectEntityId !== value.subjectEntityId || selected.layer !== value.layer) return false;
+    if (selected._recallCseKind !== 'change' && !selected.deltaId) return sameStateSource(value.after, selected);
+    return sameStateSource(value.after, selected.before) || sameStateSource(value.before, selected.after);
+  });
+  const topicEvidence = (value, anchor) => {
+    const left = relationTokens(value._rankText ?? `${value.before?.text ?? ''} ${value.after?.text ?? ''}`, entityTokens);
+    const right = relationTokens(anchor._rankText ?? anchor.text, entityTokens);
+    const shared = setIntersection(left, right);
+    const ratio = shared.length / Math.max(1, Math.min(left.size, right.size));
+    const queryShared = shared.filter(token => queryTokens.has(token) && !RELATION_GENERIC_ACTION_TOKENS.has(token));
+    return queryShared.length || (ratio >= 0.25 && shared.length >= 2) ? queryShared.length ? queryShared : shared : [];
+  };
+  return candidates.flatMap(value => {
+    if (selectedKeys.has(cseStableKey(value)) || excludedKeys.has(cseStableKey(value))) return [];
+    if (excludedValues.some(excluded => materiallySame(value, excluded))) return [];
+    const adjacent = chainAnchor(value);
+    if (adjacent) return [{ ...value, score: Math.max(Number(value.score) || 0, Number(adjacent.score) || 0), _relationEvidence:'source', _relationAnchorCseKey:cseStableKey(adjacent) }];
+    const sourceFloorIds = new Set([value.floorId, value.before?.sourceFloorId, value.after?.sourceFloorId].filter(Boolean));
+    const linked = history.map(anchor => ({ anchor, terms:sourceFloorIds.has(anchor.floorId) ? topicEvidence(value, anchor) : [] }))
+      .filter(entry => entry.terms.length).sort((a, b) => relationAnchorOrder(a.anchor, b.anchor))[0];
+    if (!linked) return [];
+    return [{ ...value, score:Math.max(Number(value.score) || 0, Number(linked.anchor.score) || 0), _relationEvidence:'source', _relationAnchorStableKey:historyStableKey(linked.anchor), _relationTerms:linked.terms.slice(0, 4) }];
+  }).sort(relationAnchorOrder);
 }
 
 function buildStorylinePlan({ context, history, states, changes }) {
@@ -836,19 +856,17 @@ function buildStorylinePlan({ context, history, states, changes }) {
   };
   const lines = [];
   const assignedHistory = new Set();
-  const historyLineLimit = Math.max(1, MAX_STORYLINES - Number(Boolean(states.length || changes.length)));
   const addHistory = (line, value, terms = []) => {
     const key = historyStableKey(value);
     if (assignedHistory.has(key)) return false;
     line.history.push(value); line.historyTerms.set(key, terms); terms.forEach(term => line.terms.set(term, (line.terms.get(term) ?? 0) + 1)); assignedHistory.add(key); return true;
   };
   const newLine = (anchor, kind = 'direct') => {
-    if (lines.length >= MAX_STORYLINES || lines.filter(line => line.history.length).length >= historyLineLimit) return null;
     const line = { storylineId: `line-${lines.length + 1}`, kind, anchorKey: historyStableKey(anchor), history: [], states: [], changes: [], terms: new Map(), historyTerms: new Map() };
     lines.push(line); addHistory(line, anchor, anchor._relationTerms ?? []); return line;
   };
   const direct = history.filter(value => !value._relationEvidence).sort(relationAnchorOrder);
-  const storylineAnchors = balancedRelationAnchors(direct, 12);
+  const storylineAnchors = [...direct];
   const candidateLines = storylineAnchors.map((anchor, order) => {
     const members = [], evidenceByKey = new Map();
     for (const value of history) {
@@ -874,21 +892,15 @@ function buildStorylinePlan({ context, history, states, changes }) {
       score: relevance + latestUserRelevance * 4 + anchorLatestUserRelevance * 2
         + Math.min(4, floorCount) * 0.8 + Math.min(8, members.length) * 0.08,
     };
-  }).sort((a, b) => Number(b.floorCount >= 2) - Number(a.floorCount >= 2) || b.score - a.score || b.floorCount - a.floorCount || a.order - b.order);
+  }).sort((a, b) => relationAnchorOrder(a.anchor, b.anchor)
+    || Number(b.floorCount >= 2) - Number(a.floorCount >= 2) || b.score - a.score || b.floorCount - a.floorCount || a.order - b.order);
   for (const candidate of candidateLines) {
-    if (lines.length >= MAX_STORYLINES) break;
     if (lines.some(line => {
       const existingAnchor = line.history.find(value => historyStableKey(value) === line.anchorKey);
       return existingAnchor && (materiallySame(candidate.anchor, existingAnchor) || topicTerms(candidate.anchor, existingAnchor).length);
     })) continue;
-    let available = candidate.members.filter(value => !assignedHistory.has(historyStableKey(value)));
+    const available = candidate.members.filter(value => !assignedHistory.has(historyStableKey(value)));
     if (new Set(available.map(value => value.floorId)).size < 2) continue;
-    const seedLimit = Math.min(4, MAX_STORYLINE_HISTORY_ITEMS);
-    if (available.length > seedLimit) {
-      const chronological = [...available].sort((a, b) => a.assistantSeq - b.assistantSeq || a._sourceOrder - b._sourceOrder);
-      const retained = new Set([chronological[0], chronological.at(-1), ...[...available].sort(relationAnchorOrder).slice(0, seedLimit - 2)]);
-      available = chronological.filter(value => retained.has(value)).slice(0, seedLimit);
-    }
     const anchor = available.includes(candidate.anchor) ? candidate.anchor : available.slice().sort(relationAnchorOrder)[0];
     const kind = available.some(value => ['commitment', 'openLoop'].includes(value.kind)) ? 'continuity' : 'direct';
     const line = newLine(anchor, kind);
@@ -921,25 +933,6 @@ function buildStorylinePlan({ context, history, states, changes }) {
       if (materiallySame(value, related) || evidence.length) addHistory(line, related, evidence);
     }
   }
-  const keepLineEndpoints = line => {
-    if (line.history.length <= MAX_STORYLINE_HISTORY_ITEMS) return;
-    const chronological = [...line.history].sort((a, b) => a.assistantSeq - b.assistantSeq || a._sourceOrder - b._sourceOrder);
-    const retained = new Set([chronological[0], chronological.at(-1)]);
-    for (const value of [...chronological].sort(relationAnchorOrder)) {
-      if (retained.size >= Math.min(6, MAX_STORYLINE_HISTORY_ITEMS)) break;
-      retained.add(value);
-    }
-    for (let slot = 1; retained.size < MAX_STORYLINE_HISTORY_ITEMS && slot < MAX_STORYLINE_HISTORY_ITEMS - 1; slot += 1) {
-      retained.add(chronological[Math.round(slot * (chronological.length - 1) / (MAX_STORYLINE_HISTORY_ITEMS - 1))]);
-    }
-    for (const value of chronological) {
-      if (retained.size >= MAX_STORYLINE_HISTORY_ITEMS) break;
-      retained.add(value);
-    }
-    line.history = chronological.filter(value => retained.has(value));
-    line.terms = new Map();
-    for (const value of line.history) for (const term of line.historyTerms.get(historyStableKey(value)) ?? []) line.terms.set(term, (line.terms.get(term) ?? 0) + 1);
-  };
   for (const value of history) {
     if (assignedHistory.has(historyStableKey(value))) continue;
     const line = newLine(value, value._relationEvidence === 'source' ? 'source' : value._relationEvidence === 'topic' ? 'topic' : ['commitment', 'openLoop'].includes(value.kind) ? 'continuity' : 'direct');
@@ -951,7 +944,6 @@ function buildStorylinePlan({ context, history, states, changes }) {
       if (materiallySame(value, related) || evidence.length) addHistory(line, related, evidence);
     }
   }
-  lines.forEach(keepLineEndpoints);
   const lineForCse = value => {
     const sourceFloors = new Set([value.floorId, value.sourceFloorId, value.before?.sourceFloorId, value.after?.sourceFloorId].filter(Boolean));
     const cseRecord = recordFor(value);
@@ -991,13 +983,11 @@ function buildStorylinePlan({ context, history, states, changes }) {
     return null;
   };
   const neutralCseLine = () => lines.find(line => line.kind === 'source' && !line.history.length)
-    ?? (lines.length < MAX_STORYLINES
-      ? (() => {
-        const line = { storylineId: `line-${lines.length + 1}`, kind: 'source', anchorKey: null, history: [], states: [], changes: [], terms: new Map(), historyTerms: new Map() };
-        lines.push(line);
-        return line;
-      })()
-      : null);
+    ?? (() => {
+      const line = { storylineId: `line-${lines.length + 1}`, kind: 'source', anchorKey: null, history: [], states: [], changes: [], terms: new Map(), historyTerms: new Map() };
+      lines.push(line);
+      return line;
+    })();
   for (const value of changes) {
     let line = lineForCse(value);
     if (!line) line = neutralCseLine();
@@ -1049,7 +1039,9 @@ function buildStorylinePlan({ context, history, states, changes }) {
 
 function historyCandidateText(value, entityById) {
   const chronology = formatChronologyAnchor(value._chronology ?? []);
-  const source = `AI #${value.assistantSeq}${chronology ? `（${chronology}）` : ''}`;
+  const seqs = value.sourceAssistantSeqs ?? [];
+  const floorLabel = seqs.length > 1 ? `AI #${seqs[0]}–#${seqs.at(-1)}` : `AI #${value.assistantSeq}`;
+  const source = `${floorLabel}${chronology ? `（${chronology}）` : ''}`;
   const names = ids => [...new Set((ids ?? []).filter(Boolean))].map(id => entityName(id, entityById)).join('、');
   let boundary = '客观剧情事实';
   if (value.category === 'narrative') boundary = '叙事回顾；可能含内心、计划或未完成事项，不代表所有人物知情；若与后文冲突以后文为准';
@@ -1067,79 +1059,29 @@ export function buildRecallHistoryCandidatePool({ source, queryContext, historyC
   const charLimit = Math.max(0, Math.min(MAX_LLM_HISTORY_CHARACTERS, Math.floor(Number(maxCharacters) || 0)));
   if (!context || itemLimit === 0 || charLimit === 0) return Object.freeze({ candidates: Object.freeze([]), text: '', limits: Object.freeze({ maxCandidates: itemLimit, maxCharacters: charLimit, actualCandidates: 0, actualCharacters: 0 }) });
   const seen = new Set();
-  const grouped = { summary: [], continuity: [], fact: [] };
+  const values = [];
   for (const value of [...context.direct, ...context.adjacent]) {
     const key = duplicateKey(value);
     if (seen.has(key)) continue;
     seen.add(key);
-    grouped[value._poolGroup ?? 'fact'].push(value);
+    values.push(value);
   }
   const groupOrder = ['summary', 'continuity', 'fact'];
-  const totalWeight = Object.values(HISTORY_GROUP_WEIGHTS).reduce((sum, value) => sum + value, 0);
-  const itemTargets = {
-    summary: Math.floor(itemLimit * HISTORY_GROUP_WEIGHTS.summary / totalWeight),
-    continuity: Math.floor(itemLimit * HISTORY_GROUP_WEIGHTS.continuity / totalWeight),
-  };
-  itemTargets.fact = itemLimit - itemTargets.summary - itemTargets.continuity;
-  const charTargets = {
-    summary: Math.floor(charLimit * HISTORY_GROUP_WEIGHTS.summary / totalWeight),
-    continuity: Math.floor(charLimit * HISTORY_GROUP_WEIGHTS.continuity / totalWeight),
-  };
-  charTargets.fact = charLimit - charTargets.summary - charTargets.continuity;
-  const candidates = [], lines = [], selected = new Set(), groupCharacters = { summary: 0, continuity: 0, fact: 0 };
-  const floorRoundRobin = values => {
-    const queues = new Map();
-    for (const value of values) queues.set(value.floorId, [...(queues.get(value.floorId) ?? []), value]);
-    const ordered = [];
-    for (let offset = 0; ordered.length < values.length; offset += 1) {
-      let added = false;
-      for (const queue of queues.values()) {
-        if (!queue[offset]) continue;
-        ordered.push(queue[offset]); added = true;
-      }
-      if (!added) break;
-    }
-    return ordered;
-  };
+  const candidates = [], lines = [], groupCharacters = { summary: 0, continuity: 0, fact: 0 };
   const totalCharacters = () => lines.reduce((sum, line) => sum + line.length, 0) + Math.max(0, lines.length - 1);
-  const tryAdd = (value, group, groupCharacterLimit = null) => {
-    if (selected.has(value) || candidates.length >= itemLimit) return false;
+  const tryAdd = value => {
+    if (candidates.length >= itemLimit) return false;
+    const group = value._poolGroup ?? 'fact';
     const key = `R${candidates.length + 1}`;
     const text = historyCandidateText(value, context.entityById);
     const line = `${key}｜${text}`;
     const separator = lines.length ? 1 : 0;
     if (totalCharacters() + separator + line.length > charLimit) return false;
-    if (groupCharacterLimit !== null && groupCharacters[group] + (groupCharacters[group] ? 1 : 0) + line.length > groupCharacterLimit) return false;
-    lines.push(line); selected.add(value); groupCharacters[group] += (groupCharacters[group] ? 1 : 0) + line.length;
+    lines.push(line); groupCharacters[group] += (groupCharacters[group] ? 1 : 0) + line.length;
     candidates.push(Object.freeze({ key, stableKey: historyStableKey(value), source: group, sourceKind: value._adjacentSummary ? 'adjacent' : 'matched', text, value }));
     return true;
   };
-  for (const group of groupOrder) {
-    let count = 0;
-    if (group === 'continuity') {
-      const commitmentTarget = Math.floor(itemTargets.continuity / 2);
-      const openLoopTarget = itemTargets.continuity - commitmentTarget;
-      for (const [kind, target] of [['commitment', commitmentTarget], ['openLoop', openLoopTarget]]) {
-        let kindCount = 0;
-        for (const value of floorRoundRobin(grouped.continuity.filter(itemValue => itemValue.kind === kind))) {
-          if (kindCount >= target) break;
-          if (tryAdd(value, group, charTargets[group])) { kindCount += 1; count += 1; }
-        }
-      }
-      for (const value of floorRoundRobin(grouped.continuity)) {
-        if (count >= itemTargets.continuity) break;
-        if (tryAdd(value, group, charTargets[group])) count += 1;
-      }
-      continue;
-    }
-    for (const value of floorRoundRobin(grouped[group])) {
-      if (count >= itemTargets[group]) break;
-      if (tryAdd(value, group, charTargets[group])) count += 1;
-    }
-  }
-  const remainder = groupOrder.flatMap(group => grouped[group].filter(value => !selected.has(value)).map((value, order) => ({ group, value, order })))
-    .sort((a, b) => b.value.score - a.value.score || b.value.priority - a.value.priority || groupOrder.indexOf(a.group) - groupOrder.indexOf(b.group) || a.order - b.order);
-  for (const entry of remainder) tryAdd(entry.value, entry.group);
+  for (const value of values.sort(relationAnchorOrder)) tryAdd(value);
   const formatted = lines.join('\n');
   return Object.freeze({
     candidates: Object.freeze(candidates),
@@ -1179,23 +1121,6 @@ function cseCandidatePayload(candidate) {
   };
 }
 
-function roundRobinBySubject(values, preferredSubjects) {
-  const subjectOrder = [...preferredSubjects];
-  for (const value of values) if (!subjectOrder.includes(value.subjectEntityId)) subjectOrder.push(value.subjectEntityId);
-  const queues = new Map(subjectOrder.map(subject => [subject, values.filter(value => value.subjectEntityId === subject)]));
-  const result = [];
-  for (let offset = 0; result.length < values.length; offset += 1) {
-    let added = false;
-    for (const subject of subjectOrder) {
-      const value = queues.get(subject)?.[offset];
-      if (!value) continue;
-      result.push(value); added = true;
-    }
-    if (!added) break;
-  }
-  return result;
-}
-
 export function buildRecallCseCandidatePool({ source, queryContext, cseContext = null, maxCandidates = MAX_LLM_CSE_CANDIDATES, maxCharacters = MAX_LLM_CSE_CHARACTERS } = {}) {
   const context = cseContext ?? cseSelectionContext(source, queryContext);
   const itemLimit = Math.max(0, Math.min(MAX_LLM_CSE_CANDIDATES, Math.floor(Number(maxCandidates) || 0)));
@@ -1210,20 +1135,14 @@ export function buildRecallCseCandidatePool({ source, queryContext, cseContext =
       seen.add(key); return true;
     });
   };
-  const currentOrder = roundRobinBySubject(unique(context.states), context.entityOrder);
-  const changeOrder = roundRobinBySubject(unique(context.changes)
-    .sort((a, b) => b.assistantSeq - a.assistantSeq || b.score - a.score || b.priority - a.priority), context.entityOrder);
-  const half = Math.floor(itemLimit / 2);
-  const currentTarget = half, changeTarget = itemLimit - half;
-  const priorityOrder = [];
-  for (let index = 0; index < Math.max(currentTarget, changeTarget); index += 1) {
-    if (index < currentTarget && currentOrder[index]) priorityOrder.push({ source: 'current', value: currentOrder[index] });
-    if (index < changeTarget && changeOrder[index]) priorityOrder.push({ source: 'change', value: changeOrder[index] });
-  }
-  priorityOrder.push(
-    ...currentOrder.slice(currentTarget).map(value => ({ source: 'current', value })),
-    ...changeOrder.slice(changeTarget).map(value => ({ source: 'change', value })),
-  );
+  const currentOrder = unique(context.states).filter(value => value.score > 0).sort(relationAnchorOrder);
+  const changeOrder = unique(context.changes).filter(value => value.score > 0).sort(relationAnchorOrder);
+  const priorityOrder = [
+    ...currentOrder.map(value => ({ source: 'current', value })),
+    ...changeOrder.map(value => ({ source: 'change', value })),
+  ].sort((a, b) => relationAnchorOrder(a.value, b.value)
+    || context.entityOrder.indexOf(a.value.subjectEntityId) - context.entityOrder.indexOf(b.value.subjectEntityId)
+    || Number(a.source === 'change') - Number(b.source === 'change'));
   const candidates = [];
   const groupsFor = list => {
     const bySubject = new Map();
@@ -1259,11 +1178,11 @@ export function buildRecallCseCandidatePool({ source, queryContext, cseContext =
   });
 }
 
-export function selectRecall({ source, queryContext, historyContext: providedHistoryContext = null, cseContext: providedCseContext = null, contextSize = 8192, maxFloors = MAX_RECALLED_FLOORS, maxItems = MAX_TOTAL_ITEMS, selectedHistoryCandidates, selectedCseCandidates, excludedHistoryCandidates = [], excludedCseCandidates = [], stateProgressionCandidates = [], reservedTokens = 0, reservedCharacters = 0 } = {}) {
-  const emptyStages = input => Object.freeze({ input, candidates: 0, dropRecent: 0, dropPersistent: 0, dropVisibility: 0, selected: 0, recentSummaryCount: 0, distantHistoryItemCount: 0, linkedHistoryItemCount: 0, stateCount: 0, currentStateCount: 0, cseChangeCount: 0, linkedCseChangeCount: 0, stateProgressionCount: 0, budgetDroppedCount: 0, finalInjectionItemCount: 0 });
-  if (source?.status !== 'ready') return Object.freeze({ status: 'empty', injectionText: '', floors: Object.freeze([]), states: Object.freeze([]), cseChanges: Object.freeze([]), stateProgressions: Object.freeze([]), timeDependencies: Object.freeze({ mode: 'selected', corrections: Object.freeze([]), reminders: Object.freeze([]) }), stages: emptyStages(0), skipReasons: Object.freeze(['sourceUnavailable']) });
+export function selectRecall({ source, queryContext, historyContext: providedHistoryContext = null, cseContext: providedCseContext = null, contextSize = 8192, maxFloors = null, maxItems = null, selectedHistoryCandidates, selectedCseCandidates, excludedHistoryCandidates = [], excludedCseCandidates = [], reservedTokens = 0, reservedCharacters = 0 } = {}) {
+  const emptyStages = input => Object.freeze({ input, candidates: 0, dropRecent: 0, dropPersistent: 0, dropVisibility: 0, selected: 0, recentSummaryCount: 0, distantHistoryItemCount: 0, linkedHistoryItemCount: 0, stateCount: 0, currentStateCount: 0, cseChangeCount: 0, linkedCseChangeCount: 0, budgetDroppedCount: 0, finalInjectionItemCount: 0 });
+  if (source?.status !== 'ready') return Object.freeze({ status: 'empty', injectionText: '', floors: Object.freeze([]), states: Object.freeze([]), cseChanges: Object.freeze([]), timeDependencies: Object.freeze({ mode: 'selected', corrections: Object.freeze([]), reminders: Object.freeze([]) }), stages: emptyStages(0), skipReasons: Object.freeze(['sourceUnavailable']) });
   const query = clean(queryContext?.text, MAX_QUERY_CHARACTERS);
-  if (!query) return Object.freeze({ status: 'empty', injectionText: '', floors: Object.freeze([]), states: Object.freeze([]), cseChanges: Object.freeze([]), stateProgressions: Object.freeze([]), timeDependencies: Object.freeze({ mode: 'selected', corrections: Object.freeze([]), reminders: Object.freeze([]) }), coverage: source.coverage, stages: Object.freeze({ ...emptyStages(0), candidates: source.floorMemories.length }), skipReasons: Object.freeze(['emptyQuery']) });
+  if (!query) return Object.freeze({ status: 'empty', injectionText: '', floors: Object.freeze([]), states: Object.freeze([]), cseChanges: Object.freeze([]), timeDependencies: Object.freeze({ mode: 'selected', corrections: Object.freeze([]), reminders: Object.freeze([]) }), coverage: source.coverage, stages: Object.freeze({ ...emptyStages(0), candidates: source.floorMemories.length }), skipReasons: Object.freeze(['emptyQuery']) });
   const historyContext = providedHistoryContext ?? historySelectionContext(source, queryContext);
   const cseContext = providedCseContext ?? cseSelectionContext(source, queryContext);
   const oldMemories = historyContext.oldMemories;
@@ -1273,7 +1192,6 @@ export function selectRecall({ source, queryContext, historyContext: providedHis
   const historical = (explicitHistorySelection
     ? selectedHistoryCandidates.map(value => historicalByStableKey.get(value?.stableKey ?? historyStableKey(value?.value ?? value))).filter(Boolean)
     : historyContext.direct).map(value => ({ ...value, recallSection: 'distant' }));
-  const specialRoleById = new Map(source.entities.map(entity => [entity.entityId, entity.specialRole ?? null]));
   const explicitCseSelection = Array.isArray(selectedCseCandidates);
   const cseByStableKey = new Map([...(cseContext?.states ?? []), ...(cseContext?.changes ?? [])].map(value => [cseStableKey(value), value]));
   const selectedCse = explicitCseSelection
@@ -1284,8 +1202,8 @@ export function selectRecall({ source, queryContext, historyContext: providedHis
   const linkedCse = expandLinkedCse({ source, historyContext, selectedHistory: historical, linkedHistory, selectedCse: selectedCse ?? [], excludedCse: excludedCseCandidates });
   const stateRanked = explicitCseSelection ? selectedCse.filter(value => value._recallCseKind !== 'change') : (cseContext?.states ?? []);
   const changeRanked = explicitCseSelection ? [...selectedCse.filter(value => value._recallCseKind === 'change'), ...linkedCse] : [...(cseContext?.changes ?? []).filter(value => value.score > 0), ...linkedCse];
-  const allowedItems = Math.max(0, Math.min(MAX_TOTAL_ITEMS, Math.floor(Number(maxItems) || 0)));
-  const cseItemTarget = MAX_CSE_ITEMS, historyTarget = allowedItems;
+  const requestedItemLimit = Number.isSafeInteger(maxItems) && maxItems >= 0 ? maxItems : null;
+  const allowedItems = requestedItemLimit ?? Number.MAX_SAFE_INTEGER;
   let dropPersistent = 0;
   const historyKeys = new Set();
   const recentHistoryBase = [...historyContext.recentSummaries].reverse().filter(value => {
@@ -1301,15 +1219,9 @@ export function selectRecall({ source, queryContext, historyContext: providedHis
     return true;
   });
   const cseKeys = new Set();
-  const zeroCoreFallbackRoles = new Set();
   const eligibleStates = stateRanked.filter(value => {
     if (explicitCseSelection) return true;
-    if (value.score > 0) return true;
-    if (value.layer !== 'core') return false;
-    const role = specialRoleById.get(value.subjectEntityId);
-    if (!['user', 'char'].includes(role) || zeroCoreFallbackRoles.has(role)) return false;
-    zeroCoreFallbackRoles.add(role);
-    return true;
+    return value.score > 0;
   });
   const uniqueStates = eligibleStates.filter(value => {
     const key = duplicateKey(value);
@@ -1328,10 +1240,7 @@ export function selectRecall({ source, queryContext, historyContext: providedHis
     if (historyKeys.has(key)) { dropPersistent += 1; return false; }
     historyKeys.add(key); return true;
   });
-  const priorityDirectKeys = new Set(balancedRelationAnchors(candidateHistory).map(historyStableKey));
-  const priorityDirectHistory = candidateHistory.filter(value => priorityDirectKeys.has(historyStableKey(value)));
-  const remainingDirectHistory = candidateHistory.filter(value => !priorityDirectKeys.has(historyStableKey(value)));
-  const baseHistory = [...priorityDirectHistory, ...uniqueLinkedHistory, ...remainingDirectHistory];
+  const baseHistory = [...candidateHistory, ...uniqueLinkedHistory].sort(relationAnchorOrder);
   const storylinePlan = buildStorylinePlan({ context: historyContext, history: baseHistory, states: uniqueStates, changes: uniqueChanges });
   const recentStoryline = recentHistoryBase.length ? Object.freeze({
     storylineId: 'recent', title: '近期剧情接续', basis: '最近的连续摘要按真实来源时间排列；与当前可见正文重复的楼已排除。',
@@ -1340,15 +1249,13 @@ export function selectRecall({ source, queryContext, historyContext: providedHis
   const uniqueHistory = storylinePlan.history;
   const plannedStates = storylinePlan.states;
   const plannedChanges = storylinePlan.changes;
-  const storylineDefinitions = [...(recentStoryline ? [recentStoryline] : []), ...storylinePlan.storylines];
-  const floorLimit = Math.max(0, Math.min(MAX_RECALLED_FLOORS, Number.isSafeInteger(maxFloors) ? maxFloors : MAX_RECALLED_FLOORS));
+  let storylineDefinitions = [...(recentStoryline ? [recentStoryline] : []), ...storylinePlan.storylines];
+  const requestedFloorLimit = Number.isSafeInteger(maxFloors) && maxFloors >= 0 ? maxFloors : null;
+  const floorLimit = requestedFloorLimit ?? Number.MAX_SAFE_INTEGER;
   const { characterLimit: charLimit, tokenLimit } = recallBudget(contextSize, { reservedTokens, reservedCharacters });
-  const { characterLimit: progressionCharLimit, tokenLimit: progressionTokenLimit } = recallBudgetWithProgression(contextSize, { reservedTokens, reservedCharacters });
-  const historyTokenTarget = Math.floor(tokenLimit * 0.72);
-  const historyCharTarget = Math.floor(charLimit * 2 / 3), cseCharTarget = charLimit - historyCharTarget;
   const chosenTimeReminders = [];
-  const chosenStates = [], chosenChanges = [], chosenProgressions = [], chosenRecent = [], chosenDistant = [], chosenHistory = [], chosenFloorIds = new Set();
-  const render = (states = chosenStates, changes = chosenChanges, history = chosenHistory, progressions = chosenProgressions) => {
+  const chosenStates = [], chosenChanges = [], chosenRecent = [], chosenDistant = [], chosenHistory = [], chosenFloorIds = new Set();
+  const render = (states = chosenStates, changes = chosenChanges, history = chosenHistory) => {
     const floorMap = new Map();
     for (const value of history) {
       const floor = floorMap.get(value.floorId) ?? { floorId: value.floorId, floorMemoryId: value.floorMemoryId, assistantSeq: value.assistantSeq, chronology: value._chronology ?? [], score: 0, reasons: new Set(), items: [] };
@@ -1380,17 +1287,12 @@ export function selectRecall({ source, queryContext, historyContext: providedHis
       ...publicChanges.map(value => value.storylineId),
     ].filter(Boolean));
     const storylines = storylineDefinitions.filter(value => activeIds.has(value.storylineId));
-    const publicProgressions = progressions.map(value => ({
-      subjectEntityId: value.subjectEntityId, subject: value.subject, towardEntityId: value.towardEntityId ?? null, toward: value.toward ?? null,
-      savedText: value.savedText, visibility: value.visibility, sourceStateId: value.sourceStateId, sourceFloorId: value.sourceFloorId,
-      sourceAssistantSeq: value.sourceAssistantSeq ?? null, timeBasis: value.timeBasis, suggestion: value.suggestion,
-      evidence: value.evidence.map(item => ({ kind: item.kind === 'recent' ? 'history' : item.kind, floorId: item.floorId, assistantSeq: item.assistantSeq })),
-    }));
     const timeDependencies = { mode: 'selected', corrections: [], reminders: [] };
-    const text = formatRecallInjection({ coverage: source.coverage, floors, states: publicStates, cseChanges: publicChanges, stateProgressions: publicProgressions, entityById, storylines, timeProjection: source.timeProjection, timeReminders: chosenTimeReminders, timeDependencies });
-    return { floors, states: publicStates, cseChanges: publicChanges, stateProgressions: publicProgressions, storylines, timeDependencies, text };
+    const text = formatRecallInjection({ coverage: source.coverage, floors, states: publicStates, cseChanges: publicChanges, entityById, storylines, timeProjection: source.timeProjection, timeReminders: chosenTimeReminders, timeDependencies });
+    return { floors, states: publicStates, cseChanges: publicChanges, storylines, timeDependencies, text };
   };
-  let dropSemanticDuplicate = 0;
+  let dropSemanticDuplicate = 0, budgetDropped = 0, evidenceFiltered = 0;
+  const fitsBudget = text => text.length <= charLimit && estimateRecallTokens(text) <= tokenLimit;
   const historyCoversCse = value => {
     const sourceFloors = new Set([value.floorId, value.sourceFloorId, value.before?.sourceFloorId, value.after?.sourceFloorId].filter(Boolean));
     const parts = value._recallCseKind === 'change' ? [value.before?.text, value.after?.text].filter(Boolean) : [value.text].filter(Boolean);
@@ -1398,78 +1300,129 @@ export function selectRecall({ source, queryContext, historyContext: providedHis
     const sameFloorHistory = chosenHistory.filter(itemValue => sourceFloors.has(itemValue.floorId));
     return parts.every(part => sameFloorHistory.some(itemValue => materiallySame({ text: part }, itemValue)));
   };
-  const canAddCse = (value, kind, groupLimit = null) => {
-    if (chosenStates.length + chosenChanges.length >= cseItemTarget) return false;
+  const tryAddCse = (value, kind) => {
     if (chosenHistory.some(selected => duplicateKey(selected) === duplicateKey(value))) { dropPersistent += 1; return false; }
     if (historyCoversCse(value)) { dropSemanticDuplicate += 1; return false; }
     const states = kind === 'state' ? [...chosenStates, value] : chosenStates;
     const changes = kind === 'change' ? [...chosenChanges, value] : chosenChanges;
-    if (groupLimit !== null && render(states, changes, []).text.length > groupLimit) return false;
     const text = render(states, changes, chosenHistory).text;
-    return text.length <= charLimit && estimateRecallTokens(text) <= tokenLimit;
+    if (!fitsBudget(text)) { budgetDropped += 1; return false; }
+    (kind === 'change' ? chosenChanges : chosenStates).push(value);
+    return true;
   };
-  const canAddHistory = (value, groupLimit = null) => {
+  const tryAddHistory = value => {
     if (chosenHistory.includes(value) || chosenHistory.length >= allowedItems) return false;
     if ([...chosenStates, ...chosenChanges].some(selected => duplicateKey(selected) === duplicateKey(value))) return false;
     const newFloor = !chosenFloorIds.has(value.floorId);
     if (newFloor && chosenFloorIds.size >= floorLimit) return false;
-    if (groupLimit !== null) {
-      const historyText = render([], [], [...chosenHistory, value]).text;
-      if (historyText.length > groupLimit || estimateRecallTokens(historyText) > historyTokenTarget) return false;
-    }
     const text = render(chosenStates, chosenChanges, [...chosenHistory, value]).text;
-    return text.length <= charLimit && estimateRecallTokens(text) <= tokenLimit;
-  };
-  const addHistory = value => {
+    if (!fitsBudget(text)) { budgetDropped += 1; return false; }
     chosenHistory.push(value);
     (value.recallSection === 'recent' ? chosenRecent : chosenDistant).push(value);
     chosenFloorIds.add(value.floorId);
+    return true;
   };
-  const storylineHistoryOrder = [];
-  const lineIds = [...new Set(uniqueHistory.map(value => value._storylineId))];
-  for (let offset = 0; storylineHistoryOrder.length < uniqueHistory.length; offset += 1) {
-    let added = false;
-    for (const lineId of lineIds) {
-      const value = uniqueHistory.filter(itemValue => itemValue._storylineId === lineId)[offset];
-      if (!value) continue;
-      storylineHistoryOrder.push(value); added = true;
-    }
-    if (!added) break;
+  const tryAddTime = value => {
+    chosenTimeReminders.push(value);
+    if (fitsBudget(render().text)) return true;
+    chosenTimeReminders.pop(); budgetDropped += 1; return false;
+  };
+  for (const value of recentHistory) tryAddHistory(value);
+  const timeRanked = rankedTimeReminders(source, queryContext, query, entityById);
+  evidenceFiltered += timeRanked.filter(value => value.score <= 0).length;
+  evidenceFiltered += [...(cseContext?.states ?? []), ...(cseContext?.changes ?? [])].filter(value => value.score <= 0).length;
+  evidenceFiltered += [...historyContext.facts, ...historyContext.summaries].filter(value => value.score <= 0).length;
+  const relationRank = value => value._relationEvidence === 'source' ? 1 : value._relationEvidence === 'topic' ? 2 : value._relationEvidence === 'nearby' ? 3 : 0;
+  const competitionPrimary = entry => (Number(entry.value.branchScores?.latestUser) || 0) + (entry.kind === 'time' ? timeUrgencyBoost(entry.value) : 0);
+  const competitionOrder = (a, b) => competitionPrimary(b) - competitionPrimary(a)
+    || (Number(b.value.score) || 0) - (Number(a.value.score) || 0)
+    || relationRank(a.value) - relationRank(b.value)
+    || (Number(b.value.priority) || 0) - (Number(a.value.priority) || 0)
+    || (Number(b.value.assistantSeq ?? b.value.sourceAssistantSeq) || 0) - (Number(a.value.assistantSeq ?? a.value.sourceAssistantSeq) || 0)
+    || (Number(a.value._sourceOrder) || 0) - (Number(b.value._sourceOrder) || 0);
+  const competition = [
+    ...uniqueHistory.map(value => ({ kind: 'history', value })),
+    ...plannedStates.map(value => ({ kind: 'state', value })),
+    ...plannedChanges.map(value => ({ kind: 'change', value })),
+    ...timeRanked.filter(value => value.score > 0).map(value => ({ kind: 'time', value })),
+  ].sort(competitionOrder);
+  const competitionHistoryByKey = new Map(competition.filter(entry => entry.kind === 'history').map(entry => [historyStableKey(entry.value), entry]));
+  const competitionCseByKey = new Map(competition.filter(entry => ['state', 'change'].includes(entry.kind)).map(entry => [cseStableKey(entry.value), entry]));
+  const orderedCompetition = [], orderedEntries = new Set(), orderingEntries = new Set();
+  const addInDependencyOrder = entry => {
+    if (!entry || orderedEntries.has(entry) || orderingEntries.has(entry)) return;
+    orderingEntries.add(entry);
+    addInDependencyOrder(competitionHistoryByKey.get(entry.value._relationAnchorStableKey));
+    addInDependencyOrder(competitionCseByKey.get(entry.value._relationAnchorCseKey));
+    orderingEntries.delete(entry); orderedEntries.add(entry); orderedCompetition.push(entry);
+  };
+  competition.forEach(addInDependencyOrder);
+  const chosenHistoryKeys = new Set(), chosenCseKeys = new Set();
+  for (const value of chosenHistory) chosenHistoryKeys.add(historyStableKey(value));
+  for (const entry of orderedCompetition) {
+    const { value } = entry;
+    if (value._relationAnchorStableKey && !chosenHistoryKeys.has(value._relationAnchorStableKey)) { evidenceFiltered += 1; continue; }
+    if (value._relationAnchorCseKey && !chosenCseKeys.has(value._relationAnchorCseKey)) { evidenceFiltered += 1; continue; }
+    if (entry.kind === 'history') {
+      if (tryAddHistory(value)) chosenHistoryKeys.add(historyStableKey(value));
+    } else if (entry.kind === 'time') tryAddTime(value);
+    else if (tryAddCse(value, entry.kind)) chosenCseKeys.add(cseStableKey(value));
   }
-  for (const value of recentHistory) if (canAddHistory(value)) addHistory(value);
-  for (const value of storylineHistoryOrder) if (canAddHistory(value, historyCharTarget)) addHistory(value);
-  const cseCandidates = [...plannedChanges, ...plannedStates]
-    .sort((a, b) => (b.branchScores.latestUser ?? 0) - (a.branchScores.latestUser ?? 0) || b.score - a.score || b.priority - a.priority || (b.assistantSeq ?? 0) - (a.assistantSeq ?? 0));
-  for (const value of cseCandidates) {
-    if (chosenStates.length + chosenChanges.length >= cseItemTarget) break;
-    const kind = value._recallCseKind === 'change' ? 'change' : 'state';
-    if (!canAddCse(value, kind)) continue;
-    (kind === 'change' ? chosenChanges : chosenStates).push(value);
+  const refreshFinalStorylines = () => {
+    const finalPlan = buildStorylinePlan({ context: historyContext, history: chosenDistant, states: chosenStates, changes: chosenChanges });
+    chosenDistant.splice(0, chosenDistant.length, ...finalPlan.history);
+    chosenStates.splice(0, chosenStates.length, ...finalPlan.states);
+    chosenChanges.splice(0, chosenChanges.length, ...finalPlan.changes);
+    chosenHistory.splice(0, chosenHistory.length, ...chosenRecent, ...chosenDistant);
+    storylineDefinitions = [...(recentStoryline && chosenRecent.length ? [recentStoryline] : []), ...finalPlan.storylines];
+  };
+  const dropLowestSelected = () => {
+    const selected = [
+      ...chosenDistant.map(value => ({ kind: 'history', value })),
+      ...chosenStates.map(value => ({ kind: 'state', value })),
+      ...chosenChanges.map(value => ({ kind: 'change', value })),
+      ...chosenTimeReminders.map(value => ({ kind: 'time', value })),
+    ].sort(competitionOrder);
+    const dropped = selected.at(-1);
+    if (!dropped) return false;
+    const remove = (values, predicate) => { const index = values.findIndex(predicate); if (index >= 0) values.splice(index, 1); };
+    if (dropped.kind === 'history') remove(chosenDistant, value => historyStableKey(value) === historyStableKey(dropped.value));
+    else if (dropped.kind === 'time') remove(chosenTimeReminders, value => value.itemId === dropped.value.itemId);
+    else if (dropped.kind === 'change') remove(chosenChanges, value => cseStableKey(value) === cseStableKey(dropped.value));
+    else remove(chosenStates, value => cseStableKey(value) === cseStableKey(dropped.value));
+    budgetDropped += 1;
+    let pruned;
+    do {
+      pruned = 0;
+      const historyKeys = new Set([...chosenRecent, ...chosenDistant].map(historyStableKey));
+      const cseKeys = new Set([...chosenStates, ...chosenChanges].map(cseStableKey));
+      const dependentValid = value => (!value._relationAnchorStableKey || historyKeys.has(value._relationAnchorStableKey))
+        && (!value._relationAnchorCseKey || cseKeys.has(value._relationAnchorCseKey));
+      for (const values of [chosenDistant, chosenStates, chosenChanges]) for (let index = values.length - 1; index >= 0; index -= 1) {
+        if (dependentValid(values[index])) continue;
+        values.splice(index, 1); pruned += 1;
+      }
+      budgetDropped += pruned;
+    } while (pruned);
+    return true;
+  };
+  let rendered;
+  while (true) {
+    refreshFinalStorylines();
+    rendered = render();
+    if (fitsBudget(rendered.text) || !dropLowestSelected()) break;
   }
-  for (const value of recentHistory) if (canAddHistory(value)) addHistory(value);
-  for (const value of uniqueHistory) if (canAddHistory(value)) addHistory(value);
-  const selectedHistoryKeys = () => new Set(chosenHistory.map(historyStableKey));
-  const selectedCseKeys = () => new Set([...chosenStates, ...chosenChanges].map(cseStableKey));
-  let progressionBudgetDropped = 0;
-  for (const value of Array.isArray(stateProgressionCandidates) ? stateProgressionCandidates.slice(0, 8) : []) {
-    if (source.timeProjection?.corrections?.[`${value.sourceStateId}|${value.subjectEntityId}|${value.sourceFloorId}`]) continue;
-    const cseKeysNow = selectedCseKeys(), historyKeysNow = selectedHistoryKeys();
-    if (!cseKeysNow.has(value.sourceStateStableKey)) continue;
-    if (!value.evidence.every(item => item.kind === 'recent'
-      ? chosenRecent.some(recent => recent.floorId === item.floorId && recent.assistantSeq === item.assistantSeq && recent.text === item.text)
-      : (item.kind === 'history' ? historyKeysNow : cseKeysNow).has(item.stableKey))) continue;
-    const text = render(chosenStates, chosenChanges, chosenHistory, [...chosenProgressions, value]).text;
-    if (text.length <= progressionCharLimit && estimateRecallTokens(text) <= progressionTokenLimit) chosenProgressions.push(value);
-    else progressionBudgetDropped += 1;
+  const retainedChanges = chosenChanges.filter(change => !(change.action === 'add' && chosenStates.some(state => state.subjectEntityId === change.subjectEntityId
+    && state.layer === change.layer && sameStateSnapshot(state, change.after))));
+  if (retainedChanges.length !== chosenChanges.length) {
+    dropPersistent += chosenChanges.length - retainedChanges.length;
+    chosenChanges.splice(0, chosenChanges.length, ...retainedChanges);
+    rendered = render();
   }
-  let timeBudgetDropped = 0;
-  for (const reminder of source.timeProjection?.reminders ?? []) {
-    chosenTimeReminders.push(reminder);
-    const candidate = render().text;
-    if (candidate.length > charLimit || estimateRecallTokens(candidate) > tokenLimit) { chosenTimeReminders.pop(); timeBudgetDropped += 1; }
-  }
-  const rendered = render();
-  const floors = rendered.floors, states = rendered.states, cseChanges = rendered.cseChanges, stateProgressions = rendered.stateProgressions, storylines = rendered.storylines, injectionText = rendered.text;
+  const correctedTimeIds = new Set(rendered.timeDependencies.corrections.map(value => value.itemId));
+  const timeReminderCount = rendered.timeDependencies.reminders.length;
+  const timeBudgetDropped = timeRanked.filter(value => value.score > 0 && !rendered.timeDependencies.reminders.some(item => item.itemId === value.itemId) && !correctedTimeIds.has(value.itemId)).length;
+  const floors = rendered.floors, states = rendered.states, cseChanges = rendered.cseChanges, storylines = rendered.storylines, injectionText = rendered.text;
   const skipReasons = [...(source.degradedReasons ?? [])];
   if (historyContext.bodyCoveredFloorIds.size) skipReasons.push('coreBodyDuplicate');
   if (!historical.length) skipReasons.push('noReliableMemoryMatch');
@@ -1484,10 +1437,9 @@ export function selectRecall({ source, queryContext, historyContext: providedHis
     floors: Object.freeze(floors.map(floor => Object.freeze({ ...floor, reasons: Object.freeze(floor.reasons), items: Object.freeze(floor.items.map(value => Object.freeze(value))) }))),
     states: Object.freeze(states.map(value => Object.freeze(value))),
     cseChanges: Object.freeze(cseChanges.map(value => Object.freeze(value))),
-    stateProgressions: Object.freeze(stateProgressions.map(value => Object.freeze({ ...value, evidence: Object.freeze(value.evidence.map(item => Object.freeze(item))) }))),
     storylines: Object.freeze(storylines.map(value => Object.freeze({ ...value }))),
-    stages: Object.freeze({ input: queryContext?.messageCount ?? 0, candidates: source.floorMemories.length, dropRecent: source.floorMemories.length - oldMemories.length, dropPersistent, dropVisibility: source.coverage.cseCurrent ? 0 : source.currentState.reduce((sum, subject) => sum + subject.core.length + subject.adaptive.length + subject.situational.length, 0), selected: floors.length, recentSummaryCount: chosenRecent.length, distantHistoryItemCount: chosenDistant.length, linkedHistoryItemCount: chosenDistant.filter(value => value._relationEvidence === 'source' || value._relationEvidence === 'topic').length, stateCount: states.length, currentStateCount: states.length, cseChangeCount: cseChanges.length, linkedCseChangeCount: chosenChanges.filter(value => value._relationEvidence === 'source').length, stateProgressionCount: stateProgressions.length, timeReminderCount: chosenTimeReminders.length, timeCorrectionCount: states.filter(state => source.timeProjection?.corrections?.[`${state.stateId}|${state.subjectEntityId}|${state.sourceFloorId}`]).length, timeBudgetDropped, storylineCount: storylines.length, semanticDuplicateCount: dropSemanticDuplicate, recentSummaryDroppedByBudget: recentHistory.length - chosenRecent.length, distantHistoryDroppedByBudget: uniqueHistory.length - chosenDistant.length, budgetDroppedCount: Math.max(0, recentHistory.length - chosenRecent.length) + Math.max(0, baseHistory.length - chosenDistant.length) + Math.max(0, uniqueStates.length + uniqueChanges.length - states.length - cseChanges.length - dropSemanticDuplicate) + progressionBudgetDropped + timeBudgetDropped, finalInjectionItemCount: chosenHistory.length + states.length + cseChanges.length + stateProgressions.length + chosenTimeReminders.length, estimatedTokenCount: estimateRecallTokens(injectionText), estimatedTokenBudget: progressionTokenLimit, ordinaryEstimatedTokenBudget: tokenLimit }),
+    stages: Object.freeze({ input: queryContext?.messageCount ?? 0, candidates: source.floorMemories.length, dropRecent: source.floorMemories.length - oldMemories.length, dropPersistent, dropVisibility: source.coverage.cseCurrent ? 0 : source.currentState.reduce((sum, subject) => sum + subject.core.length + subject.adaptive.length + subject.situational.length, 0), selected: floors.length, recentSummaryCount: chosenRecent.length, distantHistoryItemCount: chosenDistant.length, linkedHistoryItemCount: chosenDistant.filter(value => value._relationEvidence === 'source' || value._relationEvidence === 'topic').length, stateCount: states.length, currentStateCount: states.length, cseChangeCount: cseChanges.length, linkedCseChangeCount: chosenChanges.filter(value => value._relationEvidence === 'source').length, timeReminderCount, timeCorrectionCount: rendered.timeDependencies.corrections.length, timeBudgetDropped, storylineCount: storylines.length, semanticDuplicateCount: dropSemanticDuplicate, relevanceFilteredCount: evidenceFiltered, recentSummaryDroppedByBudget: recentHistory.length - chosenRecent.length, distantHistoryDroppedByBudget: uniqueHistory.length - chosenDistant.length, budgetDroppedCount: budgetDropped, finalInjectionItemCount: chosenHistory.length + states.length + cseChanges.length + timeReminderCount, estimatedTokenCount: estimateRecallTokens(injectionText), estimatedTokenBudget: tokenLimit }),
     skipReasons: Object.freeze(skipReasons),
-    limits: Object.freeze({ maxFloors: floorLimit, maxItems: allowedItems, maxCharacters: progressionCharLimit, ordinaryMaxCharacters: charLimit, actualCharacters: injectionText.length, estimatedTokenBudget: progressionTokenLimit, ordinaryEstimatedTokenBudget: tokenLimit, estimatedTokenCount: estimateRecallTokens(injectionText), tokenEstimateMethod: 'cjk1-latin4-punctuation2', historyEstimatedTokenTarget: historyTokenTarget, stateItemTarget: cseItemTarget, cseItemTarget, historyItemTarget: historyTarget, stateCharacterTarget: cseCharTarget, cseCharacterTarget: cseCharTarget, historyCharacterTarget: historyCharTarget }),
+    limits: Object.freeze({ maxFloors: requestedFloorLimit, maxItems: requestedItemLimit, maxCharacters: charLimit, actualCharacters: injectionText.length, estimatedTokenBudget: tokenLimit, estimatedTokenCount: estimateRecallTokens(injectionText), tokenEstimateMethod: 'cjk1-latin4-punctuation2' }),
   });
 }

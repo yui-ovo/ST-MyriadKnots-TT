@@ -515,6 +515,56 @@ test('旧 CSE load 的重放迟到时不得覆盖已经成功提交的人工长�
   assert.deepEqual(afterLateLoad.cseSubjects.find(item => item.subjectEntityId === subject.subjectEntityId).adaptive.map(item => item.text), ['新长期倾向']);
 });
 
+test('CSE root耐久后重放期间失效，不向外层回传旧epoch图', async () => {
+  const h = runtimeHarness({ chat: [user('开始'), assistant('第一楼。'), user('确认一'), assistant('第二楼。'), user('确认二')],
+    cse: () => ({ jsonData: { noMaterialChange: true } }) });
+  await h.runtime.start();
+  await h.runtime.extractNext();
+  const [, second] = h.runtime.getState().floors;
+  await h.runtime.extractFloor(second.floorId, { analyzeState: false });
+  const graph = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(graph.stateDeltas.length, 1);
+
+  let gateNextDigest = false, releaseReplay, markReplayStarted, callbacks = 0;
+  const replayStarted = new Promise(resolve => { markReplayStarted = resolve; });
+  const replayGate = new Promise(resolve => { releaseReplay = resolve; });
+  const wrappedStore = {
+    ...h.store,
+    async commitRoot(...args) {
+      const result = await h.store.commitRoot(...args);
+      if (result.status === 'saved' && result.reachable?.stateDeltas?.length > graph.stateDeltas.length) gateNextDigest = true;
+      return result;
+    },
+  };
+  const hostAdapter = createHostAdapter({ globalRef: { SillyTavern: { getContext: () => h.context } } });
+  const runtime = createCseRuntime({ store: wrappedStore, hostAdapter,
+    generateAnalysisTask: async () => ({ jsonData: { noMaterialChange: true } }),
+    onGraphCommitted: () => { callbacks += 1; }, now: () => new Date(NOW), newUuid: uuidFactory(), logger: { warn() {} } });
+  await runtime.load(graph);
+
+  const cryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  const realCrypto = globalThis.crypto;
+  const realDigest = realCrypto.subtle.digest.bind(realCrypto.subtle);
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, enumerable: true, value: {
+    subtle: { digest: async (...args) => {
+      if (gateNextDigest) { gateNextDigest = false; markReplayStarted(); await replayGate; }
+      return realDigest(...args);
+    } },
+  } });
+  try {
+    const running = runtime.analyzeFloor(second.floorId);
+    await replayStarted;
+    runtime.invalidate();
+    releaseReplay();
+    await running;
+  } finally {
+    releaseReplay();
+    Object.defineProperty(globalThis, 'crypto', cryptoDescriptor);
+  }
+  assert.equal(callbacks, 0, '失效重放不得向外层memory runtime回灌旧图');
+  assert.equal((await h.store.readReachable({ mode: 'runtime' })).stateDeltas.length, 2, 'root已耐久的CSE仍保留给后续冷读');
+});
+
 test('人工纠正可追加末 delta 未携带主体，并识别情境对象的无变、改向与清空', async () => {
   const envelope = createCseEnvelope({ floor: floor(FLOOR1, '甲在场。'), floorMemory: memory(MEMORY1), baseline, currentState: null, trackedSubjects: [entities[1]], entities });
   const compiled = await compileCseResponse({
@@ -820,9 +870,9 @@ test('稀疏 FloorMemory 不削弱正文，明确正文状态可编译且提示�
   assert.equal(compiled.delta.subjectSnapshots[0].situational[0].reason, '正文明确写出甲亲耳听见并记住');
   assert.equal(compiled.delta.source.promptVersion, CSE_PROMPT_VERSION);
   assert.equal(compiled.delta.source.compilerVersion, CSE_COMPILER_VERSION);
-  assert.equal(CSE_PROMPT_VERSION, 'qqj-v3-cse-prompt-18');
+  assert.equal(CSE_PROMPT_VERSION, 'qqj-v3-cse-prompt-22');
   assert.equal(CSE_COMPILER_VERSION, 'qqj-v3-cse-prompt-2/calibration-compiler-11');
-  assert.match(CSE_SYSTEM_PROMPT, /单次情绪、动作或台词默认只支持 Situational/);
+  assert.match(CSE_SYSTEM_PROMPT, /单次事件造成的即时情绪、动作或台词若有值得保留的当下影响，只可进入 Situational/);
   assert.match(CSE_SYSTEM_PROMPT, /人物被提及不等于本人在场/);
   assert.match(CSE_SYSTEM_PROMPT, /这条主要回答人物现在怎样、处境如何，还是此刻怎样对待某人/);
   assert.match(CSE_SYSTEM_PROMPT, /另一人只是背景、原因或事件参与者，还是这项态度或相处反应的明确对象/);
@@ -831,6 +881,10 @@ test('稀疏 FloorMemory 不削弱正文，明确正文状态可编译且提示�
   assert.match(CSE_SYSTEM_PROMPT, /对各方使用同一判断标准/);
   assert.match(CSE_SYSTEM_PROMPT, /private 只表示可见性，明确的私密态度仍可填写 toward/);
   assert.match(CSE_SYSTEM_PROMPT, /previousState 中旧 toward 也必须按本楼证据审视，不得盲从/);
+  assert.match(CSE_SYSTEM_PROMPT, /authorialOtherStateContext 不重复 previousState 已提供的人物/);
+  assert.match(CSE_SYSTEM_PROMPT, /仅针对填写了 toward 的 Adaptive，text 直接写具体长期倾向/);
+  assert.match(CSE_SYSTEM_PROMPT, /同一含义应写成“更愿意主动解释误会”.*不要写成“在和人物乙相处过程中，更愿意主动解释误会”/s);
+  assert.match(buildCseSystemPrompt('仅保留我的自定义指导'), /必要的适用条件、第三人，以及本身有实际语义的对象名称仍应保留/);
   assert.match(CSE_SYSTEM_PROMPT, /单方 A→B 不得自动镜像成 B→A/);
   assert.match(CSE_SYSTEM_PROMPT, /最新作者设定、明确用户纠正和本楼正文/);
   assert.match(CSE_SYSTEM_PROMPT, /根级 changeSummary\/summary 不会被当作人物状态/);
@@ -838,7 +892,15 @@ test('稀疏 FloorMemory 不削弱正文，明确正文状态可编译且提示�
   assert.match(CSE_SYSTEM_PROMPT, /reason 是可选的简短解释.*reason 也不能代替 evidence/s);
   assert.match(CSE_SYSTEM_PROMPT, /previousState 按 subject 分列各人的 ownState.*不代表其他人物已经知道它/s);
   assert.match(CSE_SYSTEM_PROMPT, /直接输出的 adaptive、situational 数组表示该类在本楼结束时的完整结果/);
-  assert.match(CSE_SYSTEM_PROMPT, /situational 中仍有效者保留，已结束者移除/);
+  assert.match(CSE_SYSTEM_PROMPT, /situational 中仍需持续关注者保留，已结束或仅剩历史流水者按上述规则移除或提炼/);
+  assert.match(CSE_SYSTEM_PROMPT, /同一楼、同一连续事件链中的多个动作、台词或多个 quote 始终只算一次事件证据/);
+  assert.match(CSE_SYSTEM_PROMPT, /单次事件造成的即时情绪、动作或台词.*只可进入 Situational.*不得把它改写成“当 X 时总会\/会……”之类长期条件模式/s);
+  assert.match(CSE_SYSTEM_PROMPT, /新增 Adaptive 只能由明确作者设定、明确作者纠正，或正文明确回顾并证实多个彼此独立的既往事件形成重复模式/);
+  assert.match(CSE_SYSTEM_PROMPT, /不得拿 previousState、旧状态的 reason.*补足独立证据/s);
+  assert.match(CSE_SYSTEM_PROMPT, /已发送或已收到消息、已拍到照片、已完成部署、已达成一次行动、已得知一条信息等已经完成的过程默认交给摘要/);
+  assert.match(CSE_SYSTEM_PROMPT, /若确有未解决后果，只写仍在生效的后果，不保留过程流水/);
+  assert.match(CSE_SYSTEM_PROMPT, /每次输出某人物的 situational 完整列表时，必须同时清理 previousState 中已经结束、已被替代或只剩历史意义的条目/);
+  assert.match(CSE_SYSTEM_PROMPT, /这些过程退出当前列表不需要正文逐条宣布“结束”/);
   assert.match(CSE_SYSTEM_PROMPT, /无足够依据更新整个类别时省略该类别/);
   assert.match(CSE_SYSTEM_PROMPT, /合并身份后同一个人的有效状态.*不要把合并前的旧名称或旧身份另算作另一人/s);
   assert.match(CSE_SYSTEM_PROMPT, /adaptive review 的 previousText 与 toward 必须按上文规则精确指向旧项/);
@@ -947,6 +1009,9 @@ test('生产 CSE 请求 seam 固定样例可并存自身无对象与行为关系
   assert.doesNotMatch(sentSystemPrompt, /你是“千千结”的人物状态理解器/);
   assert.match(sentSystemPrompt, /这条主要回答人物现在怎样、处境如何，还是此刻怎样对待某人/);
   assert.match(sentSystemPrompt, /关系反应可以通过明确指向对方的言语和行为表现/);
+  assert.match(sentSystemPrompt, /同一楼、同一连续事件链中的多个动作、台词或多个 quote 始终只算一次事件证据/);
+  assert.match(sentSystemPrompt, /新增 Adaptive 只能由明确作者设定、明确作者纠正，或正文明确回顾并证实多个彼此独立的既往事件形成重复模式/);
+  assert.match(sentSystemPrompt, /每次输出某人物的 situational 完整列表时，必须同时清理 previousState 中已经结束、已被替代或只剩历史意义的条目/);
   assert.deepEqual(result.delta.subjectSnapshots[0].situational.map(item => [item.text, item.towardEntityId, item.visibility]), [
     ['困倦放松，正在入睡', null, 'private'],
     ['拒绝乙触碰', B, 'observable'],
@@ -1963,19 +2028,38 @@ test('合并身份编译以 canonical 并集判断变化，并用旧成员空快
   assert.deepEqual(projectCseStateIdentityReferences(afterLaterOld, { ...chainProjection, deletedEntityIds: [USER] }).subjects, [], '删除 canonical 的既有投影过滤保持不变');
 });
 
-test('他人状态移入独立作者态上下文并保持隐私过滤；空 delta 也可重放为已分析', async () => {
+test('作者态上下文按 entityId 排除 previousState 已提供人物，并保留其余人物公开状态', async () => {
+  const sameNameId = '88888888-2222-4222-8222-222222222222';
+  const sameNameEntity = { id: sameNameId, entityType: 'person', displayName: '甲', aliases: [{ name: '另一位甲' }], specialRole: 'none' };
+  const allEntities = [...entities, sameNameEntity];
   const current = { subjects: [
     { subjectEntityId: USER, core: [], adaptive: [], situational: [{ text: '用户私心', visibility: 'private', reason: '私密', origin: 'floor', towardEntityId: null, sourceFloorId: FLOOR1, sourceDeltaId: null }] },
-    { subjectEntityId: A, core: [{ text: '作者设定', visibility: 'authorial', reason: '卡', origin: 'baseline', towardEntityId: null, sourceFloorId: null, sourceDeltaId: null }], adaptive: [], situational: [{ text: '公开动作', visibility: 'observable', reason: '看见', origin: 'floor', towardEntityId: null, sourceFloorId: FLOOR1, sourceDeltaId: null }] },
+    { subjectEntityId: A, core: [{ text: '作者设定', visibility: 'authorial', reason: '卡', origin: 'baseline', towardEntityId: null, sourceFloorId: null, sourceDeltaId: null }], adaptive: [{ text: '甲的私下判断', visibility: 'private', reason: '内心', origin: 'floor', towardEntityId: null, sourceFloorId: FLOOR1, sourceDeltaId: null }], situational: [{ text: '甲的公开动作', visibility: 'observable', reason: '看见', origin: 'floor', towardEntityId: null, sourceFloorId: FLOOR1, sourceDeltaId: null }] },
+    { subjectEntityId: B, core: [{ text: '乙的作者设定', visibility: 'authorial', reason: '卡', origin: 'baseline', towardEntityId: null, sourceFloorId: null, sourceDeltaId: null }], adaptive: [{ text: '乙的私下判断', visibility: 'private', reason: '内心', origin: 'floor', towardEntityId: null, sourceFloorId: FLOOR1, sourceDeltaId: null }], situational: [{ text: '乙的公开动作', visibility: 'observable', reason: '看见', origin: 'floor', towardEntityId: null, sourceFloorId: FLOOR1, sourceDeltaId: null }] },
+    { subjectEntityId: sameNameId, core: [], adaptive: [], situational: [{ text: '同名人物公开动作', visibility: 'observable', reason: '看见', origin: 'floor', towardEntityId: null, sourceFloorId: FLOOR1, sourceDeltaId: null }] },
   ] };
-  const envelope = createCseEnvelope({ floor: floor(FLOOR1, '正文'), floorMemory: memory(MEMORY1), baseline, currentState: current, trackedSubjects: entities.slice(0, 2), entities });
+  const envelope = createCseEnvelope({ floor: floor(FLOOR1, '正文'), floorMemory: memory(MEMORY1), baseline, currentState: current, trackedSubjects: entities.slice(0, 2), entities: allEntities });
   const forUser = envelope.request.payload.previousState.find(item => item.subject === '林岚');
   assert.equal('publicStateOfOthers' in forUser, false);
   assert.deepEqual(Object.keys(forUser), ['subject', 'coreUserEdited', 'ownState']);
   assert.equal(forUser.coreUserEdited, false);
-  const authorialForA = envelope.request.payload.authorialOtherStateContext.find(item => item.subject === '甲');
-  assert.deepEqual(authorialForA.core, []);
-  assert.deepEqual(authorialForA.situational.map(item => item.text), ['公开动作']);
+  const forA = envelope.request.payload.previousState.find(item => item.subject === '甲');
+  assert.deepEqual(forA.ownState.core.map(item => item.text), ['作者设定']);
+  assert.deepEqual(forA.ownState.adaptive.map(item => item.text), ['甲的私下判断']);
+  assert.deepEqual(forA.ownState.situational.map(item => item.text), ['甲的公开动作']);
+  const authorial = envelope.request.payload.authorialOtherStateContext;
+  assert.equal(authorial.some(item => item.subject === '林岚'), false);
+  assert.deepEqual(authorial.map(item => item.subject), ['乙', '甲'], '同名不同 entityId 不能随 tracked 甲误删');
+  assert.deepEqual(authorial.flatMap(item => [...item.core, ...item.adaptive, ...item.situational].map(value => value.text)), ['乙的公开动作', '同名人物公开动作']);
+
+  const noPrevious = createCseEnvelope({ floor: floor(FLOOR1, '正文'), floorMemory: memory(MEMORY1), baseline, currentState: { subjects: [current.subjects[1]] }, trackedSubjects: [entities[2]], entities: allEntities });
+  assert.deepEqual(noPrevious.request.payload.previousState, [], 'tracked 人物没有前态时不得伪造 previousState');
+  assert.deepEqual(noPrevious.request.payload.authorialOtherStateContext[0].situational.map(item => item.text), ['甲的公开动作'], '其他人物已有公开状态仍须保留');
+
+  const empty = createCseEnvelope({ floor: floor(FLOOR1, '正文'), floorMemory: memory(MEMORY1), baseline, currentState: null, trackedSubjects: [entities[0]], entities: allEntities });
+  assert.deepEqual(empty.request.payload.previousState, []);
+  assert.deepEqual(empty.request.payload.authorialOtherStateContext, []);
+
   const compiled = await compileCseResponse({ response: { noMaterialChange: true }, envelope, previousCurrentState: null, now: NOW, deltaId: 'cccccccc-1111-4111-8111-111111111111' });
   assert.equal(compiled.delta.noMaterialChange, true);
   const replay = await replayCurrentState({ chatId: CHAT, narrativeGeneration: GEN, baselineId: baseline.id, floors: [floor(FLOOR1, '正文')], floorMemories: [{ ...memory(MEMORY1), floorId: FLOOR1, recordStatus: 'active' }], stateDeltas: [compiled.delta], now: NOW });

@@ -22,7 +22,7 @@ class Node {
 }
 const flatten = node => [node, ...(node.children ?? []).flatMap(flatten)];
 
-test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢复各页滚动位置', async () => {
+test('真实面板入口按千人/千结/千事/双丝网/设置映射视图，并恢复各页滚动位置', async () => {
   const [source, panelHtml, panelCss] = await Promise.all([
     readFile(new URL('../src/ui/panel.js', import.meta.url), 'utf8'),
     readFile(new URL('../src/ui/panel.html', import.meta.url), 'utf8'),
@@ -32,9 +32,9 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
   const panelNode = new Node('section'), body = new Node('main'), view = new Node('div');
   const topbar = new Node('header'), resize = new Node('button'), close = new Node('button'), themeButton = new Node('button'), fabButton = new Node('button');
   const themeSvg = new Node('svg'); themeButton.querySelector = selector => selector === 'svg' ? themeSvg : null;
-  const profileTab = new Node('button'), eventTab = new Node('button'), peopleTab = new Node('button'), settingsTab = new Node('button'); profileTab.dataset.tab = 'profiles'; eventTab.dataset.tab = 'events'; peopleTab.dataset.tab = 'people'; settingsTab.dataset.tab = 'settings';
+  const profileTab = new Node('button'), eventTab = new Node('button'), qianshiTab = new Node('button'), peopleTab = new Node('button'), settingsTab = new Node('button'); profileTab.dataset.tab = 'profiles'; eventTab.dataset.tab = 'events'; qianshiTab.dataset.tab = 'qianshi'; peopleTab.dataset.tab = 'people'; settingsTab.dataset.tab = 'settings';
   const nodeMap = new Map([['.panel', panelNode], ['.body', body], ['.view', view], ['.topbar', topbar], ['.panel-resize-handle', resize], ['.close', close], ['.theme-btn', themeButton], ['.fab-toggle-btn', fabButton]]);
-  const root = { innerHTML: '', querySelector: selector => nodeMap.get(selector) ?? null, querySelectorAll: selector => selector === '.tab' ? [profileTab, eventTab, peopleTab, settingsTab] : [] };
+  const root = { innerHTML: '', querySelector: selector => nodeMap.get(selector) ?? null, querySelectorAll: selector => selector === '.tab' ? [profileTab, eventTab, qianshiTab, peopleTab, settingsTab] : [] };
   const host = new Node('host'); host.attachShadow = () => root;
   let firstElement = true;
   const documentEvents = {};
@@ -86,6 +86,16 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
     async activate() { calls.push(['profiles-activate']); return { status: 'ready' }; },
     deactivate() { calls.push(['profiles-deactivate']); },
   };
+  const qianshiTimelineView = {
+    mount(target) { calls.push(['qianshi-mount', target]); target.replaceChildren(new Node('qianshi')); },
+    async activate() { calls.push(['qianshi-activate']); return { status: 'ready' }; },
+    deactivate() { calls.push(['qianshi-deactivate']); },
+  };
+  const storageManagementView = {
+    mount(target) { calls.push(['storage-mount', target]); target.replaceChildren(new Node('storage')); },
+    async activate() { calls.push(['storage-activate']); return { status: 'ready' }; },
+    deactivate() { calls.push(['storage-deactivate']); },
+  };
   const values = { pluginEnabled: true, appearanceTheme: 'auto', fabShow: true, autoHideEnabled: false, autoHideKeepAiCount: 3 };
   const updates = [];
   const settings = { isEnabled: () => true, get: () => values, update(value) { Object.assign(values, value); updates.push(value); return value; } };
@@ -100,7 +110,7 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
   const memoryRuntime = { subscribe(listener) { memoryListeners.add(listener); return () => memoryListeners.delete(listener); } };
   const autoHideApplies = [];
   let autoHideApplyStatus = null;
-  const panel = entry.namespace.createPanel({ settings, v3FoundationView, timeRuntime, memoryRuntime, peopleProfilesView, documentRef, isSevenDaysLedgerInjectionEnabled: () => ledgerInjectionEnabled, onTimeEvolutionChange: () => { timeChanges += 1; }, navigatorRef: { clipboard: { async writeText(value) { clipboardWrites.push(value); if (clipboardFail) throw new Error('clipboard denied'); } } }, dialog: { setAppearance() {}, confirm(options) { timeConfirms.push(options); dialogActive = true; return new Promise(resolve => { resolveTimeConfirm = result => { dialogActive = false; resolve(result); }; }); }, custom(options) { helpDialog = options; dialogActive = true; return Promise.resolve(true); }, closeAll() { resolveTimeConfirm?.(false); dialogActive = false; }, hasActive: () => dialogActive, cancelTop() { dialogCancels += 1; dialogActive = false; } }, onFabShowChange: value => { fabVisible = value; }, onAutoHideChange: async value => { autoHideApplies.push(value); return autoHideApplyStatus ? { status: autoHideApplyStatus } : undefined; } });
+  const panel = entry.namespace.createPanel({ settings, v3FoundationView, timeRuntime, memoryRuntime, peopleProfilesView, qianshiTimelineView, storageManagementView, documentRef, isSevenDaysLedgerInjectionEnabled: () => ledgerInjectionEnabled, onTimeEvolutionChange: () => { timeChanges += 1; }, navigatorRef: { clipboard: { async writeText(value) { clipboardWrites.push(value); if (clipboardFail) throw new Error('clipboard denied'); } } }, dialog: { setAppearance() {}, confirm(options) { timeConfirms.push(options); dialogActive = true; return new Promise(resolve => { resolveTimeConfirm = result => { dialogActive = false; resolve(result); }; }); }, custom(options) { helpDialog = options; dialogActive = true; return Promise.resolve(true); }, closeAll() { resolveTimeConfirm?.(false); dialogActive = false; }, hasActive: () => dialogActive, cancelTop() { dialogCancels += 1; dialogActive = false; } }, onFabShowChange: value => { fabVisible = value; }, onAutoHideChange: async value => { autoHideApplies.push(value); return autoHideApplyStatus ? { status: autoHideApplyStatus } : undefined; } });
 
   await panel.show();
   assert.equal(diagnostics.starts, 1); assert.match(root.innerHTML, /\.body\{[^}]*touch-action:pan-y/);
@@ -115,7 +125,7 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
   assert.equal(view.children[0]?.className, 'settings-page', '设置页应真实占据面板内容容器');
   assert.equal(view.children[0]?.children.some(node => node.className === 'master-switch'), true, '设置首开不得被真实 setPage 重绘清掉总开关');
   const settingsGroups = view.children[0]?.children.filter(node => node.tag === 'details');
-  assert.deepEqual(settingsGroups.map(node => node.drawerTitle), ['通用设置', '记忆设置', '教程与配置文件'], '设置页应有三个同级大抽屉');
+  assert.deepEqual(settingsGroups.map(node => node.drawerTitle), ['通用设置', '记忆设置', '教程与配置文件'], '存储管理应收进记忆设置，不再占用顶层抽屉');
   const documentation = settingsGroups[2];
   assert.equal(documentation.open, false); assert.equal(view.children[0].children.at(-1), documentation, '教程与配置文件必须是设置页最后一项');
   const documentationCopy = flatten(documentation).map(node => node.textContent).join('|');
@@ -133,7 +143,7 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
   assert.equal(calls.length, callsBeforeHelp, '打开静态教程不得读取或激活记忆runtime');
   assert.equal(helpDialog.title, '千千结使用说明'); assert.equal(helpDialog.confirmText, '关闭'); assert.equal(helpDialog.cancelText, '');
   const helpSections = flatten(helpDialog.content).filter(node => node.tag === 'details');
-  assert.equal(helpSections.length, 9); assert.equal(helpSections[0].open, true); assert.ok(helpSections.slice(1).every(node => node.open === false));
+  assert.equal(helpSections.length, 10); assert.equal(helpSections[0].open, true); assert.ok(helpSections.slice(1).every(node => node.open === false));
   assert.equal(helpSections.at(-1).children[0].textContent, '排障手册');
   assert.match(flatten(helpDialog.content).map(node => node.textContent).join('|'), /保留包裹符.*清洗包裹符.*人物状态重构/);
   dialogActive = false;
@@ -151,6 +161,20 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
   fallback = flatten(rerenderedDocumentation).find(node => node.className === 'v3-diagnostic-fallback');
   assert.match(fallback?.value ?? '', /globalThis\.qqj_v3_public_bridge_v1/, '设置页重绘后保留手动复制文本');
   const memoryControls = settingsGroups[1].children[0].children;
+  const storageDrawer = memoryControls.find(node => node.drawerTitle === '存储管理');
+  assert.equal(storageDrawer?.drawerLevel, 'sub');
+  assert.equal(storageDrawer?.id, 'qqj-settings-sub-storage');
+  const storageActivationsBefore = calls.filter(([kind]) => kind === 'storage-activate').length;
+  storageDrawer.open = true; storageDrawer.fire('toggle');
+  assert.equal(calls.filter(([kind]) => kind === 'storage-activate').length, storageActivationsBefore, '父抽屉收起时子抽屉不得读取清单');
+  settingsGroups[1].open = true; settingsGroups[1].fire('toggle');
+  assert.equal(calls.filter(([kind]) => kind === 'storage-activate').length, storageActivationsBefore + 1);
+  settingsGroups[1].open = false; settingsGroups[1].fire('toggle');
+  assert.equal(calls.at(-1)[0], 'storage-deactivate');
+  settingsGroups[1].open = true; settingsGroups[1].fire('toggle');
+  assert.equal(calls.filter(([kind]) => kind === 'storage-activate').length, storageActivationsBefore + 2);
+  storageDrawer.open = false; storageDrawer.fire('toggle');
+  assert.equal(calls.at(-1)[0], 'storage-deactivate');
   const autoHideInput = memoryControls.find(node => node.tag === 'label' && node.children.some(child => child.textContent === '自动隐藏已记忆旧楼'))?.children.find(node => node.tag === 'input');
   const keepInput = memoryControls.find(node => node.className === 'qqj-auto-hide-row')?.children.find(node => node.tag === 'input');
   assert.equal(autoHideInput?.checked, false); assert.equal(keepInput?.value, '3'); assert.equal(keepInput?.className, 'settings-input settings-num');
@@ -187,6 +211,8 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
   assert.match(panelCss, /\.settings-group-body\{[^}]*padding:0 12px 8px 26px/);
   assert.match(panelCss, /\.settings-sub-body\.settings-drawer-list\{gap:0;padding:0 2px\}/);
   assert.match(panelCss, /\.settings-sub>\.settings-sub-summary\{[^}]*min-height:36px;padding:8px 2px/);
+  assert.match(panelCss, /\.qqj-storage-management\{display:grid;gap:9px\}/);
+  assert.doesNotMatch(panelCss, /\.qqj-storage-management\{[^}]*(?:padding|border-top)/);
   autoHideInput.checked = true; autoHideInput.fire('change'); await new Promise(resolve => setImmediate(resolve));
   assert.equal(autoHideApplies.at(-1).enabled, true); assert.equal(autoHideApplies.at(-1).keepAiCount, 3);
   assert.equal(memoryControls.find(node => node.className?.split?.(' ').includes('settings-result'))?.textContent, '已开启；后续按最近 3 个 AI 楼保留，已隐藏楼保持隐藏。');
@@ -202,6 +228,10 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
   assert.equal(view.children[0]?.className, 'qqj-page qqj-people-page', '返回内容页应移除设置 DOM 并呈现真实内容视图');
   eventTab.fire('click');
   assert.equal(body.scrollTop, 71, '回到千结时恢复千结滚动位置');
+  qianshiTab.fire('click'); body.scrollTop = 57;
+  assert.ok(calls.some(([kind]) => kind === 'qianshi-activate'), '千事必须挂载独立时间线视图');
+  eventTab.fire('click');
+  assert.equal(body.scrollTop, 71, '从千事返回千结仍恢复千结滚动位置');
   profileTab.fire('click');
   assert.equal(body.scrollTop, 31, '回到千人时恢复千人滚动位置');
 
@@ -220,7 +250,7 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
   assert.match(panelCss, /\.icon-btn svg\{width:18px;height:18px;[^}]*stroke-width:1\.8/);
   assert.doesNotMatch(panelCss, /@media\(max-width:640px\)[^}]*\.icon-btn\{width:30px/, '手机端不应再次缩小三枚顶部按钮的实际图形或点击框');
   assert.match(panelCss, /@media\(max-width:640px\)\{\.panel>\.panel-resize-handle\{display:none\}\}/, '手机把手隐藏规则须覆盖通用 display:grid，避免生成多余底部行');
-  assert.match(panelCss, /\.panel:has\(\.qqj-manual-save-bar\)\{background:var\(--panel\)\}/, '编辑页底部使用完整统一背景，不拼固定高度色块');
+  assert.doesNotMatch(panelCss, /\.panel:has\(\.qqj-manual-save-bar\)\{background:var\(--panel\)\}/, '编辑页底部不应再绘制整条保存栏背景');
   assert.doesNotMatch(panelCss, /linear-gradient\(to top,var\(--panel\)/, '不得重新引入底部高度拼接接缝');
   assert.match(panelCss, /\.qqj-api-editor>\.settings-sub-body>\.sub-advanced\+\.qqj-manual-save-bar\{margin-top:-9px\}/, '高级设置和 API 按钮栏之间抵消父容器 gap，避免重复留白');
   assert.doesNotMatch(panelCss, /\.qqj-profile-switcher\{touch-action:pan-x\}/, '人物横条不得用pan-x-only阻断从条内起步的整页纵向滚动');
@@ -256,7 +286,7 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
   const buttonEnd = touchEvent({ changedTouches: [touch(160, 105)], target: buttonTarget }); body.fire('touchend', buttonEnd);
   if (!buttonEnd.defaultPrevented) buttonTarget.click();
   assert.equal(buttonEnd.defaultPrevented, true); assert.equal(buttonClicks, 0, '按钮起始的横滑不得触发业务点击');
-  assert.equal(panel.getState().activeTab, 'people', '按钮起始横滑应进入双丝网');
+  assert.equal(panel.getState().activeTab, 'qianshi', '按钮起始横滑应进入千事');
   body.fire('touchstart', touchEvent({ touches: [touch(120, 100)], target: buttonTarget }));
   const buttonTapEnd = touchEvent({ changedTouches: [touch(120, 100)], target: buttonTarget }); body.fire('touchend', buttonTapEnd);
   if (!buttonTapEnd.defaultPrevented) buttonTarget.click();
@@ -264,7 +294,10 @@ test('真实面板入口按千人/千结/双丝网/设置映射视图，并恢�
 
   body.fire('touchstart', { touches: [touch(260, 100)], target: swipeTarget });
   body.fire('touchend', { changedTouches: [touch(160, 105)], target: swipeTarget });
-  assert.equal(panel.getState().screen, 'settings', '第三次左滑应进入设置页');
+  assert.equal(panel.getState().activeTab, 'people', '第三次左滑应进入双丝网');
+  body.fire('touchstart', { touches: [touch(260, 100)], target: swipeTarget });
+  body.fire('touchend', { changedTouches: [touch(160, 105)], target: swipeTarget });
+  assert.equal(panel.getState().screen, 'settings', '第四次左滑应进入设置页');
   const settingsInputTarget = { closest: selector => selector.includes('input') ? {} : null };
   body.fire('touchstart', { touches: [touch(100, 100)], target: settingsInputTarget });
   body.fire('touchend', { changedTouches: [touch(200, 105)], target: settingsInputTarget });

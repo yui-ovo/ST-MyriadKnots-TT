@@ -14,6 +14,8 @@ async function loadBootstrap(overrides = {}) {
     './ui/source-permission-view.js': { createSourcePermissionView: () => null },
     './ui/v3-foundation-view.js': { createV3FoundationView: () => null },
     './ui/people-profiles-view.js': { createPeopleProfilesView: () => null },
+    './ui/qianshi-timeline-view.js': { createQianshiTimelineView: () => null },
+    './ui/storage-management-view.js': { createStorageManagementView: () => ({ mount() {}, activate: async () => ({ status: 'ready' }), deactivate() {} }) },
     './ui/dialog.js': { createDialogManager: () => ({ host: null, confirm() {}, info() {}, setAppearance() {} }) },
     ...overrides,
   };
@@ -62,7 +64,7 @@ test('bootstrap 保留 transient stale 时的已挂载面板，disabled 仍显�
 });
 
 test('bootstrap 只挂载一个悬浮球，点击切换面板且总开关同步显隐', async () => {
-  let fabOptions, foundationOptions, peopleOptions, panelOptions, shows = 0, closes = 0; const appended = [], bodyAppended = [], fabAppearances = [], inlineAppearances = [];
+  let fabOptions, foundationOptions, peopleOptions, qianshiOptions, storageOptions, panelOptions, shows = 0, closes = 0; const appended = [], bodyAppended = [], fabAppearances = [], inlineAppearances = [];
   const fabHost = { style: {} };
   const dialogHost = { id: 'dialog-host' };
   const bootstrap = await loadBootstrap({ './ui/fab.js': { createFab: options => { fabOptions = options; return { host: fabHost, setBusy() {}, setAppearance(value) { fabAppearances.push(value); } }; } } });
@@ -78,19 +80,26 @@ test('bootstrap 只挂载一个悬浮球，点击切换面板且总开关同步�
   const instance = bootstrap({
     settings: { isEnabled: () => true, get: () => current }, enableFab: true,
     sessionStateProvider, prepareSession, backendDiagnosticProvider, isSevenDaysLedgerInjectionEnabled, timeRuntime, v3FoundationRuntime: memoryRuntime, pluginVersion: '0.1.9-test',
-    v3FoundationViewFactory: options => { foundationOptions = options; return stubView(); }, peopleProfilesViewFactory: options => { peopleOptions = options; return stubView(); }, peopleWorkspaceRuntime: { getState: () => ({}) },
+    v3FoundationViewFactory: options => { foundationOptions = options; return stubView(); }, peopleProfilesViewFactory: options => { peopleOptions = options; return stubView(); }, qianshiTimelineViewFactory: options => { qianshiOptions = options; return stubView(); }, peopleWorkspaceRuntime: { getState: () => ({}) },
     documentRef: { activeElement: null, defaultView: {}, getElementById: () => null, createElement: () => ({}), documentElement: { append: node => appended.push(node) }, body: { append: node => bodyAppended.push(node) } },
     inlineRenderer: { setAppearance(value) { inlineAppearances.push(value); } },
-    panelFactory: options => { panelOptions = options; return panel; }, dialogFactory: () => ({ host: dialogHost, confirm() {}, info() {}, setAppearance() {} }), wandInstaller() {},
+    storageManagement: { getState() {}, scan() {}, cleanup() {}, setAutoEnabled() {}, subscribe() {} },
+    storageManagementViewFactory: options => { storageOptions = options; return stubView(); },
+    panelFactory: options => { panelOptions = options; return panel; }, dialogFactory: () => ({ host: dialogHost, confirm() {}, choose: () => 'chosen', info() {}, setAppearance() {} }), wandInstaller() {},
   });
   assert.deepEqual(appended, [dialogHost], '弹窗 host 应挂在 documentElement，避免手机宿主 body 布局裁切');
   assert.equal(peopleOptions.dialog.host, dialogHost, '千人头像裁剪应复用 QQJ 弹窗管理器');
   assert.equal(peopleOptions.sessionStateProvider, sessionStateProvider);
   assert.equal(peopleOptions.prepareSession, prepareSession);
+  assert.equal(qianshiOptions.runtime, memoryRuntime, '千事必须直接复用完整 memory runtime 快照与现有订阅');
+  assert.equal(Object.hasOwn(qianshiOptions, 'settings'), false, '千事时间线不再接收重要标记设置接口');
+  assert.equal(panelOptions.qianshiTimelineView.activate instanceof Function, true);
   assert.equal(panelOptions.isSevenDaysLedgerInjectionEnabled, isSevenDaysLedgerInjectionEnabled);
+  assert.equal(panelOptions.storageManagementView.activate instanceof Function, true);
+  assert.equal(storageOptions.manager.getState instanceof Function, true);
   assert.equal(panelOptions.timeRuntime, undefined); assert.equal(panelOptions.memoryRuntime, undefined);
   assert.equal(foundationOptions.timeRuntime, timeRuntime); assert.equal(foundationOptions.runtime, memoryRuntime);
-  assert.deepEqual(bodyAppended, [panel.host, fabHost]); assert.equal(typeof fabOptions.onClick, 'function'); assert.equal(typeof foundationOptions.infoImpl, 'function');
+  assert.deepEqual(bodyAppended, [panel.host, fabHost]); assert.equal(typeof fabOptions.onClick, 'function'); assert.equal(typeof foundationOptions.infoImpl, 'function'); assert.equal(await foundationOptions.chooseImpl({}), 'chosen');
   assert.equal(foundationOptions.sessionStateProvider, sessionStateProvider); assert.deepEqual(foundationOptions.sessionStateProvider(), { status: 'preparing' }); assert.equal(sessionReads, 1);
   assert.equal(foundationOptions.backendDiagnosticProvider, backendDiagnosticProvider); assert.equal(backendReads, 0); assert.deepEqual(foundationOptions.backendDiagnosticProvider(), { sinceClientCreatedRequestCounts: { get: 2, put: 1, delete: 0 } }); assert.equal(backendReads, 1);
   assert.equal(foundationOptions.pluginVersion, '0.1.9-test');

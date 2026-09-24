@@ -87,7 +87,7 @@ const recallInjection = (...bullets) => [
 const descendantText = node => `${node?.textContent ?? ''}${(node?.children ?? []).map(descendantText).join('')}`;
 
 test('独立时间签名文本兼容纯时间及覆盖说明后的两种历史，旧楼展示原文与预算结果', async () => {
-  const reminder = '甲 / 擦伤：原观察；当前推测：可能减轻 <script>示例</script>';
+  const reminder = '甲 / 擦伤：原观察（5月9日）：手腕擦伤；已过2天（第3天）；当前推测（5月11日）：可能减轻 <script>示例</script>';
   const timeProjection = { corrections: {}, reminders: [{ itemId: 'time', text: reminder, distance: 0 }] };
   const coverage = { memoryComplete: true, cseCurrent: true };
   const onlyText = formatRecallInjection({ coverage, floors: [], states: [], entityById: new Map(), timeProjection, timeReminders: timeProjection.reminders });
@@ -107,10 +107,12 @@ test('独立时间签名文本兼容纯时间及覆盖说明后的两种历史�
   const h = createHarness({ chat, memoryState: { floors: [], memoryEntities: [] }, projectReceipt: async () => only });
   const node = messageElement(0, { user: true }); h.chatRoot.append(node); h.renderer.start(); await h.flushMicrotasks();
   const view = resolveInlineAnchor(node).querySelector('[data-qqj-inline-host="true"]').__qqjInlineCard;
-  const drawer = view.recallUi.events.querySelector('.time-progression');
+  assert.equal(view.recallUi.qianshi, null, '无千事字段的旧回执不显示千事区');
+  const drawer = view.recallUi.events.querySelector('.time-reference');
   assert.match(descendantText(drawer), /本轮时间参考（1条）/u);
   assert.notEqual(drawer.open, true);
-  assert.equal(drawer.querySelector('.time-progression-copy').textContent, reminder);
+  assert.deepEqual(drawer.querySelectorAll('.time-reference-copy').map(value => value.textContent), ['源状态：手腕擦伤', '推算状态：可能减轻 <script>示例</script>']);
+  assert.doesNotMatch(descendantText(drawer), /原观察|已过2天|第3天|当前推测/u);
   assert.equal(drawer.querySelector('script'), null);
   timeProjection.reminders[0].text = '后来后台的新推测';
   assert.deepEqual(projectInlineRecallReceipt(only).timeReferenceItems, [reminder]);
@@ -118,6 +120,60 @@ test('独立时间签名文本兼容纯时间及覆盖说明后的两种历史�
   assert.deepEqual(projectInlineRecallReceipt({ ...only, injectionText: '' }).timeReferenceItems, []);
   const old = { ...only, schemaVersion: 11, injectionText: recallInjection('AI #1：原观察这个词不应猜成校正'), selectedFloors: [{ floorId: HISTORY_FLOOR, assistantSeq: 1 }] };
   assert.deepEqual(projectInlineRecallReceipt(old).timeReferenceItems, []);
+});
+
+test('楼内时间参考只精简固定格式，期限与结构化校正保源状态/推算状态，旧自由文本不猜', () => {
+  const correction = '原观察（5月9日）：手腕擦伤；已过2天（第3天）；当前推测（5月11日）：可能减轻';
+  const deadline = '甲 / 归还钥匙：原观察（5月10日）：答应归还钥匙；约定期限 5月12日，还有1天；尚未确认发生或完成。';
+  const annual = '甲 / 生日：原日期 5月12日；下次日期 2026-05-12，还有3天。尚未确认庆祝、纪念或履约。';
+  const free = '旧版自由文本，没有可证明的源状态与推算状态';
+  const state = { stateId: 'state', subjectEntityId: 'person', sourceFloorId: HISTORY_FLOOR, subject: '甲', layer: 'situational', visibility: 'observable', text: '手腕擦伤', reason: '正文状态' };
+  const key = `state|person|${HISTORY_FLOOR}`;
+  const timeProjection = { corrections: { [key]: { itemId: 'body', text: correction } } };
+  const reminders = [{ itemId: 'deadline', text: deadline }, { itemId: 'annual', text: annual }, { itemId: 'old', text: free }];
+  const injectionText = formatRecallInjection({ coverage: { memoryComplete: true, cseCurrent: true }, floors: [], states: [state], cseChanges: [], entityById: new Map(), timeProjection, timeReminders: reminders });
+  const receipt = { schemaVersion: 11, status: 'ready', selectedFloors: [], selectedStates: [state], selectedCseChanges: [], storylines: [], injectionText,
+    timeDependencies: { mode: 'selected', corrections: [{ itemId: 'body', text: correction }], reminders: [{ itemId: 'deadline', text: deadline }, { itemId: 'annual', text: annual }, { itemId: 'old', text: free }] } };
+  const projected = projectInlineRecallReceipt(receipt);
+  assert.deepEqual(projected.timeReferenceDisplayItems, [
+    { source: '手腕擦伤', projection: '可能减轻' },
+    { source: '答应归还钥匙', projection: '约定期限 5月12日，还有1天；尚未确认发生或完成。' },
+    { source: '原日期 5月12日', projection: '下次日期 2026-05-12，还有3天。尚未确认庆祝、纪念或履约。' },
+    { text: free },
+  ]);
+  const legacy = projectInlineRecallReceipt({ ...receipt, timeDependencies: undefined });
+  assert.deepEqual(legacy.timeReferenceDisplayItems[0], { source: '手腕擦伤', projection: '可能减轻' });
+  const incidental = '旧记录提到原观察：手腕擦伤；当前推测：可能减轻，但这不是固定时间格式';
+  const incidentalReminder = { itemId: 'incidental', text: incidental };
+  const incidentalInjection = formatRecallInjection({ coverage: { memoryComplete: true, cseCurrent: true }, floors: [], states: [], cseChanges: [], entityById: new Map(),
+    timeProjection: { corrections: {}, reminders: [incidentalReminder] }, timeReminders: [incidentalReminder] });
+  const incidentalReceipt = { ...receipt, selectedStates: [], timeDependencies: undefined, injectionText: incidentalInjection };
+  assert.deepEqual(projectInlineRecallReceipt(incidentalReceipt).timeReferenceDisplayItems, [{ text: incidental }]);
+});
+
+test('新版时间参考精确解析短源状态，校正缺少依赖时仍不显示0或外层依据', () => {
+  const correction = '多处擦伤（归并：腰侧、手腕与膝盖共同观察）：观察于2026-05-10 04:00；发生于2026-05-08 20:00；距发生3天；当前推测（2026-05-11 20:00）：仍可能有压痛，暂无最新观察确认';
+  const body = '时间状态参考 / 甲 / 擦伤：观察于2026-05-10 04:40；发生时间未知；距观察15.8小时；当前推测（2026-05-10 20:30）：可能逐渐减轻，仍待新观察确认';
+  const deadline = '甲 / 归还钥匙：观察/发生于2026-05-10；距发生1天；约定期限 2026-05-12，还有1天。';
+  const malformed = '甲 / 擦伤：观察于2026-05-10；发生时间未知；距观察1天';
+  const state = { stateId: 'state', subjectEntityId: 'person', sourceFloorId: HISTORY_FLOOR, subject: '甲', storylineId: 'line-time', layer: 'situational', visibility: 'observable', text: '旧状态', reason: '正文状态' };
+  const key = `state|person|${HISTORY_FLOOR}`;
+  const reminders = [{ itemId: 'body', text: body }, { itemId: 'deadline', text: deadline }, { itemId: 'malformed', text: malformed }];
+  const storylines = [{ storylineId: 'line-time', title: '时间状态', basis: '人物当前状态直接匹配' }];
+  const timeDependencies = { mode: 'selected', corrections: [{ itemId: 'short', text: '擦伤' }, { itemId: 'merged', text: correction }], reminders: reminders.map(value => ({ ...value })) };
+  const injectionText = formatRecallInjection({ coverage: { memoryComplete: true, cseCurrent: true }, floors: [], states: [state], cseChanges: [], entityById: new Map(),
+    storylines, timeProjection: { corrections: { [key]: { itemId: 'merged', text: correction } }, reminders }, timeReminders: reminders, timeDependencies: { mode: 'selected', corrections: [], reminders: [] } });
+  const receipt = { schemaVersion: 14, status: 'ready', selectedFloors: [], selectedStates: [state], selectedCseChanges: [], storylines, injectionText, timeDependencies };
+  const projected = projectInlineRecallReceipt(receipt);
+  assert.deepEqual(projected.timeReferenceDisplayItems, [
+    { source: '多处擦伤（归并：腰侧、手腕与膝盖共同观察）', projection: '仍可能有压痛，暂无最新观察确认' },
+    { source: '擦伤', projection: '可能逐渐减轻，仍待新观察确认' },
+    { source: '归还钥匙', projection: '约定期限 2026-05-12，还有1天。' },
+    { text: malformed },
+  ]);
+  assert.doesNotMatch(JSON.stringify(projected.timeReferenceDisplayItems), /源状态：0|推算状态：0/u);
+  const withoutDependencies = projectInlineRecallReceipt({ ...receipt, timeDependencies: undefined });
+  assert.deepEqual(withoutDependencies.timeReferenceDisplayItems[0], { source: '多处擦伤（归并：腰侧、手腕与膝盖共同观察）', projection: '仍可能有压痛，暂无最新观察确认' });
 });
 
 async function actualCseReceipt() {
@@ -225,6 +281,16 @@ test('楼内纯投影沿用宿主角色语义，并给出紧凑记忆/准确召�
   assert.equal(unknown.historyItems.length, 0); assert.equal(unknown.summary, '召回内容请在详细回执中查看。');
 });
 
+test('楼内旧内部时间字段优先显示正文提取的多段 fallback，正常时间不被覆盖', () => {
+  const project = (sourceText, timeFallback) => projectInlineMemoryFloor({ floors: [{ floorId: 'floor', assistantSeq: 1, messageIndex: 1, status: 'ready', summary: '摘要', timeFallback, memory: { chronology: [{ time: { sourceText } }], locations: [], participants: [] } }] }, 1);
+  const time252 = '10月30日 周五 12:45 → 10月30日 周五 13:10；10月30日 周五 14:30 → 10月30日 周五 14:50';
+  const time254 = '11月2日 周一 08:00 → 11月2日 周一 08:20；11月2日 周一 09:10 → 11月2日 周一 09:40；11月2日 周一 11:00 → 11月2日 周一 11:15；11月2日 周一 13:30 → 11月2日 周一 14:00';
+  assert.equal(project('| date=0081-10-30 | weekday=周五 | time=12:45', time252).time, time252, '252 型只显示两段完整区间，不显示悬空尾');
+  assert.equal(project('| date=0081-11-02 | time=08:00', time254).time, time254, '254 型显示全部四段完整区间');
+  assert.equal(project('人工校准：次日清晨', '不应覆盖').time, '人工校准：次日清晨');
+  assert.equal(project('| date=0081-11-02 | time=08:00', '').time, '| date=0081-11-02 | time=08:00', '无 fallback 时保持旧值，不凭空改写');
+});
+
 test('楼内空投影区分同步、读取失败与真正未稳定，并始终禁用提取', () => {
   const syncing = projectInlineMemoryFloor({ memorySnapshotStatus: 'syncing', floors: [], pending: { messageIndex: 2 } }, 0);
   assert.deepEqual({ status: syncing.status, statusText: syncing.statusText, canExtract: syncing.canExtract }, { status: 'syncing', statusText: '正在读取本楼状态', canExtract: false });
@@ -242,7 +308,7 @@ test('楼内空投影区分同步、读取失败与真正未稳定，并始终�
   ] };
   const consecutive = projectInlineMemoryFloor(waitingState, 84, 43);
   assert.deepEqual({ status: consecutive.status, statusText: consecutive.statusText, canExtract: consecutive.canExtract }, { status: 'pending', statusText: '连续 AI，尚待确认', canExtract: false });
-  assert.match(consecutive.summary, /尚未摘要.*连续 AI 消息/);
+  assert.match(consecutive.summary, /尚未摘要.*连续 AI 回复分别登记并按顺序摘要/);
   const earlier = projectInlineMemoryFloor(waitingState, 85, 44);
   assert.equal(earlier.statusText, '等待前面楼层处理'); assert.match(earlier.summary, /前面的 AI 楼尚未确认/);
   const latest = projectInlineMemoryFloor(waitingState, 87, 45);
@@ -392,13 +458,13 @@ test('renderer 为user/AI/隐藏普通楼挂透明Shadow卡，排除system，默
 
 });
 
-test('真实schema14回执分为事与人，完整保留私密变化并按楼层倒序展示', async () => {
+test('真实schema15回执分为事与人，完整保留私密变化并按楼层倒序展示', async () => {
   const { chat, receipt, floorIds } = await actualCseReceipt();
   const memoryState = { floors: floorIds.map((floorId, index) => ({ floorId, assistantSeq: index + 1, messageIndex: 41 + index })), memoryEntities: [] };
   const h = createHarness({ chat, memoryState, projectReceipt: async () => receipt });
   const userElement = messageElement(1, { user: true }); h.chatRoot.append(userElement); h.renderer.start(); await h.flushMicrotasks();
   const view = resolveInlineAnchor(userElement).querySelector('[data-qqj-inline-host="true"]').__qqjInlineCard;
-  assert.equal(receipt.schemaVersion, 14);
+  assert.equal(receipt.schemaVersion, 15);
   assert.equal(receipt.selectedCseChanges.find(value => value.action === 'remove' && value.before?.text === '仍在钟楼等候')?.before.text, '仍在钟楼等候');
   const projection = projectInlineRecallReceipt(receipt);
   assert.equal(projection.protocolRecognized, true);
@@ -442,30 +508,27 @@ test('真实schema14回执分为事与人，完整保留私密变化并按楼层
 
 });
 
-test('schema13 时间推演只在事页生成一个默认折叠区，并逐字保留状态与推演正文', async () => {
+test('schema13 旧推演保留原回执正文，但不再生成专属投影或卡片区', async () => {
   const state = { stateId:'state-time', sourceFloorId:'progress-floor', sourceDeltaId:'progress-delta', subjectEntityId:'person-time', subject:'左佐', layer:'situational', towardEntityId:null, toward:null, text:'保存时仍明显疲惫', reason:'当时连续奔波', visibility:'private', sourceAssistantSeq:7, storylineId:'line-time' };
   const progression = { subjectEntityId:'person-time', subject:'左佐', towardEntityId:null, toward:null, savedText:state.text, visibility:'private', sourceStateId:state.stateId, sourceFloorId:state.sourceFloorId, sourceAssistantSeq:7, timeBasis:'入夜后过了一阵；具体时长未知', suggestion:'保存时仍明显疲惫 → 此刻可表现为有所恢复，但精力尚未完全回稳', evidence:[] };
   const storylines = [{ storylineId:'line-time', title:'相关人物状态补充', basis:'当前输入直接匹配以下已有人物状态材料。' }];
   const coverage = { stableAiFloors:7, stableThroughAssistantSeq:7, rememberedAiFloors:7, cseThroughAssistantSeq:7, memoryComplete:true, cseCurrent:true, missingAssistantSeq:[] };
-  const injectionText = formatRecallInjection({ coverage, floors:[], states:[state], cseChanges:[], stateProgressions:[progression], entityById:new Map(), storylines });
+  const baseInjection = formatRecallInjection({ coverage, floors:[], states:[state], cseChanges:[], entityById:new Map(), storylines });
+  const injectionText = baseInjection.replace('</qqj_recalled_context>', `[时间推演（仅供作者续写表现参考，不是新剧情事实，也不表示任何角色已知）]\n- ${progression.suggestion}\n</qqj_recalled_context>`);
   const receipt = { schemaVersion:13, status:'ready', injectionText, selectedFloors:[], selectedStates:[state], selectedCseChanges:[], stateProgressions:[progression], storylines, stages:{ recentSummaryCount:0, distantHistoryItemCount:0, stateCount:1, cseChangeCount:0, stateProgressionCount:1 } };
   const projection = projectInlineRecallReceipt(receipt);
   assert.equal(projection.protocolRecognized, true);
-  assert.deepEqual(projection.stateProgressionItems, [progression]);
+  assert.equal(Object.hasOwn(projection, 'stateProgressionItems'), false);
   assert.match(injectionText, new RegExp(progression.suggestion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   const chat = [{ is_user:true, is_system:false, mes:'继续', extra:{ [RECALL_RECEIPT_KEY]:receipt } }];
   const memoryState = { floors:[{ floorId:'progress-floor', assistantSeq:7, messageIndex:77 }], memoryEntities:[] };
   const h = createHarness({ chat, memoryState, projectReceipt:async () => receipt });
   const userElement = messageElement(0, { user:true }); h.chatRoot.append(userElement); h.renderer.start(); await h.flushMicrotasks();
   const view = resolveInlineAnchor(userElement).querySelector('[data-qqj-inline-host="true"]').__qqjInlineCard;
-  const details = view.recallUi.events.querySelector('.time-progression');
-  assert.ok(details);
-  assert.notEqual(details.open, true);
-  assert.match(view.recallStyle.textContent, /\.time-progression:not\(\[open\]\)>\.time-progression-list\{display:none\}/);
-  assert.match(descendantText(details), /左佐 · 原记录：仅本人知晓/);
-  assert.equal(details.querySelector('.time-progression-copy').textContent, `${state.text}\n推测应为：${progression.suggestion}`);
-  assert.equal(details.querySelector('.time-progression-meta'), null);
+  assert.equal(view.recallUi.events.querySelector('.time-progression'), null);
   assert.equal(view.recallUi.people.querySelector('.time-progression'), null);
+  assert.doesNotMatch(descendantText(view.recallUi.events), new RegExp(progression.suggestion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(projection.injectionText, new RegExp(progression.suggestion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
 test('refine 显示删除与新增两侧，当前状态独立常驻并使用真实宿主楼号', async () => {
@@ -528,6 +591,129 @@ test('桌面扁平页签合并同楼剧情线但不丢不同正文或人物变�
   assert.deepEqual(ui.timelines.children[0].querySelectorAll('.change-copy').map(node => node.textContent), ['甲线人物变化', '乙线人物变化']);
 });
 
+test('v15 楼内投影接受第五条剧情线，旧 v14 仍保持四线历史边界', () => {
+  const storylines = Array.from({ length:5 }, (_, index) => ({ storylineId:`line-${index + 1}`, title:`剧情线 ${index + 1}`, basis:`独立依据 ${index + 1}` }));
+  const states = storylines.map((line, index) => ({
+    stateId:`state-${index + 1}`, storylineId:line.storylineId, subjectEntityId:`person-${index + 1}`, subject:`人物 ${index + 1}`,
+    layer:'situational', text:`状态 ${index + 1}`, reason:'正文依据', visibility:'authorial', towardEntityId:null, toward:null, sourceAssistantSeq:index + 1,
+  }));
+  const injectionText = formatRecallInjection({
+    coverage:{ memoryComplete:true, cseCurrent:true }, floors:[], states, cseChanges:[], storylines,
+    entityById:new Map(states.map(value => [value.subjectEntityId, { displayName:value.subject }])),
+  });
+  const receipt = { schemaVersion:15, strategyVersion:'continuity-v15', status:'ready', injectionText, storylines, selectedFloors:[], selectedStates:states, selectedCseChanges:[] };
+  const current = projectInlineRecallReceipt(receipt);
+  assert.equal(current.protocolRecognized, true);
+  assert.equal(current.storylineGroups.length, 5);
+  assert.equal(current.stateItems.length, 5);
+
+  const legacy = projectInlineRecallReceipt({ ...receipt, strategyVersion:'continuity-v14' });
+  assert.equal(legacy.protocolRecognized, false);
+  assert.equal(legacy.storylineGroups.length, 0);
+  assert.equal(legacy.stateItems.length, 0);
+});
+
+test('v15 楼内投影只精确剥离已签千事尾块，保留七组八条旧事及人物与时间', () => {
+  const storylines = Array.from({ length:7 }, (_, index) => ({ storylineId:`line-${index + 1}`, title:`剧情线 ${index + 1}`, basis:`依据 ${index + 1}` }));
+  const floors = storylines.map((line, index) => ({ floorId:`floor-${index + 1}`, floorMemoryId:`memory-${index + 1}`, assistantSeq:index + 1, chronology:[], items:[
+    { category:'objective', kind:'event', text:`旧事 ${index + 1}-1`, recallSection:'distant', storylineId:line.storylineId },
+    ...(index === 0 ? [{ category:'objective', kind:'event', text:'旧事 1-2', recallSection:'distant', storylineId:line.storylineId }] : []),
+  ] }));
+  const states = [{ stateId:'state-1', storylineId:'line-1', subjectEntityId:'person-1', subject:'甲', layer:'situational', text:'仍在等待', reason:'正文依据', visibility:'authorial', towardEntityId:null, toward:null, sourceAssistantSeq:1 }];
+  const reminder = { itemId:'time-1', text:'甲 / 约定期限 明日；尚未确认发生或完成。' };
+  const ordinary = formatRecallInjection({ coverage:{ memoryComplete:true, cseCurrent:true }, floors, states, cseChanges:[], storylines,
+    entityById:new Map([['person-1', { displayName:'甲' }]]), timeProjection:{ corrections:{} }, timeReminders:[reminder] });
+  const qianshiProgress = { text:'[当前剧情进度]\n- [待办] 归还旧书', fingerprint:'sha256:qianshi', eventIds:[], matterIds:['matter-1'] };
+  const injectionText = `${ordinary}\n\n<qqj_qianshi_progress>\n${qianshiProgress.text}\n</qqj_qianshi_progress>`;
+  const receipt = { schemaVersion:15, strategyVersion:'continuity-v15', status:'ready', injectionText, qianshiProgress, storylines,
+    selectedFloors:floors.map(value => ({ floorId:value.floorId, floorMemoryId:value.floorMemoryId, assistantSeq:value.assistantSeq, reasons:[] })), selectedStates:states, selectedCseChanges:[] };
+  const projected = projectInlineRecallReceipt(receipt);
+  assert.equal(projected.protocolRecognized, true);
+  assert.equal(projected.storylineGroups.length, 7);
+  assert.equal(projected.historyItems.length, 8);
+  assert.equal(projected.stateItems.length, 1);
+  assert.deepEqual(projected.timeReferenceItems, [reminder.text]);
+  assert.equal(projected.qianshiProgressText, qianshiProgress.text);
+  assert.equal(projected.injectionText, injectionText, '只读投影不得修改真实注入文本');
+
+  const mismatched = projectInlineRecallReceipt({ ...receipt, qianshiProgress:{ ...qianshiProgress, text:'另一份进度' } });
+  assert.equal(mismatched.protocolRecognized, false, '回执声明与尾块不一致时不得宽松忽略');
+  assert.equal(mismatched.qianshiProgressText, '', '回执声明与真实注入不一致时不得展示另一份千事文本');
+  const arbitrary = projectInlineRecallReceipt({ ...receipt, qianshiProgress:null, injectionText:`${ordinary}\n\n任意后缀` });
+  assert.equal(arbitrary.protocolRecognized, false, '任意后缀不得绕过协议校验');
+  assert.equal(projectInlineRecallReceipt({ ...receipt, schemaVersion:14 }).qianshiProgressText, '', '旧回执不补造千事展示');
+});
+
+test('楼内事页原样展示本轮已签千事，支持仅千事、即时复用与重绘展开状态', async () => {
+  const historyText = '[当前剧情进度]\n- <script>alert(1)</script> & 仍需赴约\n- ' + '很长的进度'.repeat(500);
+  const liveText = '[当前剧情进度]\n- 即时回执中的进度';
+  const reusedText = '[当前剧情进度]\n- 复用已存回执中的进度';
+  const progress = text => ({ text, fingerprint:`sha256:${text.length}`, eventIds:[], matterIds:['matter-1'] });
+  const block = text => `<qqj_qianshi_progress>\n${text}\n</qqj_qianshi_progress>`;
+  const storylines = [{ storylineId:'line-qianshi', title:'钟楼余波', basis:'钟楼旧事直接相关' }];
+  const floor = { floorId:HISTORY_FLOOR, assistantSeq:1, chronology:[], items:[{ category:'objective', kind:'event', text:'钟楼旧事', recallSection:'distant', storylineId:'line-qianshi' }] };
+  const reminder = { itemId:'deadline', text:'甲 / 赴约：原观察（今日）：仍需赴约；约定期限 明日；尚未确认发生或完成。' };
+  const ordinary = formatRecallInjection({ coverage:{ memoryComplete:true, cseCurrent:true }, floors:[floor], states:[], cseChanges:[], storylines,
+    entityById:new Map(), timeProjection:{ corrections:{} }, timeReminders:[reminder] });
+  const historical = {
+    schemaVersion:15, strategyVersion:'continuity-v15', status:'ready', injectionText:`${ordinary}\n\n${block(historyText)}`,
+    qianshiProgress:progress(historyText), storylines, selectedFloors:[{ floorId:HISTORY_FLOOR, assistantSeq:1, reasons:[] }], selectedStates:[], selectedCseChanges:[],
+  };
+  const historicalProjection = projectInlineRecallReceipt(historical);
+  assert.equal(historicalProjection.qianshiProgressText, historyText);
+  assert.equal(historicalProjection.injectionText, historical.injectionText, '展示投影不得改写实际注入字节');
+
+  const unrecognized = { ...historical, injectionText:`<qqj_recalled_context>\n普通部分为未知旧格式\n</qqj_recalled_context>\n\n${block(historyText)}` };
+  const unrecognizedProjection = projectInlineRecallReceipt(unrecognized);
+  assert.equal(unrecognizedProjection.protocolRecognized, false, '千事展示不能放宽普通召回协议');
+  assert.equal(unrecognizedProjection.qianshiProgressText, historyText, '精确匹配的已签千事不依赖普通召回解析结果');
+  assert.equal(unrecognizedProjection.injectionText, unrecognized.injectionText);
+  const unrecognizedChat = [{ is_user:true, is_system:false, mes:'未知普通格式', extra:{ [RECALL_RECEIPT_KEY]:{ schemaVersion:15 } } }];
+  const unrecognizedHarness = createHarness({ chat:unrecognizedChat, memoryState:{ floors:[], memoryEntities:[] }, projectReceipt:async () => unrecognized });
+  unrecognizedHarness.chatRoot.append(messageElement(0, { user:true })); unrecognizedHarness.renderer.start(); await unrecognizedHarness.flushMicrotasks();
+  const unrecognizedView = unrecognizedHarness.chatRoot.querySelector('[data-qqj-inline-host="true"]').__qqjInlineCard;
+  assert.equal(unrecognizedView.recallUi.qianshi.querySelector('.time-reference-copy').textContent, historyText);
+  assert.equal(unrecognizedView.recallUi.pills.children.length, 0, '未知普通部分仍不生成普通旧事');
+
+  const chat = [{ is_user:true, is_system:false, mes:'继续', extra:{ [RECALL_RECEIPT_KEY]:{ schemaVersion:15 } } }];
+  const h = createHarness({ chat, memoryState:{ floors:[{ floorId:HISTORY_FLOOR, assistantSeq:1, messageIndex:7 }], memoryEntities:[] }, projectReceipt:async () => historical });
+  h.chatRoot.append(messageElement(0, { user:true })); h.renderer.start(); await h.flushMicrotasks();
+  const view = h.chatRoot.querySelector('[data-qqj-inline-host="true"]').__qqjInlineCard;
+  let ui = view.recallUi;
+  assert.equal(ui.qianshi.children[0].textContent, '本轮千事进度');
+  assert.equal(ui.qianshi.querySelector('.time-reference-copy').textContent, historyText, '长文本必须原样完整保留');
+  assert.equal(ui.qianshi.querySelector('script'), null, '千事文本不得作为HTML解析');
+  assert.match(descendantText(ui.events.querySelectorAll('.time-reference')[1]), /本轮时间参考（1条）/u, '原时间参考仍独立显示');
+  assert.equal(ui.qianshi.open, false);
+  ui.qianshi.open = true; ui.qianshi.emit('toggle');
+  h.setMemory({ floors:[{ floorId:HISTORY_FLOOR, assistantSeq:1, messageIndex:8 }], memoryEntities:[] });
+  h.memorySubscribers.values().next().value(); await h.flushMicrotasks();
+  ui = view.recallUi;
+  assert.equal(ui.qianshi.open, true, '来源楼号重绘后保留千事折叠状态');
+  ui.peopleTab.click(); ui.eventTab.click();
+  assert.equal(ui.qianshi.open, true, '切换人/事页签不改变千事折叠状态');
+
+  const only = text => ({ schemaVersion:15, strategyVersion:'continuity-v15', status:'ready', userMessageIndex:0,
+    injectionText:block(text), qianshiProgress:progress(text), storylines:[], selectedFloors:[], selectedStates:[], selectedCseChanges:[] });
+  const onlyProjection = projectInlineRecallReceipt(only(liveText));
+  assert.equal(onlyProjection.protocolRecognized, true, '只有千事时也应识别为合法回执');
+  assert.equal(onlyProjection.qianshiProgressText, liveText);
+  assert.equal(onlyProjection.historyItems.length, 0);
+  assert.equal(onlyProjection.summary, '本轮已注入千事进度。');
+
+  const liveState = { recallStatus:'ready', activeRecall:null, lastRecallBinding:{ chatId:'chat-a', userMessageIndex:0 }, lastRecall:only(liveText) };
+  const liveHarness = createHarness({ chat:[{ is_user:true, is_system:false, mes:'即时用户楼' }], memoryState:{ floors:[], memoryEntities:[] }, recallState:liveState });
+  liveHarness.chatRoot.append(messageElement(0, { user:true })); liveHarness.renderer.start(); await liveHarness.flushMicrotasks();
+  const liveView = liveHarness.chatRoot.querySelector('[data-qqj-inline-host="true"]').__qqjInlineCard;
+  assert.equal(liveView.recallUi.qianshi.querySelector('.time-reference-copy').textContent, liveText, '即时回执显示自身保存的千事文本');
+  liveHarness.setRecall({ recallStatus:'ready', activeRecall:null, lastRecallBinding:{ chatId:'chat-a', userMessageIndex:0 }, lastRecall:{ ...only(reusedText), reusedReceipt:true } });
+  for (const listener of liveHarness.recallSubscribers) listener();
+  await liveHarness.flushMicrotasks();
+  assert.equal(liveView.recallUi.qianshi.querySelector('.time-reference-copy').textContent, reusedText, '复用入口显示复用回执自身保存的文本');
+  assert.equal(liveView.recallUi.pills.children.length, 0, '只有千事时不补造普通旧事');
+  assert.equal(liveView.recallUi.display.hidden, true);
+});
+
 test('新剧情线格式由来源标题统领同楼旧事与变化，集中边界和时间推演仍可完整投影', () => {
   const storylines = [{ storylineId: 'line-a', title: '钟楼余波', basis: '同人物与钟楼事件存在直接记录关联。' }];
   const states = [
@@ -538,10 +724,6 @@ test('新剧情线格式由来源标题统领同楼旧事与变化，集中边�
     deltaId: 'delta-11', floorId: 'floor-11', assistantSeq: 11, subjectEntityId: 'p1', subject: '左佐', storylineId: 'line-a', layer: 'situational', action: 'remove',
     before: { stateId: 'state-old', sourceFloorId: 'floor-8', sourceDeltaId: 'delta-8', text: '仍在门外等待', visibility: 'private', reason: '旧楼私下计划', sourceAssistantSeq: 8 }, after: null,
   }];
-  const progressions = [
-    { subjectEntityId: 'p1', subject: '左佐', towardEntityId: 'p2', toward: '辛夷', savedText: states[0].text, visibility: 'private', sourceStateId: 'state-private', sourceFloorId: 'floor-11', sourceAssistantSeq: 11, timeBasis: '次日清晨；具体时长未知', suggestion: '控制冲动仍可能有余波，但不预设下一步决定', evidence: [{ kind: 'history', floorId: 'floor-11', assistantSeq: 11 }] },
-    { subjectEntityId: 'p2', subject: '辛夷', towardEntityId: null, toward: null, savedText: states[1].text, visibility: 'authorial', sourceStateId: 'state-authorial', sourceFloorId: 'floor-8', sourceAssistantSeq: 8, timeBasis: '经过一夜', suggestion: '迟疑可以淡化，但仍由后文决定是否表现出来', evidence: [] },
-  ];
   const floors = [
     { floorId: 'floor-8', floorMemoryId: 'memory-8', assistantSeq: 8, chronology: [{ time: { kind: 'explicit', precision: 'approximate', sourceText: '冬至夜' } }], items: [
       { category: 'narrative', kind: 'summary', text: '左佐没有说出口的计划仍未完成', recallSection: 'distant', storylineId: 'line-a' },
@@ -555,20 +737,22 @@ test('新剧情线格式由来源标题统领同楼旧事与变化，集中边�
   ];
   const injectionText = formatRecallInjection({
     coverage: { memoryComplete: true, cseCurrent: true, missingAssistantSeq: [], rememberedAiFloors: 2, stableAiFloors: 2, cseThroughAssistantSeq: 11 },
-    floors, states, cseChanges: changes, stateProgressions: progressions,
+    floors, states, cseChanges: changes,
     entityById: new Map([['p1', { displayName: '左佐' }], ['p2', { displayName: '辛夷' }]]), storylines,
   });
   const projection = projectInlineRecallReceipt({
     schemaVersion: 13, strategyVersion: 'continuity-v9', status: 'ready', injectionText, storylines,
     selectedFloors: floors.map(value => ({ floorId: value.floorId, assistantSeq: value.assistantSeq, reasons: [] })),
-    selectedStates: states, selectedCseChanges: changes, stateProgressions: progressions,
+    selectedStates: states, selectedCseChanges: changes,
   });
   assert.equal(projection.protocolRecognized, true);
+  assert.equal(projection.storylineGroups[0].basis, storylines[0].basis, 'basis仍留在回执与UI数据中');
+  assert.doesNotMatch(injectionText, /\[关联依据\]/u, '新版注入不逐线重复basis');
   assert.deepEqual(projection.historyItems.map(value => value.assistantSeq), [8, 8, 8, 8, 11]);
   assert.equal(projection.historyItems[2].text, 'AI #2：门上刻着的编号仍需核对', '新格式正文以 AI # 开头时仍继承标题来源并逐字保留');
   assert.equal(projection.historyItems[3].text, '[变化] 只是旧事原文，不是控制行', '新格式正文以变化标签开头时不得被当成控制行');
   assert.equal(projection.cseChangeCount, 1);
-  assert.equal(projection.stateProgressionCount, 2);
+  assert.equal(Object.hasOwn(projection, 'stateProgressionCount'), false);
   assert.equal(injectionText.split('叙事回顾可能含内心、计划或未完成事项').length - 1, 1);
   assert.equal(injectionText.match(/AI #8（明确时间（约略）：冬至夜）/gu)?.length, 1, '同楼完整时间只写在来源标题');
   assert.doesNotMatch(injectionText, /^- AI #\d+（/mu);
@@ -577,11 +761,6 @@ test('新剧情线格式由来源标题统领同楼旧事与变化，集中边�
   assert.match(injectionText, /\[来源 AI #11\][\s\S]*- \[变化\]/u);
   assert.match(injectionText, /状态来源 AI #8/u, '变化侧来自不同楼时仍明确保留来源');
   assert.match(injectionText, /“之前”只是被移除的旧状态，不是当前状态/u);
-  const progressionSection = injectionText.split('[时间推演')[1];
-  assert.doesNotMatch(progressionSection, new RegExp(states[0].text, 'u'));
-  assert.doesNotMatch(progressionSection, new RegExp(states[1].text, 'u'));
-  assert.match(progressionSection, /接续上方 adaptive 当前状态[\s\S]*原记录知情范围 private，仅可用于该人物/u);
-  assert.match(progressionSection, /接续上方 situational 当前状态[\s\S]*原记录知情范围 authorial，仅供作者塑造/u);
 });
 
 test('旧版召回胶囊近到远共用展示区，重绘保留选择且切聊不串状态', async () => {
@@ -787,7 +966,24 @@ test('同楼仍在运行的召回不会被已存历史回执异步覆盖', async
   const h = createHarness({ chat, memoryState: { floors: [], memoryEntities: [] }, recallState: running, projectReceipt: async () => ({ status: 'ready', injectionText: '已存历史回执', selectedFloors: [], selectedStates: [] }) });
   h.chatRoot.append(messageElement(0, { user: true })); h.renderer.start(); await h.flushMicrotasks();
   const view = h.chatRoot.querySelector('[data-qqj-inline-host="true"]').__qqjInlineCard;
-  assert.equal(view.status.textContent, '寻回中'); assert.equal(descendantText(view.root).includes('已存历史回执'), false);
+  assert.equal(view.status.textContent, '准备召回中'); assert.equal(descendantText(view.root).includes('已存历史回执'), false);
+});
+
+test('楼内召回按已绑定阶段区分准备与模型选择，其他运行阶段保留原文案', async () => {
+  const chat = [{ is_user: true, is_system: false, mes: '当前用户楼' }];
+  const recallState = { recallStatus: 'running', activeRecall: { chatId: 'chat-a', userMessageIndex: 0, phase: 'input' }, lastRecall: null };
+  const h = createHarness({ chat, memoryState: { floors: [], memoryEntities: [] }, recallState });
+  h.chatRoot.append(messageElement(0, { user: true })); h.renderer.start(); await h.flushMicrotasks();
+  const view = h.chatRoot.querySelector('[data-qqj-inline-host="true"]').__qqjInlineCard;
+  assert.equal(view.status.textContent, '准备召回中');
+  recallState.activeRecall.phase = 'selecting';
+  for (const listener of h.recallSubscribers) listener(recallState);
+  await h.flushMicrotasks();
+  assert.equal(view.status.textContent, '召回中');
+  recallState.activeRecall.phase = 'receipt';
+  for (const listener of h.recallSubscribers) listener(recallState);
+  await h.flushMicrotasks();
+  assert.equal(view.status.textContent, '寻回中');
 });
 
 test('即时lastRecall必须同时匹配当前chat与用户楼索引', async () => {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { projectTime, timeDistance, timeHours, nextCycleTime, storyTimes, timeRecallProjection } from '../src/v3/time-engine.js';
+import { formatStoryTime, projectTime, timeDistance, timeHours, nextCycleTime, storyTimes, timeRecallProjection } from '../src/v3/time-engine.js';
 import { formatRecallInjection, selectRecall, buildRecallQueryContext, estimateRecallTokens } from '../src/v3/recall-selector.js';
 import { projectInlineRecallReceipt } from '../src/ui/inline-projection.js';
 
@@ -17,7 +17,7 @@ function reachable(date = '2026-05-10', extra = false) {
   return { status: 'ready', rootRevision: 1, root: { chatId: CHAT, narrativeGeneration: GEN, headCheckpointId: 'head' }, checkpoint: { id: 'head' }, cseUnavailable: true, floors, floorMemories: memories,
     entities: [{ id: PERSON, entityType: 'person', displayName: '甲', aliases: [], recordStatus: 'active', status: 'established' }] };
 }
-test('明确年月日、相对日、无年同月算术与未知边界', () => {
+test('明确年月日、相对日、无年公历跨月算术与未知边界', () => {
   const anchor = projectTime('2026年5月10日');
   assert.equal(projectTime('昨天', anchor).date, '2026-05-09');
   assert.equal(timeDistance(projectTime('昨天', anchor), anchor), 1);
@@ -25,35 +25,85 @@ test('明确年月日、相对日、无年同月算术与未知边界', () => {
   const yearless = projectTime('5月10日');
   assert.equal(yearless.year, null);
   assert.equal(timeDistance(yearless, projectTime('5月12日')), 2);
-  assert.equal(timeDistance(yearless, projectTime('6月1日')), null);
+  assert.equal(timeDistance(yearless, projectTime('6月1日')), 22);
+  assert.equal(timeDistance(projectTime('10月31日 23:15'), projectTime('11月1日 08:15')), 1);
+  assert.equal(timeDistance(projectTime('11月1日 08:15'), projectTime('10月31日 23:15')), -1);
+  assert.equal(timeHours(projectTime('10月31日 23:15'), projectTime('11月1日 08:15')), 9);
+  assert.equal(timeDistance(projectTime('2月28日'), projectTime('3月1日')), null, '无年份跨二月末不能猜闰年');
+  assert.equal(timeDistance(projectTime('3月1日'), projectTime('2月28日')), null, '反向比较也不能猜闰年');
+  assert.equal(timeDistance(projectTime('12月31日'), projectTime('1月1日')), null, '无年份不能把年末到年初猜成跨年');
   assert.equal(projectTime('次日', yearless).monthDay, 11);
   assert.equal(projectTime('次日', projectTime('2月28日')).date, null);
   assert.equal(projectTime('木叶历七年霜月').date, null);
   assert.equal(projectTime('昨天').date, null);
 });
 
+test('纪元年保留具名身份与同月日差，中文数字与裸数字纪年仍按既有公历数值计算', () => {
+  for (const value of ['纪元年10月4日', '星辉历纪元年霜月初四']) {
+    const projected = projectTime(value);
+    assert.equal(projected.raw, value);
+    assert.equal(projected.year, null);
+    assert.doesNotMatch(projected.date, /纪1年/u);
+  }
+  assert.equal(timeDistance(projectTime('纪元年10月3日'), projectTime('纪元年10月5日')), 2);
+  assert.equal(timeDistance(projectTime('纪元年10月3日'), projectTime('纪元年霜月5日')), null);
+  assert.equal(timeDistance(projectTime('星辉历纪元年霜月初三'), projectTime('星辉历纪元年霜月初五')), 2);
+  assert.equal(timeDistance(projectTime('星辉历纪元年霜月初三'), projectTime('星辉历纪元年雪月初五')), null);
+  assert.equal(projectTime('三零五三年10月4日').year, 3053);
+  assert.equal(timeDistance(projectTime('三零五三年10月4日'), projectTime('三零五三年10月6日')), 2);
+  assert.equal(projectTime('3053年10月4日').year, 3053);
+  assert.equal(timeDistance(projectTime('3053年10月4日'), projectTime('3053年10月6日')), 2);
+  assert.equal(projectTime('公历2026年10月4日').date, '2026-10-04');
+  assert.equal(projectTime('2026-10-04').date, '2026-10-04');
+  assert.equal(projectTime('纪元年·秋').raw, '纪元年·秋', '未知自由文本保留，不拒存');
+});
 
-test('程序回灌原观察时间、经过/第N天及预计标识，明确关联状态成组预算', async () => {
+
+test('程序回灌区分观察与发生时间、经过单一单位及预计标识，明确关联状态成组预算', async () => {
   const source = { entities: [{ entityId: PERSON, displayName: '甲' }], identityProjection: {}, currentState: [{ subjectEntityId: PERSON, core: [], adaptive: [], situational: [{ stateId: 'state', sourceFloorId: FLOOR }] }] };
   const item = { id: 'item', subjectEntityId: PERSON, type: 'cycle', label: '周期', status: 'active', observation: '周期开始', observationKey: 'key', observationTime: projectTime('2026-05-09'), occurrenceTime: projectTime('2026-05-09'), dueTime: projectTime('2026-05-12'), stateRefs: [{ stateId: 'state', sourceFloorId: FLOOR }], projection: { text: '自然进程可能减轻', observationKey: 'key', applicableTime: projectTime('2026-05-11') } };
   const projection = timeRecallProjection([item], source, projectTime('2026-05-11'));
-  assert.match(projection.corrections[`state|${PERSON}|${FLOOR}`].text, /已过2天（第3天）/u);
-  assert.match(projection.reminders[0].text, /预计周期日.*尚未确认/u);
+  assert.match(projection.corrections[`state|${PERSON}|${FLOOR}`].text, /周期：观察\/发生于2026-05-09；距发生2天；当前推测（2026-05-11）：自然进程可能减轻/u);
+  assert.doesNotMatch(projection.corrections[`state|${PERSON}|${FLOOR}`].text, /第3天|小时/u);
+  assert.match(projection.reminders[0].text, /预计周期日 2026-05-12，还有1天/u);
+  assert.doesNotMatch(projection.reminders[0].text, /尚未确认发生或完成/u);
   const state = { stateId: 'state', sourceFloorId: FLOOR, subjectEntityId: PERSON, subject: '甲', layer: 'situational', text: '现在仍受伤', reason: '旧观察', visibility: 'observable' };
-  const injection = formatRecallInjection({ floors: [], states: [state], coverage: { memoryComplete: true, cseCurrent: true }, entityById: new Map(), timeProjection: projection });
+  const injection = formatRecallInjection({ floors: [], states: [state], coverage: { memoryComplete: true, cseCurrent: true }, entityById: new Map(), timeProjection: projection,
+    timeReminders: [{ ...projection.reminders[0], itemId: 'separate-due' }] });
   assert.equal(injection.includes('现在仍受伤'), false);
-  assert.match(injection, /原观察.*当前推测/u);
+  assert.match(injection, /观察\/发生于.*当前推测/u);
+  assert.match(injection, /当前推测及预计\/期限节点尚未获正文确认，不代表已经发生或完成/u);
   assert.equal(state.text, '现在仍受伤');
   const without = formatRecallInjection({ floors: [], states: [state], coverage: { memoryComplete: true, cseCurrent: true }, entityById: new Map() }); assert.match(without, /现在仍受伤/u);
   const fresh = { ...source, currentState: [{ subjectEntityId: PERSON, core: [], adaptive: [], situational: [{ stateId: 'new', sourceFloorId: 'floor-2' }] }] };
   assert.equal(Object.keys(timeRecallProjection([item], fresh, projectTime('2026-05-11')).corrections).length, 0);
 });
 
+test('刻度召回日期标签优先保留来源文本且不重复追加时钟', () => {
+  const source = { entities: [{ entityId: PERSON, displayName: '甲' }], identityProjection: {}, currentState: [] };
+  const item = { id: 'deadline', subjectEntityId: PERSON, type: 'deadline', label: '归还档案', status: 'active', observation: '约定归还',
+    observationKey: 'key', observationTime: projectTime('3053年10月3日 08:00'), occurrenceTime: projectTime(''),
+    dueTime: projectTime('3053年10月4日 08:00') };
+  const projection = timeRecallProjection([item], source, projectTime('3053年10月3日 08:00'));
+  assert.match(projection.reminders[0].text, /约定期限 3053年10月4日 08:00，还有1天/u);
+  assert.doesNotMatch(projection.reminders[0].text, /08:00 08:00/u);
+  const unpadded = projectTime('3053年10月4日 8:00');
+  assert.equal(unpadded.clock, '08:00');
+  assert.equal((formatStoryTime(unpadded).match(/8:00|08:00/gu) ?? []).length, 1, '原文 8:00 与解析后的 08:00 按分钟等价去重');
+  const eraFullWidthClock = projectTime('纪元年10月4日 ８：００');
+  assert.equal(formatStoryTime(eraFullWidthClock), '纪元年10月4日 ８：００', '识别全角时钟去重，但显示保持原文');
+  for (const raw of ['昨天 ８：００', '昨天 8：00']) {
+    const anchoredRelative = projectTime(raw, projectTime('2026-05-10'));
+    assert.equal(anchoredRelative.date, '2026-05-09');
+    assert.equal(formatStoryTime(anchoredRelative), '2026-05-09 08:00', '识别全角数字或混合冒号后，仍显示已锚定的相对日期投影');
+  }
+});
+
 
 test('真实selectRecall校正与原状态共同保留或舍弃，到期无话题独立入预算', () => {
   const state = { stateId: 'state', text: '手腕擦伤', visibility: 'observable', reason: '身体观察', origin: 'floor', towardEntityId: null, sourceFloorId: FLOOR, sourceDeltaId: 'delta', sourceAssistantSeq: 1 };
   const source = { status: 'ready', chatId: CHAT, entities: [{ entityId: PERSON, displayName: '甲', aliases: [], entityType: 'person', specialRole: 'char' }], floorMemories: [], cseChanges: [], currentState: [{ subjectEntityId: PERSON, core: [], adaptive: [], situational: [state] }], coverage: { memoryComplete: true, cseCurrent: true }, bodyMatch: { visibleFloorIds: [], summaryCoveredFloorIds: [] }, timeProjection: {
-    corrections: { [`state|${PERSON}|${FLOOR}`]: { itemId: 'item', text: '原观察（5月9日）：手腕擦伤；已过2天（第3天）；当前推测：可能减轻' } }, reminders: [{ itemId: 'due', text: '甲 / 约定期限5月12日；尚未确认完成', distance: 1 }],
+    corrections: { [`state|${PERSON}|${FLOOR}`]: { itemId: 'item', text: '原观察（5月9日）：手腕擦伤；已过2天（第3天）；当前推测：可能减轻' } }, reminders: [{ itemId: 'due', type: 'deadline', subjectEntityId: PERSON, rankText: '约定期限 归还', text: '甲 / 约定期限5月12日；尚未确认完成', distance: 1 }],
   } };
   const queryContext = buildRecallQueryContext({ coreChat: [{ is_user: true, mes: '甲的手腕怎么样' }] });
   const selected = selectRecall({ source, queryContext, contextSize: 8192 });
@@ -78,8 +128,9 @@ test('formatter仅记录实际渲染的校正，时间项来源变化也进入�
   const state = { stateId: 'state', subjectEntityId: PERSON, sourceFloorId: FLOOR, storylineId: 'unrendered-line', text: '原状态' };
   const projection = { corrections: { [`state|${PERSON}|${FLOOR}`]: { itemId: 'body', text: '时间校正文本' } } };
   const deps = { corrections: [], reminders: [] };
-  const text = formatRecallInjection({ states: [state], floors: [], cseChanges: [], coverage: { memoryComplete: true, cseCurrent: true }, entityById: new Map(), storylines: [{ storylineId: 'other-line', title: '另一条线', basis: '测试' }], timeProjection: projection, timeDependencies: deps });
+  const text = formatRecallInjection({ states: [state], floors: [], cseChanges: [], coverage: { memoryComplete: true, cseCurrent: true }, entityById: new Map(), storylines: [{ storylineId: 'other-line', title: '另一条线', basis: '测试' }], timeProjection: projection, timeReminders:[{ itemId:'body', text:'独立提醒' }], timeDependencies: deps });
   assert.equal(text.includes('时间校正文本'), false); assert.deepEqual(deps.corrections, []);
+  assert.match(text, /独立提醒/); assert.equal(deps.reminders.length, 1, '未渲染的校正不能删除实际提醒');
   const item = { id: 'body', subjectEntityId: PERSON, type: 'body', label: '擦伤', status: 'active', observation: '擦伤', observationKey: 'observation', observationTime: projectTime('2026-05-09'), occurrenceTime: projectTime('2026-05-09'), dueTime: projectTime(''), stateRefs: [{ stateId: 'state', sourceFloorId: FLOOR }], sourceRefs: [{ floorId: FLOOR, canonicalFingerprint: 'old-body' }] };
   const source = { entities: [{ entityId: PERSON, displayName: '甲' }], currentState: [{ subjectEntityId: PERSON, core: [], adaptive: [], situational: [state] }] };
   const first = timeRecallProjection([item], source, projectTime('2026-05-11')).corrections[`state|${PERSON}|${FLOOR}`];
@@ -88,18 +139,20 @@ test('formatter仅记录实际渲染的校正，时间项来源变化也进入�
   assert.equal(first.text, second.text); assert.notEqual(first.sourceSignature, second.sourceSignature);
 });
 
-test('有效身体推测无同源CSE时独立参考同预算，首次观察与匹配状态不重复', () => {
+test('有效身体推测无同源CSE时独立参考同预算，未知发生时间不冒充观察时间', () => {
   const current = projectTime('2026-05-10 20:30');
   const item = { id: 'body', subjectEntityId: PERSON, type: 'body', label: '擦伤', status: 'active', observation: '擦伤', observationKey: 'observed', observationTime: projectTime('2026-05-10 04:40'), occurrenceTime: projectTime(''), dueTime: projectTime(''), stateRefs: [], projection: { observationKey: 'observed', applicableTime: current, text: '可能逐渐减轻，仍待新观察确认' } };
   const source = { status: 'ready', chatId: CHAT, entities: [{ entityId: PERSON, displayName: '甲', aliases: [], entityType: 'person', specialRole: 'char' }], currentState: [], floorMemories: [], cseChanges: [], identityProjection: {}, coverage: { memoryComplete: true, cseCurrent: true }, bodyMatch: { visibleFloorIds: [], summaryCoveredFloorIds: [] } };
   source.timeProjection = timeRecallProjection([item], source, current);
   assert.equal(source.timeProjection.reminders.length, 1);
-  const selected = selectRecall({ source, queryContext: buildRecallQueryContext({ coreChat: [{ is_user: true, mes: '早餐吃什么' }] }), contextSize: 8192 });
-  assert.match(selected.injectionText, /时间状态参考.*观察后已过0天.*15\.8小时.*当前推测/u);
+  const relevantQuery = buildRecallQueryContext({ coreChat: [{ is_user: true, mes: '擦伤现在怎么样' }] });
+  const selected = selectRecall({ source, queryContext: relevantQuery, contextSize: 8192 });
+  assert.match(selected.injectionText, /时间状态参考 \/ 甲 \/ 擦伤：观察于2026-05-10 04:40；发生时间未知；距观察15\.8小时；当前推测/u);
+  assert.doesNotMatch(selected.injectionText, /擦伤：擦伤|距观察0天|距发生/u);
   assert.ok(estimateRecallTokens(selected.injectionText) <= selected.limits.estimatedTokenBudget);
   item.projection.text = '当前预计'.repeat(6000);
   source.timeProjection = timeRecallProjection([item], source, current);
-  const omitted = selectRecall({ source, queryContext: buildRecallQueryContext({ coreChat: [{ is_user: true, mes: '早餐吃什么' }] }), contextSize: 8192 });
+  const omitted = selectRecall({ source, queryContext: relevantQuery, contextSize: 8192 });
   assert.equal(omitted.injectionText.includes('时间状态参考'), false);
   assert.equal(projectInlineRecallReceipt({ schemaVersion: 11, status: omitted.status, injectionText: omitted.injectionText, selectedFloors: omitted.floors, selectedStates: omitted.states }).timeReferenceCount, 0, '楼内不从后台补入预算舍弃项');
   assert.equal(selected.stages.finalInjectionItemCount, selected.stages.timeReminderCount);
@@ -111,7 +164,22 @@ test('有效身体推测无同源CSE时独立参考同预算，首次观察与�
   source.currentState = [{ subjectEntityId: PERSON, core: [], adaptive: [], situational: [{ stateId: 'state', sourceFloorId: FLOOR, text: '擦伤' }] }];
   const matched = timeRecallProjection([item], source, current);
   assert.equal(Object.keys(matched.corrections).length, 1);
-  assert.equal(matched.reminders.length, 0);
+  assert.equal(matched.reminders.length, 1, "候选匹配不等于实际注入，最终由formatter去重");
+});
+
+test('不同发生与观察时间分别保留，归并说明逐字保留且经过只从发生起算', () => {
+  const item = { id: 'merged-body', subjectEntityId: PERSON, type: 'body', label: '多处擦伤', mergeDescription: '腰侧、手腕与膝盖的擦伤共同观察', status: 'active', observation: '较长的原始观察正文不进入时间注入', observationKey: 'merged-key',
+    observationTime: projectTime('2026-05-10 04:00'), occurrenceTime: projectTime('2026-05-08 20:00'), dueTime: projectTime(''), stateRefs: [{ stateId: 'state', sourceFloorId: FLOOR }],
+    projection: { observationKey: 'merged-key', applicableTime: projectTime('2026-05-11 20:00'), text: '仍可能有压痛，暂无最新观察确认' } };
+  const source = { entities: [{ entityId: PERSON, displayName: '甲' }], identityProjection: {}, currentState: [{ subjectEntityId: PERSON, core: [], adaptive: [], situational: [{ stateId: 'state', sourceFloorId: FLOOR }] }] };
+  const projection = timeRecallProjection([item], source, projectTime('2026-05-11 20:00'));
+  const correction = projection.corrections[`state|${PERSON}|${FLOOR}`].text;
+  assert.equal(correction, '多处擦伤（归并：腰侧、手腕与膝盖的擦伤共同观察）：观察于2026-05-10 04:00；发生于2026-05-08 20:00；距发生3天；当前推测（2026-05-11 20:00）：仍可能有压痛，暂无最新观察确认');
+  assert.equal(correction.includes(item.observation), false);
+  assert.equal(correction.match(/腰侧、手腕与膝盖的擦伤共同观察/gu)?.length, 1);
+  assert.doesNotMatch(correction, /距观察|小时/u);
+  assert.match(projection.reminders[0].text, /时间状态参考 \/ 甲 \/ 多处擦伤（归并：腰侧、手腕与膝盖的擦伤共同观察）：观察于/u);
+  assert.equal(projection.reminders[0].rankText, `${item.observation} ${item.mergeDescription} ${item.projection.text}`, '压缩展示不能改排序材料');
 });
 
 
@@ -131,7 +199,8 @@ test('未确认周期超期仍在真实到期回灌，不滚到下月隐藏', ()
   const source = { entities: [{ entityId: PERSON, displayName: '甲' }], currentState: [], identityProjection: {} };
   const projection = timeRecallProjection([item], source, projectTime('2026-09-18'));
   assert.equal(projection.reminders.length, 1);
-  assert.match(projection.reminders[0].text, /2026-09-17.*已过1天.*尚未确认/u);
+  assert.match(projection.reminders[0].text, /2026-09-17.*已过1天/u);
+  assert.doesNotMatch(projection.reminders[0].text, /尚未确认发生或完成/u);
 });
 
 
@@ -141,4 +210,92 @@ test('同日时钟回退时未来推演不可采用', () => {
   const projection = timeRecallProjection([item], source, projectTime('2026-05-10 08:00'));
   assert.equal(projection.corrections[`state|${PERSON}|${FLOOR}`].text.includes('未来预计状态'), false);
   assert.match(projection.corrections[`state|${PERSON}|${FLOOR}`].text, /待新观察确认/u);
+});
+
+function budgetSource() {
+  return { status: 'ready', chatId: CHAT, entities: [
+    { entityId: PERSON, displayName: '阿岚', aliases: ['岚岚'], specialRole: 'char' },
+    { entityId: 'other', displayName: '别人', aliases: ['你', 'user'] },
+  ], floorMemories: [], cseChanges: [], currentState: [], coverage: { memoryComplete: true, cseCurrent: true, stableThroughAssistantSeq: 40 }, bodyMatch: { visibleFloorIds: [], summaryCoveredFloorIds: [] } };
+}
+const budgetQuery = buildRecallQueryContext({ coreChat: [{ is_user: false, mes: '阿岚的手腕擦伤需要复查。' }, { is_user: true, mes: '岚岚今天手腕复查怎么样' }] });
+const runBudget = (source, options = {}) => selectRecall({ source, queryContext: budgetQuery, contextSize: 50000, ...options });
+
+function fillBudgetHistory(source) {
+  source.floorMemories = Array.from({ length: 40 }, (_, index) => ({
+    floorId: `budget-floor-${index}`, floorMemoryId: `budget-memory-${index}`, assistantSeq: index + 1,
+    summary: `阿岚手腕复查 ${index + 1} ${String.fromCodePoint(0x4e00 + index).repeat(420)}`,
+    observations: [{ subjectEntityId: PERSON, description: `阿岚手腕复查${index + 1} ${String.fromCodePoint(0x4f00 + index).repeat(400)}` }],
+    chronology: [], participants: [{ entityId: PERSON }], locations: [], commitments: [], openLoops: [], exactAnchors: [], events: [], actions: [], privateCognition: [], informationTransfers: [],
+  }));
+}
+
+test('时间BM25先选相关观察，人物别名与临近节点参与排序，同分稳定且身体0不作到期', () => {
+  const source = budgetSource();
+  const padding = '事项说明'.repeat(75);
+  source.timeProjection = { corrections: {}, reminders: [
+    { itemId: 'expired', type: 'deadline', distance: -100, text: `别人旧买菜 ${padding}` },
+    { itemId: 'body', type: 'body', distance: 0, text: `身体无关 ${padding}` },
+    { itemId: 'near', type: 'deadline', distance: 1, text: `临近节点 ${padding}` },
+    { itemId: 'relevant', type: 'deadline', subjectEntityId: PERSON, distance: 5, rankText: '手腕擦伤 复查', text: `复查相关 ${padding}` },
+  ] };
+  const ranked = runBudget(source).timeDependencies.reminders.map(value => value.itemId);
+  assert.equal(ranked[0], 'relevant');
+  assert.equal(ranked.includes('body'), false, '身体0距离本身不能冒充到期加分');
+  assert.equal(ranked.includes('expired'), false, '远期且无关的旧节点不能挤入');
+  source.timeProjection.reminders = source.timeProjection.reminders.slice(0, 3);
+  assert.deepEqual(runBudget(source).timeDependencies.reminders.map(value => value.itemId), ['near']);
+  source.timeProjection.reminders = [
+    { itemId: 'generic', subjectEntityId: 'other', rankText: '手腕复查 独立事务', text: `无关人物 ${padding}` },
+    { itemId: 'person', subjectEntityId: PERSON, rankText: '手腕复查 独立事务', text: `相关人物 ${padding}` },
+  ];
+  assert.equal(runBudget(source).timeDependencies.reminders.map(value => value.itemId)[0], 'person');
+  source.timeProjection.reminders[0].subjectEntityId = null;
+  source.timeProjection.reminders[1].subjectEntityId = null;
+  assert.equal(runBudget(source).timeDependencies.reminders.map(value => value.itemId)[0], 'generic');
+});
+
+test('满普通预算时间仍入选，少量实际预占余量给普通；无项与超大项不改变普通选材', () => {
+  const source = budgetSource(); fillBudgetHistory(source);
+  const original = runBudget(source);
+  assert.ok(original.stages.estimatedTokenCount > 3400, `实际近满预算fixture ${original.stages.estimatedTokenCount} floors ${original.floors.length}`);
+  source.timeProjection = { corrections: {}, reminders: [] };
+  assert.deepEqual(runBudget(source), original);
+  source.timeProjection.reminders = [{ itemId: 'huge', text: '复查'.repeat(4000) }];
+  const oversized = runBudget(source);
+  assert.deepEqual(oversized.floors, original.floors);
+  assert.equal(oversized.injectionText, original.injectionText);
+  assert.equal(oversized.stages.timeBudgetDropped, 1);
+  source.timeProjection.reminders = [{ itemId: 'small', type: 'deadline', subjectEntityId: PERSON, text: '阿岚今天手腕复查', distance: 0 }];
+  const small = runBudget(source);
+  assert.equal(small.stages.timeReminderCount, 1);
+  assert.ok(small.stages.estimatedTokenCount > 3400, '只消耗实际文本，未固定扣掉600');
+  assert.ok(small.stages.estimatedTokenCount <= small.limits.estimatedTokenBudget);
+  assert.ok(small.injectionText.length <= small.limits.maxCharacters);
+  const reserved = runBudget(source, { reservedTokens: 7750, reservedCharacters: 31700 });
+  assert.ok(reserved.stages.estimatedTokenCount <= 250);
+  assert.ok(reserved.injectionText.length <= 300);
+});
+
+test('实际CSE校正代替提醒且空间归还，候选没渲染则提醒保留，超大替代不算预算丢失', () => {
+  const source = budgetSource(); fillBudgetHistory(source);
+  const state = { stateId: 'wrist', sourceFloorId: 'state-floor', text: '岚岚手腕仍有擦伤', visibility: 'observable', reason: '观察', sourceAssistantSeq: 1 };
+  source.currentState = [{ subjectEntityId: PERSON, core: [], adaptive: [], situational: [state] }];
+  const key = `wrist|${PERSON}|state-floor`;
+  source.timeProjection = { corrections: { [key]: { itemId: 'wrist', text: '擦伤当前可能减轻' } }, reminders: [{ itemId: 'wrist', type: 'body', subjectEntityId: PERSON, text: '擦伤独立时间推测'.repeat(30) }] };
+  const selected = runBudget(source);
+  assert.equal(selected.timeDependencies.corrections.length, 1);
+  assert.equal(selected.timeDependencies.reminders.length, 0);
+  assert.equal(selected.stages.timeReminderCount, 0);
+  assert.equal(selected.stages.timeCorrectionCount, 1);
+  assert.equal(selected.stages.timeBudgetDropped, 0);
+  assert.equal(selected.injectionText.includes('独立时间推测'), false);
+  const noReminder = structuredClone(source); noReminder.timeProjection.reminders = [];
+  assert.equal(selected.injectionText, runBudget(noReminder).injectionText, '去重后空出的空间供后续普通材料使用');
+  source.timeProjection.reminders[0].text = '巨型提醒'.repeat(300);
+  assert.equal(runBudget(source).stages.timeBudgetDropped, 0, '被实际校正代替不是预算丢失');
+  source.timeProjection.reminders[0].text = '擦伤独立时间推测';
+  const excluded = runBudget(source, { selectedCseCandidates: [] });
+  assert.equal(excluded.timeDependencies.corrections.length, 0);
+  assert.equal(excluded.stages.timeReminderCount, 1);
 });

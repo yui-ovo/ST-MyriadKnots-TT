@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, writeFile, rename, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createTauriBackendFetch, isTauriTavern } from '../src/tauri-backend.js';
 import { createBackendClient } from '../src/backend-client.js';
 import { API_BASE } from '../src/constants.js';
@@ -32,6 +33,11 @@ async function fixture(t) {
       await mkdir(location({ ...opts, key: undefined }), { recursive: true });
       await writeFile(`${path}.tmp`, JSON.stringify(opts.value));
       await rename(`${path}.tmp`, path);
+      writeCount++;
+    },
+    async deleteJson(opts) {
+      if (failWrite) throw new Error('write failure');
+      await rm(location(opts));
       writeCount++;
     },
     async listKeys(opts) { return (await names(location(opts))).filter(n => n.endsWith('.json')).map(n => n.slice(0, -5)); },
@@ -103,6 +109,88 @@ test('TT delete/recreate preserves old generations; restore conflicts with new r
   assert.equal((await f.request(`trash/qianqianjie/${deleted.trashId}/restore`, 'POST')).status, 409);
   await f.client.remove('c', 'r', 1);
   assert.equal((await (await f.request('trash/qianqianjie')).json()).length, 2);
+});
+
+test('TT tt.2 reads and updates the tt.1 on-disk format without moving old memory', async t => {
+  const f = await fixture(t);
+  const hash = text => `r-${createHash('sha256').update(text).digest('hex')}`;
+  const saved = { schemaVersion: 1, revision: 7, generationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    createdAt: '2026-09-16T00:00:00.000Z', updatedAt: '2026-09-16T01:00:00.000Z', data: { text: '旧版记忆', manual: '手动修订' } };
+  const table = hash(JSON.stringify(['qianqianjie', 'old-chat']));
+  const key = hash('v3-floor-memory-old');
+  await f.store.setJson({ namespace: 'qqj-bainiao-v1', table, key, value: {
+    format: 'qqj-tt-record-v1', namespace: 'qianqianjie', collection: 'old-chat', recordId: 'v3-floor-memory-old', current: saved, trash: [],
+  } });
+  assert.deepEqual(await f.client.get('old-chat', 'v3-floor-memory-old'), saved);
+  assert.deepEqual(await f.client.list('old-chat'), [{ recordId: 'v3-floor-memory-old', ...saved }]);
+  const updated = await f.client.put('old-chat', 'v3-floor-memory-old', { ...saved.data, added: '新版补充' }, 7);
+  assert.equal(updated.revision, 8);
+  assert.equal(updated.generationId, saved.generationId);
+  assert.equal(updated.data.manual, '手动修订');
+  assert.deepEqual(await f.store.listKeys({ namespace: 'qqj-bainiao-v1', table }), [key]);
+});
+
+test('TT permanent deletion releases the current file without creating trash and permits recreation', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.client.health()).capabilities.permanentDelete, true);
+  const old = await f.client.put('c', 'r', { text: 'obsolete' }, 0);
+  assert.deepEqual(await f.client.removePermanent('c', 'r', 1), { permanentlyDeleted: true, deletedRevision: 1 });
+  await assert.rejects(f.client.get('c', 'r'), e => e.status === 404);
+  assert.deepEqual(await f.client.list('c'), []);
+  assert.deepEqual(await (await f.request('trash/qianqianjie')).json(), []);
+  const namespace = 'qqj-bainiao-v1';
+  const [table] = await f.store.listTables({ namespace });
+  assert.deepEqual(await f.store.listKeys({ namespace, table }), []);
+  const created = await f.client.put('c', 'r', { text: 'new' }, 0);
+  assert.notEqual(created.generationId, old.generationId);
+  assert.equal(created.revision, 1);
+});
+
+test('TT permanent deletion preserves earlier trash generations across restart', async t => {
+  const f = await fixture(t);
+  const old = await f.client.put('c', 'r', { text: 'old generation' }, 0);
+  const deleted = await f.client.remove('c', 'r', 1);
+  await f.client.put('c', 'r', { text: 'permanently removed generation' }, 0);
+  await f.client.removePermanent('c', 'r', 1);
+  const fetchAfterRestart = createTauriBackendFetch({ globalRef: { ...f.globalRef } });
+  const restored = await fetchAfterRestart(`${API_BASE}/v1/trash/qianqianjie/${deleted.trashId}/restore`, { method: 'POST' });
+  assert.deepEqual(await restored.json(), old);
+  assert.deepEqual(await f.client.get('c', 'r'), old);
+});
+
+test('TT permanent deletion refuses stale/missing/invalid requests and leaves data on native IO failure', async t => {
+  const f = await fixture(t);
+  const saved = await f.client.put('c', 'r', 'keep', 0);
+  await assert.rejects(f.client.removePermanent('c', 'r', 0), e => e.status === 409);
+  await assert.rejects(f.client.removePermanent('c', 'missing', 0), e => e.status === 404);
+  await assert.rejects(f.client.removePermanent('c', 'r', -1), e => e.status === 400);
+  assert.equal((await f.request('records/qianqianjie/c/r/permanent')).status, 405);
+  assert.equal((await f.request('records/qianqianjie/c/r/other', 'DELETE', { expectedRevision: 1 })).status, 404);
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(f.client.removePermanent('c', 'r', 1, { signal: controller.signal }), e => e.name === 'AbortError');
+  f.failWrite(true);
+  await assert.rejects(f.client.removePermanent('c', 'r', 1), /write failure/);
+  assert.deepEqual(await f.client.get('c', 'r'), saved);
+  f.failWrite(false);
+  await f.client.remove('c', 'r', 1);
+  const next = await f.client.put('c', 'r', 'keep with trash', 0);
+  f.failWrite(true);
+  await assert.rejects(f.client.removePermanent('c', 'r', 1), /write failure/);
+  assert.deepEqual(await f.client.get('c', 'r'), next);
+  assert.equal((await (await f.request('trash/qianqianjie')).json()).length, 1);
+});
+
+test('TT concurrent permanent cleanup cannot delete a newer revision', async t => {
+  const f = await fixture(t);
+  await f.client.put('c', 'r', 'old', 0);
+  const second = createBackendClient({ fetchImpl: createTauriBackendFetch({ globalRef: f.globalRef }) });
+  const [updated, removed] = await Promise.allSettled([
+    f.client.put('c', 'r', 'new', 1), second.removePermanent('c', 'r', 1),
+  ]);
+  assert.equal(updated.status, 'fulfilled');
+  assert.equal(removed.status, 'rejected');
+  assert.equal(removed.reason.status, 409);
+  assert.equal((await f.client.get('c', 'r')).data, 'new');
 });
 
 test('TT failed write/delete keeps prior data and produces no phantom trash', async t => {

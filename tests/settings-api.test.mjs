@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { applyPluginEnabledImmediately, createSettingsStore, normalizeAutoHideKeepAiCount, normalizeAutoMemoryBatchSize } from '../src/settings.js';
+import { applyPluginEnabledImmediately, createSettingsStore, DEFAULT_SETTINGS, normalizeAutoHideKeepAiCount, normalizeAutoMemoryBatchSize } from '../src/settings.js';
 import { createApiResolver, createApiTools, createTaskRouter } from '../src/api-routing.js';
 
 const configured = (name, id, key = 'TEST_KEY') => ({ id, name, url: 'https://api.example.test/v1', key, model: 'test-model', excludeParams: [], timeoutSec: 30, stream: false });
@@ -77,11 +77,40 @@ test('自动隐藏默认关闭并保留最近 3 个 AI 楼，数量只接受合�
   assert.equal(settings.get().autoHideKeepAiCount, 3);
 });
 
+test('存储自动清理默认关闭，只保存合法的逐聊天稳定楼进度', () => {
+  const extensionSettings = {};
+  const { settings, saves } = setup(extensionSettings);
+  assert.equal(settings.get().storageAutoCleanupEnabled, false);
+  assert.deepEqual(settings.get().storageAutoCleanupProgress, {});
+  settings.update({ storageAutoCleanupEnabled: true, storageAutoCleanupProgress: {
+    '123e4567-e89b-42d3-a456-426614174000': 20,
+    invalid: 10,
+    '223e4567-e89b-42d3-a456-426614174000': -1,
+  } });
+  assert.equal(settings.get().storageAutoCleanupEnabled, true);
+  assert.deepEqual(settings.get().storageAutoCleanupProgress, { '123e4567-e89b-42d3-a456-426614174000': 20 });
+  assert.equal(saves(), 1);
+});
+
+test('旧千事重要覆盖设置读取时保持原样，但不再进入默认值或更新接口', () => {
+  const oldOverrides = { 'chat-a': { 'event-1': true, 'event-2': false, invalid: 'true' }, broken: null };
+  const extensionSettings = { qianqianjie: { qianshiImportanceOverrides: structuredClone(oldOverrides) } };
+  const { settings, saves } = setup(extensionSettings);
+  assert.deepEqual(settings.get().qianshiImportanceOverrides, oldOverrides);
+  settings.update({ appearanceScale: 1.1 });
+  assert.deepEqual(settings.get().qianshiImportanceOverrides, oldOverrides);
+  assert.equal(Object.hasOwn(settings.get(), 'qianshiImportanceOverrides'), true, '现有字段只保留，不在读取或普通更新时改写');
+  assert.equal(Object.hasOwn(DEFAULT_SETTINGS, 'qianshiImportanceOverrides'), false);
+  settings.update({ qianshiImportanceOverrides: { 'chat-b': { 'event-3': true } } });
+  assert.deepEqual(settings.get().qianshiImportanceOverrides, oldOverrides, '已移除的专用更新入口不再生效');
+  assert.equal(saves(), 2);
+});
+
 test('时间戳功能默认开启，参考标签独立规范化，五类自定义提示词保留用户原文', () => {
   const extensionSettings = {};
   const { settings } = setup(extensionSettings);
   assert.equal(settings.get().storyClockEnabled, true); assert.equal(settings.get().storyClockPrompt, '');
-  assert.equal(settings.get().storyClockReferenceTags, 'Ti');
+  assert.equal(settings.get().storyClockReferenceTags, '');
   assert.equal(settings.get().processingPrompt, ''); assert.equal(settings.get().summaryPrompt, ''); assert.equal(settings.get().csePrompt, ''); assert.equal(settings.get().profilePrompt, '');
   settings.update({ storyClockEnabled: false, storyClockPrompt: '  原样换行\n', storyClockReferenceTags: ' TI，时标\nti\n[[...]] ', processingPrompt: '  破限原样\n', summaryPrompt: '  摘要要求\n', csePrompt: '  CSE 要求\n', profilePrompt: '  人物资料要求\n' });
   assert.equal(settings.get().storyClockEnabled, false); assert.equal(settings.get().storyClockPrompt, '  原样换行\n');

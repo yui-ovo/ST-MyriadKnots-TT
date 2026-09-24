@@ -58,7 +58,7 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
   const ready = async () => {
     await (globalRef.__TAURITAVERN__?.ready ?? globalRef.__TAURITAVERN_MAIN_READY__);
     const store = globalRef.__TAURITAVERN__?.api?.extension?.store;
-    for (const method of ['tryGetJson', 'setJson', 'listKeys', 'listTables']) {
+    for (const method of ['tryGetJson', 'setJson', 'deleteJson', 'listKeys', 'listTables']) {
       if (typeof store?.[method] !== 'function') throw new Error('TT 本地存储接口不可用，请确认 TauriTavern 版本并重启应用');
     }
     return store;
@@ -110,18 +110,20 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
     abort(signal);
     if (parts.length === 1 && parts[0] === 'health' && method === 'GET') {
       await store.listTables({ namespace: STORAGE_NAMESPACE });
-      return { ok: true, plugin: { id: 'st-bainiaodata', name: 'Bainiao Data (TT)', version: '0.1.0-tt.1' },
+      return { ok: true, plugin: { id: 'st-bainiaodata', name: 'Bainiao Data (TT)', version: '0.1.0-tt.2' },
         api: { current: 1, supported: [1] }, storage: { scope: 'tauritavern-data-root', envelopeSchemaVersion: 1 },
         capabilities: { records: true, recordList: true, optimisticRevision: true, atomicReplace: true, trash: true,
-          trashRestore: true, pagination: false, batchTransactions: false, trashGc: false },
-        adapter: { version: 1, revisionScope: 'single-app-runtime' } };
+          trashRestore: true, permanentDelete: true, pagination: false, batchTransactions: false, trashGc: false },
+        adapter: { version: 2, revisionScope: 'single-app-runtime' } };
     }
     const namespace = segment(parts[1]);
     if (namespace === 'system-trash') throw error(400, 'Reserved namespace');
     // Namespace lock also protects collection/trash scans against concurrent mutation.
     return locked(globalRef, `${STORAGE_NAMESPACE}:${namespace}`, async () => {
       abort(signal);
-      if (parts[0] === 'records' && [3, 4].includes(parts.length)) {
+      const permanent = parts.length === 5 && parts[4] === 'permanent';
+      if (parts[0] === 'records' && ([3, 4].includes(parts.length) || permanent)) {
+        if (permanent && method !== 'DELETE') throw error(405, 'Unsupported method');
         const collection = segment(parts[2]);
         const table = await tableFor(namespace, collection);
         if (parts.length === 3 && method === 'GET') {
@@ -144,6 +146,15 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
         if (method === 'DELETE' && !slot.current) throw error(404, 'Record not found');
         const actual = slot.current?.revision ?? 0;
         if (actual !== expected) throw error(409, 'Revision conflict');
+        if (permanent) {
+          // Upstream permanent deletion removes only the current generation;
+          // older soft-deleted generations in the same slot remain restorable.
+          slot.current = null;
+          abort(signal);
+          if (slot.trash.length) await store.setJson({ ...options(table, key), value: slot });
+          else await store.deleteJson(options(table, key));
+          return { permanentlyDeleted: true, deletedRevision: actual };
+        }
         const timestamp = new Date().toISOString();
         let result;
         if (method === 'PUT') {
