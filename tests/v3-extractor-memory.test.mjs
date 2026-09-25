@@ -164,6 +164,38 @@ function harness({ text = '裴晚生提醒你带伞。', initialChat = null, uti
   return { runtime, foundationRuntime, store, backend, context, hostAdapter, calls, warnings, emit, readReachableModes, snapshotCount: () => snapshotCalls, setEnabled(value) { enabled = value; }, setAutomation(value) { automation = value; } };
 }
 
+test('manual summary is ready while its subsequent CSE waits; success or timeout releases the work lock', async t => {
+  for (const outcome of ['success', 'timeout']) await t.test(outcome, async () => {
+    let finishCse, cseReleased = false;
+    const h = harness({ utility: options => {
+      if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { summary: '已保存的摘要' } };
+      if (cseReleased) throw Object.assign(new Error('API 请求超时'), { code: 'QQJ_TIMEOUT' });
+      return new Promise((resolve, reject) => { finishCse = () => {
+        cseReleased = true;
+        if (outcome === 'success') resolve({ jsonData: { noMaterialChange: true } });
+        else reject(Object.assign(new Error('API 请求超时'), { code: 'QQJ_TIMEOUT' }));
+      }; });
+    } });
+    await h.runtime.start();
+    const floorId = h.runtime.getState().floors[0].floorId;
+    const pending = h.runtime.extractFloor(floorId);
+    await waitFor(() => typeof finishCse === 'function');
+    const during = h.runtime.getState();
+    assert.equal(during.floors.find(floor => floor.floorId === floorId).status, 'ready');
+    assert.equal(during.floors.find(floor => floor.floorId === floorId).summary, '已保存的摘要');
+    assert.equal(during.activeExtraction.phase, 'analyzingCse');
+    assert.equal(during.activeMemoryWork.phase, 'analyzingCse');
+    assert.equal(during.memoryWorkBusy, true, 'CSE is still active; do not admit conflicting work');
+    finishCse(); await pending;
+    const settled = h.runtime.getState();
+    assert.equal(settled.memoryWorkBusy, false);
+    assert.equal(settled.activeExtraction, null);
+    assert.equal(settled.activeCse, null);
+    assert.equal(settled.floors.find(floor => floor.floorId === floorId).status, 'ready');
+    if (outcome === 'timeout') assert.equal(settled.lastCseError.code, 'QQJ_TIMEOUT');
+  });
+});
+
 async function waitFor(predicate, message = '等待异步状态超时') {
   for (let attempt = 0; attempt < 5000; attempt += 1) {
     if (predicate()) return;

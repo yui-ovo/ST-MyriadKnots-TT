@@ -535,7 +535,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
   function floorState(floor, memoryMap, provenance) {
     const memory = memoryMap.get(floor.id) ?? null;
     const meta = provenance[floor.id] ?? null;
-    const running = active?.floorId === floor.id;
+    const running = active?.floorId === floor.id && active.phase !== 'analyzingCse';
     const savedFailure = failureScopeMatches(reachable?.root) ? failureScope.failures[floor.id] ?? null : null;
     const transientFailure = lastFailure?.floorId === floor.id ? lastFailure : null;
     const status = running ? 'running' : memory?.recordStatus === 'active'
@@ -1357,7 +1357,12 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
       operation.phase = 'committing'; notify();
       await commitRevision(operation, { oldReachable: source, replacement, newEntities: result.newEntities, provenanceEntry: { api: result.metadata, attempts: result.attempts, transportAttempts: result.transportAttempts, responseFingerprint: result.responseFingerprint, extractorVersion: replacement.extractorVersion, promptVersion: EXTRACTOR_PROMPT_VERSION, promptGuidanceFingerprint: `sha256:${await sha256(String(promptGuidanceSnapshot ?? ''))}`, systemPromptFingerprint: `sha256:${await sha256((aggregate ? buildHighFloorExtractorSystemPrompt : buildExtractorSystemPrompt)(promptGuidanceSnapshot, processingPromptSnapshot))}`, userIdentityFingerprint: `sha256:${await sha256(JSON.stringify(userIdentity ?? null))}`, semanticInputFingerprint, preflightTiming: operation.preflightTiming, needsReview: result.needsReview, rawFingerprint: sourceRawFingerprint, storyClockSignature: sourceClock.signature }, action: oldMemory ? 'reextract' : 'extract', validationErrors: result.validationErrors });
       summaryCommitted = true;
-      if (analyzeState && !operation.controller.signal.aborted && operation.epoch === epoch) await cseRuntime.analyzeFloor(floor.id);
+      if (analyzeState && !operation.controller.signal.aborted && operation.epoch === epoch) {
+        operation.phase = 'analyzingCse';
+        if (manualWork) manualWork.phase = 'analyzingCse';
+        notify();
+        await cseRuntime.analyzeFloor(floor.id);
+      }
     } catch (error) {
       if (result && !summaryCommitted && error?.name !== 'AbortError' && !STALE_MEMORY_CODES.has(error?.code)) {
         rememberPendingResult(floor.id, { chatId: source.root.chatId, narrativeGeneration: source.root.narrativeGeneration, sourceRawFingerprint, processingPrompt: String(processingPromptSnapshot ?? ''), dependencySnapshot, runId: operation.runId, startedAt: operation.startedAt, commitTimestamp: operation.commitTimestamp, result });
