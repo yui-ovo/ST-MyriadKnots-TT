@@ -9,6 +9,30 @@ const copy = value => JSON.parse(JSON.stringify(value));
 const abort = signal => { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError'); };
 const encoder = new TextEncoder();
 
+// Rust JSON maps may reorder object fields. Upstream fingerprints include their
+// insertion order, so carry the complete JS serialization across the native ABI.
+const encodeSlot = slot => ({ format: 'qqj-tt-json-v2', serialized: JSON.stringify(slot) });
+function decodeSlot(value) {
+  if (value?.format !== 'qqj-tt-json-v2') return { slot: value, legacy: true };
+  if (typeof value.serialized !== 'string') throw error(500, 'Invalid stored serialization');
+  try { return { slot: JSON.parse(value.serialized), legacy: false }; }
+  catch { throw error(500, 'Invalid stored serialization'); }
+}
+
+async function recoverLegacyIndex(record) {
+  if (record?.schemaVersion !== 3 || record.recordType !== 'index' || !Array.isArray(record.entries)) return;
+  const exactKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+  if (!record.entries.every(entry => exactKeys(entry, ['key', 'refs']) && Array.isArray(entry.refs)
+    && entry.refs.every(ref => exactKeys(ref, ['recordType', 'recordId', 'itemId'])))) return;
+  const entries = record.entries.map(entry => ({ key: entry.key, refs: entry.refs.map(ref => ({
+    recordType: ref.recordType, recordId: ref.recordId, itemId: ref.itemId,
+  })) }));
+  // Only restore the known upstream field order when the ORIGINAL checksum
+  // matches. Never replace a fingerprint, ID, value, or array order to force it.
+  if (`sha256:${await sha256(JSON.stringify([record.kind, record.shard, entries]))}` === record.contentFingerprint) record.entries = entries;
+}
+
 function abortable(operation, signal) {
   if (!signal) return operation();
   return new Promise((resolve, reject) => {
@@ -80,11 +104,20 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
     }
     return value;
   };
+  const unpack = async (value, namespace, collection, recordId) => {
+    const decoded = decodeSlot(value);
+    const slot = validateSlot(decoded.slot, namespace, collection, recordId);
+    if (decoded.legacy) {
+      await recoverLegacyIndex(slot.current?.data);
+      for (const item of slot.trash) await recoverLegacyIndex(item.envelope.data);
+    }
+    return slot;
+  };
   const read = async (store, table, key, namespace, collection, recordId) => {
     const result = await store.tryGetJson(options(table, key));
     if (result?.found === false) return null;
     if (result?.found !== true) throw error(500, 'Invalid storage response');
-    return validateSlot(result.value, namespace, collection, recordId);
+    return unpack(result.value, namespace, collection, recordId);
   };
   const scan = async (store, table, namespace, collection) => {
     const keys = await store.listKeys({ namespace: STORAGE_NAMESPACE, table });
@@ -110,11 +143,11 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
     abort(signal);
     if (parts.length === 1 && parts[0] === 'health' && method === 'GET') {
       await store.listTables({ namespace: STORAGE_NAMESPACE });
-      return { ok: true, plugin: { id: 'st-bainiaodata', name: 'Bainiao Data (TT)', version: '0.1.0-tt.2' },
+      return { ok: true, plugin: { id: 'st-bainiaodata', name: 'Bainiao Data (TT)', version: '0.1.0-tt.3' },
         api: { current: 1, supported: [1] }, storage: { scope: 'tauritavern-data-root', envelopeSchemaVersion: 1 },
         capabilities: { records: true, recordList: true, optimisticRevision: true, atomicReplace: true, trash: true,
           trashRestore: true, permanentDelete: true, pagination: false, batchTransactions: false, trashGc: false },
-        adapter: { version: 2, revisionScope: 'single-app-runtime' } };
+        adapter: { version: 3, revisionScope: 'single-app-runtime' } };
     }
     const namespace = segment(parts[1]);
     if (namespace === 'system-trash') throw error(400, 'Reserved namespace');
@@ -151,7 +184,7 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
           // older soft-deleted generations in the same slot remain restorable.
           slot.current = null;
           abort(signal);
-          if (slot.trash.length) await store.setJson({ ...options(table, key), value: slot });
+          if (slot.trash.length) await store.setJson({ ...options(table, key), value: encodeSlot(slot) });
           else await store.deleteJson(options(table, key));
           return { permanentlyDeleted: true, deletedRevision: actual };
         }
@@ -179,7 +212,7 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
         // Current record and deleted generations live in ONE file: delete cannot
         // lose data between a separate trash write and an unlink on iOS suspension.
         abort(signal);
-        await store.setJson({ ...options(table, key), value: slot });
+        await store.setJson({ ...options(table, key), value: encodeSlot(slot) });
         return result;
       }
       if (parts[0] === 'trash' && ((parts.length === 2 && method === 'GET')
@@ -194,8 +227,8 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
           for (const key of keys) {
             const found = await store.tryGetJson(options(table, key));
             if (found?.found !== true) throw error(500, 'Missing stored record');
-            if (found.value?.namespace !== namespace) continue;
-            const slot = validateSlot(found.value, namespace);
+            if (decodeSlot(found.value).slot?.namespace !== namespace) continue;
+            const slot = await unpack(found.value, namespace);
             if (key !== await keyFor(slot.recordId) || table !== await tableFor(namespace, slot.collection)) throw error(500, 'Stored record identity mismatch');
             for (const trash of slot.trash) entries.push({ table, key, slot, trash });
           }
@@ -210,7 +243,7 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
         slot.current = trash.envelope;
         slot.trash = slot.trash.filter(item => item.trashId !== trashId);
         abort(signal);
-        await store.setJson({ ...options(table, key), value: slot });
+        await store.setJson({ ...options(table, key), value: encodeSlot(slot) });
         return slot.current;
       }
       throw error(404, 'Unsupported local backend route');

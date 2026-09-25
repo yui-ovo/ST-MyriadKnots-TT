@@ -7,6 +7,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const nativeJson = value => Array.isArray(value) ? value.map(nativeJson) : value && typeof value === 'object'
+  ? Object.fromEntries(Object.keys(value).sort().map(key => [key, nativeJson(value[key])])) : value;
 
 async function isolateBundle(hostGlobalName, { enabled = false, withExistingPanel = false, mainApi = 'openai', invokeTypes = [], initializeWithoutSubtle = false, tauri = false } = {}) {
   const manifest = JSON.parse(await readFile(resolve(root, 'manifest.json'), 'utf8'));
@@ -18,7 +20,7 @@ async function isolateBundle(hostGlobalName, { enabled = false, withExistingPane
   const ttStore = {
     async tryGetJson(options) { const key = ttKey(options); return ttRecords.has(key) ? { found: true, value: structuredClone(ttRecords.get(key)) } : { found: false }; },
     async deleteJson(options) { ttRecords.delete(ttKey(options)); },
-    async setJson(options) { ttRecords.set(ttKey(options), structuredClone(options.value)); },
+    async setJson(options) { ttRecords.set(ttKey(options), nativeJson(options.value)); },
     async listKeys({ namespace, table = 'main' }) { const prefix = `${namespace}/${table}/`; return [...ttRecords.keys()].filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length)); },
     async listTables({ namespace }) { return [...new Set([...ttRecords.keys()].filter(key => key.startsWith(`${namespace}/`)).map(key => key.split('/')[1]))]; },
   };
@@ -116,7 +118,10 @@ async function isolateBundle(hostGlobalName, { enabled = false, withExistingPane
       await new Promise(resolvePromise => setTimeout(resolvePromise, 5));
     }
     assert.ok(ttRecords.size > 0, 'TT bundle must write through the native store');
-    assert.ok([...ttRecords.values()].some(slot => slot.current?.data?.kind === 'qqj-chat-identity-binding'));
+    assert.ok([...ttRecords.values()].some(value => {
+      const slot = value.format === 'qqj-tt-json-v2' ? JSON.parse(value.serialized) : value;
+      return slot.current?.data?.kind === 'qqj-chat-identity-binding';
+    }));
   }
   if (initializeWithoutSubtle) {
     for (let attempt = 0; attempt < 200 && hostShaCalls === 0; attempt += 1) {
