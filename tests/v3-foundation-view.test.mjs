@@ -49,6 +49,27 @@ test('已保存摘要等待 CSE 时显示人物分析阶段，不误报摘要仍
   view.deactivate();
 });
 
+test('批量摘要完成后显示真实 CSE 阶段，完成通知清除打开面板时的处理中反馈', async () => {
+  let state = { status: 'running', pluginEnabled: true, chatId: 'batch', foundationStatus: 'ready',
+    memorySnapshotStatus: 'ready', memorySyncStatus: 'idle', memoryWorkBusy: true,
+    activeMemoryWork: { kind: 'auto', phase: 'analyzingCse' }, activeAutoMemory: { phase: 'analyzingCse' },
+    activeExtraction: null, activeCse: { phase: 'analyzing' }, stableCount: 5, rememberedCount: 5,
+    unprocessedCount: 0, csePendingCount: 3, floors: [] };
+  let notify;
+  const runtime = { getState: () => state, refreshStatus: async () => state, confirmLatest: async () => state, subscribe: listener => { notify = listener; return () => {}; } };
+  const container = new Node('main');
+  const view = createV3FoundationView({ runtime, documentRef }); view.setPage('memories'); view.mount(container); await view.activate();
+  const texts = () => flatten(container).map(node => node.textContent).join('|');
+  assert.match(texts(), /摘要已保存 · 5\/5 楼 · 正在分析人物状态/);
+  assert.doesNotMatch(texts(), /正在处理摘要|正在处理\|/);
+  state = { ...state, activeCse: null, activeMemoryWork: { kind: 'auto', phase: 'syncing' }, activeAutoMemory: { phase: 'syncing' } };
+  notify(state); assert.match(texts(), /正在同步记忆状态/);
+  state = { ...state, status: 'ready', memoryWorkBusy: false, activeMemoryWork: null, activeAutoMemory: null, csePendingCount: 0 };
+  notify(state); assert.match(texts(), /已记忆 5\/5 楼/); assert.match(texts(), /记忆状态已刷新/);
+  assert.doesNotMatch(texts(), /正在处理|正在分析人物状态|正在同步记忆状态/);
+  view.deactivate();
+});
+
 test('摘要近期事项默认折叠并局部更新，草稿同步恢复可点击，读失败仅重试读取与生命周期清理', async () => {
   const css = await readFile(new URL('../src/ui/panel.css', import.meta.url), 'utf8');
   assert.match(css, /#qqj-recent-items\[hidden\]\{display:none\}/u, '作者样式需显式覆盖 settings-block 的 display:grid，不能仅依赖 UA hidden');

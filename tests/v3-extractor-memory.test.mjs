@@ -6460,7 +6460,10 @@ test('历史流水真实请求重叠，摘要先/CSE先提交都保全图且各�
     assert.ok(order.indexOf('cse:流水二') < order.indexOf('summary:流水三'), '首楼基线初始化后，下一楼摘要与前一楼 CSE 流水并行');
     if (winner === 'summary') {
       releaseSummary();
-      await waitFor(() => h.runtime.getState().rememberedCount === 5);
+      await waitFor(() => h.runtime.getState().rememberedCount === 5 && !h.runtime.getState().activeExtraction);
+      assert.equal(h.runtime.getState().activeMemoryWork.phase, 'analyzingCse');
+      assert.equal(h.runtime.getState().activeAutoMemory.phase, 'analyzingCse');
+      assert.equal(h.runtime.getState().memoryWorkBusy, true, '摘要已完成但 CSE 仍在途，继续保留工作锁');
       assert.equal(batches.length, 0, '摘要结束时CSE仍在途，不提前通知时间任务');
       releaseCse();
     } else {
