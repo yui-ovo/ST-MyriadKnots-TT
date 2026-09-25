@@ -18331,12 +18331,19 @@ function eh({ settings: e, documentRef: t = globalThis.document, open: n = !1, o
 		e.update({ appearanceScale: Number(m.value) }), d();
 	}), p.append(m, h);
 	let g = a("input", "settings-input");
-	return g.value = u.appearanceFontCssUrl ?? "", g.placeholder = "https://…/font.css", g.addEventListener("change", () => {
+	g.value = u.appearanceFontCssUrl ?? "", g.placeholder = "https://…/font.css", g.addEventListener("change", () => {
 		e.update({
 			appearanceFontCssUrl: g.value,
 			appearanceFontFamily: ""
 		}), d();
-	}), l.append(o("主题", f), o("界面缩放", p), o("自定义字体 CSS URL", g)), { node: c };
+	}), l.append(o("主题", f), o("界面缩放", p), o("自定义字体 CSS URL", g)), l.append(a("p", "settings-subhead", "楼层卡片"));
+	for (let [t, n] of [["inlineRecallVisible", "显示楼层召回卡片"], ["inlineMemoryVisible", "显示楼层记忆卡片"]]) {
+		let r = a("label", "setting-switch"), i = a("input");
+		i.type = "checkbox", i.checked = u[t] !== !1, i.setAttribute("aria-label", n), i.addEventListener("change", () => {
+			e.update({ [t]: i.checked }), d();
+		}), r.append(i, a("span", "", n)), l.append(r);
+	}
+	return l.append(a("p", "settings-hint", "分别控制“本轮召回”和“第几个结”，对所有聊天立即生效。隐藏仅影响显示，摘要、人物分析和召回注入照常运行。")), { node: c };
 }
 //#endregion
 //#region src/ui/scroll-diagnostics.js
@@ -18650,6 +18657,8 @@ var fh = "qianqianjie", ph = Object.freeze({
 	csePrompt: "",
 	profilePrompt: "",
 	appearanceTheme: "auto",
+	inlineRecallVisible: !0,
+	inlineMemoryVisible: !0,
 	fabShow: !0,
 	appearanceScale: 1,
 	appearanceFontCssUrl: "",
@@ -18754,7 +18763,7 @@ function Oh({ extensionSettings: e, save: t = () => {}, now: n, random: r } = {}
 			apiPresets: []
 		};
 		for (let [e, n] of Object.entries(ph)) hh(t, e) || (t[e] = Array.isArray(n) ? [] : n && typeof n == "object" ? {} : n);
-		return mh.has(t.apiMode) || (t.apiMode = "auto"), Array.isArray(t.apiExcludeParams) || (t.apiExcludeParams = []), Array.isArray(t.apiPresets) || (t.apiPresets = []), Array.isArray(t.sourceWorldInfoExcludedBooks) || (t.sourceWorldInfoExcludedBooks = []), _h.has(t.appearanceTheme) || (t.appearanceTheme = "auto"), t.fabShow = t.fabShow !== !1, t.appearanceScale = vh(t.appearanceScale), t.apiTimeoutSec = Sh(t.apiTimeoutSec), t.autoMemoryBatchSize = bh(t.autoMemoryBatchSize), t.timeEvolutionEnabled = t.timeEvolutionEnabled === !0, t.autoHideEnabled = t.autoHideEnabled === !0, t.autoHideKeepAiCount = xh(t.autoHideKeepAiCount), t.storageAutoCleanupEnabled = t.storageAutoCleanupEnabled === !0, t.storageAutoCleanupProgress = yh(t.storageAutoCleanupProgress), t.storyClockReferenceTags = Ne(t.storyClockReferenceTags).join(","), t;
+		return mh.has(t.apiMode) || (t.apiMode = "auto"), Array.isArray(t.apiExcludeParams) || (t.apiExcludeParams = []), Array.isArray(t.apiPresets) || (t.apiPresets = []), Array.isArray(t.sourceWorldInfoExcludedBooks) || (t.sourceWorldInfoExcludedBooks = []), _h.has(t.appearanceTheme) || (t.appearanceTheme = "auto"), t.fabShow = t.fabShow !== !1, t.inlineRecallVisible = t.inlineRecallVisible !== !1, t.inlineMemoryVisible = t.inlineMemoryVisible !== !1, t.appearanceScale = vh(t.appearanceScale), t.apiTimeoutSec = Sh(t.apiTimeoutSec), t.autoMemoryBatchSize = bh(t.autoMemoryBatchSize), t.timeEvolutionEnabled = t.timeEvolutionEnabled === !0, t.autoHideEnabled = t.autoHideEnabled === !0, t.autoHideKeepAiCount = xh(t.autoHideKeepAiCount), t.storageAutoCleanupEnabled = t.storageAutoCleanupEnabled === !0, t.storageAutoCleanupProgress = yh(t.storageAutoCleanupProgress), t.storyClockReferenceTags = Ne(t.storyClockReferenceTags).join(","), t;
 	}, a = (e = !1) => {
 		try {
 			return t();
@@ -18763,7 +18772,7 @@ function Oh({ extensionSettings: e, save: t = () => {}, now: n, random: r } = {}
 		}
 	}, o = (e, { observeSaveFailure: t = !1 } = {}) => {
 		let n = i();
-		return hh(e, "pluginEnabled") && (n.pluginEnabled = e.pluginEnabled !== !1), hh(e, "timeEvolutionEnabled") && (n.timeEvolutionEnabled = e.timeEvolutionEnabled === !0), hh(e, "storyClockEnabled") && (n.storyClockEnabled = e.storyClockEnabled !== !1), hh(e, "storyClockPrompt") && (n.storyClockPrompt = gh(e.storyClockPrompt)), hh(e, "storyClockReferenceTags") && (n.storyClockReferenceTags = Ne(e.storyClockReferenceTags).join(",")), hh(e, "autoMemoryBatchSize") && (n.autoMemoryBatchSize = bh(e.autoMemoryBatchSize)), hh(e, "autoHideEnabled") && (n.autoHideEnabled = e.autoHideEnabled === !0), hh(e, "autoHideKeepAiCount") && (n.autoHideKeepAiCount = xh(e.autoHideKeepAiCount)), hh(e, "storageAutoCleanupEnabled") && (n.storageAutoCleanupEnabled = e.storageAutoCleanupEnabled === !0), hh(e, "storageAutoCleanupProgress") && (n.storageAutoCleanupProgress = yh(e.storageAutoCleanupProgress)), hh(e, "apiMode") && (n.apiMode = mh.has(e.apiMode) ? e.apiMode : "auto"), hh(e, "selectedSevenDaysPresetId") && (n.selectedSevenDaysPresetId = gh(e.selectedSevenDaysPresetId).trim()), hh(e, "summaryPresetId") && (n.summaryPresetId = gh(e.summaryPresetId).trim()), hh(e, "recallPresetId") && (n.recallPresetId = gh(e.recallPresetId).trim()), hh(e, "apiUrl") && (n.apiUrl = gh(e.apiUrl).trim()), hh(e, "apiKey") && (n.apiKey = gh(e.apiKey).trim()), hh(e, "apiModel") && (n.apiModel = gh(e.apiModel).trim()), hh(e, "apiExcludeParams") && (n.apiExcludeParams = Ch(e.apiExcludeParams)), hh(e, "apiTimeoutSec") && (n.apiTimeoutSec = Sh(e.apiTimeoutSec)), hh(e, "apiStream") && (n.apiStream = e.apiStream === !0), hh(e, "apiPresetActiveId") && (n.apiPresetActiveId = gh(e.apiPresetActiveId).trim()), hh(e, "sourceWorldInfoExcludedBooks") && (n.sourceWorldInfoExcludedBooks = Array.isArray(e.sourceWorldInfoExcludedBooks) ? e.sourceWorldInfoExcludedBooks : []), hh(e, "sourceKeepTags") && (n.sourceKeepTags = Ot(e.sourceKeepTags).join(",")), hh(e, "sourceExtraTags") && (n.sourceExtraTags = Ot(e.sourceExtraTags).join(",")), hh(e, "processingPrompt") && (n.processingPrompt = gh(e.processingPrompt)), hh(e, "summaryPrompt") && (n.summaryPrompt = gh(e.summaryPrompt)), hh(e, "csePrompt") && (n.csePrompt = gh(e.csePrompt)), hh(e, "profilePrompt") && (n.profilePrompt = gh(e.profilePrompt)), hh(e, "appearanceTheme") && (n.appearanceTheme = _h.has(e.appearanceTheme) ? e.appearanceTheme : "auto"), hh(e, "fabShow") && (n.fabShow = e.fabShow !== !1), hh(e, "appearanceScale") && (n.appearanceScale = vh(e.appearanceScale)), hh(e, "appearanceFontCssUrl") && (n.appearanceFontCssUrl = gh(e.appearanceFontCssUrl).trim()), hh(e, "appearanceFontFamily") && (n.appearanceFontFamily = gh(e.appearanceFontFamily).trim()), a(t), n;
+		return hh(e, "pluginEnabled") && (n.pluginEnabled = e.pluginEnabled !== !1), hh(e, "timeEvolutionEnabled") && (n.timeEvolutionEnabled = e.timeEvolutionEnabled === !0), hh(e, "storyClockEnabled") && (n.storyClockEnabled = e.storyClockEnabled !== !1), hh(e, "storyClockPrompt") && (n.storyClockPrompt = gh(e.storyClockPrompt)), hh(e, "storyClockReferenceTags") && (n.storyClockReferenceTags = Ne(e.storyClockReferenceTags).join(",")), hh(e, "autoMemoryBatchSize") && (n.autoMemoryBatchSize = bh(e.autoMemoryBatchSize)), hh(e, "autoHideEnabled") && (n.autoHideEnabled = e.autoHideEnabled === !0), hh(e, "autoHideKeepAiCount") && (n.autoHideKeepAiCount = xh(e.autoHideKeepAiCount)), hh(e, "storageAutoCleanupEnabled") && (n.storageAutoCleanupEnabled = e.storageAutoCleanupEnabled === !0), hh(e, "storageAutoCleanupProgress") && (n.storageAutoCleanupProgress = yh(e.storageAutoCleanupProgress)), hh(e, "apiMode") && (n.apiMode = mh.has(e.apiMode) ? e.apiMode : "auto"), hh(e, "selectedSevenDaysPresetId") && (n.selectedSevenDaysPresetId = gh(e.selectedSevenDaysPresetId).trim()), hh(e, "summaryPresetId") && (n.summaryPresetId = gh(e.summaryPresetId).trim()), hh(e, "recallPresetId") && (n.recallPresetId = gh(e.recallPresetId).trim()), hh(e, "apiUrl") && (n.apiUrl = gh(e.apiUrl).trim()), hh(e, "apiKey") && (n.apiKey = gh(e.apiKey).trim()), hh(e, "apiModel") && (n.apiModel = gh(e.apiModel).trim()), hh(e, "apiExcludeParams") && (n.apiExcludeParams = Ch(e.apiExcludeParams)), hh(e, "apiTimeoutSec") && (n.apiTimeoutSec = Sh(e.apiTimeoutSec)), hh(e, "apiStream") && (n.apiStream = e.apiStream === !0), hh(e, "apiPresetActiveId") && (n.apiPresetActiveId = gh(e.apiPresetActiveId).trim()), hh(e, "sourceWorldInfoExcludedBooks") && (n.sourceWorldInfoExcludedBooks = Array.isArray(e.sourceWorldInfoExcludedBooks) ? e.sourceWorldInfoExcludedBooks : []), hh(e, "sourceKeepTags") && (n.sourceKeepTags = Ot(e.sourceKeepTags).join(",")), hh(e, "sourceExtraTags") && (n.sourceExtraTags = Ot(e.sourceExtraTags).join(",")), hh(e, "processingPrompt") && (n.processingPrompt = gh(e.processingPrompt)), hh(e, "summaryPrompt") && (n.summaryPrompt = gh(e.summaryPrompt)), hh(e, "csePrompt") && (n.csePrompt = gh(e.csePrompt)), hh(e, "profilePrompt") && (n.profilePrompt = gh(e.profilePrompt)), hh(e, "appearanceTheme") && (n.appearanceTheme = _h.has(e.appearanceTheme) ? e.appearanceTheme : "auto"), hh(e, "fabShow") && (n.fabShow = e.fabShow !== !1), hh(e, "inlineRecallVisible") && (n.inlineRecallVisible = e.inlineRecallVisible !== !1), hh(e, "inlineMemoryVisible") && (n.inlineMemoryVisible = e.inlineMemoryVisible !== !1), hh(e, "appearanceScale") && (n.appearanceScale = vh(e.appearanceScale)), hh(e, "appearanceFontCssUrl") && (n.appearanceFontCssUrl = gh(e.appearanceFontCssUrl).trim()), hh(e, "appearanceFontFamily") && (n.appearanceFontFamily = gh(e.appearanceFontFamily).trim()), a(t), n;
 	}, s = () => {
 		let e = i();
 		return wh({
@@ -22985,8 +22994,13 @@ function m_({ settings: e, apiTools: t, onPluginEnabledChange: n, onStoryClockCh
 		manager: h,
 		documentRef: E,
 		confirmImpl: (e) => I.confirm(e)
-	}), V = (e) => {
-		F?.setAppearance?.(e), b?.setAppearance?.(e);
+	}), V = (t) => {
+		F?.setAppearance?.(t), b?.setAppearance?.(t);
+		let n = e?.get?.();
+		b?.setVisibility?.({
+			recall: n?.inlineRecallVisible,
+			memory: n?.inlineMemoryVisible
+		});
 	}, H = e?.isEnabled?.() !== !1, U = () => H, W = async (e) => {
 		if (!U()) return P.show(e?.currentTarget || e?.target || E.activeElement), P.setEnabled(!1);
 		try {
@@ -36653,40 +36667,40 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 	if (!e || typeof e.getState != "function" || typeof e.extractFloor != "function") throw TypeError("楼内渲染 memory runtime 无效");
 	if (!t || typeof t.getState != "function") throw TypeError("楼内渲染 recall runtime 无效");
 	if (!n || typeof n.snapshot != "function") throw TypeError("楼内渲染 host adapter 无效");
-	let s = !1, c = !1, l = 0, u = 0, d = 0, f = null, p = null, m = null, h = !1, g = /* @__PURE__ */ new Map(), _ = /* @__PURE__ */ new Map(), v = /* @__PURE__ */ new Map(), y = /* @__PURE__ */ new Set(), b = [], x = null, S = null, C = Object.freeze({
+	let s = !1, c = !1, l = 0, u = 0, d = 0, f = null, p = null, m = null, h = !1, g = /* @__PURE__ */ new Map(), _ = /* @__PURE__ */ new Map(), v = /* @__PURE__ */ new Map(), y = /* @__PURE__ */ new Set(), b = [], x = null, S = null, C = !0, w = !0, T = (e) => e === "user" ? C : e === "assistant" && w, E = Object.freeze({
 		knot: "#a8322f",
 		line: "color-mix(in srgb,currentColor 18%,transparent)"
-	}), w = /* @__PURE__ */ new WeakMap(), T = {}, E = (e) => {
-		LC(e?.style, "--qqj-inline-knot", C.knot), LC(e?.style, "--qqj-inline-line", C.line);
-	}, D = () => {
+	}), D = /* @__PURE__ */ new WeakMap(), O = {}, k = (e) => {
+		LC(e?.style, "--qqj-inline-knot", E.knot), LC(e?.style, "--qqj-inline-line", E.line);
+	}, A = () => {
 		m !== null && (i?.clearTimeout?.(m), m = null), p?.disconnect?.(), p = null, u += 1;
-	}, O = () => {
+	}, j = () => {
 		for (let e of g.values()) PC(e.host);
 		g.clear();
 		for (let e of r?.querySelectorAll?.(OC) ?? []) PC(e);
-	}, k = () => {
-		l += 1, D(), y.clear(), f = null, O();
-	}, A = (e, t, n) => `${e}:${t}:${n}`, j = (e) => {
+	}, M = () => {
+		l += 1, A(), y.clear(), f = null, j();
+	}, N = (e, t, n) => `${e}:${t}:${n}`, P = (e) => {
 		e.expanded = !e.expanded, _.set(e.stateKey, e.expanded), UC(e);
-	}, M = (t) => {
+	}, F = (t) => {
 		let n = t.projection;
 		!s || t.extracting || n?.kind !== "assistant" || !n.canExtract || !n.floorId || (t.extracting = !0, t.extract.disabled = !0, Promise.resolve(e.extractFloor(n.floorId)).catch((e) => {
 			o?.warn?.("[qianqianjie] 楼内重新提取失败", { code: String(e?.code ?? e?.name ?? "V3_INLINE_EXTRACT_FAILED").slice(0, 120) });
 		}).finally(() => {
-			t.extracting = !1, z();
+			t.extracting = !1, H();
 		}));
-	}, N = (e, t, n, i) => {
+	}, I = (e, t, n, i) => {
 		let a = zC(e);
 		if (!a?.append) return null;
 		let o = g.get(t);
 		if (o && (o.kind !== n || o.host?.parentElement !== a || o.host?.isConnected === !1) && (PC(o.host), g.delete(t), o = null), !o) {
 			let e = [...a.querySelectorAll?.(OC) ?? []].find((e) => RC(e) === t) ?? null;
-			e && e.__qqjInlineOwner !== T && (PC(e), e = null), e || (e = r.createElement("div"), e.className = "qqj-inline-host", e.setAttribute?.("data-qqj-inline-host", "true"), e.setAttribute?.("data-message-id", String(t)), e.dataset && (e.dataset.qqjInlineHost = "true", e.dataset.messageId = String(t)), a.append(e)), e.__qqjInlineOwner = T, E(e);
-			let s = A(i, t, n);
-			o = e.__qqjInlineCard ?? HC(r, e, n, _.get(s) === !0, j, M), o.stateKey = s, o.kind = n, g.set(t, o);
+			e && e.__qqjInlineOwner !== O && (PC(e), e = null), e || (e = r.createElement("div"), e.className = "qqj-inline-host", e.setAttribute?.("data-qqj-inline-host", "true"), e.setAttribute?.("data-message-id", String(t)), e.dataset && (e.dataset.qqjInlineHost = "true", e.dataset.messageId = String(t)), a.append(e)), e.__qqjInlineOwner = O, k(e);
+			let s = N(i, t, n);
+			o = e.__qqjInlineCard ?? HC(r, e, n, _.get(s) === !0, P, F), o.stateKey = s, o.kind = n, g.set(t, o);
 		}
 		return o;
-	}, P = (e, t, n) => {
+	}, L = (e, t, n) => {
 		if (e?.activeRecall?.chatId === t && e.activeRecall.userMessageIndex === n) {
 			let t = e.activeRecall.phase, n = t === "input" || t === "source", r = t === "selecting";
 			return Object.freeze({
@@ -36700,24 +36714,24 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 			});
 		}
 		return e?.lastRecallBinding?.chatId === t && e.lastRecallBinding.userMessageIndex === n && e?.lastRecall?.userMessageIndex === n ? TC(e.lastRecall) : null;
-	}, F = (e, t, n, r) => {
+	}, R = (e, t, n, r) => {
 		let i = e.extra?.[Rb];
 		if (!i || typeof i != "object") return Promise.resolve(null);
-		let o = w.get(i);
+		let o = D.get(i);
 		if (o && o.chatId === t && o.messageIndex === n && o.messageText === e.mes && o.stamp === r) return o.promise;
 		let s = Promise.resolve(a(e, {
 			chatId: t,
 			userMessageIndex: n
 		})).catch(() => null);
-		return w.set(i, {
+		return D.set(i, {
 			chatId: t,
 			messageIndex: n,
 			messageText: e.mes,
 			stamp: r,
 			promise: s
 		}), s;
-	}, I = (i, a, o, c, u, d, p) => {
-		let m = P(d, c, o), h = a.extra?.[Rb];
+	}, z = (i, a, o, c, u, d, p) => {
+		let m = L(d, c, o), h = a.extra?.[Rb];
 		if (!h || typeof h != "object") {
 			KC(i, m ?? TC(null), r, u, v);
 			return;
@@ -36736,7 +36750,7 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 			historyGroups: Object.freeze([]),
 			kind: "user"
 		}), r, u, v);
-		F(a, c, o, y).then((u) => {
+		R(a, c, o, y).then((u) => {
 			if (!s || p !== l || a.mes !== _ || a.extra?.qqj_v3_recall_receipt !== h || FC(h) !== y || g.get(o) !== i) return;
 			let d;
 			try {
@@ -36747,11 +36761,12 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 			let m = Array.isArray(d?.chat) ? d.chat : [], b = String(d?.context?.chatMetadata?.qianqianjie?.chatId ?? "").trim();
 			if (`${b || d?.chatId || "no-chat"}|${d?.chatId || ""}` !== f || b !== c || m[o] !== a) return;
 			i.receiptIdentity = h, i.receiptMessageText = _, i.receiptStamp = y, i.receiptChatId = c, i.receiptSettled = !0;
-			let x = P(t.getState(), c, o);
+			let x = L(t.getState(), c, o);
 			KC(i, x?.status === "running" ? x : u ? TC(u) : x ?? TC(null), r, WC(m, b, e.getState()), v);
 		});
-	}, L = () => {
+	}, B = () => {
 		if (!s || c || !r?.querySelector) return !0;
+		if (!C && !w) return j(), y.clear(), !0;
 		let a;
 		try {
 			a = n.snapshot();
@@ -36759,13 +36774,13 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 			return !1;
 		}
 		let o = Array.isArray(a?.chat) ? a.chat : [], u = String(a?.context?.chatMetadata?.qianqianjie?.chatId ?? "").trim(), d = `${u || a?.chatId || "no-chat"}|${a?.chatId || ""}`;
-		f !== d && (l += 1, m !== null && (i?.clearTimeout?.(m), m = null), p?.disconnect?.(), p = null, y.clear(), O(), f = d);
+		f !== d && (l += 1, m !== null && (i?.clearTimeout?.(m), m = null), p?.disconnect?.(), p = null, y.clear(), j(), f = d);
 		let h = l, _ = r.querySelector("#chat");
 		if (!_?.querySelectorAll) return !1;
 		let b = /* @__PURE__ */ new Map();
 		for (let e of _.querySelectorAll(".mes")) {
 			let t = RC(e), n = CC(jC(t) ? o[t] : null);
-			if (!n) continue;
+			if (!T(n)) continue;
 			let r = b.get(t);
 			(!r || BC(e, n) >= r.priority) && b.set(t, {
 				element: e,
@@ -36773,30 +36788,30 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 				priority: BC(e, n)
 			});
 		}
-		let x = e.getState(), S = t.getState(), C = WC(o, u, x), w = /* @__PURE__ */ new Map(), T = 0;
-		for (let e = 0; e < o.length; e += 1) CC(o[e]) === "assistant" && w.set(e, ++T);
-		let E = !0;
+		let x = e.getState(), S = t.getState(), E = WC(o, u, x), D = /* @__PURE__ */ new Map(), O = 0;
+		for (let e = 0; e < o.length; e += 1) CC(o[e]) === "assistant" && D.set(e, ++O);
+		let k = !0;
 		for (let [e, t] of b) {
-			let n = N(t.element, e, t.role, d);
+			let n = I(t.element, e, t.role, d);
 			if (!n) {
-				E = !1;
+				k = !1;
 				continue;
 			}
-			t.role === "assistant" ? KC(n, wC(x, e, w.get(e)), r, C, v) : I(n, o[e], e, u, C, S, h);
+			t.role === "assistant" ? KC(n, wC(x, e, D.get(e)), r, E, v) : z(n, o[e], e, u, E, S, h);
 		}
 		for (let [e, t] of [...g]) b.has(e) || (PC(t.host), g.delete(e));
 		for (let e of r.querySelectorAll(OC)) {
 			let t = RC(e);
 			(!jC(t) || g.get(t)?.host !== e) && PC(e);
 		}
-		o.reduce((e, t) => e + +!!CC(t), 0) > 0 && b.size === 0 && (E = !1);
-		for (let e of y) CC(o[e]) && !b.has(e) && (E = !1);
-		return E && y.clear(), E;
-	}, R = (e) => {
-		if (!s || c || e !== u || (p?.disconnect?.(), p = null, L()) || d >= DC.length) return;
+		o.reduce((e, t) => e + +!!T(CC(t)), 0) > 0 && b.size === 0 && (k = !1);
+		for (let e of y) T(CC(o[e])) && !b.has(e) && (k = !1);
+		return k && y.clear(), k;
+	}, V = (e) => {
+		if (!s || c || e !== u || (p?.disconnect?.(), p = null, B()) || d >= DC.length) return;
 		let t = i?.MutationObserver ?? globalThis.MutationObserver, n = r?.querySelector?.("#chat") ?? r?.body;
 		typeof t == "function" && n && (p = new t(() => {
-			p?.disconnect?.(), p = null, m !== null && (i?.clearTimeout?.(m), m = null), R(e);
+			p?.disconnect?.(), p = null, m !== null && (i?.clearTimeout?.(m), m = null), V(e);
 		}), p.observe(n, {
 			childList: !0,
 			subtree: !0,
@@ -36805,10 +36820,10 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 		}));
 		let a = d;
 		d += 1, m = i?.setTimeout?.(() => {
-			m = null, R(e);
+			m = null, V(e);
 		}, DC[a]) ?? null;
 	};
-	function z(...e) {
+	function H(...e) {
 		if (!(!s || c)) {
 			for (let t of e) {
 				let e = MC(t);
@@ -36824,11 +36839,11 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 				}
 			}
 			h || (h = !0, Promise.resolve().then(() => {
-				h = !1, !(!s || c) && (D(), d = 0, R(u));
+				h = !1, !(!s || c) && (A(), d = 0, V(u));
 			}));
 		}
 	}
-	let B = () => {
+	let U = () => {
 		let e;
 		try {
 			e = n.snapshot();
@@ -36853,7 +36868,7 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 			let n = r[e];
 			if (!n) continue;
 			let i = (...t) => {
-				(e === "CHAT_CHANGED" || e === "CHAT_RENAMED") && k(), z(...t);
+				(e === "CHAT_CHANGED" || e === "CHAT_RENAMED") && M(), H(...t);
 			};
 			t.on(n, i), b.push({
 				source: t,
@@ -36862,36 +36877,45 @@ function qC({ memoryRuntime: e, recallRuntime: t, hostAdapter: n, documentRef: r
 			});
 		}
 	};
-	function V() {
-		return c || s ? { status: c ? "destroyed" : "ready" } : (s = !0, B(), x = e.subscribe?.(() => z()) ?? null, S = t.subscribe?.(() => z()) ?? null, z(), { status: "ready" });
+	function W() {
+		return c || s ? { status: c ? "destroyed" : "ready" } : (s = !0, U(), x = e.subscribe?.(() => H()) ?? null, S = t.subscribe?.(() => H()) ?? null, H(), { status: "ready" });
 	}
-	function H() {
-		s = !1, k(), x?.(), x = null, S?.(), S = null;
+	function ee() {
+		s = !1, M(), x?.(), x = null, S?.(), S = null;
 		for (let { source: e, event: t, handler: n } of b.splice(0)) typeof e.removeListener == "function" ? e.removeListener(t, n) : e.off?.(t, n);
 		return { status: "stopped" };
 	}
-	function U(e) {
-		return e === !0 ? V() : H();
+	function G(e) {
+		return e === !0 ? W() : ee();
 	}
-	function W(e) {
-		C = Object.freeze({
+	function K({ recall: e = !0, memory: t = !0 } = {}) {
+		let n = e !== !1, r = t !== !1;
+		if (n !== C || r !== w) {
+			C = n, w = r;
+			for (let [e, t] of g) T(t.kind) || (PC(t.host), g.delete(e));
+			H();
+		}
+	}
+	function te(e) {
+		E = Object.freeze({
 			knot: IC(e?.palette?.knot, "#a8322f"),
 			line: IC(e?.palette?.line, "color-mix(in srgb,currentColor 18%,transparent)")
 		});
-		for (let e of g.values()) E(e.host);
-		return C;
+		for (let e of g.values()) k(e.host);
+		return E;
 	}
-	function ee() {
-		H(), c = !0, D(), O(), _.clear(), v.clear();
+	function q() {
+		ee(), c = !0, A(), j(), _.clear(), v.clear();
 	}
 	return Object.freeze({
-		start: V,
-		stop: H,
-		setEnabled: U,
-		setAppearance: W,
-		destroy: ee,
-		schedule: z,
-		refresh: L,
+		start: W,
+		stop: ee,
+		setEnabled: G,
+		setAppearance: te,
+		setVisibility: K,
+		destroy: q,
+		schedule: H,
+		refresh: B,
 		getDebugState: () => Object.freeze({
 			active: s,
 			destroyed: c,
