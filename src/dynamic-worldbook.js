@@ -11,12 +11,13 @@ export function bookError(message) { return Object.assign(new Error(message), { 
 function check(condition, message = '动态世界书数据无效，已保留原记录。') { if (!condition) throw bookError(message); }
 const has = value => Array.isArray(value) ? value.length > 0 : typeof value === 'object' && value !== null ? Object.keys(value).length > 0 : Boolean(value);
 export function protectedReason(entry) {
-  if (entry.disable || entry.disabled || entry.enabled === false) return '原书已禁用';
   const content = String(entry.content ?? '');
-  if (!content.trim() || content.length > 8000) return '空条目或超过 8000 字符';
   if (/<%|<\/?(?:script|style|iframe|UpdateVariable|JSONPatch|initvar)\b|\{\{(?!\s*(?:user|char)\s*\}\})|\b(?:getvar|setvar|stat_data|insertOrAssignVariables|z\.object)\b/iu.test(content)) return '含模板、脚本或变量指令';
-  if (/MVU|EJS|变量|规则|指令|提示词|系统|初始化|玩法|输出格式|rule|prompt|schema/iu.test(String(entry.comment ?? ''))) return '规则或玩法条目';
-  if (content.includes('@@') || /(?:必须|禁止|不要).{0,12}(?:输出|回复|格式|变量)/u.test(content)) return '含执行或输出规则';
+  return '';
+}
+// Activation conditions are independent of permission to maintain the text.
+export function nativeSelectionReason(entry) {
+  if (entry.disable || entry.disabled || entry.enabled === false) return '原书已禁用';
   if (['sticky', 'cooldown', 'delay', 'delayUntilRecursion', 'vectorized', 'group', 'automationId', 'decorators', 'triggers'].some(key => has(entry[key]))) return '含特殊触发或分组条件';
   if (entry.useProbability && Number(entry.probability) !== 100) return '含概率条件';
   if (entry.selective && has(entry.keysecondary)) return '含二级关键词条件';
@@ -37,24 +38,38 @@ export function sourceEntries(book) {
 }
 export async function bookFingerprint(entries) { return sha256(stableJson(entries)); }
 export async function createBook(chatId, name, source) {
-  return { schemaVersion: 1, chatId, book: name, sourceHash: await bookFingerprint(source), enabled: false, automatic: true, interval: 3,
+  return { schemaVersion: 2, chatId, book: name, sourceHash: await bookFingerprint(source), enabled: false, automatic: true, interval: 3,
     catchingUp: true, processed: [], entries: source.map(entry => ({ uid: entry.uid, label: String(entry.comment || entry.key?.join('、') || `条目 ${entry.uid}`),
-      original: String(entry.content ?? ''), content: String(entry.content ?? ''), protectedReason: protectedReason(entry), managed: false, locked: false, history: [] })) };
+      original: String(entry.content ?? ''), content: String(entry.content ?? ''), protectedReason: '', managed: !(entry.disable || entry.disabled || entry.enabled === false), locked: false, history: [],
+      kind: 'fact', classification: 'pending', segments: [{ id: 'body', text: String(entry.content ?? ''), writable: false }] })) };
 }
 export function validateBook(value, chatId) {
-  check(isUuid(chatId) && value?.schemaVersion === 1 && value.chatId === chatId && typeof value.book === 'string' && value.book.length > 0);
+  value = clone(value);
+  if (value?.schemaVersion === 1 && Array.isArray(value.entries)) {
+    value.schemaVersion = 2;
+    for (const entry of value.entries) {
+      entry.kind = 'fact'; entry.classification = 'pending';
+      entry.segments = [{ id: 'body', text: entry.content, writable: !entry.protectedReason && !entry.locked }];
+      entry.protectedReason = entry.protectedReason ? `旧版自动保护：${entry.protectedReason}。可重新分类或手动调整维护权限。` : '';
+    }
+  }
+  check(isUuid(chatId) && value?.schemaVersion === 2 && value.chatId === chatId && typeof value.book === 'string' && value.book.length > 0);
   check(typeof value.sourceHash === 'string' && /^[a-f0-9]{64}$/.test(value.sourceHash));
   check(typeof value.enabled === 'boolean' && typeof value.automatic === 'boolean' && Number.isInteger(value.interval) && value.interval >= 1 && value.interval <= 20);
   check(typeof value.catchingUp === 'boolean');
   check(Array.isArray(value.processed) && value.processed.length <= 20000);
   value.processed.forEach((w, index) => check(w.index === index && /^[a-f0-9]{64}$/.test(w.hash)));
   check(Array.isArray(value.entries) && value.entries.length <= 500 && new Set(value.entries.map(e => e.uid)).size === value.entries.length);
-  const managed = value.entries.filter(e => e.managed);
-  check(managed.length <= 40 && managed.reduce((n, e) => n + (typeof e.content === 'string' ? e.content.length : 60001), 0) <= 60000, '受管条目超过 40 条或 6 万字符，未保存。');
   for (const entry of value.entries) {
     check(typeof entry.uid === 'string' && typeof entry.label === 'string' && typeof entry.original === 'string' && typeof entry.content === 'string');
     check(typeof entry.protectedReason === 'string' && typeof entry.managed === 'boolean' && typeof entry.locked === 'boolean');
-    check(!entry.managed || !entry.protectedReason && entry.content.length <= 8000);
+    check(['fact', 'rule', 'npc', 'npc_pool', 'event'].includes(entry.kind));
+    check(['pending', 'ready', 'review', 'manual'].includes(entry.classification));
+    check(Array.isArray(entry.segments) && entry.segments.length > 0 && entry.segments.length <= 100);
+    check(new Set(entry.segments.map(s => s.id)).size === entry.segments.length);
+    for (const segment of entry.segments) check(typeof segment.id === 'string' && segment.id.length > 0 && typeof segment.text === 'string' && typeof segment.writable === 'boolean');
+    check(entry.segments.map(s => s.text).join('') === entry.content);
+    check(entry.kind !== 'rule' || entry.segments.every(s => !s.writable));
     check(Array.isArray(entry.history) && entry.history.length <= 50);
     for (const h of entry.history) check(typeof h.before === 'string' && typeof h.after === 'string' && typeof h.reason === 'string' && typeof h.at === 'string'
       && ['model', 'manual', 'restore'].includes(h.kind) && Array.isArray(h.floors) && h.floors.every(Number.isSafeInteger));
@@ -96,23 +111,54 @@ export function addHistory(entry, content, kind, reason, floors = []) {
   entry.history = entry.history.slice(-50);
   entry.content = content;
 }
+export const canMaintain = entry => entry.managed && !entry.locked && entry.kind !== 'rule' && entry.segments.some(s => s.writable);
+
+// The model supplies boundaries, never the initial text. Ambiguous boundaries
+// retain every source byte and are sent to the user for review.
+export function classifyEntry(entry, result) {
+  const next = clone(entry);
+  const review = () => ({ ...next, classification: 'review', protectedReason: '分段或分类未能可靠核对，请手动检查维护权限。', segments: [{ id: 'body', text: entry.content, writable: false }] });
+  if (!result || !['fact', 'rule', 'npc', 'npc_pool', 'event'].includes(result.kind) || !Array.isArray(result.segments) || !result.segments.length || result.segments.length > 100) return review();
+  const ids = new Set(), offsets = [0];
+  for (const [index, segment] of result.segments.entries()) {
+    if (typeof segment.id !== 'string' || !segment.id || ids.has(segment.id) || typeof segment.writable !== 'boolean' || 'text' in segment) return review();
+    ids.add(segment.id);
+    if (!index) { if (segment.start != null && segment.start !== '') return review(); }
+    else {
+      if (typeof segment.start !== 'string' || !segment.start) return review();
+      const position = entry.content.indexOf(segment.start);
+      if (position <= offsets.at(-1) || entry.content.indexOf(segment.start, position + 1) !== -1) return review();
+      offsets.push(position);
+    }
+  }
+  next.kind = result.kind;
+  next.segments = result.segments.map((s, index) => ({ id: s.id, text: entry.content.slice(offsets[index], offsets[index + 1]), writable: result.kind !== 'rule' && s.writable }));
+  next.classification = result.needsReview === true ? 'review' : 'ready';
+  if (result.needsReview === true) next.segments.forEach(s => { s.writable = false; });
+  next.protectedReason = next.classification === 'review' ? '分类建议待核对，可手动调整维护权限。' : '';
+  return next;
+}
+
 export function applyChanges(data, result, floors) {
-  check(result && Array.isArray(result.changes) && result.changes.length <= data.entries.length, '更新回复格式错误，未保存本批结果。');
+  check(result && Array.isArray(result.changes) && result.changes.length <= data.entries.reduce((n, e) => n + e.segments.length, 0), '更新回复格式错误，未保存本批结果。');
   const next = clone(data), seen = new Set(), allowedFloors = new Set(floors.map(f => f.index));
   for (const change of result.changes) {
     const entry = next.entries.find(e => e.uid === change.uid);
-    check(entry && entry.managed && !entry.locked && !entry.protectedReason && !seen.has(change.uid), '模型修改了未授权或锁定条目，整批未保存。');
-    seen.add(change.uid);
-    check(typeof change.content === 'string' && change.content.trim().length > 0 && change.content.length <= 8000 && !protectedReason({ content: change.content }), '模型输出包含脚本或无效正文，整批未保存。');
+    const segment = entry?.segments.find(s => s.id === (change.segmentId ?? (entry.segments.length === 1 ? entry.segments[0].id : null)));
+    const key = stableJson([change.uid, segment?.id]);
+    check(entry && canMaintain(entry) && segment?.writable && !seen.has(key), '模型修改了未授权或锁定片段，整批未保存。');
+    seen.add(key);
+    check(typeof change.content === 'string' && change.content.trim().length > 0 && change.content.length <= 100000 && !protectedReason({ content: change.content }), '模型输出包含脚本或无效正文，整批未保存。');
     check(typeof change.reason === 'string' && change.reason.length > 0 && change.reason.length <= 1500 && Array.isArray(change.floors) && change.floors.length > 0 && change.floors.every(index => allowedFloors.has(index)), '模型修改缺少有效来源楼号，整批未保存。');
-    addHistory(entry, change.content, 'model', change.reason, change.floors);
+    segment.text = change.content;
+    addHistory(entry, entry.segments.map(s => s.text).join(''), 'model', change.reason, change.floors);
   }
   return next;
 }
 
 // Only modify the host's per-scan candidate copies. No writes to worldbook files or host caches.
 export function overlayCandidates(payload, plan, data) {
-  const byId = new Map(data.entries.filter(e => e.managed && !e.protectedReason).map(e => [e.uid, e]));
+  const byId = new Map(data.entries.filter(e => e.managed).map(e => [e.uid, e]));
   const selected = new Set(plan.selected);
   for (const name of ['globalLore', 'characterLore', 'chatLore', 'personaLore']) {
     const list = payload?.[name];
@@ -120,7 +166,10 @@ export function overlayCandidates(payload, plan, data) {
     const updated = [];
     for (const source of list) {
       const entry = source.world === data.book ? byId.get(String(source.uid)) : null;
-      if (!entry || source.content !== entry.original || protectedReason(source)) { updated.push(source); continue; }
+      if (!entry || source.content !== entry.original) { updated.push(source); continue; }
+      // Keep conditional entries on the host's own activation path, while still
+      // using the chat-local text. Selection never overrides author conditions.
+      if (nativeSelectionReason(source) || entry.kind === 'rule') { updated.push({ ...source, content: entry.content }); continue; }
       if (!source.constant && !selected.has(entry.uid)) continue;
       updated.push({ ...source, content: entry.content, constant: true });
     }

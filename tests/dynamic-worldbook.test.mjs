@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyChanges, bookFingerprint, createBook, createDynamicBookStore, DYNAMIC_BOOK_RECORD, overlayCandidates, protectedReason, sourceEntries, verifyWitness, witness } from '../src/dynamic-worldbook.js';
+import { applyChanges, bookFingerprint, createBook, createDynamicBookStore, DYNAMIC_BOOK_RECORD, overlayCandidates, protectedReason, nativeSelectionReason, classifyEntry, validateBook, stableJson, sourceEntries, verifyWitness, witness } from '../src/dynamic-worldbook.js';
 import { createDynamicWorldbookRuntime } from '../src/dynamic-worldbook-runtime.js';
 
 const CHAT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -35,7 +35,12 @@ async function fixture(t, overrides = {}) {
   const runtime = createDynamicWorldbookRuntime({ client: storage.client,
     hostAdapter: { getContext: () => context, getWorldInfoBindings: () => ({ loadWorldInfo: async () => structuredClone(book) }) },
     identityProvider: () => identity, memoryState: () => state, isEnabled: () => enabled, isGenerating: () => generating,
-    generateUpdate: async request => { updates++; return overrides.update ? overrides.update(request) : { jsonData: { changes: [{ uid: '1', content: '甲已经搬入新家。', reason: '正文明确搬入新家', floors: [2] }] } }; },
+    generateUpdate: async request => {
+      if (request.systemPrompt.includes('分析世界书资料的维护权限')) {
+        if (overrides.classify) return overrides.classify(request);
+        return { jsonData: { entries: JSON.parse(request.taskMessages[0].content).entries.map(e => ({ uid: e.uid, kind: e.uid === '3' ? 'rule' : 'fact', segments: [{ id: 'body', writable: e.uid !== '3' }] })) } };
+      }
+      updates++; return overrides.update ? overrides.update(request) : { jsonData: { changes: [{ uid: '1', content: '甲已经搬入新家。', reason: '正文明确搬入新家', floors: [2] }] } }; },
     generateSelect: async request => { selections++; return overrides.select ? overrides.select(request) : { jsonData: { selected: ['1'] } }; },
     notifyUser: text => warnings.push(text), isBookAllowed: () => overrides.allowed !== false,
   });
@@ -53,16 +58,19 @@ async function fixture(t, overrides = {}) {
     payload() { return { characterLore: Object.values(structuredClone(book.entries)).map(entry => ({ ...entry, world: '书' })), globalLore: [], chatLore: [], personaLore: [] }; },
   };
 }
-test('protected rules, variables and timed entries stay native; simple user/char macros remain eligible', () => {
-  for (const entry of [{ content: '<% script %>' }, { content: '{{getvar::x}}' }, { content: 'x', sticky: 3 }, { content: 'x', keysecondary: ['a'], selective: true },
-    { content: 'x', group: 'abc' }, { content: 'x', disable: true }, { content: 'x', comment: '输出格式' }, { content: 'x', extensions: { script: true } }]) assert.ok(protectedReason(entry));
+test('activation metadata is independent of maintenance permission; executable syntax is recognized separately', () => {
+  for (const entry of [{ content: 'x', sticky: 3 }, { content: 'x', keysecondary: ['a'], selective: true }, { content: 'x', extensions: { arbitrary: true } }]) {
+    assert.equal(protectedReason(entry), ''); assert.ok(nativeSelectionReason(entry));
+  }
+  assert.ok(protectedReason({ content: '<% script %>' }));
   assert.equal(protectedReason({ content: '{{char}}住在{{user}}隔壁。' }), '');
 });
+
 test('book fingerprint survives native TT object-key reordering', async () => {
   assert.equal(await bookFingerprint([{ uid: 'a', key: ['x'], content: 'y' }]), await bookFingerprint([{ content: 'y', key: ['x'], uid: 'a' }]));
 });
 test('replacement never mutates original rows, keeps constant and protected material, handles book duplicates', async () => {
-  const data = await createBook(CHAT, '书', sourceEntries(raw())); data.entries.forEach(e => { e.managed = !e.protectedReason; }); data.entries[0].content = '新家';
+  const data = await createBook(CHAT, '书', sourceEntries(raw())); data.entries[2].kind = 'rule'; data.entries[0].content = '新家';
   const original = Object.values(raw().entries).map(e => ({ ...e, world: '书' }));
   const snapshot = structuredClone(original), payload = { characterLore: [...original], globalLore: [...original], chatLore: [{ uid: 1, world: '其他书', content: '另一个人' }] };
   overlayCandidates(payload, { selected: ['1'] }, data);
@@ -79,7 +87,7 @@ test('CAS and corrupt record handling do not turn failures into empty records', 
   await assert.rejects(store.read(CHAT), /数据无效/);
 });
 test('invalid or unauthorized model change rejects the whole batch', async () => {
-  const data = await createBook(CHAT, '书', sourceEntries(raw())); data.entries[0].managed = true;
+  const data = await createBook(CHAT, '书', sourceEntries(raw())); data.entries[0].managed = true; data.entries[0].segments[0].writable = true;
   const good = { uid: '1', content: '新家', reason: '搬家', floors: [2] };
   for (const bad of [{ ...good, uid: '2' }, { ...good, floors: [99] }, { ...good, content: '<script>alert(1)</script>' }, { ...good, reason: '' }]) {
     assert.throws(() => applyChanges(data, { changes: [good, bad] }, [{ index: 2 }]));
@@ -101,10 +109,11 @@ test('update persists evidence and reload survives; generation replaces rather t
   assert.equal(f.book.entries[1].content, '甲住在旧公寓。');
   assert.equal(f.updates, 1); assert.equal(f.selections, 1);
 });
-test('manual edits and restore lock the entry; model cannot change locked data', async t => {
+test('manual edits preserve permissions; explicit protection blocks the model and restore is reviewable', async t => {
   const f = await fixture(t);
   await f.runtime.edit('1', { content: '甲住在用户指定地点。' });
-  assert.equal(f.runtime.getState().data.entries[0].locked, true);
+  assert.equal(f.runtime.getState().data.entries[0].segments[0].writable, true);
+  await f.runtime.edit('1', { writable: false });
   await assert.rejects(f.runtime.update({ manual: true }), /未授权或锁定/);
   assert.equal(f.runtime.getState().data.entries[0].content, '甲住在用户指定地点。');
   await f.runtime.edit('1', { restore: true });
@@ -174,4 +183,121 @@ test('partial historical scan is not injected as current world state', async t =
   await assert.rejects(f.runtime.prepare(), /追平历史/);
   await f.runtime.update({ manual: true }); assert.equal(f.runtime.getState().data.catchingUp, false);
   await f.runtime.prepare(); assert.equal(f.selections, 1);
+});
+
+test('mixed classification preserves every original byte and ambiguous boundaries require review', async () => {
+  const book = await createBook(CHAT, '书', sourceEntries({ entries: { 1: { content: '规则：固定输出。\r\n现状：住在旧家。\n', comment: '规则和人物' } } }));
+  const original = book.entries[0];
+  const classified = classifyEntry(original, { kind: 'npc', segments: [{ id: 'rule', writable: false }, { id: 'state', start: '现状：', writable: true }] });
+  assert.equal(classified.segments.map(s => s.text).join(''), original.original);
+  assert.equal(classified.segments[0].text, '规则：固定输出。\r\n');
+  assert.equal(classified.classification, 'ready');
+  for (const segments of [
+    [{ id: 'x', writable: true, text: '模型重抄正文' }],
+    [{ id: 'x', writable: false }, { id: 'y', writable: true, start: '不存在' }],
+    [{ id: 'x', writable: true }, { id: 'x', writable: true, start: '现状：' }],
+  ]) {
+    const reviewed = classifyEntry(original, { kind: 'npc', segments });
+    assert.equal(reviewed.classification, 'review'); assert.equal(reviewed.content, original.content);
+    assert.ok(reviewed.segments.every(s => !s.writable));
+  }
+  const rule = classifyEntry(original, { kind: 'rule', segments: [{ id: 'body', writable: true }] });
+  assert.equal(rule.segments[0].writable, false);
+});
+
+test('legacy migration keeps edits, history, participation and locks without writing on read', async () => {
+  const { client, records, writes } = memoryClient(), store = createDynamicBookStore(client);
+  const data = await createBook(CHAT, '书', sourceEntries(raw())); data.schemaVersion = 1;
+  for (const entry of data.entries) { delete entry.segments; delete entry.kind; delete entry.classification; }
+  data.entries[0].content = '手动新家'; data.entries[0].locked = true;
+  data.entries[0].history = [{ before: '旧家', after: '手动新家', at: '2026-10-13', kind: 'manual', reason: '用户', floors: [] }];
+  data.entries[1].managed = false; data.entries[1].protectedReason = '含扩展规则';
+  records.set(`chat-${CHAT}/${DYNAMIC_BOOK_RECORD}`, { data, revision: 7 });
+  const migrated = await store.read(CHAT);
+  assert.equal(writes.length, 0); assert.equal(migrated.revision, 7); assert.equal(migrated.data.schemaVersion, 2);
+  assert.equal(migrated.data.entries[0].content, '手动新家'); assert.equal(migrated.data.entries[0].locked, true);
+  assert.deepEqual(migrated.data.entries[0].history, data.entries[0].history);
+  assert.equal(migrated.data.entries[1].managed, false); assert.equal(migrated.data.entries[1].classification, 'pending');
+  assert.equal(records.get(`chat-${CHAT}/${DYNAMIC_BOOK_RECORD}`).data.schemaVersion, 1);
+  await store.write(CHAT, migrated.data, 7);
+  assert.equal((await store.read(CHAT)).data.entries[0].segments[0].text, '手动新家');
+});
+
+test('mixed maintenance sends only writable segments and rejects protected writes atomically', async t => {
+  let captured;
+  const f = await fixture(t, { update: request => {
+    captured = JSON.parse(request.taskMessages[0].content);
+    return { jsonData: { changes: [{ uid: '1', segmentId: 'state', content: '住在新家。', reason: '搬家', floors: [2] }] } };
+  } });
+  const key = `chat-${CHAT}/${DYNAMIC_BOOK_RECORD}`, record = f.records.get(key);
+  record.data.entries[0].segments = [{ id: 'rule', text: '甲', writable: false }, { id: 'state', text: '住在旧公寓。', writable: true }];
+  await f.runtime.refresh(); await f.runtime.update({ manual: true });
+  const sent = captured.entries.find(e => e.uid === '1');
+  assert.deepEqual(sent.segments, [{ id: 'state', text: '住在旧公寓。' }]);
+  const data = f.runtime.getState().data, entry = data.entries[0];
+  assert.equal(entry.content, '甲住在新家。'); assert.equal(entry.segments[0].text, '甲');
+  assert.throws(() => applyChanges(data, { changes: [
+    { uid: '1', segmentId: 'state', content: '另一个家。', reason: '搬家', floors: [2] },
+    { uid: '1', segmentId: 'rule', content: '坏掉的规则', reason: '违规', floors: [2] },
+  ] }, [{ index: 2 }]), /未授权/);
+  assert.equal(entry.content, '甲住在新家。');
+});
+
+test('conditional facts remain editable and host activation fields are never overridden', async t => {
+  const f = await fixture(t);
+  await f.runtime.edit('4', { content: '事件现状已经改变。' });
+  await f.runtime.prepare(); const payload = f.payload(); f.runtime.apply(payload);
+  const event = payload.characterLore.find(e => e.uid === 4);
+  assert.equal(event.content, '事件现状已经改变。'); assert.equal(event.delay, 3);
+  assert.equal(event.constant, undefined);
+  assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '4').segments[0].writable, true);
+});
+
+test('protected rule text can be manually edited but cannot be granted automatic rule maintenance', async t => {
+  const f = await fixture(t);
+  await f.runtime.edit('3', { content: '<% getvar("user-chosen") %>' });
+  assert.equal(f.runtime.getState().data.entries[2].content, '<% getvar("user-chosen") %>');
+  await assert.rejects(f.runtime.edit('3', { writable: true }), /规则类/);
+  await f.runtime.prepare(); const payload = f.payload(); f.runtime.apply(payload);
+  assert.equal(payload.characterLore[2].content, '<% getvar("user-chosen") %>');
+  assert.equal(payload.characterLore[2].constant, undefined);
+});
+
+test('stale editor cannot overwrite newer content or permissions', async t => {
+  const f = await fixture(t), old = f.runtime.getState().data.entries[0];
+  await f.runtime.edit('1', { content: '另一次保存' });
+  await assert.rejects(f.runtime.edit('1', { content: '旧草稿', expectedEntry: stableJson(old) }), /新版本/);
+  assert.equal(f.runtime.getState().data.entries[0].content, '另一次保存');
+});
+
+test('classification resumes completed batches and preserves manually reviewed entries', async t => {
+  let count = 0, fail = false;
+  const f = await fixture(t, { classify: request => {
+    count++;
+    if (fail && count === 3) throw new Error('classification offline');
+    return { jsonData: { entries: JSON.parse(request.taskMessages[0].content).entries.map(e => ({ uid: e.uid, kind: 'fact', segments: [{ id: 'body', writable: true }] })) } };
+  } });
+  for (let i = 5; i <= 20; i++) f.book.entries[i] = { uid: i, content: `人物${i}的住所。` };
+  fail = true;
+  await assert.rejects(f.runtime.initialize(), /offline/);
+  assert.equal(f.runtime.getState().data.entries.filter(e => e.classification === 'ready').length, 8);
+  await f.runtime.configure({ enabled: true });
+  await f.runtime.prepare(); assert.equal(f.selections, 0, '未完成分类时不使用半份计划');
+  await assert.rejects(f.runtime.update({ manual: true }), /分类/);
+  assert.equal(f.updates, 0);
+  await f.runtime.edit('9', { writable: false });
+  await f.runtime.classify();
+  assert.ok(f.runtime.getState().data.entries.every(e => e.classification !== 'pending'));
+  assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '9').classification, 'manual');
+  assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '9').segments[0].writable, false);
+});
+
+test('classification after a chat switch cannot save late results', async t => {
+  let resolve, pause = false;
+  const f = await fixture(t, { classify: request => pause ? new Promise(r => { resolve = r; }) : { jsonData: { entries: JSON.parse(request.taskMessages[0].content).entries.map(e => ({ uid: e.uid, kind: 'fact', segments: [{ id: 'body', writable: true }] })) } } });
+  pause = true;
+  const pending = f.runtime.initialize();
+  while (!resolve) await new Promise(r => setTimeout(r, 1));
+  const writes = f.writes.length; f.switchChat(); resolve({ jsonData: { entries: [] } });
+  await assert.rejects(pending, { name: 'AbortError' }); assert.equal(f.writes.length, writes);
 });
