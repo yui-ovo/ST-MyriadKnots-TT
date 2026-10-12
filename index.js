@@ -46,6 +46,7 @@ import { installPublicQianshiBridge } from './src/v3/public-qianshi-bridge.js';
 import { createMyKnotsStoryClockController, createStoryClockStatusProjection, extensionStoryClockState } from './src/story-clock.js';
 import { createInlineRenderer } from './src/ui/inline-renderer.js';
 import { normalizeStoryCalendar } from './src/v3/calendar-rules.js';
+import { createDynamicWorldbookRuntime } from './src/dynamic-worldbook-runtime.js';
 
 const isGenerating = () => Boolean(is_send_press || is_group_generating);
 const hostAdapter = createHostAdapter({ personaIdentifierProvider: () => user_avatar, worldInfoBindings: {
@@ -418,7 +419,17 @@ globalThis.addEventListener?.('beforeunload', publicQianshiBridgeMount.cleanup, 
 globalThis.addEventListener?.('beforeunload', autoHideController.dispose, { once: true });
 globalThis.addEventListener?.('beforeunload', inlineRenderer.destroy, { once: true });
 globalThis.addEventListener?.('beforeunload', storageManagement.dispose, { once: true });
-globalThis.qqj_v3_recall_interceptor = (coreChat, contextSize, abort, type) => v3RecallRuntime.intercept(coreChat, contextSize, abort, type);
+const dynamicWorldbook = createDynamicWorldbookRuntime({
+  client: backendClient, hostAdapter, identityProvider: () => session.identity(),
+  memoryState: () => ({ ...v3MemoryRuntime.getState(), chatId: foundationRuntime.getReachable()?.root?.chatId }),
+  generateUpdate: taskRouter.generateUtilityTask, generateSelect: taskRouter.generateRecallTask,
+  isEnabled: settings.isEnabled, isGenerating, sanitizerOptions,
+  isBookAllowed: name => sourcePermissions.filterWorldInfoSources([{ sourceName: name }]).length > 0,
+  notifyUser: text => globalThis.toastr?.warning?.(text),
+});
+const unsubscribeDynamicWorldbook = v3MemoryRuntime.subscribe(() => dynamicWorldbook.wake());
+globalThis.addEventListener?.('beforeunload', () => { unsubscribeDynamicWorldbook(); dynamicWorldbook.dispose(); }, { once: true });
+globalThis.qqj_v3_recall_interceptor = (coreChat, contextSize, abort, type) => dynamicWorldbook.intercept(v3RecallRuntime.intercept, coreChat, contextSize, abort, type);
 const setAllEnabled = async enabled => {
   const diagnosticRevisionAtStart = pluginLifecycleFailureRevision;
   try { refreshStoryClock({ announce: true }); }
@@ -442,6 +453,7 @@ const setAllEnabled = async enabled => {
   return lifecycleResult;
 };
 ui = bootstrap({
+  dynamicWorldbook,
   settings,
   apiTools,
   vectorApi,
@@ -492,7 +504,7 @@ ui = bootstrap({
 });
 lifecycle = createPluginLifecycle({
   session,
-  aborters: [taskRouter, apiTools, peopleWorkspaceRuntime, vectorIndex, vectorApi],
+  aborters: [taskRouter, apiTools, peopleWorkspaceRuntime, vectorIndex, vectorApi, dynamicWorldbook],
   isEnabled: settings.isEnabled,
   getUi: () => ui,
   onPrepared: async ({ result, isCurrent, explicitEnable }) => {
@@ -513,6 +525,7 @@ void (async () => {
     lifecycle.bind({ eventSource: host?.eventSource, eventTypes: host?.eventTypes });
     v3MemoryRuntime.bind({ eventSource: host?.eventSource, eventTypes: host?.eventTypes });
     v3RecallRuntime.bind({ eventSource: host?.eventSource, eventTypes: host?.eventTypes });
+    dynamicWorldbook.bind({ eventSource: host?.eventSource, eventTypes: host?.eventTypes });
     timeRuntime.bind({ eventSource: host?.eventSource, eventTypes: host?.eventTypes, foundationRuntime });
     for (const name of ['CHAT_CHANGED', 'GENERATION_STARTED']) {
       const eventName = host?.eventTypes?.[name];

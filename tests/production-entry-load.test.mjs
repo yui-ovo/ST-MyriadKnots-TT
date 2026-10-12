@@ -328,6 +328,8 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   const utilityTask = async () => ({ jsonData: 'utility' });
   const analysisTask = async () => ({ jsonData: 'analysis' });
   const recallTask = async () => ({ jsonData: 'recall' });
+  let dynamicBookOptions;
+  const dynamicBookRuntime = { bind() {}, abortAll() {}, wake() {}, dispose() {}, intercept: (recall, ...args) => recall(...args) };
 
   let vectorOptions, vectorClientOptions, vectorAutoOptions;
   const vectorRuntime = { getState: () => ({ status: 'idle' }), query: async value => value, abortAll() {}, subscribe: () => () => {} };
@@ -398,6 +400,7 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   const nativeWorldSettings = { charLore: [] };
   define('/scripts/world-info.js', { loadWorldInfo: async () => nativeWorld, selected_world_info: ['全局书'], world_info: nativeWorldSettings, world_info_case_sensitive: true, world_info_match_whole_words: true, world_names: ['全局书'] });
   define('./manifest.json', { version: '0.1.9-test' });
+  define('./src/dynamic-worldbook-runtime.js', { createDynamicWorldbookRuntime: options => { dynamicBookOptions = options; return dynamicBookRuntime; } });
   const backendSnapshot = { sinceClientCreatedRequestCounts: { get: 3, put: 1, delete: 0 }, latestRead: null, latestWrite: null, lastFailure: null };
   const backendClient = { getDiagnosticSnapshot: () => backendSnapshot };
   define('./src/backend-client.js', { createBackendClient: () => backendClient });
@@ -477,7 +480,7 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   define('./src/v3/time-runtime.js', { createTimeStore: () => ({}), createTimeRuntime: options => { timeOptions = options; return timeRuntime; } });
   const memoryStartOptions = [];
   let failMemoryStart = false;
-  define('./src/v3/memory-runtime.js', { createV3MemoryRuntime: options => { v3MemoryOptions = options; v3MemoryRuntime = { bind(bindOptions) { v3MemoryBindOptions = bindOptions; }, async start(startOptions) { memoryStartOptions.push(startOptions); backgroundStarts.push('memory'); if (failMemoryStart) throw new TypeError('PRIVATE late memory failure'); }, async setEnabled(value) { runtimeEnables.push(`memory:${value}`); }, async confirmConsecutiveAssistants() { confirmationCalls += 1; }, getState: () => ({}), getQianshiRecall: input => { qianshiRecallInputs.push(input); return { text: '' }; }, shouldBlockMainGeneration: () => false, allowsRealtimeTailFromEmpty: () => false }; return v3MemoryRuntime; } });
+  define('./src/v3/memory-runtime.js', { createV3MemoryRuntime: options => { v3MemoryOptions = options; v3MemoryRuntime = { subscribe: () => () => {}, bind(bindOptions) { v3MemoryBindOptions = bindOptions; }, async start(startOptions) { memoryStartOptions.push(startOptions); backgroundStarts.push('memory'); if (failMemoryStart) throw new TypeError('PRIVATE late memory failure'); }, async setEnabled(value) { runtimeEnables.push(`memory:${value}`); }, async confirmConsecutiveAssistants() { confirmationCalls += 1; }, getState: () => ({}), getQianshiRecall: input => { qianshiRecallInputs.push(input); return { text: '' }; }, shouldBlockMainGeneration: () => false, allowsRealtimeTailFromEmpty: () => false }; return v3MemoryRuntime; } });
   define('./src/v3/preparation-diagnostic.js', { preparationFailureDiagnostic: error => ({ prepareStep: null, name: error?.name ?? null, code: error?.code ?? null, detail: null, location: null }) });
   define('./src/v3/message-floor-anchor.js', { persistMessageFloorAnchors: persistAnchors, persistTargetChatIdentity: async () => ({ status: 'persisted' }) });
   define('./src/v3/recall-runtime.js', { createV3RecallRuntime: options => { v3RecallOptions = options; v3RecallRuntime = { bind() {}, async setEnabled(value) { runtimeEnables.push(`recall:${value}`); }, async intercept() {}, invalidate(reason) { recallInvalidations.push(reason); }, getState: () => ({}), getPromptSnapshot: () => null }; return v3RecallRuntime; } });
@@ -648,7 +651,8 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   assert.equal(typeof sessionOptions.contextProvider, 'function');
   assert.ok(sessionOptions.identityCoordinator);
   assert.ok(lifecycleOptions.session);
-  assert.equal(lifecycleOptions.aborters.length, 5);
+  assert.equal(lifecycleOptions.aborters.length, 6);
+  assert.ok(lifecycleOptions.aborters.includes(dynamicBookRuntime));
   assert.ok(lifecycleOptions.aborters.includes(peopleWorkspaceRuntime));
   assert.equal(typeof lifecycleOptions.onPrepared, 'function', '生产入口必须把身份成功后的后台续接注入 lifecycle');
   assert.deepEqual(backgroundStarts, [], '插件初始关闭时不得绕过 lifecycle 单独启动 memory/people');
@@ -715,6 +719,9 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   assert.equal(Object.hasOwn(v3RecallOptions, 'historicalMaintenance'), false);
   assert.equal(typeof v3RecallOptions.realtimeOrigin, 'function');
   assert.equal(typeof context.qqj_v3_recall_interceptor, 'function');
+  assert.equal(dynamicBookOptions.generateUpdate, utilityTask);
+  assert.equal(dynamicBookOptions.generateSelect, recallTask);
+  assert.equal(bootstrapOptions.dynamicWorldbook, dynamicBookRuntime);
   v3MemoryOptions.notifyUser({ kind: 'warning', action: 'openMemory', text: '千千结：第 383 楼起等待确认。' });
   assert.equal(toastCalls.length, 1);
   assert.deepEqual(toastCalls[0].slice(0, 2), ['千千结：第 383 楼起等待确认。', undefined]);
@@ -771,8 +778,8 @@ test('生产 bundle 不向现有消息楼插入节点、样式或楼卡专属订
   assert.equal(result.message.className, 'mes user-owned');
   assert.equal(result.styleAppendCalls, 0);
   assert.equal(result.observerInstances, 0);
-  assert.equal(result.eventRegistrations.get('chat'), 6, '保留 lifecycle、V3 foundation、V3 memory、V3 recall、时间推演与时间戳协调六份结构订阅');
-  assert.equal(result.eventRegistrations.get('persona'), 2, '人物身份变动除 lifecycle 外还需使年度提醒缓存失效');
+  assert.equal(result.eventRegistrations.get('chat'), 7, '六份原结构订阅加动态世界书聊天隔离');
+  assert.equal(result.eventRegistrations.get('persona'), 3, '人物身份变动也使动态世界书发送计划失效');
 });
 
 test('生产 bundle 的原生/Luker × Text/Chat 入口动态调用同一 recall seam，禁用时只清槽且绝不 abort', async () => {

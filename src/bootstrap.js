@@ -9,6 +9,7 @@ import { createStorageManagementView } from './ui/storage-management-view.js';
 import { createDialogManager } from './ui/dialog.js';
 
 export function bootstrap({
+  dynamicWorldbook,
   settings,
   apiTools,
   vectorApi,
@@ -81,6 +82,7 @@ export function bootstrap({
     }
   };
   panel = panelFactory({
+    dynamicWorldbook,
     settings,
     apiTools,
     vectorApi,

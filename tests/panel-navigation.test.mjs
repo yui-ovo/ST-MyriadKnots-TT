@@ -6,6 +6,7 @@ import { createV3FoundationView } from '../src/ui/v3-foundation-view.js';
 import { applyPluginEnabledImmediately } from '../src/settings.js';
 import { openHelpGuide } from '../src/ui/help-guide.js';
 import { publicErrorMessage } from '../src/public-error.js';
+import { createDynamicWorldbookView } from '../src/ui/dynamic-worldbook-view.js';
 
 class Node {
   constructor(tag = 'div') {
@@ -53,6 +54,7 @@ test('真实面板入口按千人/千结/千事/双丝网/设置映射视图，�
   const saveScheduleError = new Error('private settings scheduler detail');
   let apiSettingsMounts = 0, apiSettingsDisposals = 0;
   const modules = {
+    './dynamic-worldbook-view.js': { createDynamicWorldbookView },
     './panel.html?raw': { default: '' }, './panel.css?inline': { default: '' },
     './layout.js': { createPanelGeometryController: () => ({ restore() {}, cancelGesture() {} }) },
     './appearance.js': { createAppearanceController: ({ onChange }) => { const state = { mode: 'auto', effectiveTheme: 'day', palette: {} }; onChange?.(state); return { apply() { onChange?.(state); return state; }, getState: () => state, destroy() {} }; } },

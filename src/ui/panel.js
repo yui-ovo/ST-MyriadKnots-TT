@@ -11,6 +11,7 @@ import { createScrollDiagnostics } from './scroll-diagnostics.js';
 import { openHelpGuide } from './help-guide.js';
 import { applyPluginEnabledImmediately } from '../settings.js';
 import { scaleCssFontSizes } from './font-scale.js';
+import { createDynamicWorldbookView } from './dynamic-worldbook-view.js';
 
 const PUBLIC_API_EXAMPLE = `const bridge = globalThis.qqj_v3_public_bridge_v1;
 const status = bridge.getStatus();
@@ -32,6 +33,7 @@ if (snapshot.status === 'ready') {
 const shellCss = ':host{position:fixed;inset:0;z-index:4000;width:100dvw;height:100dvh;pointer-events:none;background:transparent;text-shadow:none!important;isolation:isolate}:host([hidden]){display:none!important}.panel{position:fixed;top:80px;right:20px;width:360px;height:min(600px,85dvh);max-width:calc(100dvw - 40px);max-height:85dvh;display:grid;grid-template-rows:auto auto minmax(0,1fr) 24px;pointer-events:auto}.body{min-height:0;overflow-y:auto;scrollbar-gutter:stable;touch-action:pan-y}.tabs{overflow-x:auto;flex-wrap:nowrap}.tab{flex:0 0 auto}@media(max-width:640px){.panel{top:calc(20px + env(safe-area-inset-top,0px));left:50%;right:auto;transform:translateX(-50%);width:calc(100dvw - 20px);max-width:calc(100dvw - 20px);height:calc(100dvh - 40px - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px));max-height:none;grid-template-rows:auto auto minmax(0,1fr)}.panel-resize-handle{display:none}.tabs{scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}}';
 
 export function createPanel({
+  dynamicWorldbook,
   settings,
   apiTools,
   vectorApi,
@@ -94,6 +96,7 @@ export function createPanel({
   const settingsDrawerState = createSettingsDrawerState();
   let apiEditingRole = 'analysis';
   let apiSettingsView = null;
+  let dynamicWorldbookView = null;
   const scrollPositions = new Map();
   const themeButton = root.querySelector('.theme-btn');
   const fabToggleButton = root.querySelector('.fab-toggle-btn');
@@ -163,6 +166,7 @@ export function createPanel({
     }
   };
   const unmountContent = () => {
+    dynamicWorldbookView?.dispose(); dynamicWorldbookView = null;
     apiSettingsView?.dispose(); apiSettingsView = null;
     v3FoundationView.deactivate();
     peopleProfilesView.deactivate();
@@ -311,6 +315,12 @@ export function createPanel({
     if (worldbook) generalBody.append(worldbook);
     generalBody.append(prompts.node, appearanceSettings.node);
     page.append(general);
+    if (dynamicWorldbook) {
+      dynamicWorldbookView = createDynamicWorldbookView({ runtime: dynamicWorldbook, documentRef,
+        confirmImpl: options => dialog?.confirm?.(options) ?? false,
+        open: subOpen('dynamic-worldbook'), onToggle: subToggle('dynamic-worldbook') });
+      page.append(dynamicWorldbookView.node);
+    }
 
     let storageGroup;
     const storageOpen = settingsDrawerState.isOpen('storage', false);

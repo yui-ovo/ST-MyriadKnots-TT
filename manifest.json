@@ -1,9 +1,9 @@
 {
-  "display_name": "千千结",
+  "display_name": "千千结 · 动态世界书自用版",
   "loading_order": 999,
-  "js": "dist/qqj-app.js?v=20261012.71-90a5e5537ecef3d7",
+  "js": "dist/qqj-app.js?v=20261012.72-79e7fb2af4a28852",
   "generate_interceptor": "qqj_v3_recall_interceptor",
   "version": "0.7.8",
-  "description": "千千结长期记忆工具",
+  "description": "基于 0.7.8 的本地自用试验版 1：动态世界书、按需选材与修改记录；默认不接管条目，手机 TT 尚待试用",
   "author": "atonal519"
 }
