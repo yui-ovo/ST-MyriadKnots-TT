@@ -47,6 +47,7 @@ import { createMyKnotsStoryClockController, createStoryClockStatusProjection, ex
 import { createInlineRenderer } from './src/ui/inline-renderer.js';
 import { normalizeStoryCalendar } from './src/v3/calendar-rules.js';
 import { createDynamicWorldbookRuntime } from './src/dynamic-worldbook-runtime.js';
+import { createMemoryTransfer } from './src/memory-transfer.js';
 
 const isGenerating = () => Boolean(is_send_press || is_group_generating);
 const hostAdapter = createHostAdapter({ personaIdentifierProvider: () => user_avatar, worldInfoBindings: {
@@ -430,6 +431,26 @@ const dynamicWorldbook = createDynamicWorldbookRuntime({
 const unsubscribeDynamicWorldbook = v3MemoryRuntime.subscribe(() => dynamicWorldbook.wake());
 globalThis.addEventListener?.('beforeunload', () => { unsubscribeDynamicWorldbook(); dynamicWorldbook.dispose(); }, { once: true });
 globalThis.qqj_v3_recall_interceptor = (coreChat, contextSize, abort, type) => dynamicWorldbook.intercept(v3RecallRuntime.intercept, coreChat, contextSize, abort, type);
+const memoryTransfer = createMemoryTransfer({ client: backendClient, session, hostAdapter, pluginVersion, freshUuid: newUuid,
+  isBusy: () => chatMemoryManagement.getState().workBusy || ['deleting', 'failed'].includes(chatMemoryManagement.getState().status)
+    || ['scanning', 'cleaning'].includes(storageManagement.getState().status) || timeRuntime.getState().active
+    || v3MemoryRuntime.getState().qianshiHistoryActive || dynamicWorldbook.getState().phase !== 'idle',
+  quiesce: async () => {
+    dynamicWorldbook.abortAll(); await autoHideController.stop();
+    await timeRuntime.stop();
+    v3MemoryRuntime.invalidate(); foundationRuntime.invalidate(); v3RecallRuntime.invalidate('memoryTransfer');
+    v3RecallRuntime.clearCurrent(); peopleWorkspaceRuntime.invalidate(); vectorIndex.abortAll();
+  },
+  onSettled: async () => {
+    session.invalidate({ cancelTask: true });
+    const result = await session.prepare();
+    if (result.status === 'ready') await v3MemoryRuntime.refreshStatus({ preferCached: false });
+  },
+  captureCalendar: chatId => settings.get().storyCalendars[chatId] ?? null,
+  persistCalendar: async (chatId, calendar) => {
+    settings.update({ storyCalendars: { ...settings.get().storyCalendars, [chatId]: calendar } }, { observeSaveFailure: true });
+  },
+});
 const setAllEnabled = async enabled => {
   const diagnosticRevisionAtStart = pluginLifecycleFailureRevision;
   try { refreshStoryClock({ announce: true }); }
@@ -453,6 +474,7 @@ const setAllEnabled = async enabled => {
   return lifecycleResult;
 };
 ui = bootstrap({
+  memoryTransfer,
   dynamicWorldbook,
   settings,
   apiTools,

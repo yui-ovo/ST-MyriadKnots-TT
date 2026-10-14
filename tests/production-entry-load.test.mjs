@@ -401,6 +401,9 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   define('/scripts/world-info.js', { loadWorldInfo: async () => nativeWorld, selected_world_info: ['全局书'], world_info: nativeWorldSettings, world_info_case_sensitive: true, world_info_match_whole_words: true, world_names: ['全局书'] });
   define('./manifest.json', { version: '0.1.9-test' });
   define('./src/dynamic-worldbook-runtime.js', { createDynamicWorldbookRuntime: options => { dynamicBookOptions = options; return dynamicBookRuntime; } });
+  let memoryTransferOptions;
+  const memoryTransferRuntime = {};
+  define('./src/memory-transfer.js', { createMemoryTransfer: options => { memoryTransferOptions = options; return memoryTransferRuntime; } });
   const backendSnapshot = { sinceClientCreatedRequestCounts: { get: 3, put: 1, delete: 0 }, latestRead: null, latestWrite: null, lastFailure: null };
   const backendClient = { getDiagnosticSnapshot: () => backendSnapshot };
   define('./src/backend-client.js', { createBackendClient: () => backendClient });
@@ -527,6 +530,12 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   await vectorOptions.sourceProvider({ targetIdentity: { hostChatId: 'host-chat', chatId: 'test', characterLocator: 'char.png', personaLocator: 'me.png' } });
   assert.equal(memoryManagementOptions.vectorRuntime, vectorRuntime);
   assert.equal(memoryManagementOptions.memoryMigration, memoryMigrationRuntime);
+  assert.equal(bootstrapOptions.memoryTransfer, memoryTransferRuntime);
+  assert.equal(memoryTransferOptions.session, memoryManagementOptions.session);
+  assert.equal(memoryTransferOptions.client, memoryManagementOptions.client);
+  assert.equal(typeof memoryTransferOptions.isBusy, 'function');
+  assert.equal(typeof memoryTransferOptions.quiesce, 'function');
+  assert.equal(typeof memoryTransferOptions.onSettled, 'function');
   assert.equal(typeof memoryMigrationOptions.captureStoryCalendar, 'function');
   assert.equal(typeof memoryMigrationOptions.persistStoryCalendar, 'function');
   assert.equal(coreCacheOptions.localForage, hostLocalForage);
