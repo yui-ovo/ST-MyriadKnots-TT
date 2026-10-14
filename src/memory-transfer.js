@@ -7,10 +7,10 @@ import { validatePeopleWorkspace } from './v3/people-workspace.js';
 import { vectorRecordOwned } from './v3/vector-index.js';
 import { normalizeStoryCalendar } from './v3/calendar-rules.js';
 import { selectAssistantMessage } from './v3/foundation-domain.js';
-import { DYNAMIC_BOOK_RECORD, validateBook, primaryBook, sourceEntries, bookFingerprint, stableJson } from './dynamic-worldbook.js';
+import { DYNAMIC_BOOK_RECORD, validateBook, primaryBook, sourceEntries, bookFingerprint, stableJson, witness, verifyWitness } from './dynamic-worldbook.js';
 
 export const MEMORY_PACKAGE_LIMIT = 64 * 1024 * 1024;
-const FORMAT = 'qqj-chat-memory', VERSION = 1, ROLLBACK = 'self-use-memory-transfer-rollback-v1';
+const FORMAT = 'qqj-chat-memory', VERSION = 2, ROLLBACK = 'self-use-memory-transfer-rollback-v1';
 const ANCHOR = 'qianqianjie_floor', HIDDEN = 'qianqianjieAutoHide', RECEIPT = 'qqj_v3_recall_receipt';
 const clone = value => structuredClone(value);
 const fail = message => Object.assign(new Error(message), { code: 'QQJ_MEMORY_TRANSFER' });
@@ -21,10 +21,16 @@ const coreTypes = new Set(['root', 'floor', 'run', 'checkpoint', 'floorMemory', 
 const isAux = id => id === DYNAMIC_BOOK_RECORD || id === 'v3-people-workspace' || /^v3-people-snapshot-[\da-f-]{36}$/i.test(id)
   || id === 'v3-time-head' || /^v3-time-batch-[\da-f]{32}$/.test(id) || id === 'qqj-vector-index' || /^qqj-vector-shard-[\da-f]{40}$/.test(id);
 
-// Names and avatars may change on another device. Compare the entire selected
-// conversation, including swipe selection and user timestamps used by stability proofs.
-export async function transferWitness(chat) {
+// V1 mixed body and host bookkeeping into one irreversible hash. Keep its exact
+// reader for existing packages/undo records; V2 compares story content separately.
+export async function transferWitness(chat, { version = VERSION } = {}) {
   check(Array.isArray(chat) && chat.length > 0 && chat.length <= 20000, '聊天内容为空或超过支持的楼数。');
+  if (version === 2) return Promise.all(chat.map(message => {
+    const normalize = text => String(text ?? '').replace(/\r\n?/g, '\n');
+    const selected = selectAssistantMessage(message);
+    return sha256(stableJson({ user: message.is_user === true, type: message.extra?.type ?? null,
+      text: normalize(message.mes), selectedText: selected ? normalize(selected.rawContent) : null }));
+  }));
   return Promise.all(chat.map(async message => sha256(stableJson({
     user: message.is_user === true, system: message.is_system === true && message.extra?.[HIDDEN]?.schemaVersion !== 1,
     text: String(message.mes ?? '').replace(/\r\n?/g, '\n'),
@@ -80,7 +86,7 @@ export async function parseMemoryPackage(input) {
   check(bytes(input) <= MEMORY_PACKAGE_LIMIT, '记忆包不能超过 64 MB。');
   let value;
   try { value = typeof input === 'string' ? JSON.parse(input) : clone(input); } catch { throw fail('文件不是有效的 JSON 记忆包。'); }
-  check(value?.format === FORMAT && value.formatVersion === VERSION && isUuid(value.source?.chatId), '这不是支持的千千结记忆包。请用“导出当前聊天记忆”生成文件。');
+  check(value?.format === FORMAT && [1, VERSION].includes(value.formatVersion) && isUuid(value.source?.chatId), '这不是支持的千千结记忆包。请用“导出当前聊天记忆”生成文件。');
   const { checksum, ...payload } = value;
   check(typeof checksum === 'string' && checksum === await sha256(stableJson(payload)), '记忆包完整性校验失败，文件可能损坏。');
   check(Array.isArray(value.messages) && value.messages.length > 0 && value.messages.length <= 20000
@@ -88,6 +94,7 @@ export async function parseMemoryPackage(input) {
   check(Array.isArray(value.markers) && value.markers.length === value.messages.length, '楼层标记数量不匹配。');
   check(value.prequel === null || typeof value.prequel === 'string', '前情内容无效。');
   check(value.calendar === null || normalizeStoryCalendar(value.calendar), '故事历法设置无效。');
+  if (value.formatVersion === 2) check(typeof value.dynamicHistoryVerified === 'boolean', '动态世界书历史核对信息无效。');
   const graph = await validateRecords(value.records, value.source.chatId);
   const aliases = new Set((graph.migrationDescriptor?.carriedAliases ?? []).map(alias => alias.aliasId));
   for (const markers of value.markers) {
@@ -185,9 +192,11 @@ export function createMemoryTransfer({ client, session, hostAdapter, isBusy = ()
       check([...collected].every(([id, old]) => verify.some(item => item.recordId === id && item.revision === old.revision && same(item.data, old.data)))
         && verify.filter(item => isAux(item.recordId)).length === list.filter(item => isAux(item.recordId)).length, '导出期间记忆发生变化，请重试。');
       current(captured);
+      const dynamicBook = records.find(item => item.id === DYNAMIC_BOOK_RECORD)?.data;
       const payload = { format: FORMAT, formatVersion: VERSION, pluginVersion, exportedAt: now().toISOString(),
         source: { chatId: captured.identity.chatId, character: captured.target.characterName },
         messages: await transferWitness(captured.chat), markers: exportMarkers(captured.chat, graph), records,
+        dynamicHistoryVerified: dynamicBook ? await verifyWitness(captured.chat, dynamicBook.processed) : true,
         prequel: typeof captured.metadata.qianqianjiePrequel === 'string' ? captured.metadata.qianqianjiePrequel : null,
         calendar: clone(captureCalendar(captured.identity.chatId)) };
       const value = { ...payload, checksum: await sha256(stableJson(payload)) };
@@ -198,6 +207,8 @@ export function createMemoryTransfer({ client, session, hostAdapter, isBusy = ()
   async function dynamicCompatibility(value) {
     const book = value.records.find(item => item.id === DYNAMIC_BOOK_RECORD)?.data;
     if (!book) return { name: null, status: '记忆包不含动态世界书。' };
+    if (value.formatVersion === 2 && !value.dynamicHistoryVerified) return { name: null,
+      status: '旧动态副本的已处理剧情与导出聊天不一致：跳过此副本，摘要与人物状态仍可恢复。' };
     try {
       const ctx = hostAdapter.getContext(), name = primaryBook(ctx), loader = ctx.loadWorldInfo ?? hostAdapter.getWorldInfoBindings?.().loadWorldInfo;
       if (name && loader && await bookFingerprint(sourceEntries(await loader(name))) === book.sourceHash) return { name, status: '世界书一致：恢复动态副本、权限与修改记录。' };
@@ -207,7 +218,13 @@ export function createMemoryTransfer({ client, session, hostAdapter, isBusy = ()
   async function preview(input) {
     check(!active && !isBusy(), '请等待聊天生成和记忆任务完成后再导入。');
     const captured = capture(), { value, graph } = await parseMemoryPackage(input);
-    check(same(await transferWitness(captured.chat), value.messages), '当前聊天与记忆包不一致（正文、楼数或候选发生变化）。请先导入同一次导出的酒馆 JSONL 聊天，再打开它。');
+    check(captured.chat.length === value.messages.length,
+      `当前聊天与记忆包不一致：当前 ${captured.chat.length} 条，记忆包 ${value.messages.length} 条。请打开对应的完整聊天记录。`);
+    const actual = await transferWitness(captured.chat, { version: value.formatVersion });
+    const mismatch = actual.findIndex((hash, index) => hash !== value.messages[index]);
+    check(mismatch < 0, value.formatVersion === 1
+      ? `旧版记忆包在第 ${mismatch} 楼的综合校验不同，可能只是时间戳、候选编号或隐藏标记变化，不能据此判断正文不同。请两边更新插件，在旧设备重新导出记忆包后再试，无需重做摘要。`
+      : `当前聊天与记忆包不一致：第 ${mismatch} 楼的发言方、正文或当前选中的回复不同（楼号从 0 开始）。请核对该楼；本次未写入记忆。`);
     await verifyConversation(graph, captured.chat);
     const dynamic = await dynamicCompatibility(value); current(captured);
     const oldRoot = await optionalGet(`chat-${captured.identity.chatId}`, 'v3-root'); current(captured);
@@ -254,7 +271,13 @@ export function createMemoryTransfer({ client, session, hostAdapter, isBusy = ()
       const chatId = freshUuid(); check(isUuid(chatId) && chatId !== captured.identity.chatId && chatId !== value.source.chatId, '新记忆编号无效。');
       check((await client.list(`chat-${chatId}`)).length === 0, '新记忆编号已存在，请重试。');
       const records = value.records.filter(item => item.id !== DYNAMIC_BOOK_RECORD || dynamic.name).map(item => rehomeRecord(item, chatId));
-      const book = records.find(item => item.id === DYNAMIC_BOOK_RECORD); if (book) book.data.book = dynamic.name;
+      const book = records.find(item => item.id === DYNAMIC_BOOK_RECORD);
+      if (book) {
+        book.data.book = dynamic.name;
+        // All selected bodies were verified. Rebind only the dynamic book's
+        // host-sensitive progress witnesses, preserving its text and permissions.
+        if (value.formatVersion === 2) book.data.processed = await witness(captured.chat, book.data.processed.length - 1);
+      }
       await validateRecords(records, chatId);
       // Everything is staged in a fresh collection. The old collection is never overwritten.
       for (const item of records.filter(item => item.id !== 'v3-root')) {
@@ -284,10 +307,14 @@ export function createMemoryTransfer({ client, session, hostAdapter, isBusy = ()
           return next;
         };
         message.extra = apply(message.extra, value.markers[index].extra);
-        if (Array.isArray(message.swipe_info)) message.swipe_info.forEach((swipe, n) => { swipe.extra = apply(swipe.extra, value.markers[index].swipes?.[n]); });
+        if (Array.isArray(message.swipe_info)) message.swipe_info.forEach((swipe, n) => {
+          // V2 permits a different history/order of unselected alternatives.
+          // Never transplant an old alternative's anchor onto an unrelated one.
+          swipe.extra = apply(swipe.extra, value.formatVersion === 1 ? value.markers[index].swipes?.[n] : null);
+        });
       });
       await client.put(`chat-${chatId}`, ROLLBACK, { schemaVersion: 1, chatId, previousChatId: captured.identity.chatId,
-        header: initial.header, messages: initial.chat, importedMessages: await transferWitness(messages), importedRoot: root }, 0);
+        header: initial.header, messages: initial.chat, importedMessages: await transferWitness(messages, { version: 1 }), importedRoot: root }, 0);
       const result = await publish(captured, initial, header, messages, chatId);
       return { ...result, chatId, summaries: previewValue.summaries, dynamic: dynamic.status };
     });
@@ -297,7 +324,7 @@ export function createMemoryTransfer({ client, session, hostAdapter, isBusy = ()
     return exclusive(captured, async () => {
       const rollback = (await optionalGet(`chat-${captured.identity.chatId}`, ROLLBACK))?.data;
       check(rollback?.schemaVersion === 1 && rollback.chatId === captured.identity.chatId, '当前聊天没有可撤销的导入。');
-      check(same(await transferWitness(captured.chat), rollback.importedMessages), '导入后已继续聊天或修改正文。请先导出当前记忆；本次不覆盖新剧情。');
+      check(same(await transferWitness(captured.chat, { version: 1 }), rollback.importedMessages), '导入后已继续聊天或修改正文。请先导出当前记忆；本次不覆盖新剧情。');
       const initial = await readTargetChat(captured.target, { fetchImpl });
       check(same(initial.chat, captured.chat) && same(initial.header.chat_metadata, captured.metadata), '当前聊天尚未保存完成，请稍后重试。');
       const header = clone(initial.header), messages = clone(initial.chat);

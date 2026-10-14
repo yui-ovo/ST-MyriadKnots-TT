@@ -9,7 +9,7 @@ import { createChatSession } from '../src/chat-session.js';
 import { createChatIdentityCoordinator } from '../src/chat-identity.js';
 import { EXTRACTOR_SYSTEM_PROMPT } from '../src/v3/extractor.js';
 import { sha256 } from '../src/identity.js';
-import { stableJson, createBook, DYNAMIC_BOOK_RECORD } from '../src/dynamic-worldbook.js';
+import { stableJson, createBook, DYNAMIC_BOOK_RECORD, witness, verifyWitness } from '../src/dynamic-worldbook.js';
 const SOURCE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const NOW = '2026-09-05T00:00:00.000Z';
 const assistant = mes => ({ is_user: false, is_system: false, mes, swipes: [mes], swipe_id: 0 });
@@ -199,6 +199,85 @@ test('hidden messages, local time records, vector cache and arbitrary non-QQJ me
 test('source changed without reconciliation cannot be exported with stale memories', async () => {
   const f = await fixture(); f.ctx.chat[1].mes = 'changed'; f.ctx.chat[1].swipes[0] = 'changed';
   await assert.rejects(f.runtime.exportCurrent(), /记忆中的楼层与聊天正文不一致/);
+});
+
+test('cross-host timestamp, visibility, absent/default swipe index and unselected history changes preserve real memory/CSE', async () => {
+  const f = await fixture(), target = await f.target();
+  target.chat[0].send_date = 1790000000000; target.chat[0].name = 'renamed persona';
+  target.chat[2].send_date = 'different host timestamp representation';
+  target.chat[4].send_date = '2026-10-15T01:00:00.000Z';
+  target.chat[1].is_system = true; // native import may omit the QQJ auto-hide marker
+  target.chat[1].swipes = ['unused alternative', target.chat[1].mes]; target.chat[1].swipe_id = 1;
+  target.chat[1].swipe_info = [{ extra: { unrelated: true } }, { extra: { variables: { retained: true } } }];
+  delete target.chat[3].swipes; delete target.chat[3].swipe_id;
+  f.api.reloadFromContext();
+  await f.runtime.importPreview(await f.runtime.preview(f.exported.text));
+  const store = createFoundationStore({ client: f.backend.client, contextProvider: () => f.session.identity() });
+  const foundation = createFoundationRuntime({ hostAdapter: f.host, store, contextProvider: () => target, newUuid: uuidFactory(), logger: { warn() {} } });
+  assert.equal((await foundation.start()).status, 'ready');
+  const restored = await store.readReachable({ mode: 'full' });
+  assert.deepEqual(restored.floorMemories.map(item => item.id), f.graph.floorMemories.map(item => item.id));
+  assert.deepEqual(restored.stateDeltas.map(item => item.id), f.graph.stateDeltas.map(item => item.id));
+  assert.equal(target.chat[1].swipe_id, 1); assert.equal(target.chat[0].send_date, 1790000000000);
+  assert.deepEqual(target.chat[1].swipe_info[1].extra, { variables: { retained: true } });
+  const memory = createV3MemoryRuntime({ foundationRuntime: foundation, store, hostAdapter: f.host,
+    automationSettings: () => ({ enabled: false, batchSize: 1 }), newUuid: uuidFactory(), logger: { warn() {} },
+    generateAnalysisTask: async () => assert.fail('must not reanalyze'), generateUtilityTask: async () => assert.fail('must not resummarize') });
+  await memory.start(); assert.equal(memory.getState().rememberedCount, 1);
+});
+
+test('V2 diagnostics identify counts and the first differing story floor, including user edits and rerolls', async () => {
+  const f = await fixture();
+  let target = await f.target(); target.chat[0].mes = 'different user message';
+  await assert.rejects(f.runtime.preview(f.exported.text), /第 0 楼.*发言方、正文/);
+  target = await f.target(); target.chat[1].swipes.push('actually different selected answer'); target.chat[1].swipe_id = 1;
+  await assert.rejects(f.runtime.preview(f.exported.text), /第 1 楼/);
+  target = await f.target(); target.chat.push(user('new'));
+  await assert.rejects(f.runtime.preview(f.exported.text), /当前 6 条，记忆包 5 条/);
+  target = await f.target(); target.chat[0].is_user = false;
+  await assert.rejects(f.runtime.preview(f.exported.text), /第 0 楼/);
+  assert.equal(f.api.saves, 0);
+});
+
+test('V1 stays readable when exact, and asks for a new export when the mixed hash cannot prove equality', async () => {
+  const f = await fixture(), old = JSON.parse(f.exported.text);
+  old.formatVersion = 1; old.messages = await transferWitness(f.ctx.chat, { version: 1 });
+  const { checksum, ...payload } = old; old.checksum = await sha256(stableJson(payload));
+  let target = await f.target(); assert.equal((await f.runtime.preview(old)).messages, 5);
+  target.chat[0].send_date = 'timestamp changed';
+  await assert.rejects(f.runtime.preview(old), /旧版记忆包.*第 0 楼.*重新导出/);
+  target = await f.target(); await f.runtime.importPreview(await f.runtime.preview(old));
+  await f.runtime.undo(); assert.equal(target.chatMetadata.qianqianjie.chatId, TARGET);
+});
+
+test('matching dynamic worldbook rebinds progress to local swipe representation without resetting edits', async () => {
+  const f = await fixture(), entries = [{ uid: '0', content: 'old home', comment: '住所' }];
+  const book = await createBook(SOURCE, 'old-book', entries);
+  book.processed = await witness(f.ctx.chat, f.ctx.chat.length - 1); book.entries[0].excluded = true;
+  await f.backend.client.put(`chat-${SOURCE}`, DYNAMIC_BOOK_RECORD, book, 0);
+  const exported = await f.runtime.exportCurrent(), target = await f.target();
+  target.characters[0].data.extensions = { world: 'new-book-name' };
+  target.loadWorldInfo = async () => ({ entries: { 0: entries[0] } });
+  target.chat[1].swipes = ['other', target.chat[1].mes]; target.chat[1].swipe_id = 1;
+  f.api.reloadFromContext();
+  await f.runtime.importPreview(await f.runtime.preview(exported.text));
+  const saved = f.backend.records.get(`chat-${IMPORTED}/${DYNAMIC_BOOK_RECORD}`).data;
+  assert.equal(await verifyWitness(target.chat, saved.processed), true);
+  assert.equal(saved.entries[0].excluded, true); assert.equal(saved.book, 'new-book-name');
+});
+
+test('rebinding must not silently reactivate a source dynamic copy with stale story witnesses', async () => {
+  const f = await fixture(), entries = [{ uid: '0', content: 'home' }];
+  const book = await createBook(SOURCE, 'book', entries);
+  book.processed = [{ index: 0, hash: '0'.repeat(64) }];
+  await f.backend.client.put(`chat-${SOURCE}`, DYNAMIC_BOOK_RECORD, book, 0);
+  const exported = await f.runtime.exportCurrent(), target = await f.target();
+  target.characters[0].data.extensions = { world: 'book' };
+  target.loadWorldInfo = async () => ({ entries: { 0: entries[0] } });
+  const plan = await f.runtime.preview(exported.text);
+  assert.match(plan.dynamic, /已处理剧情/);
+  await f.runtime.importPreview(plan);
+  assert.equal(f.backend.records.has(`chat-${IMPORTED}/${DYNAMIC_BOOK_RECORD}`), false);
 });
 
 function context(hostChatId, qqjChatId, chat, characterAvatar = 'character.png') {

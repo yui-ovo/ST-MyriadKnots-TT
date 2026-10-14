@@ -26099,7 +26099,7 @@ function db(e, t) {
 }
 //#endregion
 //#region src/memory-transfer.js
-var fb = 67108864, pb = "qqj-chat-memory", mb = 1, hb = "self-use-memory-transfer-rollback-v1", gb = "qianqianjie_floor", _b = "qianqianjieAutoHide", vb = "qqj_v3_recall_receipt", yb = (e) => structuredClone(e), bb = (e) => Object.assign(Error(e), { code: "QQJ_MEMORY_TRANSFER" }), xb = (e, t) => {
+var fb = 67108864, pb = "qqj-chat-memory", mb = 2, hb = "self-use-memory-transfer-rollback-v1", gb = "qianqianjie_floor", _b = "qianqianjieAutoHide", vb = "qqj_v3_recall_receipt", yb = (e) => structuredClone(e), bb = (e) => Object.assign(Error(e), { code: "QQJ_MEMORY_TRANSFER" }), xb = (e, t) => {
 	if (!e) throw bb(t);
 }, Sb = (e, t) => oy(e) === oy(t), Cb = (e) => new TextEncoder().encode(typeof e == "string" ? e : JSON.stringify(e)).byteLength, wb = /* @__PURE__ */ new Set([
 	"root",
@@ -26114,8 +26114,16 @@ var fb = 67108864, pb = "qqj-chat-memory", mb = 1, hb = "self-use-memory-transfe
 	"migrationDescriptor",
 	"index"
 ]), Tb = (e) => e === "self-use-dynamic-worldbook-v1" || e === "v3-people-workspace" || /^v3-people-snapshot-[\da-f-]{36}$/i.test(e) || e === "v3-time-head" || /^v3-time-batch-[\da-f]{32}$/.test(e) || e === "qqj-vector-index" || /^qqj-vector-shard-[\da-f]{40}$/.test(e);
-async function Eb(e) {
-	return xb(Array.isArray(e) && e.length > 0 && e.length <= 2e4, "聊天内容为空或超过支持的楼数。"), Promise.all(e.map(async (e) => y(oy({
+async function Eb(e, { version: t = mb } = {}) {
+	return xb(Array.isArray(e) && e.length > 0 && e.length <= 2e4, "聊天内容为空或超过支持的楼数。"), t === 2 ? Promise.all(e.map((e) => {
+		let t = (e) => String(e ?? "").replace(/\r\n?/g, "\n"), n = Ce(e);
+		return y(oy({
+			user: e.is_user === !0,
+			type: e.extra?.type ?? null,
+			text: t(e.mes),
+			selectedText: n ? t(n.rawContent) : null
+		}));
+	})) : Promise.all(e.map(async (e) => y(oy({
 		user: e.is_user === !0,
 		system: e.is_system === !0 && e.extra?.[_b]?.schemaVersion !== 1,
 		text: String(e.mes ?? "").replace(/\r\n?/g, "\n"),
@@ -26174,9 +26182,9 @@ async function kb(e) {
 	} catch {
 		throw bb("文件不是有效的 JSON 记忆包。");
 	}
-	xb(t?.format === pb && t.formatVersion === mb && _(t.source?.chatId), "这不是支持的千千结记忆包。请用“导出当前聊天记忆”生成文件。");
+	xb(t?.format === pb && [1, mb].includes(t.formatVersion) && _(t.source?.chatId), "这不是支持的千千结记忆包。请用“导出当前聊天记忆”生成文件。");
 	let { checksum: n, ...r } = t;
-	xb(typeof n == "string" && n === await y(oy(r)), "记忆包完整性校验失败，文件可能损坏。"), xb(Array.isArray(t.messages) && t.messages.length > 0 && t.messages.length <= 2e4 && t.messages.every((e) => /^[a-f0-9]{64}$/.test(e)), "聊天核对信息无效。"), xb(Array.isArray(t.markers) && t.markers.length === t.messages.length, "楼层标记数量不匹配。"), xb(t.prequel === null || typeof t.prequel == "string", "前情内容无效。"), xb(t.calendar === null || Gi(t.calendar), "故事历法设置无效。");
+	xb(typeof n == "string" && n === await y(oy(r)), "记忆包完整性校验失败，文件可能损坏。"), xb(Array.isArray(t.messages) && t.messages.length > 0 && t.messages.length <= 2e4 && t.messages.every((e) => /^[a-f0-9]{64}$/.test(e)), "聊天核对信息无效。"), xb(Array.isArray(t.markers) && t.markers.length === t.messages.length, "楼层标记数量不匹配。"), xb(t.prequel === null || typeof t.prequel == "string", "前情内容无效。"), xb(t.calendar === null || Gi(t.calendar), "故事历法设置无效。"), t.formatVersion === 2 && xb(typeof t.dynamicHistoryVerified == "boolean", "动态世界书历史核对信息无效。");
 	let i = await Ob(t.records, t.source.chatId), a = new Set((i.migrationDescriptor?.carriedAliases ?? []).map((e) => e.aliasId));
 	for (let e of t.markers) {
 		xb(e && typeof e.extra == "object" && Array.isArray(e.swipes), "楼层标记格式无效。");
@@ -26282,7 +26290,7 @@ function Pb({ client: e, session: t, hostAdapter: n, isBusy: r = () => !1, quies
 			await Ob(a, t.identity.chatId), await Ab(r, t.chat);
 			let s = await e.list(`chat-${t.identity.chatId}`);
 			xb([...n].every(([e, t]) => s.some((n) => n.recordId === e && n.revision === t.revision && Sb(n.data, t.data))) && s.filter((e) => Tb(e.recordId)).length === i.filter((e) => Tb(e.recordId)).length, "导出期间记忆发生变化，请重试。"), h(t);
-			let c = {
+			let c = a.find((e) => e.id === iy)?.data, l = {
 				format: pb,
 				formatVersion: mb,
 				pluginVersion: d,
@@ -26294,15 +26302,16 @@ function Pb({ client: e, session: t, hostAdapter: n, isBusy: r = () => !1, quies
 				messages: await Eb(t.chat),
 				markers: Mb(t.chat, r),
 				records: a,
+				dynamicHistoryVerified: !c || await Cy(t.chat, c.processed),
 				prequel: typeof t.metadata.qianqianjiePrequel == "string" ? t.metadata.qianqianjiePrequel : null,
 				calendar: yb(o(t.identity.chatId))
-			}, l = {
-				...c,
-				checksum: await y(oy(c))
+			}, f = {
+				...l,
+				checksum: await y(oy(l))
 			};
-			return xb(Cb(l) <= fb, "导出数据超过第一版支持的 64 MB。"), {
+			return xb(Cb(f) <= fb, "导出数据超过第一版支持的 64 MB。"), {
 				filename: `千千结记忆-${u().toISOString().replace(/[:.]/g, "-")}.qqj-memory.json`,
-				text: JSON.stringify(l)
+				text: JSON.stringify(f)
 			};
 		});
 	}
@@ -26311,6 +26320,10 @@ function Pb({ client: e, session: t, hostAdapter: n, isBusy: r = () => !1, quies
 		if (!t) return {
 			name: null,
 			status: "记忆包不含动态世界书。"
+		};
+		if (e.formatVersion === 2 && !e.dynamicHistoryVerified) return {
+			name: null,
+			status: "旧动态副本的已处理剧情与导出聊天不一致：跳过此副本，摘要与人物状态仍可恢复。"
 		};
 		try {
 			let e = n.getContext(), r = hy(e), i = e.loadWorldInfo ?? n.getWorldInfoBindings?.().loadWorldInfo;
@@ -26327,26 +26340,28 @@ function Pb({ client: e, session: t, hostAdapter: n, isBusy: r = () => !1, quies
 	async function x(e) {
 		xb(!f && !r(), "请等待聊天生成和记忆任务完成后再导入。");
 		let t = m(), { value: n, graph: i } = await kb(e);
-		xb(Sb(await Eb(t.chat), n.messages), "当前聊天与记忆包不一致（正文、楼数或候选发生变化）。请先导入同一次导出的酒馆 JSONL 聊天，再打开它。"), await Ab(i, t.chat);
-		let a = await b(n);
+		xb(t.chat.length === n.messages.length, `当前聊天与记忆包不一致：当前 ${t.chat.length} 条，记忆包 ${n.messages.length} 条。请打开对应的完整聊天记录。`);
+		let a = (await Eb(t.chat, { version: n.formatVersion })).findIndex((e, t) => e !== n.messages[t]);
+		xb(a < 0, n.formatVersion === 1 ? `旧版记忆包在第 ${a} 楼的综合校验不同，可能只是时间戳、候选编号或隐藏标记变化，不能据此判断正文不同。请两边更新插件，在旧设备重新导出记忆包后再试，无需重做摘要。` : `当前聊天与记忆包不一致：第 ${a} 楼的发言方、正文或当前选中的回复不同（楼号从 0 开始）。请核对该楼；本次未写入记忆。`), await Ab(i, t.chat);
+		let o = await b(n);
 		h(t);
-		let o = await S(`chat-${t.identity.chatId}`, "v3-root");
+		let s = await S(`chat-${t.identity.chatId}`, "v3-root");
 		h(t);
-		let s = Object.freeze({
+		let c = Object.freeze({
 			character: n.source.character,
 			messages: n.messages.length,
 			summaries: i.floorMemories.filter((e) => e.recordStatus === "active" && e.summary).length,
 			states: i.stateDeltas.filter((e) => e.recordStatus === "active").length,
-			dynamic: a.status,
-			replacesMemory: !!o?.data?.headCheckpointId,
+			dynamic: o.status,
+			replacesMemory: !!s?.data?.headCheckpointId,
 			exportedAt: n.exportedAt
 		});
-		return p.set(s, {
+		return p.set(c, {
 			captured: t,
 			value: n,
-			dynamic: a,
-			oldRoot: o
-		}), s;
+			dynamic: o,
+			oldRoot: s
+		}), c;
 	}
 	async function S(t, n) {
 		try {
@@ -26397,7 +26412,7 @@ function Pb({ client: e, session: t, hostAdapter: n, isBusy: r = () => !1, quies
 			let d = l();
 			xb(_(d) && d !== r.identity.chatId && d !== i.source.chatId, "新记忆编号无效。"), xb((await e.list(`chat-${d}`)).length === 0, "新记忆编号已存在，请重试。");
 			let f = i.records.filter((e) => e.id !== "self-use-dynamic-worldbook-v1" || a.name).map((e) => Nb(e, d)), p = f.find((e) => e.id === iy);
-			p && (p.data.book = a.name), await Ob(f, d);
+			p && (p.data.book = a.name, i.formatVersion === 2 && (p.data.processed = await Sy(r.chat, p.data.processed.length - 1))), await Ob(f, d);
 			for (let t of f.filter((e) => e.id !== "v3-root")) h(r), xb(Sb((await e.put(`chat-${d}`, t.id, t.data, 0)).data, t.data), "新副本的存储返回内容不一致，未切换当前记忆。");
 			let m = f.find((e) => e.id === "v3-root").data;
 			xb((await ib({
@@ -26438,7 +26453,7 @@ function Pb({ client: e, session: t, hostAdapter: n, isBusy: r = () => !1, quies
 					return n;
 				};
 				e.extra = n(e.extra, i.markers[t].extra), Array.isArray(e.swipe_info) && e.swipe_info.forEach((e, r) => {
-					e.extra = n(e.extra, i.markers[t].swipes?.[r]);
+					e.extra = n(e.extra, i.formatVersion === 1 ? i.markers[t].swipes?.[r] : null);
 				});
 			}), await e.put(`chat-${d}`, hb, {
 				schemaVersion: 1,
@@ -26446,7 +26461,7 @@ function Pb({ client: e, session: t, hostAdapter: n, isBusy: r = () => !1, quies
 				previousChatId: r.identity.chatId,
 				header: n.header,
 				messages: n.chat,
-				importedMessages: await Eb(y),
+				importedMessages: await Eb(y, { version: 1 }),
 				importedRoot: m
 			}, 0), {
 				...await C(r, n, v, y, d),
@@ -26460,7 +26475,7 @@ function Pb({ client: e, session: t, hostAdapter: n, isBusy: r = () => !1, quies
 		let e = m();
 		return g(e, async () => {
 			let t = (await S(`chat-${e.identity.chatId}`, hb))?.data;
-			xb(t?.schemaVersion === 1 && t.chatId === e.identity.chatId, "当前聊天没有可撤销的导入。"), xb(Sb(await Eb(e.chat), t.importedMessages), "导入后已继续聊天或修改正文。请先导出当前记忆；本次不覆盖新剧情。");
+			xb(t?.schemaVersion === 1 && t.chatId === e.identity.chatId, "当前聊天没有可撤销的导入。"), xb(Sb(await Eb(e.chat, { version: 1 }), t.importedMessages), "导入后已继续聊天或修改正文。请先导出当前记忆；本次不覆盖新剧情。");
 			let n = await ce(e.target, { fetchImpl: c });
 			xb(Sb(n.chat, e.chat) && Sb(n.header.chat_metadata, e.metadata), "当前聊天尚未保存完成，请稍后重试。");
 			let r = yb(n.header), i = yb(n.chat);
