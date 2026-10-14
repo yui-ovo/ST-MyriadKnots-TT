@@ -26,7 +26,7 @@ function memoryClient() {
   return { client, records, writes };
 }
 async function fixture(t, overrides = {}) {
-  const storage = memoryClient(), book = raw(), warnings = [], events = new Map();
+  const storage = memoryClient(), book = overrides.book ?? raw(), warnings = [], events = new Map();
   let identity = { chatId: CHAT, hostChatId: 'chat-a', characterLocator: 'a.png', personaLocator: 'u.png' }, enabled = true, generating = false;
   let context = { chatId: 'chat-a', groupId: null, characters: [{ data: { extensions: { world: '书' } } }], characterId: 0,
     chat: [{ mes: '甲住在旧公寓。', is_user: false }, { mes: '我们搬家吧', is_user: true }, { mes: '甲搬入新家，旧公寓已经退租。', is_user: false }, { mes: '好的', is_user: true }] };
@@ -47,8 +47,8 @@ async function fixture(t, overrides = {}) {
   t.after(() => runtime.dispose());
   const eventTypes = Object.fromEntries(['CHAT_CHANGED', 'WORLDINFO_ENTRIES_LOADED', 'GENERATION_STARTED', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'WORLDINFO_UPDATED'].map(key => [key, key]));
   runtime.bind({ eventTypes, eventSource: { on(key, fn) { events.set(key, fn); }, removeListener(key) { events.delete(key); } } });
-  if (overrides.allowed !== false) {
-    await runtime.initialize(); await runtime.edit('1', { managed: true }); await runtime.edit('2', { managed: true });
+  if (overrides.allowed !== false && !overrides.skipSetup) {
+    await runtime.initialize(); await runtime.classify(); await runtime.edit('1', { managed: true }); await runtime.edit('2', { managed: true });
     await runtime.configure({ enabled: true, interval: 1 });
   }
   return { runtime, book, context, warnings, events, ...storage,
@@ -279,7 +279,8 @@ test('classification resumes completed batches and preserves manually reviewed e
   } });
   for (let i = 5; i <= 20; i++) f.book.entries[i] = { uid: i, content: `人物${i}的住所。` };
   fail = true;
-  await assert.rejects(f.runtime.initialize(), /offline/);
+  await f.runtime.initialize();
+  await assert.rejects(f.runtime.classify(), /offline/);
   assert.equal(f.runtime.getState().data.entries.filter(e => e.classification === 'ready').length, 8);
   await f.runtime.configure({ enabled: true });
   await f.runtime.prepare(); assert.equal(f.selections, 0, '未完成分类时不使用半份计划');
@@ -296,8 +297,98 @@ test('classification after a chat switch cannot save late results', async t => {
   let resolve, pause = false;
   const f = await fixture(t, { classify: request => pause ? new Promise(r => { resolve = r; }) : { jsonData: { entries: JSON.parse(request.taskMessages[0].content).entries.map(e => ({ uid: e.uid, kind: 'fact', segments: [{ id: 'body', writable: true }] })) } } });
   pause = true;
-  const pending = f.runtime.initialize();
+  await f.runtime.initialize();
+  const pending = f.runtime.classify();
   while (!resolve) await new Promise(r => setTimeout(r, 1));
   const writes = f.writes.length; f.switchChat(); resolve({ jsonData: { entries: [] } });
   await assert.rejects(pending, { name: 'AbortError' }); assert.equal(f.writes.length, writes);
+});
+
+test('disabled entries are absent from every auxiliary request even after legacy participation is enabled', async t => {
+  const book = raw(), requests = [];
+  for (const [index, flags] of [{ disable: true }, { disabled: true }, { enabled: false }].entries()) {
+    const uid = index + 5; book.entries[uid] = { uid, comment: `CLOSED_LABEL_${uid}`, content: `CLOSED_BODY_${uid}`, constant: true, ...flags };
+  }
+  const f = await fixture(t, { book, skipSetup: true,
+    classify: request => { requests.push(request); return { jsonData: { entries: JSON.parse(request.taskMessages[0].content).entries.map(e => ({ uid: e.uid, kind: 'fact', segments: [{ id: 'body', writable: true }] })) } }; },
+    update: request => { requests.push(request); return { jsonData: { changes: [] } }; },
+    select: request => { requests.push(request); return { jsonData: { selected: ['1'] } }; },
+  });
+  await f.runtime.initialize(); assert.equal(requests.length, 0, '本地建档不给模型发送任何正文');
+  const record = f.records.get(`chat-${CHAT}/${DYNAMIC_BOOK_RECORD}`);
+  for (const entry of record.data.entries) { delete entry.excluded; delete entry.sourceDisabled; }
+  await f.runtime.refresh();
+  for (const uid of ['5', '6', '7']) {
+    assert.equal(f.runtime.getState().data.entries.find(e => e.uid === uid).sourceDisabled, true);
+    await f.runtime.edit(uid, { managed: true, writable: true, content: `CHANGED_DISABLED_${uid}` });
+    await assert.rejects(f.runtime.classify({ uid }), /禁用/);
+  }
+  await f.runtime.classify(); await f.runtime.configure({ enabled: true });
+  await f.runtime.update({ manual: true }); await f.runtime.prepare();
+  assert.ok(requests.length >= 3);
+  assert.doesNotMatch(JSON.stringify(requests), /CLOSED_LABEL|CLOSED_BODY|CHANGED_DISABLED/);
+  const payload = f.payload(); f.runtime.apply(payload);
+  for (const uid of [5, 6, 7]) assert.deepEqual(payload.characterLore.find(e => e.uid === uid), { ...book.entries[uid], world: '书' });
+});
+
+test('excluded active status entry keeps native behavior and never enters classification, maintenance or selection', async t => {
+  const book = raw(), requests = [];
+  book.entries[5] = { uid: 5, comment: 'EXCLUDED_STATUS_LABEL', content: 'EXCLUDED_STATUS_BODY', constant: true, disable: false };
+  const f = await fixture(t, { book, skipSetup: true,
+    classify: request => { requests.push(request); return { jsonData: { entries: JSON.parse(request.taskMessages[0].content).entries.map(e => ({ uid: e.uid, kind: 'fact', segments: [{ id: 'body', writable: true }] })) } }; },
+    update: request => { requests.push(request); return { jsonData: { changes: [] } }; },
+    select: request => { requests.push(request); return { jsonData: { selected: ['1'] } }; },
+  });
+  await f.runtime.initialize(); await f.runtime.edit('5', { excluded: true });
+  await f.runtime.edit('5', { content: 'EDITED_EXCLUDED_STATUS', writable: true });
+  await assert.rejects(f.runtime.classify({ uid: '5' }), /排除/);
+  await f.runtime.classify(); await f.runtime.configure({ enabled: true });
+  await f.runtime.update({ manual: true }); await f.runtime.prepare();
+  assert.doesNotMatch(JSON.stringify(requests), /EXCLUDED_STATUS|EDITED_EXCLUDED/);
+  assert.equal(f.runtime.getState().lastSelection.selected.includes('5'), false);
+  const payload = f.payload(); f.runtime.apply(payload);
+  assert.deepEqual(payload.characterLore.find(e => e.uid === 5), { ...book.entries[5], world: '书' });
+  const data = f.runtime.getState().data;
+  assert.throws(() => applyChanges(data, { changes: [{ uid: '5', content: 'forbidden', reason: 'x', floors: [2] }] }, [{ index: 2 }]), /未授权/);
+  await f.runtime.refresh(); assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '5').excluded, true);
+  const count = requests.length; await f.runtime.initialize(); assert.equal(requests.length, count);
+  assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '5').excluded, true, '重建同一本书不会悄悄撤销排除');
+});
+
+test('excluded pending rows do not block ordinary entries and unexclusion restores the classification requirement', async t => {
+  const f = await fixture(t, { skipSetup: true }); await f.runtime.initialize();
+  for (const uid of ['2', '3', '4']) await f.runtime.edit(uid, { excluded: true });
+  await f.runtime.classify(); await f.runtime.configure({ enabled: true });
+  await f.runtime.prepare(); assert.equal(f.selections, 1);
+  await f.runtime.update({ manual: true }); assert.equal(f.updates, 1);
+  await f.runtime.edit('2', { excluded: false });
+  await assert.rejects(f.runtime.update({ manual: true }), /分类/);
+  await f.runtime.prepare(); assert.equal(f.selections, 1, '新开放的待分类资料不能直接发送');
+});
+
+test('excluding during a running classification cancels late results and does not overwrite new content', async t => {
+  let resolve;
+  const f = await fixture(t, { skipSetup: true, classify: () => new Promise(r => { resolve = r; }) });
+  await f.runtime.initialize();
+  const old = f.runtime.getState().data.entries[0];
+  await f.runtime.edit('1', { content: '较新的玩家修改' });
+  const running = f.runtime.classify({ uid: '1' }); const rejected = assert.rejects(running, { name: 'AbortError' });
+  while (!resolve) await new Promise(r => setTimeout(r, 1));
+  const exclusion = f.runtime.edit('1', { excluded: true, expectedEntry: stableJson(old) }, CHAT);
+  resolve({ jsonData: { entries: [{ uid: '1', kind: 'fact', segments: [{ id: 'body', writable: true }] }] } });
+  await rejected; await exclusion;
+  const entry = f.runtime.getState().data.entries[0];
+  assert.equal(entry.excluded, true); assert.equal(entry.content, '较新的玩家修改');
+  assert.equal(entry.classification, 'manual', '迟到的分类结果没有覆盖权限');
+});
+
+test('new source disable invalidates an already prepared plan before application', async t => {
+  const f = await fixture(t); await f.runtime.edit('1', { content: '副本新家' }); await f.runtime.prepare();
+  const payload = f.payload(); payload.characterLore[0].disable = true;
+  f.runtime.apply(payload);
+  assert.equal(payload.characterLore[0].content, f.book.entries[1].content);
+  assert.equal(payload.characterLore[0].disable, true);
+  f.book.entries[1].disable = true;
+  const calls = f.selections;
+  await assert.rejects(f.runtime.prepare(), /原世界书已变化/); assert.equal(f.selections, calls);
 });

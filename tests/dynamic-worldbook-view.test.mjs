@@ -36,6 +36,27 @@ test('settings view wires opt-in, text editing with owner, confirmations and saf
   assert.ok(nodes.some(node => node.tag === 'pre' && node.textContent === '<script>rule</script>'));
   assert.ok(nodes.filter(node => node.tag === 'textarea').every(node => node.innerHTML === undefined));
   assert.ok(nodes.filter(node => node.tag === 'textarea').every(node => !node.disabled), '保护只约束 AI，不禁止玩家编辑');
+  const excluded = nodes.find(node => node.tag === 'label' && node.children.some(child => child.textContent === '排除此条（动态世界书 AI 不读取、不修改）')).children[0];
+  excluded.checked = true; excluded.fire('change'); await tick();
+  assert.deepEqual(calls[2], ['1', { excluded: true, expectedEntry: stableJson(data.entries[0]) }, 'owner-a']);
   listener({ phase: 'idle', data: null }); assert.equal(flatten(view.node).some(node => node.tag === 'textarea'), false);
   view.dispose(); assert.equal(listener, null);
+});
+
+test('excluded and source-disabled pending rows show no classification action and keep manual editing available', () => {
+  const data = { chatId: 'owner-a', book: '书', processed: [], entries: [
+    { uid: '1', label: '状态栏', content: '状态', original: '状态', managed: true, excluded: true, classification: 'pending', kind: 'fact', segments: [{ id: 'body', text: '状态', writable: false }], history: [] },
+    { uid: '2', label: '关闭条目', content: '关闭', original: '关闭', managed: false, sourceDisabled: true, classification: 'pending', kind: 'fact', segments: [{ id: 'body', text: '关闭', writable: false }], history: [] },
+  ], interval: 3 };
+  let classified = 0;
+  const runtime = { getState: () => ({ phase: 'idle', data }), subscribe: () => () => {}, classify: () => { classified++; } };
+  const view = createDynamicWorldbookView({ runtime, documentRef: { createElement: tag => new Node(tag) } });
+  const nodes = flatten(view.node);
+  assert.equal(nodes.some(node => node.textContent === '继续分类维护权限'), false);
+  assert.ok(nodes.some(node => node.textContent === '状态栏 · 已排除'));
+  assert.ok(nodes.some(node => node.textContent === '关闭条目 · 原书已禁用'));
+  for (const button of nodes.filter(node => node.textContent === '重新分类此条')) { assert.equal(button.disabled, true); button.fire('click'); }
+  assert.equal(classified, 0);
+  assert.ok(nodes.filter(node => node.tag === 'textarea').every(node => !node.disabled));
+  view.dispose();
 });

@@ -10,6 +10,8 @@ function sort(value) {
 export function bookError(message) { return Object.assign(new Error(message), { code: 'QQJ_DYNAMIC_BOOK' }); }
 function check(condition, message = '动态世界书数据无效，已保留原记录。') { if (!condition) throw bookError(message); }
 const has = value => Array.isArray(value) ? value.length > 0 : typeof value === 'object' && value !== null ? Object.keys(value).length > 0 : Boolean(value);
+export const isSourceDisabled = entry => Boolean(entry.disable || entry.disabled || entry.enabled === false);
+export const canReadEntry = entry => !entry.excluded && !entry.sourceDisabled;
 export function protectedReason(entry) {
   const content = String(entry.content ?? '');
   if (/<%|<\/?(?:script|style|iframe|UpdateVariable|JSONPatch|initvar)\b|\{\{(?!\s*(?:user|char)\s*\}\})|\b(?:getvar|setvar|stat_data|insertOrAssignVariables|z\.object)\b/iu.test(content)) return '含模板、脚本或变量指令';
@@ -17,7 +19,7 @@ export function protectedReason(entry) {
 }
 // Activation conditions are independent of permission to maintain the text.
 export function nativeSelectionReason(entry) {
-  if (entry.disable || entry.disabled || entry.enabled === false) return '原书已禁用';
+  if (isSourceDisabled(entry)) return '原书已禁用';
   if (['sticky', 'cooldown', 'delay', 'delayUntilRecursion', 'vectorized', 'group', 'automationId', 'decorators', 'triggers'].some(key => has(entry[key]))) return '含特殊触发或分组条件';
   if (entry.useProbability && Number(entry.probability) !== 100) return '含概率条件';
   if (entry.selective && has(entry.keysecondary)) return '含二级关键词条件';
@@ -40,7 +42,8 @@ export async function bookFingerprint(entries) { return sha256(stableJson(entrie
 export async function createBook(chatId, name, source) {
   return { schemaVersion: 2, chatId, book: name, sourceHash: await bookFingerprint(source), enabled: false, automatic: true, interval: 3,
     catchingUp: true, processed: [], entries: source.map(entry => ({ uid: entry.uid, label: String(entry.comment || entry.key?.join('、') || `条目 ${entry.uid}`),
-      original: String(entry.content ?? ''), content: String(entry.content ?? ''), protectedReason: '', managed: !(entry.disable || entry.disabled || entry.enabled === false), locked: false, history: [],
+      original: String(entry.content ?? ''), content: String(entry.content ?? ''), protectedReason: '', managed: !isSourceDisabled(entry), locked: false, history: [],
+      excluded: false, sourceDisabled: isSourceDisabled(entry),
       kind: 'fact', classification: 'pending', segments: [{ id: 'body', text: String(entry.content ?? ''), writable: false }] })) };
 }
 export function validateBook(value, chatId) {
@@ -61,6 +64,10 @@ export function validateBook(value, chatId) {
   value.processed.forEach((w, index) => check(w.index === index && /^[a-f0-9]{64}$/.test(w.hash)));
   check(Array.isArray(value.entries) && value.entries.length <= 500 && new Set(value.entries.map(e => e.uid)).size === value.entries.length);
   for (const entry of value.entries) {
+    // New controls are additive; preserve every existing permission and edit.
+    if (entry.excluded === undefined) entry.excluded = false;
+    if (entry.sourceDisabled === undefined) entry.sourceDisabled = false;
+    check(typeof entry.excluded === 'boolean' && typeof entry.sourceDisabled === 'boolean');
     check(typeof entry.uid === 'string' && typeof entry.label === 'string' && typeof entry.original === 'string' && typeof entry.content === 'string');
     check(typeof entry.protectedReason === 'string' && typeof entry.managed === 'boolean' && typeof entry.locked === 'boolean');
     check(['fact', 'rule', 'npc', 'npc_pool', 'event'].includes(entry.kind));
@@ -111,7 +118,7 @@ export function addHistory(entry, content, kind, reason, floors = []) {
   entry.history = entry.history.slice(-50);
   entry.content = content;
 }
-export const canMaintain = entry => entry.managed && !entry.locked && entry.kind !== 'rule' && entry.segments.some(s => s.writable);
+export const canMaintain = entry => canReadEntry(entry) && entry.managed && !entry.locked && entry.kind !== 'rule' && entry.segments.some(s => s.writable);
 
 // The model supplies boundaries, never the initial text. Ambiguous boundaries
 // retain every source byte and are sent to the user for review.
@@ -158,7 +165,7 @@ export function applyChanges(data, result, floors) {
 
 // Only modify the host's per-scan candidate copies. No writes to worldbook files or host caches.
 export function overlayCandidates(payload, plan, data) {
-  const byId = new Map(data.entries.filter(e => e.managed).map(e => [e.uid, e]));
+  const byId = new Map(data.entries.filter(e => e.managed && canReadEntry(e)).map(e => [e.uid, e]));
   const selected = new Set(plan.selected);
   for (const name of ['globalLore', 'characterLore', 'chatLore', 'personaLore']) {
     const list = payload?.[name];
@@ -166,7 +173,7 @@ export function overlayCandidates(payload, plan, data) {
     const updated = [];
     for (const source of list) {
       const entry = source.world === data.book ? byId.get(String(source.uid)) : null;
-      if (!entry || source.content !== entry.original) { updated.push(source); continue; }
+      if (!entry || isSourceDisabled(source) || source.content !== entry.original) { updated.push(source); continue; }
       // Keep conditional entries on the host's own activation path, while still
       // using the chat-local text. Selection never overrides author conditions.
       if (nativeSelectionReason(source) || entry.kind === 'rule') { updated.push({ ...source, content: entry.content }); continue; }

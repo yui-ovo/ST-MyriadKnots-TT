@@ -1,9 +1,9 @@
 {
   "display_name": "千千结 · 动态世界书自用版",
   "loading_order": 999,
-  "js": "dist/qqj-app.js?v=20261013.73-a2bbdfd081750dda",
+  "js": "dist/qqj-app.js?v=20261015.74-cfbe1bd7908105fd",
   "generate_interceptor": "qqj_v3_recall_interceptor",
   "version": "0.7.8",
-  "description": "基于 0.7.8 的自用版：动态世界书自动分类、片段维护权限与修改记录",
+  "description": "基于 0.7.8 的自用版：动态世界书、片段权限、禁用过滤与条目排除",
   "author": "atonal519"
 }
