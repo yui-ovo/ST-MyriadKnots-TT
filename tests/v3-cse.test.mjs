@@ -1586,6 +1586,17 @@ test('CSE 真实 compact 路由在503与无业务 JSON 间共享总预算，第�
   assert.deepEqual(bodies.map(body => body.messages), [bodies[0].messages, bodies[0].messages, bodies[0].messages]);
 });
 
+test('CSE raw provider explanation stays in session and out of persisted memory', async () => {
+  const h = runtimeHarness({ cse: () => { const error = new Error('接口返回错误'); error.code = 'QQJ_PROVIDER_ERROR'; error.providerErrorDetails = 'UNIQUE_RAW_UPSTREAM_EXPLANATION'; throw error; } });
+  await h.runtime.start();
+  await h.runtime.extractNext();
+  assert.equal(h.runtime.getState().lastCseError.providerErrorDetails, 'UNIQUE_RAW_UPSTREAM_EXPLANATION');
+  assert.doesNotMatch(JSON.stringify([...h.backend.records]), /UNIQUE_RAW_UPSTREAM_EXPLANATION/);
+  const cold = runtimeHarness({ sharedBackend: h.backend, chat: h.context.chat });
+  await cold.runtime.start();
+  assert.equal(cold.runtime.getState().lastCseError?.providerErrorDetails, undefined);
+});
+
 test('CSE provider errors retain upstream details without retrying as empty output', async () => {
   const envelope = createCseEnvelope({ floor: floor(FLOOR1, '甲今天状态平稳。'), floorMemory: memory(MEMORY1), baseline, currentState: null, trackedSubjects: [entities[1]], entities });
   let fetches = 0;

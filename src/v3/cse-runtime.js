@@ -658,7 +658,11 @@ export function createCseRuntime({ store, hostAdapter, generateAnalysisTask, isE
         ? { floorId, runId: operation.runId, code: 'V3_CSE_STALE', message: '原目标分支或 FloorMemory 已变化，迟到状态没有写入。', phase: 'stale' }
         : { floorId, runId: operation.runId, code: String(error?.code ?? 'V3_CSE_FAILED').slice(0, 120), message: sanitizeSensitiveText(error?.message ?? '状态分析失败，可单独重试。').slice(0, 500), phase: 'retryableError', ...(operation.userCoreExtraction ? { userCoreExtraction: operation.userCoreExtraction } : {}), diagnostics: sanitizeDiagnosticValue(error?.cseDiagnostics ?? error?.sourceDiagnostics ?? null) };
       if (failure.phase === 'retryableError') publishFailureHint(value, floorId, failure);
-      if (reachable?.root?.chatId === operation.targetIdentity?.chatId || !operation.pinnedTarget) lastFailure = failure;
+      // Keep opt-in upstream text only in this session's failure state, outside
+      // persisted failure hints and the safe diagnostic payload.
+      const localFailure = failure.phase === 'retryableError' && typeof error?.providerErrorDetails === 'string'
+        ? { ...failure, providerErrorDetails: error.providerErrorDetails } : failure;
+      if (reachable?.root?.chatId === operation.targetIdentity?.chatId || !operation.pinnedTarget) lastFailure = localFailure;
       logger?.warn?.('[qianqianjie] V3 CSE failed', { code: error?.code ?? error?.name ?? 'V3_CSE_FAILED' });
     } finally { if (active === operation) active = null; }
     return notify();

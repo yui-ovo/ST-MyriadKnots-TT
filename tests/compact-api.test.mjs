@@ -59,7 +59,26 @@ test('HTTP 200 provider errors are preserved safely in JSON, SSE and streaming J
       assert.equal(error.providerError.type, '[REDACTED]');
       assert.equal(error.providerError.message, '上游拒绝了请求参数');
       assert.equal(error.responseDiagnostic.providerErrorPresent, true);
-      assert.doesNotMatch(JSON.stringify(error), /PRIVATE|private.invalid|TEST_KEY/);
+      assert.doesNotMatch(JSON.stringify(error), /private.invalid|TEST_KEY/);
+      assert.doesNotMatch(JSON.stringify(error.providerError), /PRIVATE/);
+      assert.match(error.providerErrorDetails, /Invalid argument PRIVATE_STORY/);
+      return true;
+    });
+  }
+});
+
+test('unclassified provider explanation remains available with only credentials redacted', async () => {
+  for (const suffix of ['', '; api_key="OTHER_KEY"; Bearer abc123; https://private.invalid; TEST_KEY']) {
+    const client = createCompactApiClient({ fetchImpl: async () => jsonResponse({ error: {
+      message: `Bad Request: max_tokens=30000 exceeds endpoint allowance${suffix}`,
+    } }) });
+    await assert.rejects(client.generateTask({ config: config(), taskMessages: [] }), error => {
+      if (!suffix) {
+        assert.equal(error.providerError.message, '上游错误详情已隐藏');
+        assert.match(error.message, /接口错误原文/);
+      }
+      assert.match(error.providerErrorDetails, /Bad Request: max_tokens=30000 exceeds endpoint allowance/);
+      assert.doesNotMatch(error.providerErrorDetails, /OTHER_KEY|abc123|private.invalid|TEST_KEY/);
       return true;
     });
   }
@@ -70,7 +89,8 @@ test('string and boolean error envelopes remain errors with safe descriptions', 
     const client = createCompactApiClient({ fetchImpl: async () => jsonResponse(payload) });
     await assert.rejects(client.generateTask({ config: config(), taskMessages: [] }), error => {
       assert.equal(error.code, 'QQJ_PROVIDER_ERROR');
-      assert.doesNotMatch(JSON.stringify(error), /PRIVATE_STORY/);
+      assert.doesNotMatch(JSON.stringify(error.providerError), /PRIVATE_STORY/);
+      assert.match(error.providerErrorDetails, /PRIVATE_STORY/);
       assert.match(error.message, /超过限制|请求参数/);
       return true;
     });

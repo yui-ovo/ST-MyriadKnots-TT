@@ -1,5 +1,21 @@
 // Shape only: never retain provider text, reasoning, refusals, or arbitrary keys.
 const TYPES = new Set(['missing', 'null', 'string', 'array', 'object', 'number', 'boolean', 'other']);
+// Opt-in error details: keep the actual explanation, not a template. This may
+// contain provider-echoed context, so it is separate from the safe diagnostic.
+export function redactProviderErrorText(value, secrets = []) {
+  if (!['string', 'number'].includes(typeof value)) return '';
+  let text = String(value);
+  for (const secret of secrets.filter(value => typeof value === 'string' && value).sort((a, b) => b.length - a.length)) {
+    text = text.split(secret).join('[凭据或地址已遮盖]');
+  }
+  return text
+    .replace(/\b(?:https?|wss?):\/\/[^\s<>"']+/giu, '[接口地址已遮盖]')
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=-]+/giu, '[认证信息已遮盖]')
+    .replace(/\bsk-[a-z0-9_-]+/giu, '[密钥已遮盖]')
+    .replace(/((?:["']?)(?:api[_ -]?key|x-api-key|proxy_password|authorization|cookie|set-cookie|secret|token)(?:["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/giu, '$1[凭据已遮盖]')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .slice(0, 4000);
+}
 const PROVIDER_MESSAGES = new Set([
   '上游不接受当前 JSON 响应格式', '上游拒绝了请求参数', '上游认为请求内容超过限制',
   '上游请求频率受限', '上游认证或权限检查失败', '上游未找到请求的资源',

@@ -5,7 +5,7 @@ import { scrollManualEditorToTop } from './manual-editor-scroll.js';
 import { publicErrorMessage } from '../public-error.js';
 import { formatStoryTime } from '../v3/time-engine.js';
 import { sanitizeTaskMetadata } from '../v3/safe-metadata.js';
-import { sanitizeCompletionDiagnostic, sanitizeProviderDiagnostic } from '../completion-diagnostic.js';
+import { redactProviderErrorText, sanitizeCompletionDiagnostic, sanitizeProviderDiagnostic } from '../completion-diagnostic.js';
 
 const placeNameCache = new WeakMap();
 function placeNamesFor(entities) {
@@ -1684,6 +1684,18 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
         return current;
       }); });
       body.append(copyCse, element('span', 'settings-hint', '含失败请求的预设名、模型、结束原因与回复格式；不含正文、提示词、Key 或接口地址。'));
+      if (state.lastCseError.providerErrorDetails) {
+        const raw = setDetailsState(element('details', 'qqj-provider-error-details'), 'provider-error-details', false);
+        raw.append(element('summary', '', '接口错误原文'), element('p', 'settings-hint', '已遮盖密钥与接口地址；错误原文可能含接口回显的材料，转发前请检查。'));
+        raw.append(element('pre', 'qqj-provider-error-text', redactProviderErrorText(state.lastCseError.providerErrorDetails)));
+        const copyRaw = element('button', 'secondary-action', '复制接口错误原文'); copyRaw.type = 'button';
+        copyRaw.addEventListener('click', () => { void run('复制接口错误原文', async () => {
+          const current = runtime.getState();
+          feedback = await copy(redactProviderErrorText(current.lastCseError?.providerErrorDetails) || '当前没有接口错误原文，请在失败后、刷新前查看。');
+          return current;
+        }); });
+        raw.append(copyRaw); body.append(raw);
+      }
     }
     if (uiDiagnosticProvider) {
       const uiDiagnostic = element('div', 'qqj-ui-diagnostic-action');
@@ -1810,7 +1822,7 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
     ? { ...state, memorySnapshotStatus: 'syncing', memorySyncStatus: 'syncing', memoryWorkBusy: true }
     : state;
   const applySyncingPresentation = () => {
-    const safeButtons = new Set(['取消', '分析记录', '返回当前状态', '复制安全诊断', '复制完整诊断', '复制界面诊断', '复制状态诊断', '复制 CSE 失败诊断', '复制调用示例']);
+    const safeButtons = new Set(['取消', '分析记录', '返回当前状态', '复制安全诊断', '复制完整诊断', '复制界面诊断', '复制状态诊断', '复制 CSE 失败诊断', '复制接口错误原文', '复制调用示例']);
     const visit = node => {
       for (const child of Array.from(node?.children ?? [])) {
         const tag = String(child?.tagName ?? child?.tag ?? '').toLowerCase();

@@ -1680,7 +1680,7 @@ test('三页职责分离，千结只保留摘要编辑/重提，双丝网归位�
 });
 
 test('CSE failure copy uses latest failure metadata and excludes candidates, prompts and secrets', async () => {
-  const failure = { code: 'QQJ_EMPTY', phase: 'retryableError', floorId: 'floor', diagnostics: {
+  const failure = { code: 'QQJ_EMPTY', phase: 'retryableError', floorId: 'floor', providerErrorDetails: 'Unknown server explanation PRIVATE_DETAIL <b>plain text</b> https://private.invalid Bearer abc123', diagnostics: {
     attempts: 3, transportAttempts: 3, metadata: { source: 'shared-preset', sourceLabel: 'analysis-preset', model: 'actual-model', finishReason: 'stop', key: 'PRIVATE_KEY', url: 'https://private.invalid' },
     candidate: 'PRIVATE_STORY', providerError: { code: 'invalid_argument', message: 'PRIVATE_PROVIDER', body: 'PRIVATE_BODY' }, response: { contentType: 'string', contentCharacters: 0, reasoningPresent: true, content: 'PRIVATE_CONTENT' },
   } };
@@ -1699,6 +1699,13 @@ test('CSE failure copy uses latest failure metadata and excludes candidates, pro
   assert.equal(report.response.reasoningPresent, true);
   assert.deepEqual(report.providerError, { code: 'invalid_argument', message: '上游错误详情已隐藏' });
   assert.doesNotMatch(copied, /PRIVATE|private.invalid|candidate/);
+  const raw = flatten(container).find(node => node.className === 'qqj-provider-error-text');
+  assert.match(raw.textContent, /Unknown server explanation PRIVATE_DETAIL <b>plain text<\/b>/);
+  assert.doesNotMatch(raw.textContent, /private.invalid|abc123/);
+  flatten(container).find(node => node.textContent === '复制接口错误原文').click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(copied, /PRIVATE_DETAIL/);
+  assert.doesNotMatch(copied, /private.invalid|abc123/);
 });
 
 test('管理页刷新状态按钮发起 fresh 读取并显式核对 foundation', async () => {

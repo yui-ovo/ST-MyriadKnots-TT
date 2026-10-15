@@ -1,6 +1,6 @@
 import { parseJsonWithSymbolRepair, repairJsonWithUniqueMissingObjectClose } from './json-symbol-repair.js';
 import { parseAdditionalParams } from './settings.js';
-import { describeCompletionResponse } from './completion-diagnostic.js';
+import { describeCompletionResponse, redactProviderErrorText } from './completion-diagnostic.js';
 
 const PROTECTED_BODY_KEYS = new Set(['chat_completion_source', 'reverse_proxy', 'proxy_password', 'model', 'messages', 'json_schema']);
 const DEFAULT_MODEL = 'gpt-4o-mini';
@@ -159,7 +159,11 @@ function rejectProviderError(data, { secrets = [], httpStatus = 0 } = {}) {
     message: providerMessageTemplate(typeof data.error === 'string' ? data.error : candidate.message),
   }).filter(([, value]) => value !== null));
   const error = safeError('provider-error', httpStatus, { providerError });
-  if (providerError.message) error.message = `接口返回错误：${providerError.message}`;
+  const rawMessage = typeof data.error === 'string' ? data.error : candidate.message;
+  error.providerErrorDetails = redactProviderErrorText(rawMessage, secrets)
+    || '接口只返回了错误标记，没有附带错误说明。';
+  if (providerError.message && providerError.message !== '上游错误详情已隐藏') error.message = `接口返回错误：${providerError.message}`;
+  else error.message = '接口返回错误，请在详细诊断中展开“接口错误原文”查看。';
   error.responseDiagnostic = describeCompletionResponse(data);
   throw error;
 }
