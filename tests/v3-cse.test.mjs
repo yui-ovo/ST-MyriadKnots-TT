@@ -1586,6 +1586,23 @@ test('CSE 真实 compact 路由在503与无业务 JSON 间共享总预算，第�
   assert.deepEqual(bodies.map(body => body.messages), [bodies[0].messages, bodies[0].messages, bodies[0].messages]);
 });
 
+test('CSE empty response retains actual route and safe shape through all retries', async () => {
+  const envelope = createCseEnvelope({ floor: floor(FLOOR1, '甲今天状态平稳。'), floorMemory: memory(MEMORY1), baseline, currentState: null, trackedSubjects: [entities[1]], entities });
+  let fetches = 0;
+  const router = analysisRouter(async () => { fetches++; return { ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: '', reasoning_content: 'PRIVATE_REASONING' } }] }) }; });
+  await assert.rejects(runCseRequest({ generateAnalysisTask: router.generateAnalysisTask, envelope, previousCurrentState: null, now: NOW, deltaId: '27252525-2525-4252-8252-252525252525' }), error => {
+    assert.equal(error.code, 'QQJ_EMPTY');
+    assert.equal(error.cseDiagnostics.transportAttempts, 3);
+    assert.equal(error.cseDiagnostics.metadata.finishReason, 'stop');
+    assert.notEqual(error.cseDiagnostics.metadata.model, 'unknown');
+    assert.equal(error.cseDiagnostics.response.reasoningPresent, true);
+    assert.equal(error.cseDiagnostics.response.contentCharacters, 0);
+    assert.doesNotMatch(JSON.stringify(error.cseDiagnostics), /PRIVATE_REASONING/);
+    return true;
+  });
+  assert.equal(fetches, 3);
+});
+
 test('CSE 三次无业务 JSON 只发三个 HTTP，并保留最后格式错误与3/3诊断', async () => {
   const envelope = createCseEnvelope({ floor: floor(FLOOR1, '甲今天状态平稳。'), floorMemory: memory(MEMORY1), baseline, currentState: null, trackedSubjects: [entities[1]], entities });
   let fetches = 0;

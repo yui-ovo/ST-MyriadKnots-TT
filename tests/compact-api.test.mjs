@@ -45,6 +45,36 @@ const sseResponse = (chunks, contentType = 'text/event-stream') => {
   const encoder = new TextEncoder(); let index = 0;
   return { ok: true, status: 200, headers: { get: () => contentType }, body: { getReader: () => ({ read: async () => index < chunks.length ? { done: false, value: encoder.encode(chunks[index++]) } : { done: true } }) } };
 };
+test('empty completion diagnostics distinguish response shapes without retaining text', async () => {
+  for (const [content, type] of [['', 'string'], [[{ type: 'text', text: 'PRIVATE_STORY' }], 'array']]) {
+    const client = createCompactApiClient({ fetchImpl: async () => jsonResponse({ choices: [{ finish_reason: 'stop', message: { content, reasoning_content: 'PRIVATE_REASONING', refusal: 'PRIVATE_REFUSAL' } }] }) });
+    await assert.rejects(client.generateTask({ config: config(), taskMessages: [] }), error => {
+      assert.equal(error.code, 'QQJ_EMPTY');
+      assert.equal(error.finishReason, 'stop');
+      assert.equal(error.responseDiagnostic.contentType, type);
+      assert.equal(error.responseDiagnostic.reasoningPresent, true);
+      assert.equal(error.responseDiagnostic.refusalPresent, true);
+      assert.doesNotMatch(JSON.stringify(error.responseDiagnostic), /PRIVATE/);
+      return true;
+    });
+  }
+});
+
+test('empty SSE diagnostics preserve reasoning/refusal flags across terminal events', async () => {
+  const client = createCompactApiClient({ fetchImpl: async () => sseResponse([
+    'data: {"choices":[{"delta":{"reasoning_content":"PRIVATE_REASONING","refusal":"PRIVATE_REFUSAL"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n\ndata: [DONE]\n\n',
+  ]) });
+  await assert.rejects(client.generateTask({ config: config({ stream: true }), taskMessages: [] }), error => {
+    assert.equal(error.code, 'QQJ_EMPTY');
+    assert.equal(error.finishReason, 'content_filter');
+    assert.equal(error.responseDiagnostic.eventCount, 2);
+    assert.equal(error.responseDiagnostic.reasoningPresent, true);
+    assert.equal(error.responseDiagnostic.refusalPresent, true);
+    assert.doesNotMatch(JSON.stringify(error.responseDiagnostic), /PRIVATE/);
+    return true;
+  });
+});
 async function settlesSoon(promise) {
   let timer;
   try { return await Promise.race([promise.then(() => 'success', error => typeof error.code === 'string' ? error.code : error.name), new Promise(resolve => { timer = setTimeout(() => resolve('still-pending'), 150); })]); }

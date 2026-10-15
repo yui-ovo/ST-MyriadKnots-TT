@@ -4,6 +4,8 @@ import { bindHorizontalStrip, openPeopleOrderDialog } from './people-interaction
 import { scrollManualEditorToTop } from './manual-editor-scroll.js';
 import { publicErrorMessage } from '../public-error.js';
 import { formatStoryTime } from '../v3/time-engine.js';
+import { sanitizeTaskMetadata } from '../v3/safe-metadata.js';
+import { sanitizeCompletionDiagnostic } from '../completion-diagnostic.js';
 
 const placeNameCache = new WeakMap();
 function placeNamesFor(entities) {
@@ -1668,6 +1670,20 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
     copyState.addEventListener('click', () => { void copyStateDiagnostic(); });
     stateDiagnosticAction.append(copyState, element('span', 'settings-hint', '只含运行状态与错误代码，不含聊天正文、身份编号或 API 配置。'));
     body.append(stateDiagnosticAction);
+    if (state.lastCseError) {
+      const copyCse = element('button', 'secondary-action', '复制 CSE 失败诊断'); copyCse.type = 'button';
+      copyCse.addEventListener('click', () => { void run('复制 CSE 失败诊断', async () => {
+        const current = runtime.getState(), failure = current.lastCseError, diagnostic = failure?.diagnostics;
+        const floor = current.floors?.find(item => item.floorId === failure?.floorId);
+        feedback = await copy(JSON.stringify({ kind: 'cse-failure', formatVersion: 1,
+          error: errorDiagnostic(failure), messageIndex: Number.isSafeInteger(floor?.messageIndex) ? floor.messageIndex : null,
+          api: sanitizeTaskMetadata(diagnostic?.metadata), attempts: countDiagnostic(diagnostic?.attempts),
+          transportAttempts: countDiagnostic(diagnostic?.transportAttempts), response: sanitizeCompletionDiagnostic(diagnostic?.response),
+        }, null, 2));
+        return current;
+      }); });
+      body.append(copyCse, element('span', 'settings-hint', '含失败请求的预设名、模型、结束原因与回复格式；不含正文、提示词、Key 或接口地址。'));
+    }
     if (uiDiagnosticProvider) {
       const uiDiagnostic = element('div', 'qqj-ui-diagnostic-action');
       const copyUi = element('button', 'secondary-action', '复制界面诊断'); copyUi.type = 'button';
@@ -1793,7 +1809,7 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
     ? { ...state, memorySnapshotStatus: 'syncing', memorySyncStatus: 'syncing', memoryWorkBusy: true }
     : state;
   const applySyncingPresentation = () => {
-    const safeButtons = new Set(['取消', '分析记录', '返回当前状态', '复制安全诊断', '复制完整诊断', '复制界面诊断', '复制状态诊断', '复制调用示例']);
+    const safeButtons = new Set(['取消', '分析记录', '返回当前状态', '复制安全诊断', '复制完整诊断', '复制界面诊断', '复制状态诊断', '复制 CSE 失败诊断', '复制调用示例']);
     const visit = node => {
       for (const child of Array.from(node?.children ?? [])) {
         const tag = String(child?.tagName ?? child?.tag ?? '').toLowerCase();

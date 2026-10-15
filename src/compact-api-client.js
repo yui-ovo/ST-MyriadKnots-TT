@@ -1,5 +1,6 @@
 import { parseJsonWithSymbolRepair, repairJsonWithUniqueMissingObjectClose } from './json-symbol-repair.js';
 import { parseAdditionalParams } from './settings.js';
+import { describeCompletionResponse } from './completion-diagnostic.js';
 
 const PROTECTED_BODY_KEYS = new Set(['chat_completion_source', 'reverse_proxy', 'proxy_password', 'model', 'messages', 'json_schema']);
 const DEFAULT_MODEL = 'gpt-4o-mini';
@@ -153,7 +154,8 @@ function completionDetails(data) {
   const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? data?.content ?? '';
   const text = typeof content === 'string' ? content.trim() : '';
   if (!text || ['none', '<none>'].includes(text.toLowerCase())) {
-    const error = safeError('empty'); if (finishReason) error.finishReason = finishReason; throw error;
+    const error = safeError('empty'); if (finishReason) error.finishReason = finishReason;
+    error.responseDiagnostic = describeCompletionResponse(data); throw error;
   }
   return { text, finishReason };
 }
@@ -262,12 +264,21 @@ async function readSseResponse(response, { requireSse = false, signal } = {}) {
     return completionDetails(data);
   }
   const decoder = new TextDecoder(); let buffer = '', output = '', event = [], finishReason = '', sawDataLine = false, complete = false, eof = false;
+  let responseDiagnostic = { eventCount: 0 };
   const flush = () => {
     if (!event.length) return;
     const payload = event.join('\n').trim(); event = [];
     if (!payload) return;
     if (payload === '[DONE]') { complete = true; return; }
     let value; try { value = JSON.parse(payload); } catch { throw safeError('stream-event-json'); }
+    const shape = describeCompletionResponse(value);
+    responseDiagnostic = { ...shape, eventCount: responseDiagnostic.eventCount + 1,
+      contentType: shape.contentType === 'missing' ? responseDiagnostic.contentType ?? 'missing' : shape.contentType,
+      contentCharacters: (responseDiagnostic.contentCharacters ?? 0) + shape.contentCharacters,
+      contentParts: (responseDiagnostic.contentParts ?? 0) + shape.contentParts,
+      reasoningPresent: responseDiagnostic.reasoningPresent === true || shape.reasoningPresent,
+      refusalPresent: responseDiagnostic.refusalPresent === true || shape.refusalPresent,
+      toolCallsPresent: responseDiagnostic.toolCallsPresent === true || shape.toolCallsPresent };
     if (value?.error) throw safeError('unsupported');
     const currentFinishReason = normalizeFinishReason(value?.choices?.[0]?.finish_reason);
     if (currentFinishReason) finishReason = currentFinishReason;
@@ -295,7 +306,7 @@ async function readSseResponse(response, { requireSse = false, signal } = {}) {
   }
   if (requireSse && !sawDataLine) throw safeError('stream-protocol');
   if (truncatedFinishReason(finishReason)) throw safeError('output-truncated', 0, { finishReason });
-  if (!output.trim()) { const error = safeError('empty'); if (finishReason) error.finishReason = finishReason; throw error; }
+  if (!output.trim()) { const error = safeError('empty'); if (finishReason) error.finishReason = finishReason; error.responseDiagnostic = responseDiagnostic; throw error; }
   return { text: output.trim(), finishReason };
 }
 

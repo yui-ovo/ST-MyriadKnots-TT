@@ -5,6 +5,7 @@ import { sanitizeMemoryContent } from '../memory-content-sanitizer.js';
 import { deterministicUuid } from './foundation-domain.js';
 import { validateEntityRecord } from './memory-schema.js';
 import { sanitizeDiagnosticValue, sanitizeTaskMetadata } from './safe-metadata.js';
+import { sanitizeCompletionDiagnostic } from '../completion-diagnostic.js';
 import { CSE_ISOLATION_CODES, CSE_VISIBILITIES, LATEST_CSE_CALIBRATION_VERSION, isSupportedCseCalibrationVersion, stateFingerprint, validateBaselineRecord, validateCurrentStateRecord, validateStateDeltaRecord } from './cse-schema.js';
 import { withBaseProcessingPrompt } from '../internal-processing-prompt.js';
 import { buildEntityIdentityDirectory, identityLabelKey } from './entity-identity.js';
@@ -928,7 +929,7 @@ export async function runCseRequest({ generateAnalysisTask, envelope, previousCu
       if (retryable && attempts < 3 && transportBudget.remaining > 0) continue;
       const failedAttempts = transportBudget.used || attempts;
       if (failedAttempts > 1) error.message = `已尝试 ${failedAttempts} 次仍失败：${error.message}`;
-      error.cseDiagnostics = { attempts, transportAttempts: transportBudget.used || error?.transportAttempts || null, metadata: sanitizeTaskMetadata(error?.taskMetadata ?? metadata), candidate: (() => { try { return JSON.stringify(candidate).slice(0, 24000); } catch { return null; } })(), providerError: sanitizeDiagnosticValue(error?.providerError ?? null) };
+      error.cseDiagnostics = { attempts, transportAttempts: transportBudget.used || error?.transportAttempts || null, metadata: sanitizeTaskMetadata(error?.taskMetadata ?? metadata), response: sanitizeCompletionDiagnostic(error?.responseDiagnostic), candidate: (() => { try { return JSON.stringify(candidate).slice(0, 24000); } catch { return null; } })(), providerError: sanitizeDiagnosticValue(error?.providerError ?? null) };
       throw error;
     }
   }

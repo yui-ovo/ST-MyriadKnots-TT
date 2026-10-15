@@ -1679,6 +1679,27 @@ test('三页职责分离，千结只保留摘要编辑/重提，双丝网归位�
   for (const button of flatten(container).filter(node => node.tag === 'button')) assert.equal(button.type, 'button');
 });
 
+test('CSE failure copy uses latest failure metadata and excludes candidates, prompts and secrets', async () => {
+  const failure = { code: 'QQJ_EMPTY', phase: 'retryableError', floorId: 'floor', diagnostics: {
+    attempts: 3, transportAttempts: 3, metadata: { source: 'shared-preset', sourceLabel: 'analysis-preset', model: 'actual-model', finishReason: 'stop', key: 'PRIVATE_KEY', url: 'https://private.invalid' },
+    candidate: 'PRIVATE_STORY', providerError: { message: 'PRIVATE_PROVIDER' }, response: { contentType: 'string', contentCharacters: 0, reasoningPresent: true, content: 'PRIVATE_CONTENT' },
+  } };
+  let state = { status: 'ready', foundationStatus: 'ready', pluginEnabled: true, floors: [{ floorId: 'floor', messageIndex: 186 }], lastCseError: failure }, copied;
+  const runtime = { getState: () => state, refreshStatus: async () => state, confirmLatest: async () => state };
+  const view = createV3FoundationView({ runtime, documentRef, navigatorRef: { clipboard: { writeText: async value => { copied = value; } } } });
+  const container = new Node('main'); view.setPage('management'); view.mount(container);
+  state = { ...state, lastCseError: { ...failure, diagnostics: { ...failure.diagnostics, metadata: { ...failure.diagnostics.metadata, model: 'latest-model' } } } };
+  flatten(container).find(node => node.textContent === '复制 CSE 失败诊断').click();
+  await new Promise(resolve => setImmediate(resolve));
+  const report = JSON.parse(copied);
+  assert.equal(report.kind, 'cse-failure');
+  assert.equal(report.messageIndex, 186);
+  assert.equal(report.api.model, 'latest-model');
+  assert.equal(report.api.finishReason, 'stop');
+  assert.equal(report.response.reasoningPresent, true);
+  assert.doesNotMatch(copied, /PRIVATE|private.invalid|candidate/);
+});
+
 test('管理页刷新状态按钮发起 fresh 读取并显式核对 foundation', async () => {
   const state = { status: 'ready', memorySnapshotStatus: 'ready', pluginEnabled: true, chatId: CHAT, foundationStatus: 'ready', stableCount: 0, rememberedCount: 0, unprocessedCount: 0, pending: null, headCheckpointId: 'head', lastError: null, lastExtractorError: null, lastCseError: null, floors: [], memoryWorkBusy: false };
   const calls = [];
