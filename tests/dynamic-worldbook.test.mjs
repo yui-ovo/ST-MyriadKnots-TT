@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { applyChanges, bookFingerprint, createBook, createDynamicBookStore, DYNAMIC_BOOK_RECORD, overlayCandidates, protectedReason, nativeSelectionReason, classifyEntry, validateBook, stableJson, sourceEntries, verifyWitness, witness } from '../src/dynamic-worldbook.js';
 import { createDynamicWorldbookRuntime } from '../src/dynamic-worldbook-runtime.js';
+import { createCompactApiClient } from '../src/compact-api-client.js';
+import { createTaskRouter } from '../src/api-routing.js';
 
 const CHAT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OTHER = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -32,16 +34,26 @@ async function fixture(t, overrides = {}) {
     chat: [{ mes: '甲住在旧公寓。', is_user: false }, { mes: '我们搬家吧', is_user: true }, { mes: '甲搬入新家，旧公寓已经退租。', is_user: false }, { mes: '好的', is_user: true }] };
   let state = { chatId: CHAT, memorySnapshotStatus: 'ready', floors: [0, 2].map(messageIndex => ({ status: 'ready', messageIndex, summary: '搬家', sourceMessageIndexes: [messageIndex] })) };
   let updates = 0, selections = 0;
+  const reply = async (request, result) => {
+    result = await result;
+    if (!overrides.apiTransport) return result;
+    const compactClient = createCompactApiClient({ fetchImpl: async () => new Response(JSON.stringify({
+      choices: [{ message: { content: '```json\n' + JSON.stringify(result.jsonData) + '\n```' }, finish_reason: 'stop' }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }) });
+    const route = () => ({ kind: 'independent', config: { url: 'https://example.invalid/v1', key: 'test', model: 'test' } });
+    const router = createTaskRouter({ compactClient, resolver: { resolve: route, resolveUtility: route, resolveRecall: route } });
+    return router.generateUtilityTask(request);
+  };
   const runtime = createDynamicWorldbookRuntime({ client: storage.client,
     hostAdapter: { getContext: () => context, getWorldInfoBindings: () => ({ loadWorldInfo: async () => structuredClone(book) }) },
     identityProvider: () => identity, memoryState: () => state, isEnabled: () => enabled, isGenerating: () => generating,
     generateUpdate: async request => {
       if (request.systemPrompt.includes('分析世界书资料的维护权限')) {
-        if (overrides.classify) return overrides.classify(request);
-        return { jsonData: { entries: JSON.parse(request.taskMessages[0].content).entries.map(e => ({ uid: e.uid, kind: e.uid === '3' ? 'rule' : 'fact', segments: [{ id: 'body', writable: e.uid !== '3' }] })) } };
+        if (overrides.classify) return reply(request, overrides.classify(request));
+        return reply(request, { jsonData: { entries: JSON.parse(request.taskMessages[0].content).entries.map(e => ({ uid: e.uid, kind: e.uid === '3' ? 'rule' : 'fact', segments: [{ id: 'body', writable: e.uid !== '3' }] })) } });
       }
-      updates++; return overrides.update ? overrides.update(request) : { jsonData: { changes: [{ uid: '1', content: '甲已经搬入新家。', reason: '正文明确搬入新家', floors: [2] }] } }; },
-    generateSelect: async request => { selections++; return overrides.select ? overrides.select(request) : { jsonData: { selected: ['1'] } }; },
+      updates++; return reply(request, overrides.update ? overrides.update(request) : { jsonData: { changes: [{ uid: '1', content: '甲已经搬入新家。', reason: '正文明确搬入新家', floors: [2] }] } }); },
+    generateSelect: async request => { selections++; return reply(request, overrides.select ? overrides.select(request) : { jsonData: { selected: ['1'] } }); },
     notifyUser: text => warnings.push(text), isBookAllowed: () => overrides.allowed !== false,
   });
   t.after(() => runtime.dispose());
@@ -146,8 +158,61 @@ test('selection failure falls back with visible diagnostic; recall abort skips s
   const f = await fixture(t, { select: () => ({ jsonData: { selected: ['not-found'] } }) });
   let aborts = 0; await f.runtime.intercept(async () => {}, [], 1000, () => { aborts++; }, 'normal');
   assert.equal(aborts, 0); assert.equal(f.warnings.length, 1); assert.match(f.runtime.getState().lastSelection.status, /原世界书/);
+  assert.equal(f.selections, 2); assert.match(f.warnings[0], /本批候选以外的编号/);
+  const payload = f.payload(), original = structuredClone(payload); f.runtime.apply(payload); assert.deepEqual(payload, original);
   const count = f.selections; await f.runtime.intercept(async (chat, size, abort) => abort(true), [], 1000, () => { aborts++; }, 'normal');
   assert.equal(f.selections, count); assert.equal(aborts, 1);
+});
+
+test('actual API textData envelope works for classification, maintenance and selection', async t => {
+  const f = await fixture(t, { apiTransport: true });
+  await f.runtime.update({ manual: true });
+  await f.runtime.prepare();
+  const payload = f.payload(); f.runtime.apply(payload);
+  assert.equal(payload.characterLore[0].content, '甲已经搬入新家。');
+  assert.equal(f.book.entries[1].content, '甲住在旧公寓。');
+  assert.equal(f.updates, 1); assert.equal(f.selections, 1);
+  assert.equal(f.warnings.length, 0);
+});
+
+test('selection normalizes exact numeric IDs and whitespace without a second API call', async t => {
+  const f = await fixture(t, { select: () => ({ textData: '{"selected":[1," 1 ",1]}' }) });
+  await f.runtime.prepare();
+  assert.deepEqual(f.runtime.getState().lastSelection.selected, ['1', '2']);
+  assert.equal(f.selections, 1);
+});
+
+test('invalid selection is corrected once using only the same allowed candidates', async t => {
+  const requests = [];
+  const f = await fixture(t, { select: request => {
+    requests.push(request);
+    return { textData: requests.length === 1 ? '{"selected":["住所"]}' : '{"selected":["1"]}' };
+  } });
+  await f.runtime.prepare();
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0].taskMessages, requests[1].taskMessages);
+  assert.match(requests[1].systemPrompt, /允许的 uid：\["1"\]/);
+  assert.deepEqual(f.runtime.getState().lastSelection.selected, ['1', '2']);
+});
+
+test('missing, malformed and truncated selection output gets one correction; empty selection is valid', async t => {
+  for (const response of [{ textData: 'not json' }, { textData: '{}' }, { textData: '{"selected":["1"]}', taskMetadata: { finishReason: 'length' } }]) {
+    let calls = 0;
+    const f = await fixture(t, { select: () => ++calls === 1 ? response : { textData: '{"selected":[]}' } });
+    await f.runtime.prepare();
+    assert.equal(calls, 2);
+    assert.deepEqual(f.runtime.getState().lastSelection.selected, ['2']);
+  }
+});
+
+test('provider failure and chat switch never trigger a selection correction', async t => {
+  const failure = Object.assign(new Error('provider failure'), { code: 'QQJ_PROVIDER_ERROR' });
+  const f = await fixture(t, { select: () => { throw failure; } });
+  await assert.rejects(f.runtime.prepare(), error => error === failure);
+  assert.equal(f.selections, 1);
+  const switched = await fixture(t, { select: () => { switched.switchChat(); return { textData: '{}' }; } });
+  await assert.rejects(switched.runtime.prepare(), { name: 'AbortError' });
+  assert.equal(switched.selections, 1);
 });
 test('quiet generations make no selection calls and never use old plans', async t => {
   const f = await fixture(t); await f.runtime.prepare('quiet'); assert.equal(f.selections, 0);
