@@ -46,6 +46,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   appearanceTheme: 'auto',
   inlineRecallVisible: true,
   inlineMemoryVisible: true,
+  dynamicWorldbookHideSourceDisabled: false,
   fabShow: true,
   appearanceScale: 1,
   appearanceFontCssUrl: '',
@@ -180,6 +181,7 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (!APPEARANCE_THEMES.has(settings.appearanceTheme)) settings.appearanceTheme = 'auto';
     settings.inlineRecallVisible = settings.inlineRecallVisible !== false;
     settings.inlineMemoryVisible = settings.inlineMemoryVisible !== false;
+    settings.dynamicWorldbookHideSourceDisabled = settings.dynamicWorldbookHideSourceDisabled === true;
     settings.fabShow = settings.fabShow !== false;
     settings.appearanceScale = normalizeScale(settings.appearanceScale);
     settings.apiTimeoutSec = normalizeTimeout(settings.apiTimeoutSec);
@@ -236,6 +238,7 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (own(patch, 'appearanceTheme')) settings.appearanceTheme = APPEARANCE_THEMES.has(patch.appearanceTheme) ? patch.appearanceTheme : 'auto';
     if (own(patch, 'inlineRecallVisible')) settings.inlineRecallVisible = patch.inlineRecallVisible !== false;
     if (own(patch, 'inlineMemoryVisible')) settings.inlineMemoryVisible = patch.inlineMemoryVisible !== false;
+    if (own(patch, 'dynamicWorldbookHideSourceDisabled')) settings.dynamicWorldbookHideSourceDisabled = patch.dynamicWorldbookHideSourceDisabled === true;
     if (own(patch, 'fabShow')) settings.fabShow = patch.fabShow !== false;
     if (own(patch, 'appearanceScale')) settings.appearanceScale = normalizeScale(patch.appearanceScale);
     if (own(patch, 'appearanceFontCssUrl')) settings.appearanceFontCssUrl = text(patch.appearanceFontCssUrl).trim();

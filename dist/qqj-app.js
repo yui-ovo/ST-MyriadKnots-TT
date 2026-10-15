@@ -10038,6 +10038,7 @@ var Hc = "qianqianjie", Uc = Object.freeze({
 	appearanceTheme: "auto",
 	inlineRecallVisible: !0,
 	inlineMemoryVisible: !0,
+	dynamicWorldbookHideSourceDisabled: !1,
 	fabShow: !0,
 	appearanceScale: 1,
 	appearanceFontCssUrl: "",
@@ -10196,7 +10197,7 @@ function cl({ extensionSettings: e, save: t = () => {}, now: n, random: r } = {}
 			apiPresets: []
 		};
 		for (let [e, n] of Object.entries(Uc)) Gc(t, e) || (t[e] = Array.isArray(n) ? [] : n && typeof n == "object" ? {} : n);
-		return Wc.has(t.apiMode) || (t.apiMode = "auto"), Array.isArray(t.apiExcludeParams) || (t.apiExcludeParams = []), Array.isArray(t.apiPresets) || (t.apiPresets = []), Array.isArray(t.sourceWorldInfoExcludedBooks) || (t.sourceWorldInfoExcludedBooks = []), qc.has(t.appearanceTheme) || (t.appearanceTheme = "auto"), t.inlineRecallVisible = t.inlineRecallVisible !== !1, t.inlineMemoryVisible = t.inlineMemoryVisible !== !1, t.fabShow = t.fabShow !== !1, t.appearanceScale = Jc(t.appearanceScale), t.apiTimeoutSec = $c(t.apiTimeoutSec), t.autoMemoryBatchSize = Zc(t.autoMemoryBatchSize), t.timeEvolutionEnabled = t.timeEvolutionEnabled === !0, t.storyCalendars = Xc(t.storyCalendars), t.autoHideEnabled = t.autoHideEnabled === !0, t.autoHideKeepAiCount = Qc(t.autoHideKeepAiCount), t.storageAutoCleanupEnabled = t.storageAutoCleanupEnabled === !0, t.storageAutoCleanupProgress = Yc(t.storageAutoCleanupProgress), t.storyClockReferenceTags = kc(t.storyClockReferenceTags).join(","), t;
+		return Wc.has(t.apiMode) || (t.apiMode = "auto"), Array.isArray(t.apiExcludeParams) || (t.apiExcludeParams = []), Array.isArray(t.apiPresets) || (t.apiPresets = []), Array.isArray(t.sourceWorldInfoExcludedBooks) || (t.sourceWorldInfoExcludedBooks = []), qc.has(t.appearanceTheme) || (t.appearanceTheme = "auto"), t.inlineRecallVisible = t.inlineRecallVisible !== !1, t.inlineMemoryVisible = t.inlineMemoryVisible !== !1, t.dynamicWorldbookHideSourceDisabled = t.dynamicWorldbookHideSourceDisabled === !0, t.fabShow = t.fabShow !== !1, t.appearanceScale = Jc(t.appearanceScale), t.apiTimeoutSec = $c(t.apiTimeoutSec), t.autoMemoryBatchSize = Zc(t.autoMemoryBatchSize), t.timeEvolutionEnabled = t.timeEvolutionEnabled === !0, t.storyCalendars = Xc(t.storyCalendars), t.autoHideEnabled = t.autoHideEnabled === !0, t.autoHideKeepAiCount = Qc(t.autoHideKeepAiCount), t.storageAutoCleanupEnabled = t.storageAutoCleanupEnabled === !0, t.storageAutoCleanupProgress = Yc(t.storageAutoCleanupProgress), t.storyClockReferenceTags = kc(t.storyClockReferenceTags).join(","), t;
 	}, a = (e = !1) => {
 		try {
 			return t();
@@ -10213,7 +10214,7 @@ function cl({ extensionSettings: e, save: t = () => {}, now: n, random: r } = {}
 			"vectorKey",
 			"vectorModel"
 		]) Gc(e, t) && (n[t] = Kc(e[t]).trim());
-		return Gc(e, "apiUrl") && (n.apiUrl = Kc(e.apiUrl).trim()), Gc(e, "apiKey") && (n.apiKey = Kc(e.apiKey).trim()), Gc(e, "apiModel") && (n.apiModel = Kc(e.apiModel).trim()), Gc(e, "apiExcludeParams") && (n.apiExcludeParams = tl(e.apiExcludeParams)), Gc(e, "apiAdditionalParams") && (n.apiAdditionalParams = Kc(e.apiAdditionalParams).trim()), Gc(e, "apiQianqianjieTemperature") && (n.apiQianqianjieTemperature = el(e.apiQianqianjieTemperature)), Gc(e, "apiTimeoutSec") && (n.apiTimeoutSec = $c(e.apiTimeoutSec)), Gc(e, "apiStream") && (n.apiStream = e.apiStream === !0), Gc(e, "apiPresetActiveId") && (n.apiPresetActiveId = Kc(e.apiPresetActiveId).trim()), Gc(e, "sourceWorldInfoExcludedBooks") && (n.sourceWorldInfoExcludedBooks = Array.isArray(e.sourceWorldInfoExcludedBooks) ? e.sourceWorldInfoExcludedBooks : []), Gc(e, "sourceKeepTags") && (n.sourceKeepTags = U(e.sourceKeepTags).join(",")), Gc(e, "sourceExtraTags") && (n.sourceExtraTags = U(e.sourceExtraTags).join(",")), Gc(e, "processingPrompt") && (n.processingPrompt = Kc(e.processingPrompt)), Gc(e, "summaryPrompt") && (n.summaryPrompt = Kc(e.summaryPrompt)), Gc(e, "csePrompt") && (n.csePrompt = Kc(e.csePrompt)), Gc(e, "profilePrompt") && (n.profilePrompt = Kc(e.profilePrompt)), Gc(e, "appearanceTheme") && (n.appearanceTheme = qc.has(e.appearanceTheme) ? e.appearanceTheme : "auto"), Gc(e, "inlineRecallVisible") && (n.inlineRecallVisible = e.inlineRecallVisible !== !1), Gc(e, "inlineMemoryVisible") && (n.inlineMemoryVisible = e.inlineMemoryVisible !== !1), Gc(e, "fabShow") && (n.fabShow = e.fabShow !== !1), Gc(e, "appearanceScale") && (n.appearanceScale = Jc(e.appearanceScale)), Gc(e, "appearanceFontCssUrl") && (n.appearanceFontCssUrl = Kc(e.appearanceFontCssUrl).trim()), Gc(e, "appearanceFontFamily") && (n.appearanceFontFamily = Kc(e.appearanceFontFamily).trim()), a(t), n;
+		return Gc(e, "apiUrl") && (n.apiUrl = Kc(e.apiUrl).trim()), Gc(e, "apiKey") && (n.apiKey = Kc(e.apiKey).trim()), Gc(e, "apiModel") && (n.apiModel = Kc(e.apiModel).trim()), Gc(e, "apiExcludeParams") && (n.apiExcludeParams = tl(e.apiExcludeParams)), Gc(e, "apiAdditionalParams") && (n.apiAdditionalParams = Kc(e.apiAdditionalParams).trim()), Gc(e, "apiQianqianjieTemperature") && (n.apiQianqianjieTemperature = el(e.apiQianqianjieTemperature)), Gc(e, "apiTimeoutSec") && (n.apiTimeoutSec = $c(e.apiTimeoutSec)), Gc(e, "apiStream") && (n.apiStream = e.apiStream === !0), Gc(e, "apiPresetActiveId") && (n.apiPresetActiveId = Kc(e.apiPresetActiveId).trim()), Gc(e, "sourceWorldInfoExcludedBooks") && (n.sourceWorldInfoExcludedBooks = Array.isArray(e.sourceWorldInfoExcludedBooks) ? e.sourceWorldInfoExcludedBooks : []), Gc(e, "sourceKeepTags") && (n.sourceKeepTags = U(e.sourceKeepTags).join(",")), Gc(e, "sourceExtraTags") && (n.sourceExtraTags = U(e.sourceExtraTags).join(",")), Gc(e, "processingPrompt") && (n.processingPrompt = Kc(e.processingPrompt)), Gc(e, "summaryPrompt") && (n.summaryPrompt = Kc(e.summaryPrompt)), Gc(e, "csePrompt") && (n.csePrompt = Kc(e.csePrompt)), Gc(e, "profilePrompt") && (n.profilePrompt = Kc(e.profilePrompt)), Gc(e, "appearanceTheme") && (n.appearanceTheme = qc.has(e.appearanceTheme) ? e.appearanceTheme : "auto"), Gc(e, "inlineRecallVisible") && (n.inlineRecallVisible = e.inlineRecallVisible !== !1), Gc(e, "inlineMemoryVisible") && (n.inlineMemoryVisible = e.inlineMemoryVisible !== !1), Gc(e, "dynamicWorldbookHideSourceDisabled") && (n.dynamicWorldbookHideSourceDisabled = e.dynamicWorldbookHideSourceDisabled === !0), Gc(e, "fabShow") && (n.fabShow = e.fabShow !== !1), Gc(e, "appearanceScale") && (n.appearanceScale = Jc(e.appearanceScale)), Gc(e, "appearanceFontCssUrl") && (n.appearanceFontCssUrl = Kc(e.appearanceFontCssUrl).trim()), Gc(e, "appearanceFontFamily") && (n.appearanceFontFamily = Kc(e.appearanceFontFamily).trim()), a(t), n;
 	}, s = () => {
 		let e = i();
 		return il({
@@ -24832,19 +24833,19 @@ function Fy(e, t, n) {
 }
 //#endregion
 //#region src/ui/dynamic-worldbook-view.js
-function Iy({ runtime: e, documentRef: t = globalThis.document, confirmImpl: n = async () => !1, open: r = !1, onToggle: i } = {}) {
-	let { drawer: a, body: o } = mc({
-		documentRef: t,
+function Iy({ runtime: e, settings: t = null, documentRef: n = globalThis.document, confirmImpl: r = async () => !1, open: i = !1, onToggle: a } = {}) {
+	let { drawer: o, body: s } = mc({
+		documentRef: n,
 		title: "动态世界书 · 自用试验",
 		level: "group",
-		open: r,
-		onToggle: i
-	}), s = (e, n = "", r = "") => {
-		let i = t.createElement(e);
-		return i.textContent = n, i.className = r, i;
-	}, c = s("p", "", "settings-result"), l = s("div");
-	o.append(s("p", "先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用摘要 API，选材使用召回 API。原世界书保留。", "settings-hint"), c, l);
-	let u = !1, d = !1, f = null, p = {
+		open: i,
+		onToggle: a
+	}), c = (e, t = "", r = "") => {
+		let i = n.createElement(e);
+		return i.textContent = t, i.className = r, i;
+	}, l = c("p", "", "settings-result"), u = c("div");
+	s.append(c("p", "先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用摘要 API，选材使用召回 API。原世界书保留。", "settings-hint"), l, u);
+	let d = !1, f = !1, p = null, m = t?.get?.()?.dynamicWorldbookHideSourceDisabled === !0, h = {
 		idle: "空闲",
 		loading: "读取中",
 		classifying: "正在分类维护权限，已完成批次会保存",
@@ -24852,130 +24853,136 @@ function Iy({ runtime: e, documentRef: t = globalThis.document, confirmImpl: n =
 		updating: "更新资料中",
 		selecting: "本轮选材中"
 	};
-	function m(e) {
-		c.textContent = e.error || p[e.phase] || e.phase;
+	function g(e) {
+		l.textContent = e.error || h[e.phase] || e.phase;
 	}
-	async function h(t) {
+	async function _(t) {
 		try {
-			await t(), u || v(e.getState());
+			await t(), d || b(e.getState());
 		} catch (t) {
-			u || (!f && e.getState().data && v(e.getState()), c.textContent = t.message);
+			d || (!p && e.getState().data && b(e.getState()), l.textContent = t.message);
 		}
 	}
-	function g(e, t, n = !1) {
-		let r = s("button", e, "secondary-action");
+	function v(e, t, n = !1) {
+		let r = c("button", e, "secondary-action");
 		return r.type = "button", r.disabled = n, r.addEventListener("click", () => {
-			r.disabled || h(t);
+			r.disabled || _(t);
 		}), r;
 	}
-	function _(e, t, n, r = !1, i = !1) {
-		let a = s("label", "", "setting-switch"), o = s("input");
+	function y(e, t, n, r = !1, i = !1) {
+		let a = c("label", "", "setting-switch"), o = c("input");
 		return o.type = "checkbox", o.checked = t, o.disabled = r, o.addEventListener("change", () => {
 			if (i) {
 				n(o.checked);
 				return;
 			}
-			h(async () => {
+			_(async () => {
 				try {
 					await n(o.checked);
 				} catch (e) {
 					throw o.checked = t, e;
 				}
 			});
-		}), a.append(o, s("span", e)), a;
+		}), a.append(o, c("span", e)), a;
 	}
-	function v(t) {
-		if (u || d) return;
-		d = !0, m(t), l.replaceChildren();
-		let r = t.data;
-		f = r?.chatId ?? null;
-		let i = s("div", "", "settings-actions");
-		if (i.append(g("刷新状态", () => e.refresh()), g("停止", async () => e.abortAll())), i.append(g(r ? "重新建立副本" : "建立世界书副本", async () => {
-			r && !await n({
+	function b(n) {
+		if (d || f) return;
+		f = !0, g(n), u.replaceChildren();
+		let i = n.data;
+		p = i?.chatId ?? null;
+		let a = c("div", "", "settings-actions");
+		if (a.append(v("刷新状态", () => e.refresh()), v("停止", async () => e.abortAll())), a.append(v(i ? "重新建立副本" : "建立世界书副本", async () => {
+			i && !await r({
 				title: "重新建立动态世界书副本",
 				body: "将清除当前聊天的动态资料修改、锁定与记录，重新读取原世界书。同一本书已有条目的排除设置保留。原世界书和千千结记忆保留。是否继续？"
-			}) || await e.initialize({ expectedChatId: r?.chatId ?? null });
-		})), l.append(i), !r) {
-			l.append(s("p", "建立副本本身不调用 AI。建立后先勾选需要排除的条目，再继续分类。", "settings-hint")), d = !1;
+			}) || await e.initialize({ expectedChatId: i?.chatId ?? null });
+		})), u.append(a), !i) {
+			u.append(c("p", "建立副本本身不调用 AI。建立后先勾选需要排除的条目，再继续分类。", "settings-hint")), f = !1;
 			return;
 		}
-		let a = r.entries.filter((e) => yy(e) && e.classification === "pending").length;
-		a && l.append(s("p", `${a} 条尚待分类。旧版正文、开关和修改记录已保留，无需重建副本。`, "settings-hint"), g("继续分类维护权限", () => e.classify({ expectedChatId: r.chatId }))), l.append(s("p", `${r.book} · 已核对至第 ${r.processed.length ? r.processed.length - 1 : "—"} 楼`, "settings-hint")), l.append(_("在当前聊天启用动态世界书", r.enabled, (t) => e.configure({ enabled: t }, r.chatId))), l.append(_("记忆任务空闲后自动更新", r.automatic, (t) => e.configure({ automatic: t }, r.chatId)));
-		let o = s("label", "每几个已记忆 AI 回复更新一次："), c = s("input", "", "settings-input");
-		if (c.type = "number", c.min = "1", c.max = "20", c.value = String(r.interval), o.append(c, g("保存间隔", () => e.configure({ interval: Number(c.value) }, r.chatId))), l.append(o, g("立即更新一批（最多 3 楼）", () => e.update({ manual: !0 }))), l.append(s("p", "“保护”只禁止自动修改；“排除”让此条退出动态世界书的分类、选材、更新和正文替换。排除不关闭原书条目，也不阻止酒馆将原书内容交给聊天模型；已写进聊天正文的内容仍按聊天正文处理。", "settings-hint")), t.lastSelection) {
-			let e = t.lastSelection.selected.map((e) => r.entries.find((t) => t.uid === e)?.label ?? e);
-			l.append(s("p", `${t.lastSelection.status}${e.length ? `：${e.join("、")}` : ""}`, "settings-hint"));
+		let o = i.entries.filter((e) => yy(e) && e.classification === "pending").length;
+		o && u.append(c("p", `${o} 条尚待分类。旧版正文、开关和修改记录已保留，无需重建副本。`, "settings-hint"), v("继续分类维护权限", () => e.classify({ expectedChatId: i.chatId }))), u.append(c("p", `${i.book} · 已核对至第 ${i.processed.length ? i.processed.length - 1 : "—"} 楼`, "settings-hint")), u.append(y("在当前聊天启用动态世界书", i.enabled, (t) => e.configure({ enabled: t }, i.chatId))), u.append(y("记忆任务空闲后自动更新", i.automatic, (t) => e.configure({ automatic: t }, i.chatId)));
+		let s = c("label", "每几个已记忆 AI 回复更新一次："), l = c("input", "", "settings-input");
+		if (l.type = "number", l.min = "1", l.max = "20", l.value = String(i.interval), s.append(l, v("保存间隔", () => e.configure({ interval: Number(l.value) }, i.chatId))), u.append(s, v("立即更新一批（最多 3 楼）", () => e.update({ manual: !0 }))), u.append(c("p", "“保护”只禁止自动修改；“排除”让此条退出动态世界书的分类、选材、更新和正文替换。排除不关闭原书条目，也不阻止酒馆将原书内容交给聊天模型；已写进聊天正文的内容仍按聊天正文处理。", "settings-hint")), n.lastSelection) {
+			let e = n.lastSelection.selected.map((e) => i.entries.find((t) => t.uid === e)?.label ?? e);
+			u.append(c("p", `${n.lastSelection.status}${e.length ? `：${e.join("、")}` : ""}`, "settings-hint"));
 		}
-		let p = s("input", "", "settings-input");
-		p.type = "search", p.placeholder = "搜索条目", p.setAttribute("aria-label", "搜索动态世界书条目"), l.append(p);
-		let h = [];
-		for (let t of r.entries) {
-			let i = !t.locked && t.segments.some((e) => e.writable), a = i && t.segments.some((e) => !e.writable), o = !yy(t), c = s("details", "", "settings-sub"), u = s("summary", `${t.label} · ${t.sourceDisabled ? "原书已禁用" : t.excluded ? "已排除" : t.managed ? a ? "部分可更新" : i ? "可更新" : "正文受保护" : "原生"}${!o && t.classification === "review" ? " · 待核对" : !o && t.classification === "pending" ? " · 待分类" : ""}`, "settings-sub-summary"), d = s("div", "", "settings-sub-body");
-			c.append(u, d);
+		let h = c("input", "", "settings-input");
+		h.type = "search", h.value = "", h.placeholder = "搜索条目", h.setAttribute("aria-label", "搜索动态世界书条目");
+		let _ = [], b = c("p", "", "settings-hint"), x = () => {
+			let e = h.value.toLowerCase();
+			for (let t of _) t.details.hidden = m && t.sourceDisabled || !t.text.includes(e);
+			let t = m ? _.filter((e) => e.sourceDisabled).length : 0;
+			b.hidden = t === 0, b.textContent = t ? `已隐藏 ${t} 条原书已禁用条目` : "";
+		};
+		u.append(y("隐藏原书已禁用条目", m, (e) => {
+			m = e, t?.update?.({ dynamicWorldbookHideSourceDisabled: e }), x();
+		}, !1, !0), b, h);
+		for (let t of i.entries) {
+			let n = !t.locked && t.segments.some((e) => e.writable), a = n && t.segments.some((e) => !e.writable), o = !yy(t), s = c("details", "", "settings-sub"), l = c("summary", `${t.label} · ${t.sourceDisabled ? "原书已禁用" : t.excluded ? "已排除" : t.managed ? a ? "部分可更新" : n ? "可更新" : "正文受保护" : "原生"}${!o && t.classification === "review" ? " · 待核对" : !o && t.classification === "pending" ? " · 待分类" : ""}`, "settings-sub-summary"), d = c("div", "", "settings-sub-body");
+			s.append(l, d);
 			let f = (n) => e.edit(t.uid, {
 				...n,
 				expectedEntry: py(t)
-			}, r.chatId);
-			t.protectedReason && d.append(s("p", t.protectedReason, "settings-hint")), d.append(_("排除此条（动态世界书 AI 不读取、不修改）", t.excluded === !0, (e) => f({ excluded: e }))), t.sourceDisabled ? d.append(s("p", "原世界书已关闭此条，分类、选材和自动更新都会跳过，动态副本不会替换其正文。", "settings-hint")) : t.excluded && d.append(s("p", "此条继续按原世界书工作。排除立即保存，对之后的请求生效，已经发送的内容无法撤回。", "settings-hint")), d.append(_("使用当前聊天的动态副本", t.managed, (e) => f({ managed: e }), o)), t.locked && d.append(_("旧版锁定（取消后按片段权限维护）", t.locked, (e) => f({ locked: e }))), t.kind === "rule" ? d.append(s("p", "规则类条目不交给 AI 自动维护，仍可在下方手动修改副本正文。", "settings-hint")) : d.append(g("允许全部正文自动维护", () => f({ writable: !0 }), o)), d.append(g("保护全部正文", () => f({ writable: !1 }))), d.append(g("重新分类此条", () => e.classify({
+			}, i.chatId);
+			t.protectedReason && d.append(c("p", t.protectedReason, "settings-hint")), d.append(y("排除此条（动态世界书 AI 不读取、不修改）", t.excluded === !0, (e) => f({ excluded: e }))), t.sourceDisabled ? d.append(c("p", "原世界书已关闭此条，分类、选材和自动更新都会跳过，动态副本不会替换其正文。", "settings-hint")) : t.excluded && d.append(c("p", "此条继续按原世界书工作。排除立即保存，对之后的请求生效，已经发送的内容无法撤回。", "settings-hint")), d.append(y("使用当前聊天的动态副本", t.managed, (e) => f({ managed: e }), o)), t.locked && d.append(y("旧版锁定（取消后按片段权限维护）", t.locked, (e) => f({ locked: e }))), t.kind === "rule" ? d.append(c("p", "规则类条目不交给 AI 自动维护，仍可在下方手动修改副本正文。", "settings-hint")) : d.append(v("允许全部正文自动维护", () => f({ writable: !0 }), o)), d.append(v("保护全部正文", () => f({ writable: !1 }))), d.append(v("重新分类此条", () => e.classify({
 				uid: t.uid,
 				expectedEntry: py(t),
-				expectedChatId: r.chatId
+				expectedChatId: i.chatId
 			}), o));
-			let p = s("pre", t.original, "dynamic-worldbook-original");
+			let p = c("pre", t.original, "dynamic-worldbook-original");
 			p.style.whiteSpace = "pre-wrap", p.style.overflowWrap = "anywhere";
-			let m = s("details");
-			m.append(s("summary", "建档时原文"), p), d.append(m);
-			let v = t.segments.map((e) => {
+			let m = c("details");
+			m.append(c("summary", "建档时原文"), p), d.append(m);
+			let h = t.segments.map((e) => {
 				let n = { ...e };
-				d.append(s("p", `正文片段：${e.id}`)), d.append(_("保护此片段（AI 不修改）", !e.writable, (e) => {
+				d.append(c("p", `正文片段：${e.id}`)), d.append(y("保护此片段（AI 不修改）", !e.writable, (e) => {
 					n.writable = !e;
 				}, t.kind === "rule", !0));
-				let r = s("textarea", "", "settings-input");
+				let r = c("textarea", "", "settings-input");
 				return r.rows = 7, r.value = e.text, r.setAttribute("aria-label", `${t.label} ${e.id} 正文`), r.style.width = "100%", r.style.boxSizing = "border-box", d.append(r), {
 					draft: n,
 					textarea: r
 				};
 			});
-			d.append(s("p", "片段正文与勾选权限一起保存；上方整条权限按钮使用已保存正文，不保存下方草稿。", "settings-hint")), d.append(g("保存正文与权限", () => f({ segments: v.map(({ draft: e, textarea: t }) => ({
+			d.append(c("p", "片段正文与勾选权限一起保存；上方整条权限按钮使用已保存正文，不保存下方草稿。", "settings-hint")), d.append(v("保存正文与权限", () => f({ segments: h.map(({ draft: e, textarea: t }) => ({
 				...e,
 				text: t.value
-			})) })), g("恢复建档原文", async () => {
-				await n({
+			})) })), v("恢复建档原文", async () => {
+				await r({
 					title: "恢复条目原文",
 					body: `将“${t.label}”恢复为建立副本时的正文，暂时保护并等待重新分类。`
 				}) && await f({ restore: !0 });
 			}));
-			let y = s("details");
-			y.append(s("summary", `修改记录（${t.history.length}）`));
+			let g = c("details");
+			g.append(c("summary", `修改记录（${t.history.length}）`));
 			for (let e of [...t.history].reverse()) {
-				let t = s("details");
-				t.append(s("summary", `${e.at.slice(0, 19).replace("T", " ")} · ${{
+				let t = c("details");
+				t.append(c("summary", `${e.at.slice(0, 19).replace("T", " ")} · ${{
 					model: "自动更新",
 					manual: "手动修改",
 					restore: "恢复原文"
-				}[e.kind]}`)), t.append(s("p", `${e.reason}${e.floors.length ? ` · 来源第 ${e.floors.join("、")} 楼` : ""}`));
-				let n = s("pre", `修改前：\n${e.before}\n\n修改后：\n${e.after}`);
-				n.style.whiteSpace = "pre-wrap", n.style.overflowWrap = "anywhere", t.append(n), y.append(t);
+				}[e.kind]}`)), t.append(c("p", `${e.reason}${e.floors.length ? ` · 来源第 ${e.floors.join("、")} 楼` : ""}`));
+				let n = c("pre", `修改前：\n${e.before}\n\n修改后：\n${e.after}`);
+				n.style.whiteSpace = "pre-wrap", n.style.overflowWrap = "anywhere", t.append(n), g.append(t);
 			}
-			d.append(y), l.append(c), h.push({
-				details: c,
+			d.append(g), u.append(s), _.push({
+				details: s,
+				sourceDisabled: t.sourceDisabled === !0,
 				text: `${t.label}\n${t.content}`.toLowerCase()
 			});
 		}
-		p.addEventListener("input", () => {
-			let e = p.value.toLowerCase();
-			for (let t of h) t.details.hidden = !t.text.includes(e);
-		}), d = !1;
+		h.addEventListener("input", x), x(), f = !1;
 	}
-	let y = e.subscribe((e) => {
-		m(e), f && e.data?.chatId !== f && v(e);
+	let x = e.subscribe((e) => {
+		g(e), p && e.data?.chatId !== p && b(e);
 	});
-	return a.addEventListener("toggle", () => {
-		a.open && h(() => e.refresh());
-	}), v(e.getState()), r && h(() => e.refresh()), {
-		node: a,
+	return o.addEventListener("toggle", () => {
+		o.open && _(() => e.refresh());
+	}), b(e.getState()), i && _(() => e.refresh()), {
+		node: o,
 		dispose() {
-			u = !0, y();
+			d = !0, x();
 		}
 	};
 }
@@ -26895,6 +26902,7 @@ function Kb({ memoryTransfer: e, dynamicWorldbook: t, settings: n, apiTools: r, 
 			onToggle: M("memory-transfer")
 		}), c.append(H.node)), t && (V = Iy({
 			runtime: t,
+			settings: n,
 			documentRef: C,
 			confirmImpl: (e) => b?.confirm?.(e) ?? !1,
 			open: j("dynamic-worldbook"),

@@ -326,7 +326,7 @@ export function createPanel({
       page.append(memoryTransferView.node);
     }
     if (dynamicWorldbook) {
-      dynamicWorldbookView = createDynamicWorldbookView({ runtime: dynamicWorldbook, documentRef,
+      dynamicWorldbookView = createDynamicWorldbookView({ runtime: dynamicWorldbook, settings, documentRef,
         confirmImpl: options => dialog?.confirm?.(options) ?? false,
         open: subOpen('dynamic-worldbook'), onToggle: subToggle('dynamic-worldbook') });
       page.append(dynamicWorldbookView.node);

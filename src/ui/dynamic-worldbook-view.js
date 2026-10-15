@@ -1,12 +1,13 @@
 import { createSettingsDrawer } from './settings-drawer.js';
 import { canReadEntry, stableJson } from '../dynamic-worldbook.js';
 
-export function createDynamicWorldbookView({ runtime, documentRef = globalThis.document, confirmImpl = async () => false, open = false, onToggle } = {}) {
+export function createDynamicWorldbookView({ runtime, settings = null, documentRef = globalThis.document, confirmImpl = async () => false, open = false, onToggle } = {}) {
   const { drawer, body } = createSettingsDrawer({ documentRef, title: '动态世界书 · 自用试验', level: 'group', open, onToggle });
   const el = (tag, text = '', className = '') => { const node = documentRef.createElement(tag); node.textContent = text; node.className = className; return node; };
   const status = el('p', '', 'settings-result'), content = el('div');
   body.append(el('p', '先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用摘要 API，选材使用召回 API。原世界书保留。', 'settings-hint'), status, content);
   let disposed = false, rendering = false, owner = null;
+  let hideSourceDisabled = settings?.get?.()?.dynamicWorldbookHideSourceDisabled === true;
   const states = { idle: '空闲', loading: '读取中', classifying: '正在分类维护权限，已完成批次会保存', saving: '保存中', updating: '更新资料中', selecting: '本轮选材中' };
   function updateStatus(state) { status.textContent = state.error || states[state.phase] || state.phase; }
   async function action(callback) {
@@ -45,9 +46,21 @@ export function createDynamicWorldbookView({ runtime, documentRef = globalThis.d
       const names = state.lastSelection.selected.map(uid => data.entries.find(e => e.uid === uid)?.label ?? uid);
       content.append(el('p', `${state.lastSelection.status}${names.length ? `：${names.join('、')}` : ''}`, 'settings-hint'));
     }
-    const search = el('input', '', 'settings-input'); search.type = 'search'; search.placeholder = '搜索条目'; search.setAttribute('aria-label', '搜索动态世界书条目');
-    content.append(search);
+    const search = el('input', '', 'settings-input'); search.type = 'search'; search.value = ''; search.placeholder = '搜索条目'; search.setAttribute('aria-label', '搜索动态世界书条目');
     const rows = [];
+    const hiddenHint = el('p', '', 'settings-hint');
+    const filterRows = () => {
+      const query = search.value.toLowerCase();
+      for (const row of rows) row.details.hidden = (hideSourceDisabled && row.sourceDisabled) || !row.text.includes(query);
+      const count = hideSourceDisabled ? rows.filter(row => row.sourceDisabled).length : 0;
+      hiddenHint.hidden = count === 0;
+      hiddenHint.textContent = count ? `已隐藏 ${count} 条原书已禁用条目` : '';
+    };
+    content.append(checkbox('隐藏原书已禁用条目', hideSourceDisabled, value => {
+      hideSourceDisabled = value;
+      settings?.update?.({ dynamicWorldbookHideSourceDisabled: value });
+      filterRows();
+    }, false, true), hiddenHint, search);
     for (const entry of data.entries) {
       const writable = !entry.locked && entry.segments.some(s => s.writable), mixed = writable && entry.segments.some(s => !s.writable);
       const blocked = !canReadEntry(entry);
@@ -84,9 +97,10 @@ export function createDynamicWorldbookView({ runtime, documentRef = globalThis.d
         record.append(el('p', `${change.reason}${change.floors.length ? ` · 来源第 ${change.floors.join('、')} 楼` : ''}`));
         const diff = el('pre', `修改前：\n${change.before}\n\n修改后：\n${change.after}`); diff.style.whiteSpace = 'pre-wrap'; diff.style.overflowWrap = 'anywhere'; record.append(diff); history.append(record);
       }
-      area.append(history); content.append(details); rows.push({ details, text: `${entry.label}\n${entry.content}`.toLowerCase() });
+      area.append(history); content.append(details); rows.push({ details, sourceDisabled: entry.sourceDisabled === true, text: `${entry.label}\n${entry.content}`.toLowerCase() });
     }
-    search.addEventListener('input', () => { const query = search.value.toLowerCase(); for (const row of rows) row.details.hidden = !row.text.includes(query); });
+    search.addEventListener('input', filterRows);
+    filterRows();
     rendering = false;
   }
   const unsubscribe = runtime.subscribe(state => {
