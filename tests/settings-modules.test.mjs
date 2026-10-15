@@ -340,6 +340,33 @@ test('共享预设更新保留宿主未知字段，清空温度后回显未设�
   assert.equal(settings.sharedPresets()[0].qqjTemperature, undefined, '清空后回显为空');
 });
 
+test('世界书编辑默认跟随分析，另存和删除只改变世界书选择', async () => {
+  const settings = createSettingsStore({ extensionSettings: {}, save() {} });
+  settings.saveMainConfig({ url: 'https://main.test/v1', key: 'M', model: 'main' });
+  settings.upsertSharedPreset('摘要', { url: 'https://summary.test/v1', key: 'S', model: 'summary' }, 'summary');
+  settings.setSummaryPresetId('summary');
+  const confirmations = [];
+  const mount = () => createApiSettings({ settings, apiTools: {}, documentRef, promptImpl: () => '世界书专用', confirmImpl: options => { confirmations.push(options); return true; } }).node;
+  let node = mount();
+  await focusInline(fieldControl(node, '世界书API（分类与更新，默认跟随分析）'));
+  assert.equal(fieldControl(node, 'URL').value, 'https://main.test/v1');
+  assert.match(node.textContent, /世界书 API 跟随分析/u);
+  fieldControl(node, 'URL').value = 'https://worldbook.test/v1';
+  await node.find(n => n.textContent === '另存为预设').fire('click');
+  assert.ok(settings.get().worldbookPresetId);
+  assert.equal(settings.mainConfig().url, 'https://main.test/v1');
+  assert.equal(settings.summaryPresetId(), 'summary'); assert.equal(settings.get().recallPresetId, '');
+  node = mount();
+  await focusInline(fieldControl(node, '世界书API（分类与更新，默认跟随分析）'));
+  assert.equal(fieldControl(node, 'URL').value, 'https://worldbook.test/v1');
+  fieldControl(node, '模型').children[0].value = 'book-model';
+  await node.find(n => n.textContent === '保存设置').fire('click');
+  assert.equal(settings.sharedPresets().find(item => item.id === settings.get().worldbookPresetId).model, 'book-model');
+  await node.find(n => n.textContent === '删除当前预设').fire('click');
+  assert.equal(settings.get().worldbookPresetId, '');
+  assert.match(confirmations[0].note, /世界书 API 将改为跟随分析/u);
+});
+
 test('召回跟随链编辑真实目标，另存与删除只切召回角色', async () => {
   const extensionSettings = {};
   const settings = createSettingsStore({ extensionSettings, save() {}, now: () => 2, random: () => 0.5 });

@@ -11,6 +11,40 @@ const setup = extensionSettings => {
   return { settings, saves: () => saves };
 };
 
+test('世界书默认跟随分析而不是摘要，独立预设冻结在途配置且不改变其他角色', async () => {
+  const { settings } = setup({ qianqianjie: { apiMode: 'seven-preset', selectedSevenDaysPresetId: 'analysis', summaryPresetId: 'summary', recallPresetId: 'recall' },
+    'schedule-planner': { apiPresets: ['analysis', 'summary', 'recall', 'worldbook'].map(id => configured(id, id)) } });
+  const resolver = createApiResolver({ settings }), seen = [];
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const router = createTaskRouter({ resolver, compactClient: { generateTask: async ({ config }) => { seen.push(config); if (seen.length === 1) await gate; return { jsonData: {} }; } } });
+  assert.equal(settings.get().worldbookPresetId, '');
+  const pending = router.generateWorldbookTask({});
+  settings.update({ worldbookPresetId: 'worldbook' });
+  settings.upsertSharedPreset('analysis', { ...configured('analysis', 'analysis'), model: 'new' }, 'analysis');
+  release(); await pending;
+  assert.equal(seen[0].id, 'analysis'); assert.equal(seen[0].model, 'test-model');
+  const result = await router.generateWorldbookTask({});
+  assert.equal(seen.at(-1).id, 'worldbook'); assert.equal(result.taskMetadata.source, 'shared-worldbook-preset');
+  await router.generateUtilityTask({}); assert.equal(seen.at(-1).id, 'summary');
+  await router.generateRecallTask({}); assert.equal(seen.at(-1).id, 'recall');
+  settings.update({ worldbookPresetId: '' });
+  await router.generateWorldbookTask({}); assert.equal(seen.at(-1).model, 'new');
+  settings.saveMainConfig({ url: 'https://main.test/v1', key: 'main', model: 'main' });
+  settings.update({ apiMode: 'auto' });
+  await router.generateWorldbookTask({}); assert.equal(seen.at(-1).model, 'main');
+});
+
+test('世界书失效预设不回退，删除恢复跟随分析，失败诊断包含实际模型', async () => {
+  const { settings } = setup({ qianqianjie: { worldbookPresetId: 'missing' }, 'schedule-planner': { apiPresets: [configured('世界书', 'book')] } });
+  let calls = 0;
+  const router = createTaskRouter({ resolver: createApiResolver({ settings }), compactClient: { generateTask: async () => { calls++; throw Object.assign(new Error('empty'), { code: 'QQJ_EMPTY' }); } } });
+  await assert.rejects(router.generateWorldbookTask({}), { code: 'QQJ_PRESET_INVALID' });
+  assert.equal(calls, 0);
+  settings.update({ worldbookPresetId: 'book' });
+  await assert.rejects(router.generateWorldbookTask({}), error => error.taskMetadata.model === 'test-model' && error.taskMetadata.sourceLabel === '世界书');
+  settings.deleteSharedPreset('book'); assert.equal(settings.get().worldbookPresetId, '');
+});
+
 test('附加参数按主配置或共享预设保存，角色跟随与在途快照保持；清空恢复默认', async () => {
   const extensionSettings = {}, { settings, saves } = setup(extensionSettings);
   const disabled = '{"thinking":{"type":"disabled"}}';

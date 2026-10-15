@@ -67,7 +67,14 @@ export function createApiResolver({ settings } = {}) {
     // A broken recall preset fails closed; recall material must not silently move to a different API.
     return { kind: 'unavailable', source: 'shared-recall-preset', sourceLabel: preset?.name || '失效预设', config: null, reason: 'preset_missing', selectedPresetId };
   };
-  return { resolve, resolveUtility, resolveRecall, describe, describeSevenDaysPresets };
+  const resolveWorldbook = () => {
+    const selectedPresetId = String(settings.get().worldbookPresetId ?? '').trim();
+    if (!selectedPresetId) return resolve();
+    const preset = sevenDaysPresets(settings.sevenDaysSettings()).find(item => item.id === selectedPresetId);
+    if (preset && validConfig(preset)) return { kind: 'independent', source: 'shared-worldbook-preset', sourceLabel: preset.name, config: { ...preset } };
+    return { kind: 'unavailable', source: 'shared-worldbook-preset', sourceLabel: preset?.name || '失效预设', config: null, reason: 'preset_missing', selectedPresetId };
+  };
+  return { resolve, resolveUtility, resolveRecall, resolveWorldbook, describe, describeSevenDaysPresets };
 }
 
 export function createTaskRouter({ resolver, compactClient, isEnabled = () => true } = {}) {
@@ -110,7 +117,8 @@ export function createTaskRouter({ resolver, compactClient, isEnabled = () => tr
   });
   const generateAnalysisTask = options => run(options, () => resolver.resolve());
   const generateRecallTask = options => run(options, () => resolver.resolveRecall());
-  return { generateAnalysisTask, generateUtilityTask, generateRecallTask, abortAll, getActiveCount: () => active.size };
+  const generateWorldbookTask = options => run(options, () => resolver.resolveWorldbook());
+  return { generateAnalysisTask, generateUtilityTask, generateRecallTask, generateWorldbookTask, abortAll, getActiveCount: () => active.size };
 }
 
 export function createApiTools({ resolver, compactClient, isEnabled = () => true } = {}) {

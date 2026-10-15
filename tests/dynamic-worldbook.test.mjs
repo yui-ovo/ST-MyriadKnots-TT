@@ -229,6 +229,15 @@ test('update receipt shows in-flight calls, failure and chat isolation without p
   f.switchChat(); assert.equal(f.runtime.getState().lastUpdate, null);
 });
 
+test('empty update response failure receipt reports the actual API model', async t => {
+  const f = await fixture(t, { update: () => { throw Object.assign(new Error('模型没有返回内容'), {
+    code: 'QQJ_EMPTY', taskMetadata: { sourceLabel: '世界书专用', model: 'book-model' },
+  }); } });
+  await assert.rejects(f.runtime.update({ manual: true }), { code: 'QQJ_EMPTY' });
+  assert.deepEqual(f.runtime.getState().lastUpdate.api, { sourceLabel: '世界书专用', model: 'book-model' });
+  assert.equal(f.runtime.getState().lastUpdate.responses, 0);
+});
+
 test('selection normalizes exact numeric IDs and whitespace without a second API call', async t => {
   const f = await fixture(t, { select: () => ({ textData: '{"selected":[1," 1 ",1]}' }) });
   await f.runtime.prepare();

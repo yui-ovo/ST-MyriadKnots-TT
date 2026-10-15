@@ -91,6 +91,7 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
           if (kind === 'updating') {
             const receipt = updateAttempt?.key === target.key && updateAttempt.receipt.status === 'running'
               ? updateAttempt.receipt : newUpdateReceipt();
+            if (error.taskMetadata) receipt.api = { model: String(error.taskMetadata.model ?? '').slice(0, 160), sourceLabel: String(error.taskMetadata.sourceLabel ?? '').slice(0, 160) };
             updateAttempt = { key: target.key, receipt: { ...receipt, status: error.name === 'AbortError' ? 'stopped' : 'failed', at: new Date().toISOString(), message: failure } };
           }
         }

@@ -328,6 +328,7 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   const utilityTask = async () => ({ jsonData: 'utility' });
   const analysisTask = async () => ({ jsonData: 'analysis' });
   const recallTask = async () => ({ jsonData: 'recall' });
+  const worldbookTask = async () => ({ jsonData: 'worldbook' });
   let dynamicBookOptions;
   const dynamicBookRuntime = { bind() {}, abortAll() {}, wake() {}, dispose() {}, intercept: (recall, ...args) => recall(...args) };
 
@@ -416,7 +417,7 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   define('./src/api-routing.js', {
     createApiResolver: () => ({}),
     createApiTools: () => ({ abortAll() {} }),
-    createTaskRouter: () => ({ generateAnalysisTask: analysisTask, generateUtilityTask: utilityTask, generateRecallTask: recallTask, abortAll() {} }),
+    createTaskRouter: () => ({ generateAnalysisTask: analysisTask, generateUtilityTask: utilityTask, generateRecallTask: recallTask, generateWorldbookTask: worldbookTask, abortAll() {} }),
   });
   define('./src/compact-api-client.js', { createCompactApiClient: options => { compactOptions = options; return {}; } });
   define('./src/chat-session.js', { createChatSession: options => {
@@ -729,7 +730,7 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   assert.equal(Object.hasOwn(v3RecallOptions, 'historicalMaintenance'), false);
   assert.equal(typeof v3RecallOptions.realtimeOrigin, 'function');
   assert.equal(typeof context.qqj_v3_recall_interceptor, 'function');
-  assert.equal(dynamicBookOptions.generateUpdate, utilityTask);
+  assert.equal(dynamicBookOptions.generateUpdate, worldbookTask);
   assert.equal(dynamicBookOptions.generateSelect, recallTask);
   assert.equal(bootstrapOptions.dynamicWorldbook, dynamicBookRuntime);
   v3MemoryOptions.notifyUser({ kind: 'warning', action: 'openMemory', text: '千千结：第 383 楼起等待确认。' });

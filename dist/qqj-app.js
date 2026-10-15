@@ -10012,6 +10012,7 @@ var Hc = "qianqianjie", Uc = Object.freeze({
 	selectedSevenDaysPresetId: "",
 	summaryPresetId: "",
 	recallPresetId: "",
+	worldbookPresetId: "",
 	vectorEnabled: !1,
 	vectorPresetId: "",
 	vectorUrl: "",
@@ -10207,7 +10208,7 @@ function cl({ extensionSettings: e, save: t = () => {}, now: n, random: r } = {}
 	}, o = (e, { observeSaveFailure: t = !1 } = {}) => {
 		Gc(e, "apiAdditionalParams") && rl(e.apiAdditionalParams);
 		let n = i();
-		Gc(e, "pluginEnabled") && (n.pluginEnabled = e.pluginEnabled !== !1), Gc(e, "timeEvolutionEnabled") && (n.timeEvolutionEnabled = e.timeEvolutionEnabled === !0), Gc(e, "storyCalendars") && (n.storyCalendars = Xc(e.storyCalendars)), Gc(e, "storyClockEnabled") && (n.storyClockEnabled = e.storyClockEnabled !== !1), Gc(e, "storyClockPrompt") && (n.storyClockPrompt = Kc(e.storyClockPrompt)), Gc(e, "storyClockReferenceTags") && (n.storyClockReferenceTags = kc(e.storyClockReferenceTags).join(",")), Gc(e, "autoMemoryBatchSize") && (n.autoMemoryBatchSize = Zc(e.autoMemoryBatchSize)), Gc(e, "autoHideEnabled") && (n.autoHideEnabled = e.autoHideEnabled === !0), Gc(e, "autoHideKeepAiCount") && (n.autoHideKeepAiCount = Qc(e.autoHideKeepAiCount)), Gc(e, "storageAutoCleanupEnabled") && (n.storageAutoCleanupEnabled = e.storageAutoCleanupEnabled === !0), Gc(e, "storageAutoCleanupProgress") && (n.storageAutoCleanupProgress = Yc(e.storageAutoCleanupProgress)), Gc(e, "apiMode") && (n.apiMode = Wc.has(e.apiMode) ? e.apiMode : "auto"), Gc(e, "selectedSevenDaysPresetId") && (n.selectedSevenDaysPresetId = Kc(e.selectedSevenDaysPresetId).trim()), Gc(e, "summaryPresetId") && (n.summaryPresetId = Kc(e.summaryPresetId).trim()), Gc(e, "recallPresetId") && (n.recallPresetId = Kc(e.recallPresetId).trim()), Gc(e, "vectorEnabled") && (n.vectorEnabled = e.vectorEnabled === !0);
+		Gc(e, "pluginEnabled") && (n.pluginEnabled = e.pluginEnabled !== !1), Gc(e, "timeEvolutionEnabled") && (n.timeEvolutionEnabled = e.timeEvolutionEnabled === !0), Gc(e, "storyCalendars") && (n.storyCalendars = Xc(e.storyCalendars)), Gc(e, "storyClockEnabled") && (n.storyClockEnabled = e.storyClockEnabled !== !1), Gc(e, "storyClockPrompt") && (n.storyClockPrompt = Kc(e.storyClockPrompt)), Gc(e, "storyClockReferenceTags") && (n.storyClockReferenceTags = kc(e.storyClockReferenceTags).join(",")), Gc(e, "autoMemoryBatchSize") && (n.autoMemoryBatchSize = Zc(e.autoMemoryBatchSize)), Gc(e, "autoHideEnabled") && (n.autoHideEnabled = e.autoHideEnabled === !0), Gc(e, "autoHideKeepAiCount") && (n.autoHideKeepAiCount = Qc(e.autoHideKeepAiCount)), Gc(e, "storageAutoCleanupEnabled") && (n.storageAutoCleanupEnabled = e.storageAutoCleanupEnabled === !0), Gc(e, "storageAutoCleanupProgress") && (n.storageAutoCleanupProgress = Yc(e.storageAutoCleanupProgress)), Gc(e, "apiMode") && (n.apiMode = Wc.has(e.apiMode) ? e.apiMode : "auto"), Gc(e, "selectedSevenDaysPresetId") && (n.selectedSevenDaysPresetId = Kc(e.selectedSevenDaysPresetId).trim()), Gc(e, "summaryPresetId") && (n.summaryPresetId = Kc(e.summaryPresetId).trim()), Gc(e, "recallPresetId") && (n.recallPresetId = Kc(e.recallPresetId).trim()), Gc(e, "worldbookPresetId") && (n.worldbookPresetId = Kc(e.worldbookPresetId).trim()), Gc(e, "vectorEnabled") && (n.vectorEnabled = e.vectorEnabled === !0);
 		for (let t of [
 			"vectorPresetId",
 			"vectorUrl",
@@ -10338,7 +10339,7 @@ function cl({ extensionSettings: e, save: t = () => {}, now: n, random: r } = {}
 			if (o.length === r.length) return !1;
 			n.apiPresets = o;
 			let s = i();
-			return s.apiMode === "seven-preset" && Kc(s.selectedSevenDaysPresetId).trim() === t && (s.apiMode = "auto", s.selectedSevenDaysPresetId = ""), Kc(s.summaryPresetId).trim() === t && (s.summaryPresetId = ""), Kc(s.recallPresetId).trim() === t && (s.recallPresetId = ""), Kc(s.vectorPresetId).trim() === t && (s.vectorEnabled = !1), a(), !0;
+			return s.apiMode === "seven-preset" && Kc(s.selectedSevenDaysPresetId).trim() === t && (s.apiMode = "auto", s.selectedSevenDaysPresetId = ""), Kc(s.summaryPresetId).trim() === t && (s.summaryPresetId = ""), Kc(s.recallPresetId).trim() === t && (s.recallPresetId = ""), Kc(s.worldbookPresetId).trim() === t && (s.worldbookPresetId = ""), Kc(s.vectorPresetId).trim() === t && (s.vectorEnabled = !1), a(), !0;
 		},
 		sharedSnapshotKey: () => {
 			let e = p() || {};
@@ -10392,7 +10393,12 @@ function ll({ settings: e, apiTools: t, vectorApi: n, vectorIndex: r, vectorOpen
 		onToggle: u
 	});
 	x.classList.add("qqj-api-editor"), S.classList.add("qqj-manual-editor");
-	let C = e.get(), w = e.sharedPresets(), T = o, E = C.apiMode === "seven-preset" ? C.selectedSevenDaysPresetId : "", D = e.summaryPresetId(), O = String(C.recallPresetId ?? "").trim(), k = (e, t) => [
+	let C = e.get(), w = e.sharedPresets(), T = o, E = C.apiMode === "seven-preset" ? C.selectedSevenDaysPresetId : "", D = e.summaryPresetId(), O = String(C.recallPresetId ?? "").trim(), k = String(C.worldbookPresetId ?? "").trim(), A = (e) => ({
+		analysis: "分析",
+		summary: "摘要",
+		recall: "召回",
+		worldbook: "世界书"
+	})[e], j = (e, t) => [
 		{
 			value: "",
 			label: e
@@ -10405,144 +10411,153 @@ function ll({ settings: e, apiTools: t, vectorApi: n, vectorIndex: r, vectorOpen
 			value: t,
 			label: `失效预设（${t}）`
 		}] : []
-	], A = _c({
+	], M = _c({
 		documentRef: c,
-		options: k("主配置", E),
+		options: j("主配置", E),
 		value: E,
 		ariaLabel: "分析 API",
-		onFocus: () => ue("analysis"),
-		onChange: (e) => ce(e)
-	}), j = _c({
+		onFocus: () => pe("analysis"),
+		onChange: (e) => de(e)
+	}), N = _c({
 		documentRef: c,
-		options: k("跟随分析API", D),
+		options: j("跟随分析API", D),
 		value: D,
 		ariaLabel: "摘要 API",
-		onFocus: () => ue("summary"),
-		onChange: (e) => le(e)
-	}), M = A.node, N = j.node, P = _c({
+		onFocus: () => pe("summary"),
+		onChange: (e) => fe(e)
+	}), P = M.node, F = N.node, I = _c({
 		documentRef: c,
-		options: k("跟随摘要API", O),
+		options: j("跟随摘要API", O),
 		value: O,
 		ariaLabel: "召回 API",
-		onFocus: () => ue("recall"),
+		onFocus: () => pe("recall"),
 		onChange: (t) => {
-			e.update({ recallPresetId: t }), ue("recall");
+			e.update({ recallPresetId: t }), pe("recall");
 		}
-	}).node, F = (t) => e.sharedPresets().find((e) => e.id === t) ?? null, I = () => {
-		let t = T === "recall" && !P.value, n = (T === "summary" || t) && !N.value, r = T === "recall" && !t ? P.value : n || T === "analysis" ? M.value : N.value, i = r ? F(r) : e.mainConfig();
+	}).node, L = _c({
+		documentRef: c,
+		options: j("跟随分析API", k),
+		value: k,
+		ariaLabel: "世界书 API",
+		onFocus: () => pe("worldbook"),
+		onChange: (t) => {
+			e.update({ worldbookPresetId: t }), pe("worldbook");
+		}
+	}).node, R = (t) => e.sharedPresets().find((e) => e.id === t) ?? null, z = () => {
+		let t = T === "worldbook" ? L : T === "recall" ? I : null, n = T === "recall" && !I.value, r = T === "worldbook" && !L.value || (T === "summary" || n) && !F.value, i = t?.value ? t.value : r || T === "analysis" ? P.value : F.value, a = i ? R(i) : e.mainConfig();
 		return Object.freeze({
 			sourceRole: T,
-			followsSummary: t,
-			followsAnalysis: n,
-			presetId: r,
-			config: i,
-			label: r ? i?.name || "已失效预设" : "主配置"
+			followsSummary: n,
+			followsAnalysis: r,
+			presetId: i,
+			config: a,
+			label: i ? a?.name || "已失效预设" : "主配置"
 		});
-	}, L = _("input", "settings-input");
-	L.placeholder = "API URL";
-	let R = _("input", "settings-input");
-	R.type = "password", R.placeholder = "留空保持原 Key";
-	let z = _("input", "settings-input");
-	z.placeholder = "模型名称";
-	let B = _("details", "qqj-model-list-section");
-	B.hidden = !0;
-	let V = _("summary", "qqj-model-list-summary"), H = _("span", "qqj-model-list-chevron", "›"), U = _("span", "", "已加载 0 个模型"), W = _("div", "qqj-model-list-body"), G = _("input", "settings-input qqj-model-list-search");
-	G.type = "search", G.placeholder = "搜索模型…", G.setAttribute("autocomplete", "off");
-	let K = _("div", "qqj-model-list-items");
-	V.append(H, U), W.append(G, K), B.append(V, W);
-	let ee = _("textarea", "settings-input");
-	ee.placeholder = "排除参数，每行一个";
-	let q = _("textarea", "settings-input");
-	q.rows = 3, q.placeholder = "{\"thinking\":{\"type\":\"disabled\"}}";
-	let te = _("p", "settings-hint", "上例适用于智谱 API；留空使用默认。"), ne = _("input", "settings-input");
-	ne.type = "number", ne.min = "5", ne.max = "600";
-	let re = _("input", "settings-input");
-	re.type = "number", re.min = "0", re.max = "2", re.step = "0.01", re.placeholder = "留空使用任务默认值";
-	let J = _("p", "settings-hint", "留空沿用当前任务温度；较高温度可能降低结构化提取稳定性。"), Y = _("input");
-	Y.type = "checkbox";
-	let ie = _("p", "settings-hint"), X, Z = [], Q = 0, ae = (e = G.value) => {
-		U.textContent = `已加载 ${Z.length} 个模型`;
-		let t = String(e ?? "").trim().toLocaleLowerCase(), n = t ? Z.filter((e) => e.toLocaleLowerCase().includes(t)) : Z;
+	}, B = _("input", "settings-input");
+	B.placeholder = "API URL";
+	let V = _("input", "settings-input");
+	V.type = "password", V.placeholder = "留空保持原 Key";
+	let H = _("input", "settings-input");
+	H.placeholder = "模型名称";
+	let U = _("details", "qqj-model-list-section");
+	U.hidden = !0;
+	let W = _("summary", "qqj-model-list-summary"), G = _("span", "qqj-model-list-chevron", "›"), K = _("span", "", "已加载 0 个模型"), ee = _("div", "qqj-model-list-body"), q = _("input", "settings-input qqj-model-list-search");
+	q.type = "search", q.placeholder = "搜索模型…", q.setAttribute("autocomplete", "off");
+	let te = _("div", "qqj-model-list-items");
+	W.append(G, K), ee.append(q, te), U.append(W, ee);
+	let ne = _("textarea", "settings-input");
+	ne.placeholder = "排除参数，每行一个";
+	let re = _("textarea", "settings-input");
+	re.rows = 3, re.placeholder = "{\"thinking\":{\"type\":\"disabled\"}}";
+	let J = _("p", "settings-hint", "上例适用于智谱 API；留空使用默认。"), Y = _("input", "settings-input");
+	Y.type = "number", Y.min = "5", Y.max = "600";
+	let ie = _("input", "settings-input");
+	ie.type = "number", ie.min = "0", ie.max = "2", ie.step = "0.01", ie.placeholder = "留空使用任务默认值";
+	let X = _("p", "settings-hint", "留空沿用当前任务温度；较高温度可能降低结构化提取稳定性。"), Z = _("input");
+	Z.type = "checkbox";
+	let Q = _("p", "settings-hint"), ae, oe = [], se = 0, ce = (e = q.value) => {
+		K.textContent = `已加载 ${oe.length} 个模型`;
+		let t = String(e ?? "").trim().toLocaleLowerCase(), n = t ? oe.filter((e) => e.toLocaleLowerCase().includes(t)) : oe;
 		if (!n.length) {
-			K.replaceChildren(_("div", "qqj-model-list-empty", t ? "无匹配项" : "暂无模型"));
+			te.replaceChildren(_("div", "qqj-model-list-empty", t ? "无匹配项" : "暂无模型"));
 			return;
 		}
-		K.replaceChildren(...n.map((e) => {
-			let t = v(e, `qqj-model-list-item${e === z.value.trim() ? " active" : ""}`, () => {
-				z.value = e, ae();
+		te.replaceChildren(...n.map((e) => {
+			let t = v(e, `qqj-model-list-item${e === H.value.trim() ? " active" : ""}`, () => {
+				H.value = e, ce();
 			});
 			return t.setAttribute("data-model", e), t;
 		}));
-	}, oe = () => {
-		Q += 1, Z = [], G.value = "", B.open = !1, B.hidden = !0, ae("");
-	}, se = () => {
-		oe();
-		let e = I(), t = e.config ?? {};
-		L.value = t.url ?? "", R.value = "", R.placeholder = t.key ? "已保存，留空保持不变" : "输入 API Key", z.value = t.model ?? "", ee.value = (t.excludeParams ?? []).join("\n"), q.value = t.qqjAdditionalParams ?? "", ne.value = String(t.timeoutSec ?? 180), re.value = t.qqjTemperature == null ? "" : String(t.qqjTemperature), Y.checked = t.stream === !0, ie.textContent = e.followsSummary ? `正在编辑：召回 API 跟随摘要${e.followsAnalysis ? "，摘要跟随分析" : ""} · ${e.label}。直接保存会更新当前${e.followsAnalysis ? "分析" : "摘要"}配置；另存可建立召回专用预设。` : e.followsAnalysis ? `正在编辑：摘要 API 跟随分析 · ${e.label}。直接保存会更新当前分析配置；另存可建立摘要专用预设。` : `正在编辑：${e.sourceRole === "recall" ? "召回" : e.sourceRole === "summary" ? "摘要" : "分析"} API · ${e.label}`, X && (X.disabled = !e.presetId || !e.config);
+	}, le = () => {
+		se += 1, oe = [], q.value = "", U.open = !1, U.hidden = !0, ce("");
+	}, ue = () => {
+		le();
+		let e = z(), t = e.config ?? {};
+		B.value = t.url ?? "", V.value = "", V.placeholder = t.key ? "已保存，留空保持不变" : "输入 API Key", H.value = t.model ?? "", ne.value = (t.excludeParams ?? []).join("\n"), re.value = t.qqjAdditionalParams ?? "", Y.value = String(t.timeoutSec ?? 180), ie.value = t.qqjTemperature == null ? "" : String(t.qqjTemperature), Z.checked = t.stream === !0, Q.textContent = e.followsSummary ? `正在编辑：${A(e.sourceRole)} API 跟随摘要${e.followsAnalysis ? "，摘要跟随分析" : ""} · ${e.label}。直接保存会更新当前${e.followsAnalysis ? "分析" : "摘要"}配置；另存可建立${A(e.sourceRole)}专用预设。` : e.followsAnalysis ? `正在编辑：${A(e.sourceRole)} API 跟随分析 · ${e.label}。直接保存会更新当前分析配置；另存可建立${A(e.sourceRole)}专用预设。` : `正在编辑：${A(e.sourceRole)} API · ${e.label}`, ae && (ae.disabled = !e.presetId || !e.config);
 	};
-	function ce(t) {
+	function de(t) {
 		e.update({
 			apiMode: t ? "seven-preset" : "auto",
 			selectedSevenDaysPresetId: t
-		}), ue("analysis");
+		}), pe("analysis");
 	}
-	function le(t) {
-		e.setSummaryPresetId(t), ue("summary");
+	function fe(t) {
+		e.setSummaryPresetId(t), pe("summary");
 	}
-	function ue(e) {
-		T = e, s?.(e), pe.textContent = "", pe.className = "settings-result", se();
+	function pe(e) {
+		T = e, s?.(e), ge.textContent = "", ge.className = "settings-result", ue();
 	}
-	let de = () => ({
-		url: L.value.trim(),
-		key: R.value.trim() || I().config?.key || "",
-		model: z.value.trim(),
-		excludeParams: ee.value,
-		qqjAdditionalParams: q.value.trim(),
-		timeoutSec: Number(ne.value),
-		stream: Y.checked,
-		qqjTemperature: re.value.trim() === "" ? null : Number(re.value)
-	}), fe = () => {
-		let e = re.value.trim();
+	let me = () => ({
+		url: B.value.trim(),
+		key: V.value.trim() || z().config?.key || "",
+		model: H.value.trim(),
+		excludeParams: ne.value,
+		qqjAdditionalParams: re.value.trim(),
+		timeoutSec: Number(Y.value),
+		stream: Z.checked,
+		qqjTemperature: ie.value.trim() === "" ? null : Number(ie.value)
+	}), he = () => {
+		let e = ie.value.trim();
 		if (!e) return !0;
 		let t = Number(e);
 		return Number.isFinite(t) && t >= 0 && t <= 2 && Math.abs(t * 100 - Math.round(t * 100)) < 1e-8;
-	}, pe = _("p", "settings-result"), me = () => {
+	}, ge = _("p", "settings-result"), _e = () => {
 		try {
-			return rl(q.value), !0;
+			return rl(re.value), !0;
 		} catch (e) {
-			return pe.textContent = e.message, pe.className = "settings-result error", !1;
+			return ge.textContent = e.message, ge.className = "settings-result error", !1;
 		}
-	}, he = () => {
-		let e = I();
+	}, ve = () => {
+		let e = z();
 		return {
 			apiMode: e.presetId ? "seven-preset" : "auto",
 			selectedSevenDaysPresetId: e.presetId,
-			config: de()
+			config: me()
 		};
-	}, ge = v("拉取模型", "secondary-action", async () => {
-		if (ge.disabled) return;
-		pe.textContent = "正在拉取模型…", pe.className = "settings-result", ge.disabled = !0;
-		let e = Q;
+	}, ye = v("拉取模型", "secondary-action", async () => {
+		if (ye.disabled) return;
+		ge.textContent = "正在拉取模型…", ge.className = "settings-result", ye.disabled = !0;
+		let e = se;
 		try {
-			let n = await t.fetchModels(he());
-			if (e !== Q) return;
-			Z = [...n], !z.value.trim() && n[0] && (z.value = n[0]), B.hidden = !1, B.open = !0, ae(""), pe.textContent = `已拉取 ${n.length} 个模型`, pe.className = "settings-result success";
+			let n = await t.fetchModels(ve());
+			if (e !== se) return;
+			oe = [...n], !H.value.trim() && n[0] && (H.value = n[0]), U.hidden = !1, U.open = !0, ce(""), ge.textContent = `已拉取 ${n.length} 个模型`, ge.className = "settings-result success";
 		} catch (t) {
-			if (e !== Q) return;
-			pe.textContent = xc(t, { fallback: "模型列表拉取失败，请检查 API 配置后重试。" }), pe.className = "settings-result error";
+			if (e !== se) return;
+			ge.textContent = xc(t, { fallback: "模型列表拉取失败，请检查 API 配置后重试。" }), ge.className = "settings-result error";
 		} finally {
-			ge.disabled = !1;
+			ye.disabled = !1;
 		}
 	});
-	G.addEventListener("input", () => ae()), z.addEventListener("input", () => {
-		B.hidden || ae();
+	q.addEventListener("input", () => ce()), H.addEventListener("input", () => {
+		U.hidden || ce();
 	});
-	let _e = () => {
-		if (!me()) return !1;
-		if (!fe()) return pe.textContent = "温度须在 0–2 之间，并按 0.01 递增。", pe.className = "settings-result error", !1;
-		let t = I();
-		if (t.presetId && !t.config) return pe.textContent = "所选 API 预设已失效，请重新选择或另存为新预设。", pe.className = "settings-result error", !1;
-		let n = de(), i = t.presetId && e.get().vectorPresetId === t.presetId && [
+	let be = () => {
+		if (!_e()) return !1;
+		if (!he()) return ge.textContent = "温度须在 0–2 之间，并按 0.01 递增。", ge.className = "settings-result error", !1;
+		let t = z();
+		if (t.presetId && !t.config) return ge.textContent = "所选 API 预设已失效，请重新选择或另存为新预设。", ge.className = "settings-result error", !1;
+		let n = me(), i = t.presetId && e.get().vectorPresetId === t.presetId && [
 			"url",
 			"key",
 			"model"
@@ -10551,12 +10566,12 @@ function ll({ settings: e, apiTools: t, vectorApi: n, vectorIndex: r, vectorOpen
 			apiMode: t.presetId ? "seven-preset" : "auto",
 			selectedSevenDaysPresetId: t.presetId
 		}), i && r?.abortAll(), !0;
-	}, ve = v("保存设置", "primary-action", () => {
-		_e() && (pe.textContent = "API 设置已保存。", pe.className = "settings-result success", se(), Cc(x));
-	}), ye = v("另存为预设", "secondary-action", async () => {
-		if (!me()) return;
-		if (!fe()) {
-			pe.textContent = "温度须在 0–2 之间，并按 0.01 递增。", pe.className = "settings-result error";
+	}, xe = v("保存设置", "primary-action", () => {
+		be() && (ge.textContent = "API 设置已保存。", ge.className = "settings-result success", ue(), Cc(x));
+	}), Se = v("另存为预设", "secondary-action", async () => {
+		if (!_e()) return;
+		if (!he()) {
+			ge.textContent = "温度须在 0–2 之间，并按 0.01 递增。", ge.className = "settings-result error";
 			return;
 		}
 		let t = String(await Promise.resolve(h({
@@ -10567,36 +10582,36 @@ function ll({ settings: e, apiTools: t, vectorApi: n, vectorIndex: r, vectorOpen
 			confirmText: "保存",
 			validate: (e) => String(e ?? "").trim() ? "" : "请输入预设名称。"
 		})) ?? "").trim();
-		if (!t || !me()) return;
-		let n = e.upsertSharedPreset(t, de());
-		T === "recall" ? e.update({ recallPresetId: n }) : T === "summary" ? e.setSummaryPresetId(n) : e.update({
+		if (!t || !_e()) return;
+		let n = e.upsertSharedPreset(t, me());
+		T === "worldbook" ? e.update({ worldbookPresetId: n }) : T === "recall" ? e.update({ recallPresetId: n }) : T === "summary" ? e.setSummaryPresetId(n) : e.update({
 			apiMode: "seven-preset",
 			selectedSevenDaysPresetId: n
 		}), p?.();
 	});
-	X = v("删除当前预设", "secondary-action", async () => {
-		let t = I();
+	ae = v("删除当前预设", "secondary-action", async () => {
+		let t = z();
 		if (!t.presetId) {
-			pe.textContent = "主配置不能删除。", pe.className = "settings-result error";
+			ge.textContent = "主配置不能删除。", ge.className = "settings-result error";
 			return;
 		}
 		if (!t.config) {
-			pe.textContent = "这个预设已不存在，未更改当前选择。", pe.className = "settings-result error";
+			ge.textContent = "这个预设已不存在，未更改当前选择。", ge.className = "settings-result error";
 			return;
 		}
 		let n = e.get(), i = n.apiMode === "seven-preset" && n.selectedSevenDaysPresetId === t.presetId, a = e.summaryPresetId() === t.presetId, o = !e.summaryPresetId(), s = n.recallPresetId === t.presetId, c = !n.recallPresetId, l = [];
-		if (i && l.push("分析 API 将回退到主配置。"), a ? l.push("摘要 API 将改为跟随分析。") : i && o && l.push("摘要 API 当前跟随分析，也将随分析回退到主配置。"), s ? l.push("召回 API 将改为跟随摘要。") : c && (a || i && o) && l.push("召回 API 当前跟随摘要，也将随摘要使用回退后的配置。"), n.vectorPresetId === t.presetId && l.push("向量召回将关闭，需重新配置。"), l.length || l.push("当前分析、摘要和召回 API 不会切换。"), (typeof g == "function" ? g() : g === !0) && l.push("构画中也会移除这个共享预设。"), !await Promise.resolve(m({
+		if (i && l.push("分析 API 将回退到主配置。"), a ? l.push("摘要 API 将改为跟随分析。") : i && o && l.push("摘要 API 当前跟随分析，也将随分析回退到主配置。"), s ? l.push("召回 API 将改为跟随摘要。") : c && (a || i && o) && l.push("召回 API 当前跟随摘要，也将随摘要使用回退后的配置。"), n.worldbookPresetId === t.presetId ? l.push("世界书 API 将改为跟随分析。") : !n.worldbookPresetId && i && l.push("世界书 API 当前跟随分析，也将随分析回退到主配置。"), n.vectorPresetId === t.presetId && l.push("向量召回将关闭，需重新配置。"), l.length || l.push("当前分析、摘要、召回和世界书 API 不会切换。"), (typeof g == "function" ? g() : g === !0) && l.push("构画中也会移除这个共享预设。"), !await Promise.resolve(m({
 			title: "删除 API 预设",
 			body: `删除预设「${t.config.name}」？`,
 			note: l.join("\n"),
 			confirmText: "删除",
 			cancelText: "取消"
 		}))) {
-			pe.textContent = "已取消删除。", pe.className = "settings-result";
+			ge.textContent = "已取消删除。", ge.className = "settings-result";
 			return;
 		}
 		if (!e.deleteSharedPreset(t.presetId)) {
-			pe.textContent = "这个预设已不存在，未更改当前选择。", pe.className = "settings-result error";
+			ge.textContent = "这个预设已不存在，未更改当前选择。", ge.className = "settings-result error";
 			return;
 		}
 		n.vectorPresetId === t.presetId && r?.abortAll();
@@ -10604,41 +10619,41 @@ function ll({ settings: e, apiTools: t, vectorApi: n, vectorIndex: r, vectorOpen
 		u.apiMode === "seven-preset" && u.selectedSevenDaysPresetId === t.presetId && e.update({
 			apiMode: "auto",
 			selectedSevenDaysPresetId: ""
-		}), pe.textContent = `已删除预设「${t.config.name}」。`, pe.className = "settings-result success", p?.();
+		}), ge.textContent = `已删除预设「${t.config.name}」。`, ge.className = "settings-result success", p?.();
 	});
-	let be = v("测试连接", "secondary-action", async () => {
-		if (!me() || be.disabled) return;
-		if (!fe()) {
-			pe.textContent = "温度须在 0–2 之间，并按 0.01 递增。", pe.className = "settings-result error";
+	let Ce = v("测试连接", "secondary-action", async () => {
+		if (!_e() || Ce.disabled) return;
+		if (!he()) {
+			ge.textContent = "温度须在 0–2 之间，并按 0.01 递增。", ge.className = "settings-result error";
 			return;
 		}
-		pe.textContent = "正在测试…", pe.className = "settings-result";
-		let e = Q;
-		be.disabled = !0;
+		ge.textContent = "正在测试…", ge.className = "settings-result";
+		let e = se;
+		Ce.disabled = !0;
 		try {
-			let n = he(), r = await t.testConnection(n);
-			if (e !== Q) return;
-			pe.textContent = `连接成功 · ${r?.model || "当前模型"}`, pe.className = "settings-result success";
+			let n = ve(), r = await t.testConnection(n);
+			if (e !== se) return;
+			ge.textContent = `连接成功 · ${r?.model || "当前模型"}`, ge.className = "settings-result success";
 		} catch (t) {
-			if (e !== Q) return;
-			pe.textContent = xc(t, { fallback: "API 连接测试失败，请检查配置后重试。" }), pe.className = "settings-result error";
+			if (e !== se) return;
+			ge.textContent = xc(t, { fallback: "API 连接测试失败，请检查配置后重试。" }), ge.className = "settings-result error";
 		} finally {
-			be.disabled = !1;
+			Ce.disabled = !1;
 		}
-	}), xe = _("div", "settings-inline");
-	xe.append(z, ge);
-	let Se = _("div", "settings-actions qqj-manual-save-bar");
-	Se.append(ve, ye, X, be);
-	let { drawer: Ce, body: we } = b({
+	}), we = _("div", "settings-inline");
+	we.append(H, ye);
+	let Te = _("div", "settings-actions qqj-manual-save-bar");
+	Te.append(xe, Se, ae, Ce);
+	let { drawer: Ee, body: De } = b({
 		title: "高级设置",
 		id: "qqj-settings-api-advanced",
 		open: d,
 		onToggle: f
 	});
-	Ce.classList.add("sub-advanced");
-	let Te = _("label", "setting-switch");
-	Te.append(Y, _("span", "", "流式请求")), we.append(y("排除参数", ee), y("附加参数（JSON）", q), te, Te, y("超时秒数", ne), y("千千结温度（0–2）", re), J);
-	let Ee = Sc({
+	Ee.classList.add("sub-advanced");
+	let Oe = _("label", "setting-switch");
+	Oe.append(Z, _("span", "", "流式请求")), De.append(y("排除参数", ne), y("附加参数（JSON）", re), J, Oe, y("超时秒数", Y), y("千千结温度（0–2）", ie), X);
+	let ke = Sc({
 		settings: e,
 		vectorApi: n,
 		vectorIndex: r,
@@ -10646,9 +10661,9 @@ function ll({ settings: e, apiTools: t, vectorApi: n, vectorIndex: r, vectorOpen
 		open: i,
 		onToggle: a
 	});
-	return S.append(y("分析API（建议高质模型）", M), y("摘要API（建议快速模型）", N), y("召回API（默认跟随摘要）", P), ie, _("p", "settings-hint", "召回可选择另一 API 预设；默认使用摘要配置。不同预设仍可能共用同一账号的并发额度。"), _("div", "settings-divider"), y("URL", L), y("Key", R), y("模型", xe), B, pe, Ce, Se, Ee.node), se(), {
+	return S.append(y("分析API（建议高质模型）", P), y("摘要API（建议快速模型）", F), y("召回API（默认跟随摘要）", I), y("世界书API（分类与更新，默认跟随分析）", L), Q, _("p", "settings-hint", "召回可选择另一 API 预设；默认使用摘要配置。不同预设仍可能共用同一账号的并发额度。"), _("p", "settings-hint", "世界书 API 用于动态条目分类和正文更新；世界书选材仍使用召回 API。选择预设立即保存；若要独立调整同一预设，请另存为预设。"), _("div", "settings-divider"), y("URL", B), y("Key", V), y("模型", we), U, ge, Ee, Te, ke.node), ue(), {
 		node: x,
-		dispose: Ee.dispose
+		dispose: ke.dispose
 	};
 }
 //#endregion
@@ -24463,7 +24478,7 @@ var oy = "千千结使用说明", sy = [
 		paragraphs: [
 			"普通 SillyTavern/Luker 使用前先安装白鳥数据后端 ST-BaiNiaoData，它是酒馆服务端插件，与千千结前端扩展不同。Luker 可用后台的服务端插件管理安装；原生酒馆默认应有根目录 plugins/ST-BaiNiaoData/index.mjs，压缩包不要多套一层文件夹，后端不要装进 public/scripts/extensions/third-party。后端仓库：https://github.com/atonal519/ST-BaiNiaoData。TauriTavern 2.2.0 使用原生扩展存储，只安装千千结前端即可，不需要白鳥后端或下述服务端配置。",
 			"普通 SillyTavern/Luker 在实际运行的酒馆根目录 config.yaml 中检查 enableServerPlugins: true；已有该键就修改原值，不要重复追加。默认 serverPluginsPath 是 ./plugins，改过则按配置路径安装；enableServerPluginsAutoUpdate 只控制自动更新，不是加载条件。安装或改配置后完整重启酒馆服务，再刷新网页；只刷新网页或切换插件开关不会加载后端。遇到后端 404 先看下面的“排障手册”，不要删除记忆来修安装。",
-			"先到“设置 → 通用设置 → API 配置”。分析 API 用于双丝网人物状态分析；摘要 API 负责逐楼摘要和千人人物资料整理；召回 API 负责 LLM 召回选材。摘要默认跟随分析，召回默认跟随摘要，也可各自选择共享预设。不同预设仍可能共用同一账号的并发额度。在 API 配置页里，保存设置不发请求；“测试连接”或“拉取模型”会发出请求。",
+			"先到“设置 → 通用设置 → API 配置”。分析 API 用于双丝网人物状态分析；摘要 API 负责逐楼摘要和千人人物资料整理；召回 API 负责 LLM 召回选材；世界书 API 负责动态世界书分类和正文更新，默认跟随分析，世界书选材仍使用召回 API。摘要默认跟随分析，召回默认跟随摘要，也可各自选择共享预设。不同预设仍可能共用同一账号的并发额度。在 API 配置页里，保存设置不发请求；“测试连接”或“拉取模型”会发出请求。",
 			"新聊天正常对话即可逐步建立记忆，不需要先打开千千结面板。旧聊天可到“设置 → 记忆管理”手动补齐；空聊天还没有可保存的记忆属于正常情况。",
 			"故事有特殊纪年或一年只有四个月时，先到“设置 → 记忆设置”确认历法。“特殊年”只填年份前的完整纪年名称，例如“启航387年”填“启航”，不填数字或“年”。时间推演是另一个默认关闭的功能，用于推算身体状态、周期和约定期限；需要时再开启，具体区别见下面“设置”。",
 			"到“千人”选择重要人物。新选择且基础资料为空的人物，会在当前聊天空闲后自动做一次首次完整整理并调用摘要 API，也会参考人物相关且未被宿主关闭的世界书条目；已有基础资料的人物不会自动首次重整，关闭或整本排除的条目不会发给模型。之后每约十个新增稳定 AI 楼会轻量粗扫有基础资料的人物，空档案不更新。人工修订后，可自行点人物菜单里的“整理当前资料”；普通刷新、切页和后续聊天不会自动重整旧人物。"
@@ -24864,7 +24879,7 @@ function Iy({ runtime: e, settings: t = null, documentRef: n = globalThis.docume
 		let i = n.createElement(e);
 		return i.textContent = t, i.className = r, i;
 	}, l = c("p", "", "settings-result"), u = c("div");
-	s.append(c("p", "先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用摘要 API，选材使用召回 API。原世界书保留。", "settings-hint"), l, u);
+	s.append(c("p", "先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用世界书 API（默认跟随分析），选材使用召回 API。原世界书保留。", "settings-hint"), l, u);
 	let d = c("div", "", "settings-sub-body"), f = c("p", "", "settings-hint"), p = c("p", "", "settings-hint");
 	d.append(c("strong", "最近更新回执"), f, p), p.style.whiteSpace = "pre-wrap";
 	let m = null, h = !1, g = !1, _ = null, v = t?.get?.()?.dynamicWorldbookHideSourceDisabled === !0, y = {
@@ -31958,6 +31973,24 @@ function tC({ settings: e } = {}) {
 				selectedPresetId: t
 			};
 		},
+		resolveWorldbook: () => {
+			let t = String(e.get().worldbookPresetId ?? "").trim();
+			if (!t) return r();
+			let n = JS(e.sevenDaysSettings()).find((e) => e.id === t);
+			return n && qS(n) ? {
+				kind: "independent",
+				source: "shared-worldbook-preset",
+				sourceLabel: n.name,
+				config: { ...n }
+			} : {
+				kind: "unavailable",
+				source: "shared-worldbook-preset",
+				sourceLabel: n?.name || "失效预设",
+				config: null,
+				reason: "preset_missing",
+				selectedPresetId: t
+			};
+		},
 		describe: () => {
 			let e = r();
 			return {
@@ -32022,6 +32055,7 @@ function nC({ resolver: e, compactClient: t, isEnabled: n = () => !0 } = {}) {
 			return e.resolveUtility();
 		}),
 		generateRecallTask: (t) => o(t, () => e.resolveRecall()),
+		generateWorldbookTask: (t) => o(t, () => e.resolveWorldbook()),
 		abortAll: a,
 		getActiveCount: () => r.size
 	};
@@ -50048,7 +50082,10 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			} catch (t) {
 				if (E(n) && (v = t.name === "AbortError" ? "任务已停止，已保存资料保留。" : t.message, e === "updating")) {
 					let e = C?.key === n.key && C.receipt.status === "running" ? C.receipt : G();
-					C = {
+					t.taskMetadata && (e.api = {
+						model: String(t.taskMetadata.model ?? "").slice(0, 160),
+						sourceLabel: String(t.taskMetadata.sourceLabel ?? "").slice(0, 160)
+					}), C = {
 						key: n.key,
 						receipt: {
 							...e,
@@ -51023,7 +51060,7 @@ var Ij = CA({
 		...xj.getState(),
 		chatId: pj.getReachable()?.root?.chatId
 	}),
-	generateUpdate: ZA.generateUtilityTask,
+	generateUpdate: ZA.generateWorldbookTask,
 	generateSelect: ZA.generateRecallTask,
 	isEnabled: jA.isEnabled,
 	isGenerating: EA,

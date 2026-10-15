@@ -36,6 +36,8 @@ export function createApiSettings({
   const analysisPresetId = current.apiMode === 'seven-preset' ? current.selectedSevenDaysPresetId : '';
   const summaryPresetId = settings.summaryPresetId();
   const recallPresetId = String(current.recallPresetId ?? '').trim();
+  const worldbookPresetId = String(current.worldbookPresetId ?? '').trim();
+  const roleLabel = role => ({ analysis: '分析', summary: '摘要', recall: '召回', worldbook: '世界书' }[role]);
   const presetOptions = (first, selectedId) => [
     { value: '', label: first },
     ...presets.map(preset => ({ value: preset.id, label: preset.name })),
@@ -57,11 +59,19 @@ export function createApiSettings({
     },
   });
   const recallSelect = recallPicker.node;
+  const worldbookPicker = createInlineSelect({
+    documentRef, options: presetOptions('跟随分析API', worldbookPresetId), value: worldbookPresetId, ariaLabel: '世界书 API',
+    onFocus: () => setEditingRole('worldbook'), onChange: value => {
+      settings.update({ worldbookPresetId: value }); setEditingRole('worldbook');
+    },
+  });
+  const worldbookSelect = worldbookPicker.node;
   const presetById = id => settings.sharedPresets().find(item => item.id === id) ?? null;
   const editingTarget = () => {
+    const independentSelect = editingRole === 'worldbook' ? worldbookSelect : editingRole === 'recall' ? recallSelect : null;
     const followsSummary = editingRole === 'recall' && !recallSelect.value;
-    const followsAnalysis = (editingRole === 'summary' || followsSummary) && !summarySelect.value;
-    const presetId = editingRole === 'recall' && !followsSummary ? recallSelect.value : followsAnalysis || editingRole === 'analysis' ? analysisSelect.value : summarySelect.value;
+    const followsAnalysis = editingRole === 'worldbook' && !worldbookSelect.value || (editingRole === 'summary' || followsSummary) && !summarySelect.value;
+    const presetId = independentSelect?.value ? independentSelect.value : followsAnalysis || editingRole === 'analysis' ? analysisSelect.value : summarySelect.value;
     const config = presetId ? presetById(presetId) : settings.mainConfig();
     return Object.freeze({ sourceRole: editingRole, followsSummary, followsAnalysis, presetId, config, label: presetId ? (config?.name || '已失效预设') : '主配置' });
   };
@@ -129,10 +139,10 @@ export function createApiSettings({
     temperature.value = config.qqjTemperature == null ? '' : String(config.qqjTemperature);
     stream.checked = config.stream === true;
     editingHint.textContent = target.followsSummary
-      ? `正在编辑：召回 API 跟随摘要${target.followsAnalysis ? '，摘要跟随分析' : ''} · ${target.label}。直接保存会更新当前${target.followsAnalysis ? '分析' : '摘要'}配置；另存可建立召回专用预设。`
+      ? `正在编辑：${roleLabel(target.sourceRole)} API 跟随摘要${target.followsAnalysis ? '，摘要跟随分析' : ''} · ${target.label}。直接保存会更新当前${target.followsAnalysis ? '分析' : '摘要'}配置；另存可建立${roleLabel(target.sourceRole)}专用预设。`
       : target.followsAnalysis
-      ? `正在编辑：摘要 API 跟随分析 · ${target.label}。直接保存会更新当前分析配置；另存可建立摘要专用预设。`
-      : `正在编辑：${target.sourceRole === 'recall' ? '召回' : target.sourceRole === 'summary' ? '摘要' : '分析'} API · ${target.label}`;
+      ? `正在编辑：${roleLabel(target.sourceRole)} API 跟随分析 · ${target.label}。直接保存会更新当前分析配置；另存可建立${roleLabel(target.sourceRole)}专用预设。`
+      : `正在编辑：${roleLabel(target.sourceRole)} API · ${target.label}`;
     if (remove) remove.disabled = !target.presetId || !target.config;
   };
 
@@ -238,7 +248,8 @@ export function createApiSettings({
     const name = String(await Promise.resolve(promptImpl({ title: '另存为预设', body: '为当前 API 配置输入一个名称。', initialValue: '千千结预设', placeholder: '预设名称', confirmText: '保存', validate: value => String(value ?? '').trim() ? '' : '请输入预设名称。' })) ?? '').trim();
     if (!name || !validAdditional()) return;
     const id = settings.upsertSharedPreset(name, draft());
-    if (editingRole === 'recall') settings.update({ recallPresetId: id });
+    if (editingRole === 'worldbook') settings.update({ worldbookPresetId: id });
+    else if (editingRole === 'recall') settings.update({ recallPresetId: id });
     else if (editingRole === 'summary') settings.setSummaryPresetId(id);
     else settings.update({ apiMode: 'seven-preset', selectedSevenDaysPresetId: id });
     rerender?.();
@@ -265,8 +276,10 @@ export function createApiSettings({
     else if (analysisUsesTarget && summaryFollowsAnalysis) effects.push('摘要 API 当前跟随分析，也将随分析回退到主配置。');
     if (recallUsesTarget) effects.push('召回 API 将改为跟随摘要。');
     else if (recallFollowsSummary && (summaryUsesTarget || analysisUsesTarget && summaryFollowsAnalysis)) effects.push('召回 API 当前跟随摘要，也将随摘要使用回退后的配置。');
+    if (currentSelection.worldbookPresetId === target.presetId) effects.push('世界书 API 将改为跟随分析。');
+    else if (!currentSelection.worldbookPresetId && analysisUsesTarget) effects.push('世界书 API 当前跟随分析，也将随分析回退到主配置。');
     if (currentSelection.vectorPresetId === target.presetId) effects.push('向量召回将关闭，需重新配置。');
-    if (!effects.length) effects.push('当前分析、摘要和召回 API 不会切换。');
+    if (!effects.length) effects.push('当前分析、摘要、召回和世界书 API 不会切换。');
     const sevenDaysAvailable = typeof isSevenDaysAvailable === 'function' ? isSevenDaysAvailable() : isSevenDaysAvailable === true;
     if (sevenDaysAvailable) effects.push('构画中也会移除这个共享预设。');
     const confirmed = await Promise.resolve(confirmImpl({ title: '删除 API 预设', body: `删除预设「${target.config.name}」？`, note: effects.join('\n'), confirmText: '删除', cancelText: '取消' }));
@@ -324,8 +337,10 @@ export function createApiSettings({
     field('分析API（建议高质模型）', analysisSelect),
     field('摘要API（建议快速模型）', summarySelect),
     field('召回API（默认跟随摘要）', recallSelect),
+    field('世界书API（分类与更新，默认跟随分析）', worldbookSelect),
     editingHint,
     element('p', 'settings-hint', '召回可选择另一 API 预设；默认使用摘要配置。不同预设仍可能共用同一账号的并发额度。'),
+    element('p', 'settings-hint', '世界书 API 用于动态条目分类和正文更新；世界书选材仍使用召回 API。选择预设立即保存；若要独立调整同一预设，请另存为预设。'),
     element('div', 'settings-divider'),
     field('URL', url),
     field('Key', key),

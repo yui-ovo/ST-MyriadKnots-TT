@@ -5,7 +5,7 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
   const { drawer, body } = createSettingsDrawer({ documentRef, title: '动态世界书 · 自用试验', level: 'group', open, onToggle });
   const el = (tag, text = '', className = '') => { const node = documentRef.createElement(tag); node.textContent = text; node.className = className; return node; };
   const status = el('p', '', 'settings-result'), content = el('div');
-  body.append(el('p', '先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用摘要 API，选材使用召回 API。原世界书保留。', 'settings-hint'), status, content);
+  body.append(el('p', '先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用世界书 API（默认跟随分析），选材使用召回 API。原世界书保留。', 'settings-hint'), status, content);
   const receiptBox = el('div', '', 'settings-sub-body'), readiness = el('p', '', 'settings-hint'), receiptText = el('p', '', 'settings-hint');
   receiptBox.append(el('strong', '最近更新回执'), readiness, receiptText);
   receiptText.style.whiteSpace = 'pre-wrap';

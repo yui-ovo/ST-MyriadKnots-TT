@@ -424,7 +424,7 @@ globalThis.addEventListener?.('beforeunload', storageManagement.dispose, { once:
 const dynamicWorldbook = createDynamicWorldbookRuntime({
   client: backendClient, hostAdapter, identityProvider: () => session.identity(),
   memoryState: () => ({ ...v3MemoryRuntime.getState(), chatId: foundationRuntime.getReachable()?.root?.chatId }),
-  generateUpdate: taskRouter.generateUtilityTask, generateSelect: taskRouter.generateRecallTask,
+  generateUpdate: taskRouter.generateWorldbookTask, generateSelect: taskRouter.generateRecallTask,
   isEnabled: settings.isEnabled, isGenerating, sanitizerOptions,
   isBookAllowed: name => sourcePermissions.filterWorldInfoSources([{ sourceName: name }]).length > 0,
   notifyUser: text => globalThis.toastr?.warning?.(text),
