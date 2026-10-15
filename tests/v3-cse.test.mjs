@@ -1586,6 +1586,21 @@ test('CSE 真实 compact 路由在503与无业务 JSON 间共享总预算，第�
   assert.deepEqual(bodies.map(body => body.messages), [bodies[0].messages, bodies[0].messages, bodies[0].messages]);
 });
 
+test('CSE provider errors retain upstream details without retrying as empty output', async () => {
+  const envelope = createCseEnvelope({ floor: floor(FLOOR1, '甲今天状态平稳。'), floorMemory: memory(MEMORY1), baseline, currentState: null, trackedSubjects: [entities[1]], entities });
+  let fetches = 0;
+  const router = analysisRouter(async () => { fetches++; return { ok: true, status: 200, json: async () => ({ error: { code: 'context_length_exceeded', message: 'context length limit exceeded PRIVATE' } }) }; });
+  await assert.rejects(runCseRequest({ generateAnalysisTask: router.generateAnalysisTask, envelope, previousCurrentState: null, now: NOW, deltaId: '27252525-2525-4252-8252-252525252525' }), error => {
+    assert.equal(error.code, 'QQJ_PROVIDER_ERROR');
+    assert.equal(error.cseDiagnostics.attempts, 1);
+    assert.equal(error.cseDiagnostics.metadata.httpStatus, 200);
+    assert.equal(error.cseDiagnostics.providerError.code, 'context_length_exceeded');
+    assert.doesNotMatch(JSON.stringify(error.cseDiagnostics), /PRIVATE/);
+    return true;
+  });
+  assert.equal(fetches, 1);
+});
+
 test('CSE empty response retains actual route and safe shape through all retries', async () => {
   const envelope = createCseEnvelope({ floor: floor(FLOOR1, '甲今天状态平稳。'), floorMemory: memory(MEMORY1), baseline, currentState: null, trackedSubjects: [entities[1]], entities });
   let fetches = 0;

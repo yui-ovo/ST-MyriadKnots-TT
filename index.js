@@ -48,6 +48,7 @@ import { createInlineRenderer } from './src/ui/inline-renderer.js';
 import { normalizeStoryCalendar } from './src/v3/calendar-rules.js';
 import { createDynamicWorldbookRuntime } from './src/dynamic-worldbook-runtime.js';
 import { createMemoryTransfer } from './src/memory-transfer.js';
+import { installExtensionUpdateRefresh } from './src/extension-update-refresh.js';
 
 const isGenerating = () => Boolean(is_send_press || is_group_generating);
 const hostAdapter = createHostAdapter({ personaIdentifierProvider: () => user_avatar, worldInfoBindings: {
@@ -540,6 +541,14 @@ lifecycle = createPluginLifecycle({
     else if (phase === 'identityPrepare' && pluginLifecycleFailure?.phase === 'identityPrepare') clearPluginLifecycleFailure();
   },
 });
+installExtensionUpdateRefresh({ moduleUrl: import.meta.url, isBusy: () => isGenerating()
+  || taskRouter.getActiveCount() > 0 || apiTools.getActiveCount() > 0
+  || v3MemoryRuntime.getState().memoryWorkBusy || Boolean(v3MemoryRuntime.getState().activeCse)
+  || v3MemoryRuntime.getState().qianshiHistoryActive || Boolean(timeRuntime.getState().active)
+  || Boolean(memoryTransfer.getState().active) || chatMemoryManagement.getState().workBusy
+  || Boolean(vectorIndex.getState().active)
+  || ['scanning', 'cleaning'].includes(storageManagement.getState().status)
+  || dynamicWorldbook.getState().phase !== 'idle' });
 void (async () => {
   const diagnosticRevisionAtStart = pluginLifecycleFailureRevision;
   try {

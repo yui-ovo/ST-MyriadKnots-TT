@@ -43,6 +43,7 @@ const safeError = (code, status = 0, details = {}) => {
     server: 'API 服务暂时异常，请稍后再试',
     network: '无法连接 API，请检查地址和网络',
     empty: '模型没有返回内容，请检查模型配置',
+    'provider-error': '接口返回了错误，未生成有效回复',
     format: '模型返回的 JSON 格式无效',
     models: '接口没有返回可用模型',
     unsupported: '当前响应格式不受支持',
@@ -148,7 +149,23 @@ async function readProviderError(response, secrets = []) {
   return Object.keys(compact).length ? Object.freeze(compact) : null;
 }
 
-function completionDetails(data) {
+function rejectProviderError(data, { secrets = [], httpStatus = 0 } = {}) {
+  if (data?.error == null || data.error === false || data.error === '') return;
+  const candidate = typeof data.error === 'object' && !Array.isArray(data.error) ? data.error : data;
+  const providerError = Object.fromEntries(Object.entries({
+    code: safeProviderIdentifier(candidate.code, secrets),
+    status: safeProviderIdentifier(candidate.status, secrets),
+    type: safeProviderIdentifier(candidate.type, secrets),
+    message: providerMessageTemplate(typeof data.error === 'string' ? data.error : candidate.message),
+  }).filter(([, value]) => value !== null));
+  const error = safeError('provider-error', httpStatus, { providerError });
+  if (providerError.message) error.message = `接口返回错误：${providerError.message}`;
+  error.responseDiagnostic = describeCompletionResponse(data);
+  throw error;
+}
+
+function completionDetails(data, diagnosticContext) {
+  rejectProviderError(data, diagnosticContext);
   const finishReason = normalizeFinishReason(data?.choices?.[0]?.finish_reason);
   if (truncatedFinishReason(finishReason)) throw safeError('output-truncated', 0, { finishReason });
   const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? data?.content ?? '';
@@ -256,12 +273,13 @@ function abortable(task, signal) {
   });
 }
 
-async function readSseResponse(response, { requireSse = false, signal } = {}) {
+async function readSseResponse(response, { requireSse = false, signal, secrets = [] } = {}) {
+  const diagnosticContext = { secrets, httpStatus: response.status };
   const reader = response.body?.getReader?.();
   if (!reader) {
     if (requireSse) throw safeError('stream-protocol');
     let data; try { data = await abortable(() => response.json(), signal); } catch (error) { if (signal?.aborted || error?.name === 'AbortError') throw abortError(); throw safeError('http-response-json'); }
-    return completionDetails(data);
+    return completionDetails(data, diagnosticContext);
   }
   const decoder = new TextDecoder(); let buffer = '', output = '', event = [], finishReason = '', sawDataLine = false, complete = false, eof = false;
   let responseDiagnostic = { eventCount: 0 };
@@ -279,7 +297,8 @@ async function readSseResponse(response, { requireSse = false, signal } = {}) {
       reasoningPresent: responseDiagnostic.reasoningPresent === true || shape.reasoningPresent,
       refusalPresent: responseDiagnostic.refusalPresent === true || shape.refusalPresent,
       toolCallsPresent: responseDiagnostic.toolCallsPresent === true || shape.toolCallsPresent };
-    if (value?.error) throw safeError('unsupported');
+    try { rejectProviderError(value, diagnosticContext); }
+    catch (error) { error.responseDiagnostic = responseDiagnostic; throw error; }
     const currentFinishReason = normalizeFinishReason(value?.choices?.[0]?.finish_reason);
     if (currentFinishReason) finishReason = currentFinishReason;
     const delta = value?.choices?.[0]?.delta?.content ?? value?.choices?.[0]?.message?.content ?? value?.choices?.[0]?.text;
@@ -372,11 +391,14 @@ export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryW
             // Streaming stays on SSE unless the server explicitly labels its response as JSON.
             if (contentType === 'application/json' || contentType.endsWith('+json')) {
               let data; try { data = await abortable(() => response.json(), linked.controller.signal); } catch (error) { if (linked.controller.signal.aborted || error?.name === 'AbortError') throw abortError(); throw safeError('http-response-json'); }
-              return completionDetails(data);
+              return completionDetails(data, { secrets: [config.key, config.url, normalizeApiUrl(config.url)], httpStatus: response.status });
             }
-            return await abortable(() => readSseResponse(response, { requireSse: contentType === 'text/event-stream', signal: linked.controller.signal }), linked.controller.signal);
+            return await abortable(() => readSseResponse(response, { requireSse: contentType === 'text/event-stream', signal: linked.controller.signal, secrets: [config.key, config.url, normalizeApiUrl(config.url)] }), linked.controller.signal);
           }
-          try { return await abortable(() => response.json(), linked.controller.signal); } catch (error) { if (linked.controller.signal.aborted || error?.name === 'AbortError') throw abortError(); throw safeError('http-response-json'); }
+          let data;
+          try { data = await abortable(() => response.json(), linked.controller.signal); } catch (error) { if (linked.controller.signal.aborted || error?.name === 'AbortError') throw abortError(); throw safeError('http-response-json'); }
+          rejectProviderError(data, { secrets: [config.key, config.url, normalizeApiUrl(config.url)], httpStatus: response.status });
+          return data;
         } catch (error) {
           if (linked.timedOut()) throw safeError('timeout');
           if (signal?.aborted || error?.name === 'AbortError') throw abortError();

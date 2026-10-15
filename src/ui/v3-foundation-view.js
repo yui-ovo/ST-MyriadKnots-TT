@@ -5,7 +5,7 @@ import { scrollManualEditorToTop } from './manual-editor-scroll.js';
 import { publicErrorMessage } from '../public-error.js';
 import { formatStoryTime } from '../v3/time-engine.js';
 import { sanitizeTaskMetadata } from '../v3/safe-metadata.js';
-import { sanitizeCompletionDiagnostic } from '../completion-diagnostic.js';
+import { sanitizeCompletionDiagnostic, sanitizeProviderDiagnostic } from '../completion-diagnostic.js';
 
 const placeNameCache = new WeakMap();
 function placeNamesFor(entities) {
@@ -1679,6 +1679,7 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
           error: errorDiagnostic(failure), messageIndex: Number.isSafeInteger(floor?.messageIndex) ? floor.messageIndex : null,
           api: sanitizeTaskMetadata(diagnostic?.metadata), attempts: countDiagnostic(diagnostic?.attempts),
           transportAttempts: countDiagnostic(diagnostic?.transportAttempts), response: sanitizeCompletionDiagnostic(diagnostic?.response),
+          providerError: sanitizeProviderDiagnostic(diagnostic?.providerError),
         }, null, 2));
         return current;
       }); });

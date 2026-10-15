@@ -1682,7 +1682,7 @@ test('三页职责分离，千结只保留摘要编辑/重提，双丝网归位�
 test('CSE failure copy uses latest failure metadata and excludes candidates, prompts and secrets', async () => {
   const failure = { code: 'QQJ_EMPTY', phase: 'retryableError', floorId: 'floor', diagnostics: {
     attempts: 3, transportAttempts: 3, metadata: { source: 'shared-preset', sourceLabel: 'analysis-preset', model: 'actual-model', finishReason: 'stop', key: 'PRIVATE_KEY', url: 'https://private.invalid' },
-    candidate: 'PRIVATE_STORY', providerError: { message: 'PRIVATE_PROVIDER' }, response: { contentType: 'string', contentCharacters: 0, reasoningPresent: true, content: 'PRIVATE_CONTENT' },
+    candidate: 'PRIVATE_STORY', providerError: { code: 'invalid_argument', message: 'PRIVATE_PROVIDER', body: 'PRIVATE_BODY' }, response: { contentType: 'string', contentCharacters: 0, reasoningPresent: true, content: 'PRIVATE_CONTENT' },
   } };
   let state = { status: 'ready', foundationStatus: 'ready', pluginEnabled: true, floors: [{ floorId: 'floor', messageIndex: 186 }], lastCseError: failure }, copied;
   const runtime = { getState: () => state, refreshStatus: async () => state, confirmLatest: async () => state };
@@ -1697,6 +1697,7 @@ test('CSE failure copy uses latest failure metadata and excludes candidates, pro
   assert.equal(report.api.model, 'latest-model');
   assert.equal(report.api.finishReason, 'stop');
   assert.equal(report.response.reasoningPresent, true);
+  assert.deepEqual(report.providerError, { code: 'invalid_argument', message: '上游错误详情已隐藏' });
   assert.doesNotMatch(copied, /PRIVATE|private.invalid|candidate/);
 });
 

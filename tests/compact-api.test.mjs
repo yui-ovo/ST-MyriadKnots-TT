@@ -45,6 +45,38 @@ const sseResponse = (chunks, contentType = 'text/event-stream') => {
   const encoder = new TextEncoder(); let index = 0;
   return { ok: true, status: 200, headers: { get: () => contentType }, body: { getReader: () => ({ read: async () => index < chunks.length ? { done: false, value: encoder.encode(chunks[index++]) } : { done: true } }) } };
 };
+test('HTTP 200 provider errors are preserved safely in JSON, SSE and streaming JSON', async () => {
+  for (const mode of ['json', 'sse', 'stream-json']) {
+    const payload = { error: { code: 'invalid_argument', status: 'INVALID_ARGUMENT', type: 'TEST_KEY', message: 'Invalid argument PRIVATE_STORY https://private.invalid TEST_KEY' } };
+    const client = createCompactApiClient({ fetchImpl: async () => mode === 'sse'
+      ? sseResponse([`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`])
+      : { ...jsonResponse(payload), headers: { get: () => 'application/json' } } });
+    await assert.rejects(client.generateTask({ config: config({ stream: mode !== 'json' }), taskMessages: [], transportBudget: { remaining: 3, used: 0 } }), error => {
+      assert.equal(error.code, 'QQJ_PROVIDER_ERROR');
+      assert.equal(error.httpStatus, 200);
+      assert.equal(error.transportAttempts, 1);
+      assert.equal(error.providerError.code, 'invalid_argument');
+      assert.equal(error.providerError.type, '[REDACTED]');
+      assert.equal(error.providerError.message, '上游拒绝了请求参数');
+      assert.equal(error.responseDiagnostic.providerErrorPresent, true);
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE|private.invalid|TEST_KEY/);
+      return true;
+    });
+  }
+});
+
+test('string and boolean error envelopes remain errors with safe descriptions', async () => {
+  for (const payload of [{ error: 'context length limit exceeded PRIVATE_STORY' }, { error: true, code: 'bad_request', message: 'invalid argument PRIVATE_STORY' }]) {
+    const client = createCompactApiClient({ fetchImpl: async () => jsonResponse(payload) });
+    await assert.rejects(client.generateTask({ config: config(), taskMessages: [] }), error => {
+      assert.equal(error.code, 'QQJ_PROVIDER_ERROR');
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE_STORY/);
+      assert.match(error.message, /超过限制|请求参数/);
+      return true;
+    });
+  }
+});
+
 test('empty completion diagnostics distinguish response shapes without retaining text', async () => {
   for (const [content, type] of [['', 'string'], [[{ type: 'text', text: 'PRIVATE_STORY' }], 'array']]) {
     const client = createCompactApiClient({ fetchImpl: async () => jsonResponse({ choices: [{ finish_reason: 'stop', message: { content, reasoning_content: 'PRIVATE_REASONING', refusal: 'PRIVATE_REFUSAL' } }] }) });

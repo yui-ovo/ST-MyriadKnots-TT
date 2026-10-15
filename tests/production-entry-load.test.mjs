@@ -513,6 +513,7 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   define('./src/v3/public-qianshi-bridge.js', { installPublicQianshiBridge: options => { publicQianshiBridgeOptions = options; return { bridge: {}, cleanup() {} }; } });
   define('./src/story-clock.js', { createMyKnotsStoryClockController: () => ({ refresh: () => ({ status: 'closed' }), getState: () => ({ status: 'closed' }), clear() {} }), createStoryClockStatusProjection: ({ controller, labelFor }) => options => ({ ...controller.refresh(options), label: labelFor(controller.getState()) }), extensionStoryClockState: () => ({ active: false, custom: false }) });
 
+  define('./src/extension-update-refresh.js', { installExtensionUpdateRefresh: () => () => {} });
   const entry = new SourceTextModule(entrySource, { context, identifier: pathToFileURL(resolve(root, 'index.js')).href });
   await entry.link(specifier => {
     const dependency = modules.get(specifier);
