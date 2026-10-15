@@ -7,6 +7,7 @@ import { createTaskRouter } from '../src/api-routing.js';
 
 const CHAT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OTHER = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const completedFloor = floor => ({ summary: '搬家', cse: { status: 'noChange', record: { endStateSubjects: [] } }, ...floor });
 const raw = () => ({ entries: {
   1: { uid: 1, comment: '住所', key: ['旧公寓'], content: '甲住在旧公寓。', constant: false, selective: true, keysecondary: [] },
   2: { uid: 2, comment: '城市', key: ['城市'], content: '城市临海。', constant: true },
@@ -32,10 +33,19 @@ async function fixture(t, overrides = {}) {
   let identity = { chatId: CHAT, hostChatId: 'chat-a', characterLocator: 'a.png', personaLocator: 'u.png' }, enabled = true, generating = false;
   let context = { chatId: 'chat-a', groupId: null, characters: [{ data: { extensions: { world: '书' } } }], characterId: 0,
     chat: [{ mes: '甲住在旧公寓。', is_user: false }, { mes: '我们搬家吧', is_user: true }, { mes: '甲搬入新家，旧公寓已经退租。', is_user: false }, { mes: '好的', is_user: true }] };
-  let state = { chatId: CHAT, memorySnapshotStatus: 'ready', floors: [0, 2].map(messageIndex => ({ status: 'ready', messageIndex, summary: '搬家', sourceMessageIndexes: [messageIndex] })) };
+  let state = { chatId: CHAT, memorySnapshotStatus: 'ready', floors: [0, 2].map(messageIndex => completedFloor({ status: 'ready', messageIndex, summary: '搬家', sourceMessageIndexes: [messageIndex] })) };
   let updates = 0, selections = 0;
   const reply = async (request, result) => {
     result = await result;
+    if (!overrides.rawUpdate && Array.isArray(result?.jsonData?.changes)) {
+      result = structuredClone(result);
+      const input = JSON.parse(request.taskMessages[0].content);
+      result.jsonData.unchangedReason ??= '本批没有新的设定变化'; result.jsonData.reviewNeeded ??= [];
+      for (const change of result.jsonData.changes) {
+        change.segmentId ??= 'body';
+        change.evidenceRefs ??= (change.floors ?? []).map(index => input.sources.find(s => s.kind === 'memory' && s.floors.includes(index))?.id ?? `invalid:${index}`);
+      }
+    }
     if (!overrides.apiTransport) return result;
     const compactClient = createCompactApiClient({ fetchImpl: async () => new Response(JSON.stringify({
       choices: [{ message: { content: '```json\n' + JSON.stringify(result.jsonData) + '\n```' }, finish_reason: 'stop' }],
@@ -47,6 +57,7 @@ async function fixture(t, overrides = {}) {
   const runtime = createDynamicWorldbookRuntime({ client: storage.client,
     hostAdapter: { getContext: () => context, getWorldInfoBindings: () => ({ loadWorldInfo: async () => structuredClone(book) }) },
     identityProvider: () => identity, memoryState: () => state, isEnabled: () => enabled, isGenerating: () => generating,
+    processingPrompt: () => overrides.processing ?? '', updateGuidance: () => overrides.guidance ?? '',
     generateUpdate: async request => {
       if (request.systemPrompt.includes('分析世界书资料的维护权限')) {
         if (overrides.classify) return reply(request, overrides.classify(request));
@@ -65,11 +76,101 @@ async function fixture(t, overrides = {}) {
   }
   return { runtime, book, context, warnings, events, ...storage,
     get updates() { return updates; }, get selections() { return selections; },
-    setState: value => { state = { ...state, ...value }; }, setEnabled: value => { enabled = value; }, setGenerating: value => { generating = value; },
+    setState: value => { state = { ...state, ...value, ...(value.floors ? { floors: value.floors.map(completedFloor) } : {}) }; }, setEnabled: value => { enabled = value; }, setGenerating: value => { generating = value; },
     switchChat() { identity = { ...identity, chatId: OTHER, hostChatId: 'chat-b' }; context = { ...context, chatId: 'chat-b', chat: [{ mes: '另一个故事', is_user: false }] }; events.get('CHAT_CHANGED')(); },
     payload() { return { characterLore: Object.values(structuredClone(book.entries)).map(entry => ({ ...entry, world: '书' })), globalLore: [], chatLore: [], personaLore: [] }; },
   };
 }
+test('update combines memory, historical CSE and all visible completed dialogue with prompt ordering', async t => {
+  const requests = [];
+  const f = await fixture(t, { processing: 'PREFIX_MARKER', guidance: 'GUIDANCE_MARKER', update: request => { requests.push(request); return { jsonData: { changes: [] } }; } });
+  f.context.chat[0].is_system = true;
+  f.context.chat[0].mes = 'HIDDEN_BODY';
+  f.setState({ cseSubjects: [{ displayName: 'FUTURE_STATE_NOT_ALLOWED' }], floors: [0, 2].map(messageIndex => ({ status: 'ready', messageIndex, summary: `MEMORY_${messageIndex}`,
+    cse: { status: 'ready', record: { endStateSubjects: [{ subjectEntityId: 'person', displayName: '甲', core: [], adaptive: [], situational: [{ text: `STATE_AT_${messageIndex}`, visibility: 'private' }] }] } } })) });
+  await f.runtime.update({ manual: true });
+  const input = JSON.parse(requests[0].taskMessages[0].content);
+  assert.match(requests[0].systemPrompt, /^PREFIX_MARKER\n\nGUIDANCE_MARKER/);
+  assert.match(requests[0].systemPrompt, /固定输出与权限要求/);
+  assert.ok(input.sources.some(s => s.id === 'memory:0' && s.text === 'MEMORY_0'));
+  assert.deepEqual(input.sources.filter(s => s.kind === 'dialogue').map(s => [s.floors[0], s.role]), [[1, 'user'], [2, 'assistant']]);
+  assert.match(JSON.stringify(input), /STATE_AT_2/);
+  assert.doesNotMatch(JSON.stringify(input), /HIDDEN_BODY|STATE_AT_0|FUTURE_STATE_NOT_ALLOWED/);
+  const r = f.runtime.getState().lastUpdate;
+  assert.deepEqual(r.materials.dialogueFloors, [1, 2]); assert.equal(r.materials.cseFloor, 2);
+  assert.equal(r.decisions[0].kind, 'unchanged'); assert.ok(r.decisions[0].reason);
+});
+
+test('missing CSE prevents updating that floor and reports a waiting reason', async t => {
+  const f = await fixture(t);
+  f.setState({ floors: [{ status: 'ready', messageIndex: 0, cse: { status: 'failed' } }] });
+  await f.runtime.update({ manual: true });
+  assert.equal(f.updates, 0); assert.match(f.runtime.getState().updateReadiness, /第 0 楼 CSE/);
+});
+
+test('invented evidence is rejected and automatic failure hold survives reload and new messages', async t => {
+  let valid = false;
+  const f = await fixture(t, { rawUpdate: true, update: () => ({ jsonData: valid
+    ? { changes: [], unchangedReason: '现状没有变化', reviewNeeded: [] }
+    : { changes: [{ uid: '1', segmentId: 'body', content: '未知地点', reason: '不存在的证据', evidenceRefs: ['memory:999'] }], reviewNeeded: [] } }) });
+  await assert.rejects(f.runtime.update(), /无效证据/);
+  await f.runtime.refresh(); assert.equal(f.runtime.getState().data.updateHold, true);
+  const reloaded = createDynamicWorldbookRuntime({ client: f.client, hostAdapter: { getContext: () => f.context },
+    identityProvider: () => ({ chatId: CHAT, hostChatId: 'chat-a', characterLocator: 'a.png', personaLocator: 'u.png' }),
+    memoryState: () => ({}), generateUpdate: () => { throw new Error('must not call'); } });
+  t.after(() => reloaded.dispose());
+  await reloaded.update(); assert.equal(reloaded.getState().data.updateHold, true);
+  f.context.chat.push({ is_user: false, mes: '另一轮' });
+  f.setState({ floors: [0, 2, 4].map(messageIndex => ({ status: 'ready', messageIndex })) });
+  await f.runtime.update(); assert.equal(f.updates, 1);
+  assert.equal(f.runtime.getState().data.entries[0].content, '甲住在旧公寓。');
+  valid = true; await f.runtime.update({ manual: true });
+  assert.equal(f.updates, 2); assert.equal(f.runtime.getState().data.updateHold, false);
+  assert.equal(f.runtime.getState().lastUpdate.decisions[0].reason, '现状没有变化');
+});
+
+test('manual and paused modes avoid automatic calls; normal interval consumes five memories in one request', async t => {
+  const f = await fixture(t, { update: () => ({ jsonData: { changes: [] } }) });
+  await f.runtime.configure({ updateMode: 'manual', interval: 5 });
+  await f.runtime.update(); assert.equal(f.updates, 0);
+  await f.runtime.update({ manual: true }); assert.equal(f.updates, 1);
+  await f.runtime.configure({ updateMode: 'paused' });
+  await assert.rejects(f.runtime.update({ manual: true }), /暂停/);
+  await f.runtime.configure({ updateMode: 'auto' });
+  for (let i = 0; i < 5; i++) {
+    if (i) f.context.chat.push({ is_user: true, mes: '继续' });
+    f.context.chat.push({ is_user: false, mes: `变化 ${i}` });
+    f.setState({ floors: [0, 2, ...Array.from({ length: i + 1 }, (_, j) => 4 + j * 2)].map(messageIndex => ({ status: 'ready', messageIndex })) });
+    await f.runtime.update();
+    assert.equal(f.updates, i === 4 ? 2 : 1);
+  }
+  assert.deepEqual(f.runtime.getState().lastUpdate.floors, [4, 6, 8, 10, 12]);
+  await f.runtime.update(); assert.equal(f.updates, 2);
+});
+
+test('changed CSE during a request rejects late output without overwriting the copy', async t => {
+  let release;
+  const f = await fixture(t, { update: () => new Promise(resolve => { release = resolve; }) });
+  const pending = f.runtime.update({ manual: true });
+  while (!release) await new Promise(resolve => setImmediate(resolve));
+  f.setState({ floors: [0, 2].map(messageIndex => ({ status: 'ready', messageIndex, summary: '记忆被更正' })) });
+  release({ jsonData: { changes: [] } });
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(f.runtime.getState().data.processed.length, 0);
+  assert.equal(f.runtime.getState().data.updateHold, true);
+});
+
+test('native selection replaces only the local copy and preserves keyword activation without calls', async t => {
+  const f = await fixture(t);
+  await f.runtime.edit('1', { content: '副本新家' });
+  await f.runtime.configure({ selectionMode: 'native', updateMode: 'paused' });
+  await f.runtime.prepare(); const payload = f.payload(); f.runtime.apply(payload);
+  assert.equal(f.selections, 0); assert.equal(payload.characterLore[0].constant, false);
+  assert.deepEqual(payload.characterLore[0].key, ['旧公寓']);
+  assert.equal(payload.characterLore[0].content, '副本新家');
+  assert.equal(f.book.entries[1].content, '甲住在旧公寓。');
+});
+
 test('activation metadata is independent of maintenance permission; executable syntax is recognized separately', () => {
   for (const entry of [{ content: 'x', sticky: 3 }, { content: 'x', keysecondary: ['a'], selective: true }, { content: 'x', extensions: { arbitrary: true } }]) {
     assert.equal(protectedReason(entry), ''); assert.ok(nativeSelectionReason(entry));
@@ -146,7 +247,9 @@ test('late maintenance after switching chat cannot persist into either chat', as
   const before = f.writes.length, pending = f.runtime.update({ manual: true });
   while (!resolve) await new Promise(r => setTimeout(r, 1));
   f.switchChat(); resolve({ jsonData: { changes: [] } });
-  await assert.rejects(pending, { name: 'AbortError' }); assert.equal(f.writes.length, before);
+  await assert.rejects(pending, { name: 'AbortError' }); assert.equal(f.writes.length, before + 1, '仅提前保存暂停标记，迟到结果不能写入');
+  const old = await createDynamicBookStore(f.client).read(CHAT);
+  assert.equal(old.data.updateHold, true); assert.equal(old.data.entries[0].content, '甲住在旧公寓。');
   await f.runtime.refresh(); assert.equal(f.runtime.getState().data, null);
 });
 test('stop and disabled master never apply cached plan', async t => {

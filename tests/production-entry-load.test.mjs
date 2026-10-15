@@ -731,6 +731,9 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   assert.equal(typeof v3RecallOptions.realtimeOrigin, 'function');
   assert.equal(typeof context.qqj_v3_recall_interceptor, 'function');
   assert.equal(dynamicBookOptions.generateUpdate, worldbookTask);
+  assert.equal(dynamicBookOptions.processingPrompt(), '  破限接线\n');
+  productionSettings.worldbookPrompt = '世界书测试指导';
+  assert.equal(dynamicBookOptions.updateGuidance(), '世界书测试指导');
   assert.equal(dynamicBookOptions.generateSelect, recallTask);
   assert.equal(bootstrapOptions.dynamicWorldbook, dynamicBookRuntime);
   v3MemoryOptions.notifyUser({ kind: 'warning', action: 'openMemory', text: '千千结：第 383 楼起等待确认。' });

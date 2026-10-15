@@ -8,6 +8,9 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
   body.append(el('p', '先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用世界书 API（默认跟随分析），选材使用召回 API。原世界书保留。', 'settings-hint'), status, content);
   const receiptBox = el('div', '', 'settings-sub-body'), readiness = el('p', '', 'settings-hint'), receiptText = el('p', '', 'settings-hint');
   receiptBox.append(el('strong', '最近更新回执'), readiness, receiptText);
+  const decisionDrawer = el('details'), decisionText = el('p', '', 'settings-hint');
+  decisionText.style.whiteSpace = 'pre-wrap';
+  decisionDrawer.append(el('summary', '修改、保持现状与待核对理由'), decisionText); receiptBox.append(decisionDrawer);
   receiptText.style.whiteSpace = 'pre-wrap';
   // Separate from editable rows: background progress must never destroy unsaved text.
   let progressLabel = null;
@@ -20,12 +23,14 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
     const receipt = state.lastUpdate ?? state.data?.lastUpdate;
     const progress = state.data ? `${state.data.book} · 已核对至第 ${state.data.processed.length ? state.data.processed.length - 1 : '—'} 楼` : '';
     if (progressLabel) progressLabel.textContent = progress;
+    decisionText.textContent = (receipt?.decisions ?? []).map(d => `${{ changed: '修改', unchanged: '保持现状', review: '待核对' }[d.kind]}${d.uid ? `（${state.data?.entries.find(e => e.uid === d.uid)?.label ?? d.uid}）` : ''}：${d.reason}${d.evidenceRefs.length ? `\n依据：${d.evidenceRefs.join('、')}` : ''}`).join('\n\n') || '暂无详细理由。旧版回执不会补算。';
     if (!receipt) { receiptText.textContent = '尚无更新回执。旧版本的调用未记录；未修改正文不代表没有调用。'; return; }
     const result = { running: '正在处理，尚未保存本批结果', updated: `已保存：修改 ${receipt.changedEntries} 个条目`, unchanged: '已调用并完成核对：本批无需修改', failed: '更新失败，本批结果未确认保存', stopped: '任务已停止，本批结果未确认保存' }[receipt.status] || receipt.status;
     receiptText.textContent = [result, `时间：${new Date(receipt.at).toLocaleString()}`,
       `发起调用 ${receipt.calls} 次 · 收到回复 ${receipt.responses} 次（按更新批次计，接口内部重试另计）`,
       receipt.floors.length ? `本批核对：第 ${receipt.floors.join('、')} 楼` : '本批尚未读取楼层',
       receipt.api && (receipt.api.sourceLabel || receipt.api.model) ? `API：${[receipt.api.sourceLabel, receipt.api.model].filter(Boolean).join(' · ')}` : '',
+      receipt.materials ? `记忆楼号：${receipt.materials.memoryFloors.join('、')}\n历史背景：${receipt.materials.backgroundFloors.join('、') || '无'}\nCSE：截至第 ${receipt.materials.cseFloor} 楼 · ${receipt.materials.cseSubjects} 人\n未隐藏正文：${receipt.materials.dialogueFloors.join('、') || '无'}` : '',
       receipt.message || '', progress].filter(Boolean).join('\n');
   }
   async function action(callback) {
@@ -37,6 +42,13 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
     const wrapper = el('label', '', 'setting-switch'), input = el('input'); input.type = 'checkbox'; input.checked = value; input.disabled = disabled;
     input.addEventListener('change', () => { if (draftOnly) { callback(input.checked); return; } void action(async () => { try { await callback(input.checked); } catch (error) { input.checked = value; throw error; } }); });
     wrapper.append(input, el('span', label)); return wrapper;
+  }
+  function select(label, value, choices, callback) {
+    const wrapper = el('label', label), control = el('select', '', 'settings-input');
+    for (const [id, title] of choices) { const option = el('option', title); option.value = id; control.append(option); }
+    control.value = value; control.setAttribute('aria-label', label);
+    control.addEventListener('change', () => void action(() => callback(control.value)));
+    wrapper.append(control); return wrapper;
   }
   function render(state) {
     if (disposed || rendering) return;
@@ -56,11 +68,17 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
     progressLabel = el('p', `${data.book} · 已核对至第 ${data.processed.length ? data.processed.length - 1 : '—'} 楼`, 'settings-hint');
     content.append(progressLabel);
     content.append(checkbox('在当前聊天启用动态世界书', data.enabled, value => runtime.configure({ enabled: value }, data.chatId)));
-    content.append(checkbox('记忆任务空闲后自动更新', data.automatic, value => runtime.configure({ automatic: value }, data.chatId)));
+    content.append(select('世界书维护方式', data.updateMode ?? (data.automatic ? 'auto' : 'manual'), [
+      ['manual', '仅手动更新'], ['auto', '每 N 条 AI 回复自动更新'], ['paused', '暂停维护（已有副本仍可使用）'],
+    ], value => runtime.configure({ updateMode: value }, data.chatId)));
     const intervalLabel = el('label', '每几个已记忆 AI 回复更新一次：'), interval = el('input', '', 'settings-input');
     interval.type = 'number'; interval.min = '1'; interval.max = '20'; interval.value = String(data.interval);
     intervalLabel.append(interval, button('保存间隔', () => runtime.configure({ interval: Number(interval.value) }, data.chatId)));
-    content.append(intervalLabel, button('立即更新一批（最多 3 楼）', () => runtime.update({ manual: true })));
+    content.append(intervalLabel, button('手动更新／重试', () => runtime.update({ manual: true }), data.updateMode === 'paused'));
+    content.append(el('p', '达到间隔并且摘要、CSE 就绪后才调用。手动成功后从新进度重新计数；失败或中断会暂停自动更新，刷新页面不会自动重试。首次补历史每批约 3 条，追平后每批最多 20 条。', 'settings-hint'));
+    content.append(select('世界书选材方式', data.selectionMode ?? 'ai', [
+      ['ai', 'AI 按需选材（发送前可能调用召回 API）'], ['native', '沿用酒馆触发规则（不调用选材 AI）'],
+    ], value => runtime.configure({ selectionMode: value }, data.chatId)));
     content.append(el('p', '“保护”只禁止自动修改；“排除”让此条退出动态世界书的分类、选材、更新和正文替换。排除不关闭原书条目，也不阻止酒馆将原书内容交给聊天模型；已写进聊天正文的内容仍按聊天正文处理。', 'settings-hint'));
     if (state.lastSelection) {
       const names = state.lastSelection.selected.map(uid => data.entries.find(e => e.uid === uid)?.label ?? uid);

@@ -10,6 +10,7 @@ import { createApiResolver, createTaskRouter } from '../src/api-routing.js';
 import { DEFAULT_EXTRACTOR_GUIDANCE } from '../src/v3/extractor.js';
 import { DEFAULT_CSE_GUIDANCE } from '../src/v3/cse-engine.js';
 import { DEFAULT_PROFILE_GUIDANCE } from '../src/v3/people-workspace.js';
+import { DEFAULT_WORLDBOOK_GUIDANCE } from '../src/dynamic-worldbook-update.js';
 
 class Node {
   constructor(tag) {
@@ -73,6 +74,21 @@ test('附加参数随 API 角色回填，非法 JSON 阻止保存、另存和测
   assert.equal(settings.mainConfig().qqjAdditionalParams, disabled, '独立召回保存不影响主配置');
   await focusInline(fieldControl(node, '分析API（建议高质模型）'));
   assert.equal(field.value, disabled);
+});
+
+test('世界书指导独立保存、加载默认和恢复，保持人物指导不变', async () => {
+  const settings = createSettingsStore({ extensionSettings: {}, save() {} });
+  settings.update({ profilePrompt: '人物指导保留' });
+  const { node } = createPromptsSettings({ settings, documentRef });
+  const drawer = node.find(n => n.id === 'qqj-settings-worldbook-prompt');
+  const input = fieldControl(drawer, '世界书更新要求');
+  input.value = '世界书自定义指导'; await input.fire('change');
+  assert.equal(settings.get().worldbookPrompt, '世界书自定义指导');
+  assert.equal(settings.get().profilePrompt, '人物指导保留');
+  await drawer.find(n => n.textContent === '载入默认再改').fire('click');
+  assert.equal(settings.get().worldbookPrompt, DEFAULT_WORLDBOOK_GUIDANCE);
+  await drawer.find(n => n.textContent === '恢复默认').fire('click');
+  assert.equal(settings.get().worldbookPrompt, '');
 });
 
 test('提示词模块字段 change 即持久化', () => {

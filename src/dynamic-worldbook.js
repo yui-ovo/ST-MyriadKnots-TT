@@ -40,7 +40,8 @@ export function sourceEntries(book) {
 }
 export async function bookFingerprint(entries) { return sha256(stableJson(entries)); }
 export async function createBook(chatId, name, source) {
-  return { schemaVersion: 2, chatId, book: name, sourceHash: await bookFingerprint(source), enabled: false, automatic: true, interval: 3,
+  return { schemaVersion: 2, chatId, book: name, sourceHash: await bookFingerprint(source), enabled: false, automatic: true, interval: 5,
+    updateMode: 'auto', selectionMode: 'ai', updateHold: false,
     catchingUp: true, processed: [], entries: source.map(entry => ({ uid: entry.uid, label: String(entry.comment || entry.key?.join('、') || `条目 ${entry.uid}`),
       original: String(entry.content ?? ''), content: String(entry.content ?? ''), protectedReason: '', managed: !isSourceDisabled(entry), locked: false, history: [],
       excluded: false, sourceDisabled: isSourceDisabled(entry),
@@ -59,6 +60,10 @@ export function validateBook(value, chatId) {
   check(isUuid(chatId) && value?.schemaVersion === 2 && value.chatId === chatId && typeof value.book === 'string' && value.book.length > 0);
   check(typeof value.sourceHash === 'string' && /^[a-f0-9]{64}$/.test(value.sourceHash));
   check(typeof value.enabled === 'boolean' && typeof value.automatic === 'boolean' && Number.isInteger(value.interval) && value.interval >= 1 && value.interval <= 20);
+  value.updateMode ??= value.automatic ? 'auto' : 'manual';
+  value.selectionMode ??= 'ai'; value.updateHold ??= false;
+  check(['auto', 'manual', 'paused'].includes(value.updateMode) && ['ai', 'native'].includes(value.selectionMode) && typeof value.updateHold === 'boolean');
+  value.automatic = value.updateMode === 'auto';
   check(typeof value.catchingUp === 'boolean');
   check(Array.isArray(value.processed) && value.processed.length <= 20000);
   value.processed.forEach((w, index) => check(w.index === index && /^[a-f0-9]{64}$/.test(w.hash)));
@@ -81,17 +86,25 @@ export function validateBook(value, chatId) {
     for (const h of entry.history) check(typeof h.before === 'string' && typeof h.after === 'string' && typeof h.reason === 'string' && typeof h.at === 'string'
       && ['model', 'manual', 'restore'].includes(h.kind) && Array.isArray(h.floors) && h.floors.every(Number.isSafeInteger));
   }
-  // Receipts are optional metadata. Keep only bounded statistics, never model text or credentials.
+  // Receipts keep bounded statistics and decision explanations, never whole prompts or credentials.
   if (value.lastUpdate != null) {
     const r = value.lastUpdate;
     const valid = r.version === 1 && ['updated', 'unchanged'].includes(r.status)
       && typeof r.at === 'string' && r.at.length <= 40 && Number.isFinite(Date.parse(r.at))
-      && Array.isArray(r.floors) && r.floors.length <= 3 && r.floors.every(i => Number.isSafeInteger(i) && i >= 0 && i < value.processed.length)
+      && Array.isArray(r.floors) && r.floors.length <= 20000 && r.floors.every(i => Number.isSafeInteger(i) && i >= 0 && i < value.processed.length)
       && [r.calls, r.responses, r.changedEntries].every(n => Number.isSafeInteger(n) && n >= 0 && n <= 500)
       && r.responses <= r.calls;
-    if (valid) value.lastUpdate = { version: 1, status: r.status, at: r.at, floors: [...r.floors], calls: r.calls,
+    if (valid) {
+      const indexes = v => Array.isArray(v) ? v.filter(i => Number.isSafeInteger(i) && i >= 0 && i < value.processed.length).slice(0, 20000) : [];
+      value.lastUpdate = { version: 1, status: r.status, at: r.at, floors: [...r.floors], calls: r.calls,
       responses: r.responses, changedEntries: r.changedEntries,
       api: r.api ? { model: String(r.api.model ?? '').slice(0, 160), sourceLabel: String(r.api.sourceLabel ?? '').slice(0, 160) } : null };
+      if (r.materials) value.lastUpdate.materials = { memoryFloors: indexes(r.materials.memoryFloors), backgroundFloors: indexes(r.materials.backgroundFloors), dialogueFloors: indexes(r.materials.dialogueFloors),
+        cseFloor: indexes([r.materials.cseFloor])[0] ?? null, cseSubjects: Number.isSafeInteger(r.materials.cseSubjects) ? Math.max(0, Math.min(500, r.materials.cseSubjects)) : 0 };
+      if (Array.isArray(r.decisions)) value.lastUpdate.decisions = r.decisions.slice(0, 100).map(d => ({ kind: ['changed', 'unchanged', 'review'].includes(d.kind) ? d.kind : 'review',
+        ...(typeof d.uid === 'string' ? { uid: d.uid.slice(0, 160) } : {}), reason: String(d.reason ?? '').slice(0, 1500),
+        evidenceRefs: Array.isArray(d.evidenceRefs) ? d.evidenceRefs.filter(s => typeof s === 'string').slice(0, 100).map(s => s.slice(0, 160)) : [] }));
+    }
     else delete value.lastUpdate;
   }
   check(stableJson(value).length <= 4000000, '动态世界书记录过大，请减少受管条目。');
@@ -189,7 +202,7 @@ export function overlayCandidates(payload, plan, data) {
       if (!entry || isSourceDisabled(source) || source.content !== entry.original) { updated.push(source); continue; }
       // Keep conditional entries on the host's own activation path, while still
       // using the chat-local text. Selection never overrides author conditions.
-      if (nativeSelectionReason(source) || entry.kind === 'rule') { updated.push({ ...source, content: entry.content }); continue; }
+      if (plan.mode === 'native' || nativeSelectionReason(source) || entry.kind === 'rule') { updated.push({ ...source, content: entry.content }); continue; }
       if (!source.constant && !selected.has(entry.uid)) continue;
       updated.push({ ...source, content: entry.content, constant: true });
     }
