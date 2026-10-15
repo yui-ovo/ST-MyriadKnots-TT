@@ -29,6 +29,12 @@ test('settings view wires opt-in, text editing with owner, confirmations and saf
   assert.equal(flatten(view.node).includes(editor), true, '调整草稿权限不丢失正在输入的正文');
   assert.equal(editor.value, '新家');
   assert.equal(calls.length, 0, '草稿权限点击保存前不写入');
+  listener({ phase: 'idle', data: { ...data, processed: [{}, {}, {}] }, updateReadiness: '等待新的已记忆 AI 回复',
+    lastUpdate: { status: 'unchanged', at: '2026-10-16T00:00:00.000Z', floors: [0, 2], calls: 1, responses: 1, changedEntries: 0, api: { model: 'test' } } });
+  const liveNodes = flatten(view.node);
+  assert.ok(liveNodes.some(node => node.textContent.includes('本批无需修改')));
+  assert.ok(liveNodes.some(node => node.textContent.includes('已核对至第 2 楼')));
+  assert.ok(liveNodes.includes(editor)); assert.equal(editor.value, '新家', '更新回执不能重建编辑器并丢失草稿');
   nodes.find(node => node.textContent === '保存正文与权限').fire('click'); await tick();
   assert.deepEqual(calls[0], ['1', { segments: [{ id: 'body', text: '新家', writable: false }], expectedEntry: stableJson(data.entries[0]) }, 'owner-a']);
   nodes = flatten(view.node); nodes.find(node => node.textContent === '恢复建档原文').fire('click'); await tick();

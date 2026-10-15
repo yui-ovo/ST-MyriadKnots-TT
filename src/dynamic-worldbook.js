@@ -81,6 +81,19 @@ export function validateBook(value, chatId) {
     for (const h of entry.history) check(typeof h.before === 'string' && typeof h.after === 'string' && typeof h.reason === 'string' && typeof h.at === 'string'
       && ['model', 'manual', 'restore'].includes(h.kind) && Array.isArray(h.floors) && h.floors.every(Number.isSafeInteger));
   }
+  // Receipts are optional metadata. Keep only bounded statistics, never model text or credentials.
+  if (value.lastUpdate != null) {
+    const r = value.lastUpdate;
+    const valid = r.version === 1 && ['updated', 'unchanged'].includes(r.status)
+      && typeof r.at === 'string' && r.at.length <= 40 && Number.isFinite(Date.parse(r.at))
+      && Array.isArray(r.floors) && r.floors.length <= 3 && r.floors.every(i => Number.isSafeInteger(i) && i >= 0 && i < value.processed.length)
+      && [r.calls, r.responses, r.changedEntries].every(n => Number.isSafeInteger(n) && n >= 0 && n <= 500)
+      && r.responses <= r.calls;
+    if (valid) value.lastUpdate = { version: 1, status: r.status, at: r.at, floors: [...r.floors], calls: r.calls,
+      responses: r.responses, changedEntries: r.changedEntries,
+      api: r.api ? { model: String(r.api.model ?? '').slice(0, 160), sourceLabel: String(r.api.sourceLabel ?? '').slice(0, 160) } : null };
+    else delete value.lastUpdate;
+  }
   check(stableJson(value).length <= 4000000, '动态世界书记录过大，请减少受管条目。');
   return clone(value);
 }

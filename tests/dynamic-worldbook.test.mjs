@@ -173,6 +173,60 @@ test('actual API textData envelope works for classification, maintenance and sel
   assert.equal(f.book.entries[1].content, '甲住在旧公寓。');
   assert.equal(f.updates, 1); assert.equal(f.selections, 1);
   assert.equal(f.warnings.length, 0);
+  const receipt = f.runtime.getState().lastUpdate;
+  assert.equal(receipt.status, 'updated'); assert.equal(receipt.changedEntries, 1);
+  assert.equal(receipt.calls, 1); assert.equal(receipt.responses, 1);
+  assert.deepEqual(receipt.floors, [0, 2]); assert.equal(receipt.api.model, 'test');
+  const saved = await createDynamicBookStore(f.client).read(CHAT);
+  assert.deepEqual(saved.data.lastUpdate, receipt, '成功回执与资料一起持久保存');
+});
+
+test('unchanged updates have a durable receipt and waiting does not overwrite it', async t => {
+  const f = await fixture(t, { update: () => ({ jsonData: { changes: [] } }) });
+  await f.runtime.update({ manual: true });
+  const receipt = f.runtime.getState().lastUpdate;
+  assert.equal(receipt.status, 'unchanged'); assert.equal(receipt.changedEntries, 0);
+  assert.equal(receipt.calls, 1); assert.equal(f.runtime.getState().data.entries[0].history.length, 0);
+  assert.equal(f.runtime.getState().data.processed.length, 3);
+  await f.runtime.update();
+  assert.deepEqual(f.runtime.getState().lastUpdate, receipt);
+  assert.match(f.runtime.getState().updateReadiness, /等待新的/);
+  assert.equal((await createDynamicBookStore(f.client).read(CHAT)).data.lastUpdate.status, 'unchanged');
+});
+
+test('readiness names memory gaps, batch threshold and busy state without claiming a model call', async t => {
+  const f = await fixture(t);
+  f.setState({ floors: [{ status: 'ready', messageIndex: 2 }] });
+  await f.runtime.update();
+  assert.equal(f.runtime.getState().lastUpdate, null); assert.equal(f.updates, 0);
+  assert.match(f.runtime.getState().updateReadiness, /第 0 楼尚无可用记忆/);
+  f.setState({ floors: [{ status: 'ready', messageIndex: 0, frozen: true }] });
+  assert.match(f.runtime.getState().updateReadiness, /冻结或继承/);
+  f.setState({ memoryWorkBusy: true });
+  await f.runtime.update(); assert.match(f.runtime.getState().updateReadiness, /CSE/);
+  f.setState({ memoryWorkBusy: false, floors: [0, 2].map(messageIndex => ({ status: 'ready', messageIndex })) });
+  await f.runtime.update(); await f.runtime.configure({ interval: 3 });
+  f.context.chat.push({ mes: '新的剧情', is_user: false });
+  f.setState({ floors: [0, 2, 4].map(messageIndex => ({ status: 'ready', messageIndex })) });
+  await f.runtime.update(); assert.match(f.runtime.getState().updateReadiness, /已攒 1\/3/);
+  assert.equal(f.updates, 1);
+});
+
+test('update receipt shows in-flight calls, failure and chat isolation without persisting failed results', async t => {
+  let release;
+  const response = new Promise(resolve => { release = resolve; });
+  const f = await fixture(t, { update: () => response });
+  const pending = f.runtime.update({ manual: true });
+  while (!f.updates) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.runtime.getState().lastUpdate.status, 'running');
+  assert.equal(f.runtime.getState().lastUpdate.calls, 1);
+  assert.equal(f.runtime.getState().lastUpdate.responses, 0);
+  release({ jsonData: {} });
+  await assert.rejects(pending);
+  const receipt = f.runtime.getState().lastUpdate;
+  assert.equal(receipt.status, 'failed'); assert.equal(receipt.responses, 1);
+  assert.equal((await createDynamicBookStore(f.client).read(CHAT)).data.lastUpdate, undefined);
+  f.switchChat(); assert.equal(f.runtime.getState().lastUpdate, null);
 });
 
 test('selection normalizes exact numeric IDs and whitespace without a second API call', async t => {

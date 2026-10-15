@@ -1,7 +1,7 @@
 {
   "display_name": "千千结 · 动态世界书自用版",
   "loading_order": 999,
-  "js": "dist/qqj-app.js?v=20261015.81-7e208aead8959e3e",
+  "js": "dist/qqj-app.js?v=20261016.82-83126296782baa81",
   "generate_interceptor": "qqj_v3_recall_interceptor",
   "version": "0.7.8",
   "description": "基于 0.7.8 的自用版：动态世界书、片段权限、条目过滤与聊天记忆导入导出",

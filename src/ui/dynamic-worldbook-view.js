@@ -6,10 +6,28 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
   const el = (tag, text = '', className = '') => { const node = documentRef.createElement(tag); node.textContent = text; node.className = className; return node; };
   const status = el('p', '', 'settings-result'), content = el('div');
   body.append(el('p', '先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用摘要 API，选材使用召回 API。原世界书保留。', 'settings-hint'), status, content);
+  const receiptBox = el('div', '', 'settings-sub-body'), readiness = el('p', '', 'settings-hint'), receiptText = el('p', '', 'settings-hint');
+  receiptBox.append(el('strong', '最近更新回执'), readiness, receiptText);
+  receiptText.style.whiteSpace = 'pre-wrap';
+  // Separate from editable rows: background progress must never destroy unsaved text.
+  let progressLabel = null;
   let disposed = false, rendering = false, owner = null;
   let hideSourceDisabled = settings?.get?.()?.dynamicWorldbookHideSourceDisabled === true;
   const states = { idle: '空闲', loading: '读取中', classifying: '正在分类维护权限，已完成批次会保存', saving: '保存中', updating: '更新资料中', selecting: '本轮选材中' };
-  function updateStatus(state) { status.textContent = state.error || states[state.phase] || state.phase; }
+  function updateStatus(state) {
+    status.textContent = state.error || states[state.phase] || state.phase;
+    readiness.textContent = state.updateReadiness || '';
+    const receipt = state.lastUpdate ?? state.data?.lastUpdate;
+    const progress = state.data ? `${state.data.book} · 已核对至第 ${state.data.processed.length ? state.data.processed.length - 1 : '—'} 楼` : '';
+    if (progressLabel) progressLabel.textContent = progress;
+    if (!receipt) { receiptText.textContent = '尚无更新回执。旧版本的调用未记录；未修改正文不代表没有调用。'; return; }
+    const result = { running: '正在处理，尚未保存本批结果', updated: `已保存：修改 ${receipt.changedEntries} 个条目`, unchanged: '已调用并完成核对：本批无需修改', failed: '更新失败，本批结果未确认保存', stopped: '任务已停止，本批结果未确认保存' }[receipt.status] || receipt.status;
+    receiptText.textContent = [result, `时间：${new Date(receipt.at).toLocaleString()}`,
+      `发起调用 ${receipt.calls} 次 · 收到回复 ${receipt.responses} 次（按更新批次计，接口内部重试另计）`,
+      receipt.floors.length ? `本批核对：第 ${receipt.floors.join('、')} 楼` : '本批尚未读取楼层',
+      receipt.api && (receipt.api.sourceLabel || receipt.api.model) ? `API：${[receipt.api.sourceLabel, receipt.api.model].filter(Boolean).join(' · ')}` : '',
+      receipt.message || '', progress].filter(Boolean).join('\n');
+  }
   async function action(callback) {
     try { await callback(); if (!disposed) render(runtime.getState()); }
     catch (error) { if (!disposed) { if (!owner && runtime.getState().data) render(runtime.getState()); status.textContent = error.message; } }
@@ -22,7 +40,7 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
   }
   function render(state) {
     if (disposed || rendering) return;
-    rendering = true; updateStatus(state); content.replaceChildren();
+    rendering = true; progressLabel = null; updateStatus(state); content.replaceChildren();
     const data = state.data; owner = data?.chatId ?? null;
     const tools = el('div', '', 'settings-actions');
     tools.append(button('刷新状态', () => runtime.refresh()), button('停止', async () => runtime.abortAll()));
@@ -31,10 +49,12 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
       await runtime.initialize({ expectedChatId: data?.chatId ?? null });
     }));
     content.append(tools);
+    content.append(receiptBox);
     if (!data) { content.append(el('p', '建立副本本身不调用 AI。建立后先勾选需要排除的条目，再继续分类。', 'settings-hint')); rendering = false; return; }
     const pending = data.entries.filter(e => canReadEntry(e) && e.classification === 'pending').length;
     if (pending) content.append(el('p', `${pending} 条尚待分类。旧版正文、开关和修改记录已保留，无需重建副本。`, 'settings-hint'), button('继续分类维护权限', () => runtime.classify({ expectedChatId: data.chatId })));
-    content.append(el('p', `${data.book} · 已核对至第 ${data.processed.length ? data.processed.length - 1 : '—'} 楼`, 'settings-hint'));
+    progressLabel = el('p', `${data.book} · 已核对至第 ${data.processed.length ? data.processed.length - 1 : '—'} 楼`, 'settings-hint');
+    content.append(progressLabel);
     content.append(checkbox('在当前聊天启用动态世界书', data.enabled, value => runtime.configure({ enabled: value }, data.chatId)));
     content.append(checkbox('记忆任务空闲后自动更新', data.automatic, value => runtime.configure({ automatic: value }, data.chatId)));
     const intervalLabel = el('label', '每几个已记忆 AI 回复更新一次：'), interval = el('input', '', 'settings-input');

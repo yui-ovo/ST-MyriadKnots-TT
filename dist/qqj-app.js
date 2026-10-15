@@ -24699,6 +24699,26 @@ function Ey(e, t) {
 			"restore"
 		].includes(e.kind) && Array.isArray(e.floors) && e.floors.every(Number.isSafeInteger));
 	}
+	if (e.lastUpdate != null) {
+		let t = e.lastUpdate;
+		t.version === 1 && ["updated", "unchanged"].includes(t.status) && typeof t.at == "string" && t.at.length <= 40 && Number.isFinite(Date.parse(t.at)) && Array.isArray(t.floors) && t.floors.length <= 3 && t.floors.every((t) => Number.isSafeInteger(t) && t >= 0 && t < e.processed.length) && [
+			t.calls,
+			t.responses,
+			t.changedEntries
+		].every((e) => Number.isSafeInteger(e) && e >= 0 && e <= 500) && t.responses <= t.calls ? e.lastUpdate = {
+			version: 1,
+			status: t.status,
+			at: t.at,
+			floors: [...t.floors],
+			calls: t.calls,
+			responses: t.responses,
+			changedEntries: t.changedEntries,
+			api: t.api ? {
+				model: String(t.api.model ?? "").slice(0, 160),
+				sourceLabel: String(t.api.sourceLabel ?? "").slice(0, 160)
+			} : null
+		} : delete e.lastUpdate;
+	}
 	return gy(py(e).length <= 4e6, "动态世界书记录过大，请减少受管条目。"), fy(e);
 }
 function Dy(e) {
@@ -24845,7 +24865,9 @@ function Iy({ runtime: e, settings: t = null, documentRef: n = globalThis.docume
 		return i.textContent = t, i.className = r, i;
 	}, l = c("p", "", "settings-result"), u = c("div");
 	s.append(c("p", "先建立本地副本，排除不想让动态世界书 AI 读取的条目，再点击继续分类。原书已禁用的条目自动跳过。分类和更新使用摘要 API，选材使用召回 API。原世界书保留。", "settings-hint"), l, u);
-	let d = !1, f = !1, p = null, m = t?.get?.()?.dynamicWorldbookHideSourceDisabled === !0, h = {
+	let d = c("div", "", "settings-sub-body"), f = c("p", "", "settings-hint"), p = c("p", "", "settings-hint");
+	d.append(c("strong", "最近更新回执"), f, p), p.style.whiteSpace = "pre-wrap";
+	let m = null, h = !1, g = !1, _ = null, v = t?.get?.()?.dynamicWorldbookHideSourceDisabled === !0, y = {
 		idle: "空闲",
 		loading: "读取中",
 		classifying: "正在分类维护权限，已完成批次会保存",
@@ -24853,30 +24875,51 @@ function Iy({ runtime: e, settings: t = null, documentRef: n = globalThis.docume
 		updating: "更新资料中",
 		selecting: "本轮选材中"
 	};
-	function g(e) {
-		l.textContent = e.error || h[e.phase] || e.phase;
+	function b(e) {
+		l.textContent = e.error || y[e.phase] || e.phase, f.textContent = e.updateReadiness || "";
+		let t = e.lastUpdate ?? e.data?.lastUpdate, n = e.data ? `${e.data.book} · 已核对至第 ${e.data.processed.length ? e.data.processed.length - 1 : "—"} 楼` : "";
+		if (m && (m.textContent = n), !t) {
+			p.textContent = "尚无更新回执。旧版本的调用未记录；未修改正文不代表没有调用。";
+			return;
+		}
+		let r = {
+			running: "正在处理，尚未保存本批结果",
+			updated: `已保存：修改 ${t.changedEntries} 个条目`,
+			unchanged: "已调用并完成核对：本批无需修改",
+			failed: "更新失败，本批结果未确认保存",
+			stopped: "任务已停止，本批结果未确认保存"
+		}[t.status] || t.status;
+		p.textContent = [
+			r,
+			`时间：${new Date(t.at).toLocaleString()}`,
+			`发起调用 ${t.calls} 次 · 收到回复 ${t.responses} 次（按更新批次计，接口内部重试另计）`,
+			t.floors.length ? `本批核对：第 ${t.floors.join("、")} 楼` : "本批尚未读取楼层",
+			t.api && (t.api.sourceLabel || t.api.model) ? `API：${[t.api.sourceLabel, t.api.model].filter(Boolean).join(" · ")}` : "",
+			t.message || "",
+			n
+		].filter(Boolean).join("\n");
 	}
-	async function _(t) {
+	async function x(t) {
 		try {
-			await t(), d || b(e.getState());
+			await t(), h || w(e.getState());
 		} catch (t) {
-			d || (!p && e.getState().data && b(e.getState()), l.textContent = t.message);
+			h || (!_ && e.getState().data && w(e.getState()), l.textContent = t.message);
 		}
 	}
-	function v(e, t, n = !1) {
+	function S(e, t, n = !1) {
 		let r = c("button", e, "secondary-action");
 		return r.type = "button", r.disabled = n, r.addEventListener("click", () => {
-			r.disabled || _(t);
+			r.disabled || x(t);
 		}), r;
 	}
-	function y(e, t, n, r = !1, i = !1) {
+	function C(e, t, n, r = !1, i = !1) {
 		let a = c("label", "", "setting-switch"), o = c("input");
 		return o.type = "checkbox", o.checked = t, o.disabled = r, o.addEventListener("change", () => {
 			if (i) {
 				n(o.checked);
 				return;
 			}
-			_(async () => {
+			x(async () => {
 				try {
 					await n(o.checked);
 				} catch (e) {
@@ -24885,39 +24928,39 @@ function Iy({ runtime: e, settings: t = null, documentRef: n = globalThis.docume
 			});
 		}), a.append(o, c("span", e)), a;
 	}
-	function b(n) {
-		if (d || f) return;
-		f = !0, g(n), u.replaceChildren();
+	function w(n) {
+		if (h || g) return;
+		g = !0, m = null, b(n), u.replaceChildren();
 		let i = n.data;
-		p = i?.chatId ?? null;
+		_ = i?.chatId ?? null;
 		let a = c("div", "", "settings-actions");
-		if (a.append(v("刷新状态", () => e.refresh()), v("停止", async () => e.abortAll())), a.append(v(i ? "重新建立副本" : "建立世界书副本", async () => {
+		if (a.append(S("刷新状态", () => e.refresh()), S("停止", async () => e.abortAll())), a.append(S(i ? "重新建立副本" : "建立世界书副本", async () => {
 			i && !await r({
 				title: "重新建立动态世界书副本",
 				body: "将清除当前聊天的动态资料修改、锁定与记录，重新读取原世界书。同一本书已有条目的排除设置保留。原世界书和千千结记忆保留。是否继续？"
 			}) || await e.initialize({ expectedChatId: i?.chatId ?? null });
-		})), u.append(a), !i) {
-			u.append(c("p", "建立副本本身不调用 AI。建立后先勾选需要排除的条目，再继续分类。", "settings-hint")), f = !1;
+		})), u.append(a), u.append(d), !i) {
+			u.append(c("p", "建立副本本身不调用 AI。建立后先勾选需要排除的条目，再继续分类。", "settings-hint")), g = !1;
 			return;
 		}
 		let o = i.entries.filter((e) => yy(e) && e.classification === "pending").length;
-		o && u.append(c("p", `${o} 条尚待分类。旧版正文、开关和修改记录已保留，无需重建副本。`, "settings-hint"), v("继续分类维护权限", () => e.classify({ expectedChatId: i.chatId }))), u.append(c("p", `${i.book} · 已核对至第 ${i.processed.length ? i.processed.length - 1 : "—"} 楼`, "settings-hint")), u.append(y("在当前聊天启用动态世界书", i.enabled, (t) => e.configure({ enabled: t }, i.chatId))), u.append(y("记忆任务空闲后自动更新", i.automatic, (t) => e.configure({ automatic: t }, i.chatId)));
+		o && u.append(c("p", `${o} 条尚待分类。旧版正文、开关和修改记录已保留，无需重建副本。`, "settings-hint"), S("继续分类维护权限", () => e.classify({ expectedChatId: i.chatId }))), m = c("p", `${i.book} · 已核对至第 ${i.processed.length ? i.processed.length - 1 : "—"} 楼`, "settings-hint"), u.append(m), u.append(C("在当前聊天启用动态世界书", i.enabled, (t) => e.configure({ enabled: t }, i.chatId))), u.append(C("记忆任务空闲后自动更新", i.automatic, (t) => e.configure({ automatic: t }, i.chatId)));
 		let s = c("label", "每几个已记忆 AI 回复更新一次："), l = c("input", "", "settings-input");
-		if (l.type = "number", l.min = "1", l.max = "20", l.value = String(i.interval), s.append(l, v("保存间隔", () => e.configure({ interval: Number(l.value) }, i.chatId))), u.append(s, v("立即更新一批（最多 3 楼）", () => e.update({ manual: !0 }))), u.append(c("p", "“保护”只禁止自动修改；“排除”让此条退出动态世界书的分类、选材、更新和正文替换。排除不关闭原书条目，也不阻止酒馆将原书内容交给聊天模型；已写进聊天正文的内容仍按聊天正文处理。", "settings-hint")), n.lastSelection) {
+		if (l.type = "number", l.min = "1", l.max = "20", l.value = String(i.interval), s.append(l, S("保存间隔", () => e.configure({ interval: Number(l.value) }, i.chatId))), u.append(s, S("立即更新一批（最多 3 楼）", () => e.update({ manual: !0 }))), u.append(c("p", "“保护”只禁止自动修改；“排除”让此条退出动态世界书的分类、选材、更新和正文替换。排除不关闭原书条目，也不阻止酒馆将原书内容交给聊天模型；已写进聊天正文的内容仍按聊天正文处理。", "settings-hint")), n.lastSelection) {
 			let e = n.lastSelection.selected.map((e) => i.entries.find((t) => t.uid === e)?.label ?? e);
 			u.append(c("p", `${n.lastSelection.status}${e.length ? `：${e.join("、")}` : ""}`, "settings-hint"));
 		}
-		let h = c("input", "", "settings-input");
-		h.type = "search", h.value = "", h.placeholder = "搜索条目", h.setAttribute("aria-label", "搜索动态世界书条目");
-		let _ = [], b = c("p", "", "settings-hint"), x = () => {
-			let e = h.value.toLowerCase();
-			for (let t of _) t.details.hidden = m && t.sourceDisabled || !t.text.includes(e);
-			let t = m ? _.filter((e) => e.sourceDisabled).length : 0;
-			b.hidden = t === 0, b.textContent = t ? `已隐藏 ${t} 条原书已禁用条目` : "";
+		let f = c("input", "", "settings-input");
+		f.type = "search", f.value = "", f.placeholder = "搜索条目", f.setAttribute("aria-label", "搜索动态世界书条目");
+		let p = [], y = c("p", "", "settings-hint"), x = () => {
+			let e = f.value.toLowerCase();
+			for (let t of p) t.details.hidden = v && t.sourceDisabled || !t.text.includes(e);
+			let t = v ? p.filter((e) => e.sourceDisabled).length : 0;
+			y.hidden = t === 0, y.textContent = t ? `已隐藏 ${t} 条原书已禁用条目` : "";
 		};
-		u.append(y("隐藏原书已禁用条目", m, (e) => {
-			m = e, t?.update?.({ dynamicWorldbookHideSourceDisabled: e }), x();
-		}, !1, !0), b, h);
+		u.append(C("隐藏原书已禁用条目", v, (e) => {
+			v = e, t?.update?.({ dynamicWorldbookHideSourceDisabled: e }), x();
+		}, !1, !0), y, f);
 		for (let t of i.entries) {
 			let n = !t.locked && t.segments.some((e) => e.writable), a = n && t.segments.some((e) => !e.writable), o = !yy(t), s = c("details", "", "settings-sub"), l = c("summary", `${t.label} · ${t.sourceDisabled ? "原书已禁用" : t.excluded ? "已排除" : t.managed ? a ? "部分可更新" : n ? "可更新" : "正文受保护" : "原生"}${!o && t.classification === "review" ? " · 待核对" : !o && t.classification === "pending" ? " · 待分类" : ""}`, "settings-sub-summary"), d = c("div", "", "settings-sub-body");
 			s.append(l, d);
@@ -24925,18 +24968,18 @@ function Iy({ runtime: e, settings: t = null, documentRef: n = globalThis.docume
 				...n,
 				expectedEntry: py(t)
 			}, i.chatId);
-			t.protectedReason && d.append(c("p", t.protectedReason, "settings-hint")), d.append(y("排除此条（动态世界书 AI 不读取、不修改）", t.excluded === !0, (e) => f({ excluded: e }))), t.sourceDisabled ? d.append(c("p", "原世界书已关闭此条，分类、选材和自动更新都会跳过，动态副本不会替换其正文。", "settings-hint")) : t.excluded && d.append(c("p", "此条继续按原世界书工作。排除立即保存，对之后的请求生效，已经发送的内容无法撤回。", "settings-hint")), d.append(y("使用当前聊天的动态副本", t.managed, (e) => f({ managed: e }), o)), t.locked && d.append(y("旧版锁定（取消后按片段权限维护）", t.locked, (e) => f({ locked: e }))), t.kind === "rule" ? d.append(c("p", "规则类条目不交给 AI 自动维护，仍可在下方手动修改副本正文。", "settings-hint")) : d.append(v("允许全部正文自动维护", () => f({ writable: !0 }), o)), d.append(v("保护全部正文", () => f({ writable: !1 }))), d.append(v("重新分类此条", () => e.classify({
+			t.protectedReason && d.append(c("p", t.protectedReason, "settings-hint")), d.append(C("排除此条（动态世界书 AI 不读取、不修改）", t.excluded === !0, (e) => f({ excluded: e }))), t.sourceDisabled ? d.append(c("p", "原世界书已关闭此条，分类、选材和自动更新都会跳过，动态副本不会替换其正文。", "settings-hint")) : t.excluded && d.append(c("p", "此条继续按原世界书工作。排除立即保存，对之后的请求生效，已经发送的内容无法撤回。", "settings-hint")), d.append(C("使用当前聊天的动态副本", t.managed, (e) => f({ managed: e }), o)), t.locked && d.append(C("旧版锁定（取消后按片段权限维护）", t.locked, (e) => f({ locked: e }))), t.kind === "rule" ? d.append(c("p", "规则类条目不交给 AI 自动维护，仍可在下方手动修改副本正文。", "settings-hint")) : d.append(S("允许全部正文自动维护", () => f({ writable: !0 }), o)), d.append(S("保护全部正文", () => f({ writable: !1 }))), d.append(S("重新分类此条", () => e.classify({
 				uid: t.uid,
 				expectedEntry: py(t),
 				expectedChatId: i.chatId
 			}), o));
-			let p = c("pre", t.original, "dynamic-worldbook-original");
-			p.style.whiteSpace = "pre-wrap", p.style.overflowWrap = "anywhere";
-			let m = c("details");
-			m.append(c("summary", "建档时原文"), p), d.append(m);
-			let h = t.segments.map((e) => {
+			let m = c("pre", t.original, "dynamic-worldbook-original");
+			m.style.whiteSpace = "pre-wrap", m.style.overflowWrap = "anywhere";
+			let h = c("details");
+			h.append(c("summary", "建档时原文"), m), d.append(h);
+			let g = t.segments.map((e) => {
 				let n = { ...e };
-				d.append(c("p", `正文片段：${e.id}`)), d.append(y("保护此片段（AI 不修改）", !e.writable, (e) => {
+				d.append(c("p", `正文片段：${e.id}`)), d.append(C("保护此片段（AI 不修改）", !e.writable, (e) => {
 					n.writable = !e;
 				}, t.kind === "rule", !0));
 				let r = c("textarea", "", "settings-input");
@@ -24945,17 +24988,17 @@ function Iy({ runtime: e, settings: t = null, documentRef: n = globalThis.docume
 					textarea: r
 				};
 			});
-			d.append(c("p", "片段正文与勾选权限一起保存；上方整条权限按钮使用已保存正文，不保存下方草稿。", "settings-hint")), d.append(v("保存正文与权限", () => f({ segments: h.map(({ draft: e, textarea: t }) => ({
+			d.append(c("p", "片段正文与勾选权限一起保存；上方整条权限按钮使用已保存正文，不保存下方草稿。", "settings-hint")), d.append(S("保存正文与权限", () => f({ segments: g.map(({ draft: e, textarea: t }) => ({
 				...e,
 				text: t.value
-			})) })), v("恢复建档原文", async () => {
+			})) })), S("恢复建档原文", async () => {
 				await r({
 					title: "恢复条目原文",
 					body: `将“${t.label}”恢复为建立副本时的正文，暂时保护并等待重新分类。`
 				}) && await f({ restore: !0 });
 			}));
-			let g = c("details");
-			g.append(c("summary", `修改记录（${t.history.length}）`));
+			let _ = c("details");
+			_.append(c("summary", `修改记录（${t.history.length}）`));
 			for (let e of [...t.history].reverse()) {
 				let t = c("details");
 				t.append(c("summary", `${e.at.slice(0, 19).replace("T", " ")} · ${{
@@ -24964,25 +25007,25 @@ function Iy({ runtime: e, settings: t = null, documentRef: n = globalThis.docume
 					restore: "恢复原文"
 				}[e.kind]}`)), t.append(c("p", `${e.reason}${e.floors.length ? ` · 来源第 ${e.floors.join("、")} 楼` : ""}`));
 				let n = c("pre", `修改前：\n${e.before}\n\n修改后：\n${e.after}`);
-				n.style.whiteSpace = "pre-wrap", n.style.overflowWrap = "anywhere", t.append(n), g.append(t);
+				n.style.whiteSpace = "pre-wrap", n.style.overflowWrap = "anywhere", t.append(n), _.append(t);
 			}
-			d.append(g), u.append(s), _.push({
+			d.append(_), u.append(s), p.push({
 				details: s,
 				sourceDisabled: t.sourceDisabled === !0,
 				text: `${t.label}\n${t.content}`.toLowerCase()
 			});
 		}
-		h.addEventListener("input", x), x(), f = !1;
+		f.addEventListener("input", x), x(), g = !1;
 	}
-	let x = e.subscribe((e) => {
-		g(e), p && e.data?.chatId !== p && b(e);
+	let T = e.subscribe((e) => {
+		b(e), _ && e.data?.chatId !== _ && w(e);
 	});
 	return o.addEventListener("toggle", () => {
-		o.open && _(() => e.refresh());
-	}), b(e.getState()), i && _(() => e.refresh()), {
+		o.open && x(() => e.refresh());
+	}), w(e.getState()), i && x(() => e.refresh()), {
 		node: o,
 		dispose() {
-			d = !0, x();
+			h = !0, T();
 		}
 	};
 }
@@ -49939,8 +49982,8 @@ function SA(e, t = 48e3) {
 	return r.length && n.push(r), n;
 }
 function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, generateUpdate: i, generateSelect: a, isEnabled: o = () => !0, isGenerating: s = () => !1, isBookAllowed: c = () => !0, sanitizerOptions: l = () => ({}), notifyUser: u = () => {} } = {}) {
-	let d = Dy(e), f = /* @__PURE__ */ new Set(), p = null, m = null, h = 0, g = null, _ = null, v = "", y = "idle", b = null, x = !1, S = null, C = [];
-	function w() {
+	let d = Dy(e), f = /* @__PURE__ */ new Set(), p = null, m = null, h = 0, g = null, _ = null, v = "", y = "idle", b = null, x = !1, S = null, C = null, w = [];
+	function T() {
 		if (!o()) throw hy("请先启用千千结。");
 		let e = t.getContext(), r = n(), i = String(e.chatId ?? e.getCurrentChatId?.() ?? "");
 		if (!r?.chatId || !i || r.hostChatId !== i || e.groupId != null) throw hy("请先等待当前单角色聊天身份准备完成。");
@@ -49956,57 +49999,72 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			chat: e.chat
 		};
 	}
-	function T(e) {
+	function E(e) {
 		try {
-			let t = w();
+			let t = T();
 			return t.key === e.key && t.chat === e.chat;
 		} catch {
 			return !1;
 		}
 	}
-	function E() {
+	function D() {
 		let e = null;
 		try {
-			e = w().key;
+			e = T();
 		} catch {}
+		let t = e && p?.key === e.key ? p.data : null;
 		return {
 			phase: y,
 			error: v,
-			data: p?.key === e ? yA(p.data) : null,
-			lastSelection: _ ? yA(_) : null
+			data: t ? yA(t) : null,
+			lastSelection: _ ? yA(_) : null,
+			updateReadiness: W(e, t),
+			lastUpdate: yA(e && C?.key === e.key ? C.receipt : t?.lastUpdate ?? null)
 		};
 	}
-	function D() {
+	function O() {
 		for (let e of f) try {
-			e(E());
+			e(D());
 		} catch {}
 	}
-	function O() {
+	function k() {
 		h += 1, g = null, _ = null, m?.controller.abort(), clearTimeout(b), b = null;
 	}
-	async function k(e, t) {
+	async function A(e, t) {
 		if (m) throw hy("动态世界书正在处理，请等待完成或点击停止。");
-		let n = w(), r = {
+		let n = T(), r = {
 			kind: e,
 			target: n,
 			token: h,
 			controller: new AbortController()
 		};
-		m = r, y = e, e !== "updating" && (v = ""), D();
+		m = r, y = e, e !== "updating" && (v = ""), O();
 		let i = () => {
-			if (r.controller.signal.aborted || r.token !== h || !T(n)) throw bA();
+			if (r.controller.signal.aborted || r.token !== h || !E(n)) throw bA();
 		};
 		return r.promise = (async () => {
 			try {
 				return await t(n, i, r.controller.signal);
-			} catch (e) {
-				throw T(n) && (v = e.name === "AbortError" ? "任务已停止，已保存资料保留。" : e.message), e;
+			} catch (t) {
+				if (E(n) && (v = t.name === "AbortError" ? "任务已停止，已保存资料保留。" : t.message, e === "updating")) {
+					let e = C?.key === n.key && C.receipt.status === "running" ? C.receipt : G();
+					C = {
+						key: n.key,
+						receipt: {
+							...e,
+							status: t.name === "AbortError" ? "stopped" : "failed",
+							at: (/* @__PURE__ */ new Date()).toISOString(),
+							message: v
+						}
+					};
+				}
+				throw t;
 			} finally {
-				m === r && (m = null, y = "idle", D());
+				m === r && (m = null, y = "idle", O());
 			}
 		})(), r.promise;
 	}
-	async function A(e, t, n = !1) {
+	async function j(e, t, n = !1) {
 		if (p?.key !== e.key || n) {
 			let n = await d.read(e.identity.chatId);
 			t(), p = {
@@ -50016,7 +50074,7 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 		}
 		return p;
 	}
-	async function j(e, n) {
+	async function M(e, n) {
 		let r = Sy(t.getContext());
 		if (!r || !c(r)) throw hy("角色没有主绑定世界书，或该书已被千千结排除。");
 		let i = t.getContext().loadWorldInfo ?? t.getWorldInfoBindings?.().loadWorldInfo;
@@ -50028,33 +50086,33 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			entries: Cy(a)
 		};
 	}
-	async function M(e, t, n) {
-		let r = await j(e, n);
+	async function N(e, t, n) {
+		let r = await M(e, n);
 		if (r.name !== t.book || await wy(r.entries) !== t.sourceHash) throw hy("原世界书已变化，动态副本暂停使用。请检查后重新建立副本。");
 		let i = new Map(r.entries.map((e) => [e.uid, e]));
 		for (let e of t.entries) e.sourceDisabled = !i.has(e.uid) || vy(i.get(e.uid));
 		return n(), r;
 	}
-	async function N(e, t, n) {
+	async function P(e, t, n) {
 		if (!await Ay(e.chat, t.processed)) throw hy("已处理的旧楼被编辑、删除或切换候选，动态副本暂停使用。请重新建立副本。");
 		n();
 	}
-	async function P(e, t, n, r, i) {
+	async function F(e, t, n, r, i) {
 		r(), g = null;
 		let a = await d.write(e.identity.chatId, t, n, i);
 		return r(), p = {
 			...a,
 			key: e.key
-		}, D(), E();
+		}, O(), D();
 	}
-	let F = () => k("loading", async (e, t) => {
-		let n = await A(e, t, !0);
-		return n.data && await M(e, n.data, t), E();
+	let I = () => A("loading", async (e, t) => {
+		let n = await j(e, t, !0);
+		return n.data && await N(e, n.data, t), D();
 	});
-	async function I(e, t, n, { uid: r = null, expectedEntry: a = null } = {}) {
-		let o = await A(e, t, !0);
+	async function L(e, t, n, { uid: r = null, expectedEntry: a = null } = {}) {
+		let o = await j(e, t, !0);
 		if (!o.data) throw hy("请先建立世界书副本。");
-		await M(e, o.data, t);
+		await N(e, o.data, t);
 		let s = o.data.entries.filter((e) => yy(e) && (r ? e.uid === r : e.classification === "pending"));
 		if (r && o.data.entries.some((e) => e.uid === r && !yy(e))) throw hy("此条已排除或在原书中禁用，不会发送给分类 AI。");
 		if (r && (!s.length || !xA(s[0], a))) throw hy("此条资料已有新版本，请刷新后重新分类。");
@@ -50081,28 +50139,28 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 				if (t(), !Array.isArray(e?.entries) || new Set(e.entries.map((e) => e.uid)).size !== e.entries.length || e.entries.some((e) => !r.some((t) => t.uid === e.uid))) throw hy("分类回复格式无效，已完成的批次保留。请点击继续分类。");
 				a = e.entries;
 			}
-			await M(e, o.data, t);
+			await N(e, o.data, t);
 			let s = yA(o.data);
-			s.entries = s.entries.map((e) => r.some((t) => t.uid === e.uid) ? Ny(e, a.find((t) => t.uid === e.uid)) : e), s.processed = [], s.catchingUp = !0, await P(e, s, o.revision, t, n), o = p;
+			s.entries = s.entries.map((e) => r.some((t) => t.uid === e.uid) ? Ny(e, a.find((t) => t.uid === e.uid)) : e), s.processed = [], s.catchingUp = !0, await F(e, s, o.revision, t, n), o = p;
 		}
-		return G(), E();
+		return te(), D();
 	}
-	let L = ({ expectedChatId: e = null, uid: t = null, expectedEntry: n = null } = {}) => k("classifying", async (r, i, a) => {
+	let R = ({ expectedChatId: e = null, uid: t = null, expectedEntry: n = null } = {}) => A("classifying", async (r, i, a) => {
 		if (e && r.identity.chatId !== e) throw hy("聊天已切换，请重新打开设置。");
 		if (s()) throw hy("请等当前回复结束后分类。");
-		return I(r, i, a, {
+		return L(r, i, a, {
 			uid: t,
 			expectedEntry: n
 		});
-	}), R = ({ expectedChatId: e = null } = {}) => k("loading", async (t, n, r) => {
+	}), z = ({ expectedChatId: e = null } = {}) => A("loading", async (t, n, r) => {
 		if (e && t.identity.chatId !== e) throw hy("聊天已切换，请重新打开设置。");
 		if (s()) throw hy("请等当前回复生成结束后建立副本。");
-		let i = await A(t, n, !0), a = await j(t, n), o = await Ty(t.identity.chatId, a.name, a.entries);
-		if (n(), i.data?.book === a.name) for (let e of o.entries) i.data.entries.find((t) => t.uid === e.uid)?.excluded && (e.excluded = !0);
-		return P(t, o, i.revision, n, r);
-	}), z = (e, t = null) => k("saving", async (n, r, i) => {
+		let i = await j(t, n, !0), a = await M(t, n), o = await Ty(t.identity.chatId, a.name, a.entries);
+		if (n(), C = null, i.data?.book === a.name) for (let e of o.entries) i.data.entries.find((t) => t.uid === e.uid)?.excluded && (e.excluded = !0);
+		return F(t, o, i.revision, n, r);
+	}), B = (e, t = null) => A("saving", async (n, r, i) => {
 		if (t && n.identity.chatId !== t) throw hy("聊天已切换，请重新打开设置。");
-		let a = await A(n, r, !0);
+		let a = await j(n, r, !0);
 		if (!a.data) throw hy("请先建立世界书副本。");
 		let o = yA(a.data);
 		for (let t of ["enabled", "automatic"]) typeof e[t] == "boolean" && (o[t] = e[t]);
@@ -50110,25 +50168,25 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			if (!Number.isInteger(e.interval) || e.interval < 1 || e.interval > 20) throw hy("更新间隔须为 1–20 个 AI 回复。");
 			o.interval = e.interval;
 		}
-		let s = await P(n, o, a.revision, r, i);
-		return G(), s;
-	}), B = async (e, t, n = null) => {
-		let r = w();
+		let s = await F(n, o, a.revision, r, i);
+		return te(), s;
+	}), V = async (e, t, n = null) => {
+		let r = T();
 		if (t.excluded === !0 && m) {
 			let e = m;
-			if (O(), await e.promise.catch(() => {}), !T(r)) throw bA();
+			if (k(), await e.promise.catch(() => {}), !E(r)) throw bA();
 		}
-		return k("saving", async (i, a, o) => {
-			if (!T(r)) throw bA();
+		return A("saving", async (i, a, o) => {
+			if (!E(r)) throw bA();
 			if (n && i.identity.chatId !== n) throw hy("聊天已切换，请重新打开设置。");
 			let c = typeof t.excluded == "boolean" && Object.keys(t).every((e) => ["excluded", "expectedEntry"].includes(e));
 			if (s() && !(c && t.excluded)) throw hy("请等当前回复结束后修改资料。");
-			let l = await A(i, a, !0);
+			let l = await j(i, a, !0);
 			if (!l.data) throw hy("请先建立世界书副本。");
 			let u = yA(l.data), d = u.entries.find((t) => t.uid === e);
 			if (!d) throw hy("条目不存在，请刷新设置。");
 			if (!(c && t.excluded) && !xA(d, t.expectedEntry)) throw hy("此条资料已有新版本，请复制草稿并刷新后再保存。");
-			if (c && t.excluded || await M(i, u, a), typeof t.excluded == "boolean" && d.excluded !== t.excluded && (d.excluded = t.excluded, d.excluded || (u.processed = [], u.catchingUp = !0)), typeof t.managed == "boolean" && d.managed !== t.managed && (d.managed = t.managed, d.managed && (u.processed = [], u.catchingUp = !0)), typeof t.locked == "boolean" && (d.locked = t.locked), typeof t.writable == "boolean") {
+			if (c && t.excluded || await N(i, u, a), typeof t.excluded == "boolean" && d.excluded !== t.excluded && (d.excluded = t.excluded, d.excluded || (u.processed = [], u.catchingUp = !0)), typeof t.managed == "boolean" && d.managed !== t.managed && (d.managed = t.managed, d.managed && (u.processed = [], u.catchingUp = !0)), typeof t.locked == "boolean" && (d.locked = t.locked), typeof t.writable == "boolean") {
 				if (t.writable && d.kind === "rule") throw hy("规则类条目不参与自动维护，仍可手动编辑正文。");
 				d.segments.forEach((e) => {
 					e.writable = t.writable;
@@ -50152,50 +50210,91 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 				if (typeof t.content != "string" || t.content.length > 1e6 || d.segments.length !== 1) throw hy("混合条目请逐片段编辑，正文最多 100 万字符。");
 				jy(d, t.content, "manual", "用户手动修改"), d.segments[0].text = t.content, d.classification = "manual";
 			}
-			let f = await P(i, u, l.revision, a, o);
-			return G(), f;
+			let f = await F(i, u, l.revision, a, o);
+			return te(), f;
 		});
 	};
-	function V(e, t) {
+	function H(e, t) {
 		let n = r();
-		if (n.chatId !== e.identity.chatId || n.memorySnapshotStatus !== "ready") return [];
-		let i = /* @__PURE__ */ new Map();
+		if (n.chatId !== e.identity.chatId || n.memorySnapshotStatus !== "ready") return {
+			floors: [],
+			reason: "等待当前聊天的千千结记忆读取完成"
+		};
+		let i = /* @__PURE__ */ new Map(), a = /* @__PURE__ */ new Map();
+		for (let e of n.floors ?? []) e.frozen || e.inherited ? a.set(e.messageIndex, "属于冻结或继承记忆，当前更新流程不读取该楼") : e.status !== "ready" && a.set(e.messageIndex, "摘要尚未完成，请先在记忆管理中补齐缺失");
 		for (let e of n.floors ?? []) if (e.status === "ready" && !e.frozen && !e.inherited) for (let t of e.sourceMessageIndexes ?? [e.messageIndex]) i.set(t, e);
-		let a = [];
+		let o = [];
 		for (let n = t.processed.length; n < e.chat.length; n += 1) {
-			let t = e.chat[n];
-			if (t.is_user) continue;
-			let r = i.get(n);
-			if (!r) break;
-			a.push({
+			if (e.chat[n].is_user) continue;
+			let t = i.get(n);
+			if (!t) return {
+				floors: o,
+				reason: `第 ${n} 楼${a.get(n) ?? "尚无可用记忆，等待摘要完成；旧楼可在记忆管理中补齐缺失"}`
+			};
+			o.push({
 				index: n,
-				summary: r.summary ?? "",
-				text: ne(t.mes, l())
+				saved: t
 			});
 		}
-		return a;
+		return {
+			floors: o,
+			reason: ""
+		};
 	}
-	async function H({ manual: e = !1 } = {}) {
+	function U(e, t) {
+		return H(e, t).floors.map(({ index: t, saved: n }) => ({
+			index: t,
+			summary: n.summary ?? "",
+			text: ne(e.chat[t].mes, l())
+		}));
+	}
+	function W(e, t) {
+		if (!e) return "等待当前聊天身份准备完成";
+		if (!t) return "尚未建立或读取动态世界书副本";
+		if (!t.enabled) return "当前聊天未启用动态世界书";
+		if (m?.kind === "updating") return "正在检查更新条件或处理本批资料";
+		if (m) return "等待当前动态世界书任务完成";
+		if (s()) return "等待聊天回复生成结束";
+		let n = r();
+		if (n.memoryWorkBusy || n.activeCse || n.activeExtraction) return "等待千千结摘要和 CSE 任务结束";
+		if (t.entries.some((e) => yy(e) && e.classification === "pending")) return "尚未调用：请先继续分类维护权限";
+		if (!t.entries.some(My)) return "尚未调用：没有允许自动更新的条目或正文片段";
+		let i = H(e, t);
+		return i.floors.length ? t.automatic ? !t.catchingUp && i.floors.length < t.interval ? `尚未调用：已攒 ${i.floors.length}/${t.interval} 条已记忆 AI 回复${i.reason ? `；${i.reason}` : ""}。可点击立即更新一批` : C?.key === e.key && ["failed", "stopped"].includes(C.receipt.status) ? "上次任务未完成，可点击立即更新一批重试" : `有 ${i.floors.length} 楼待核对，等待自动更新或点击立即更新一批` : `自动更新已关闭；有 ${i.floors.length} 楼可手动更新` : i.reason ? `尚未调用：${i.reason}` : t.processed.length ? "已检查到当前可用末尾，等待新的已记忆 AI 回复" : "尚未调用：当前没有可处理的已记忆 AI 回复";
+	}
+	function G() {
+		return {
+			version: 1,
+			status: "running",
+			at: (/* @__PURE__ */ new Date()).toISOString(),
+			floors: [],
+			calls: 0,
+			responses: 0,
+			changedEntries: 0,
+			api: null
+		};
+	}
+	async function K({ manual: e = !1 } = {}) {
 		if (m || s()) {
-			if (e) throw hy("请等当前任务结束后更新。");
+			if (O(), e) throw hy("请等当前任务结束后更新。");
 			return;
 		}
 		let t = r();
 		if (t.memoryWorkBusy || t.activeCse || t.activeExtraction) {
-			if (e) throw hy("请等千千结摘要和 CSE 处理完成。");
+			if (O(), e) throw hy("请等千千结摘要和 CSE 处理完成。");
 			return;
 		}
-		return k("updating", async (t, n, r) => {
-			let a = await A(t, n);
+		return A("updating", async (t, n, r) => {
+			let a = await j(t, n);
 			if (!a.data?.enabled || !e && !a.data.automatic) return;
 			let o = yA(a.data);
-			if (await M(t, o, n), o.entries.some((e) => yy(e) && e.classification === "pending")) {
+			if (await N(t, o, n), o.entries.some((e) => yy(e) && e.classification === "pending")) {
 				if (e) throw hy("请先点击“继续分类维护权限”，完成分类后再更新资料。");
 				return;
 			}
 			let s = o.entries.filter(My);
 			if (!s.length) return;
-			let c = V(t, o);
+			let c = U(t, o);
 			if (!c.length || !e && !o.catchingUp && c.length < o.interval) return;
 			let l = py([
 				t.key,
@@ -50203,14 +50302,21 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 				t.chat.map(Oy)
 			]);
 			if (!e && S === l) return;
-			S = l, v = "", await N(t, o, n);
-			let u = [], d = 0;
+			S = l, v = "";
+			let u = G();
+			C = {
+				key: t.key,
+				receipt: u
+			}, O(), await P(t, o, n);
+			let d = [], f = 0;
 			for (let e of c.slice(0, 3)) {
 				if (e.text.length > 48e3) throw hy(`第 ${e.index} 楼超过本批 48000 字符上限，未跳过该楼。`);
-				if (d + e.text.length > 48e3) break;
-				u.push(e), d += e.text.length;
+				if (f + e.text.length > 48e3) break;
+				d.push(e), f += e.text.length;
 			}
-			let f = u.at(-1).index, p = t.chat.slice(0, f + 1).map(Oy), m = o, h = s.map(({ uid: e, label: t, segments: n }) => ({
+			let p = d.at(-1).index, m = t.chat.slice(0, p + 1).map(Oy);
+			u.floors = d.map((e) => e.index);
+			let h = o, g = s.map(({ uid: e, label: t, segments: n }) => ({
 				uid: e,
 				label: t,
 				segments: n.filter((e) => e.writable).map(({ id: e, text: t }) => ({
@@ -50218,14 +50324,15 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 					text: t
 				}))
 			}));
-			for (let e of SA(h)) {
-				let t = _A(await i({
+			for (let e of SA(g)) {
+				u.calls += 1, O();
+				let t = await i({
 					systemPrompt: hA,
 					taskMessages: [{
 						role: "user",
 						content: JSON.stringify({
 							entries: e,
-							floors: u
+							floors: d
 						})
 					}],
 					maxTokens: 12e3,
@@ -50234,33 +50341,47 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 					includeCharacterCard: !1,
 					worldInfoSource: "none",
 					parseMode: "semantic"
-				}));
-				if (n(), !Array.isArray(t?.changes) || t.changes.some((t) => !e.some((e) => e.uid === t.uid && e.segments.some((n) => n.id === (t.segmentId ?? (e.segments.length === 1 ? e.segments[0].id : null)))))) throw hy("模型修改了未授权或锁定片段，整批未保存。");
-				m = Py(m, t, u);
+				});
+				n(), u.responses += 1, t?.taskMetadata && (u.api = {
+					model: String(t.taskMetadata.model ?? "").slice(0, 160),
+					sourceLabel: String(t.taskMetadata.sourceLabel ?? "").slice(0, 160)
+				}), O();
+				let a = _A(t);
+				if (!Array.isArray(a?.changes) || a.changes.some((t) => !e.some((e) => e.uid === t.uid && e.segments.some((n) => n.id === (t.segmentId ?? (e.segments.length === 1 ? e.segments[0].id : null)))))) throw hy("模型修改了未授权或锁定片段，整批未保存。");
+				h = Py(h, a, d);
 			}
-			if (n(), p.some((e, n) => e !== Oy(t.chat[n])) || (await M(t, o, n), m.processed = await ky(t.chat, f), m.catchingUp = c.length > u.length, n(), p.some((e, n) => e !== Oy(t.chat[n])))) throw bA();
-			await P(t, m, a.revision, n, r), G();
+			if (n(), m.some((e, n) => e !== Oy(t.chat[n])) || (await N(t, o, n), h.processed = await ky(t.chat, p), h.catchingUp = c.length > d.length, n(), m.some((e, n) => e !== Oy(t.chat[n])))) throw bA();
+			let _ = h.entries.filter((e, t) => e.content !== o.entries[t].content).length;
+			h.lastUpdate = {
+				...u,
+				at: (/* @__PURE__ */ new Date()).toISOString(),
+				status: _ ? "updated" : "unchanged",
+				changedEntries: _
+			}, await F(t, h, a.revision, n, r), C = {
+				key: t.key,
+				receipt: yA(h.lastUpdate)
+			}, O(), te();
 		});
 	}
-	async function U(e = "normal") {
+	async function ee(e = "normal") {
 		if (g = null, _ = null, !(!o() || ![
 			"normal",
 			"regenerate",
 			"swipe",
 			"continue"
-		].includes(e))) return m && (m.controller.abort(), await m.promise.catch(() => {})), k("selecting", async (e, t, n) => {
-			let r = (await A(e, t, !0)).data;
+		].includes(e))) return m && (m.controller.abort(), await m.promise.catch(() => {})), A("selecting", async (e, t, n) => {
+			let r = (await j(e, t, !0)).data;
 			if (!r?.enabled || !r.entries.some((e) => e.managed)) return;
-			let i = await M(e, r, t);
+			let i = await N(e, r, t);
 			if (r.entries.some((e) => yy(e) && e.classification === "pending")) {
 				_ = {
 					selected: [],
 					status: "维护权限尚未分类完成，本轮使用原世界书。"
-				}, D();
+				}, O();
 				return;
 			}
-			if (r.catchingUp && r.processed.length && r.entries.some(My) && V(e, r).length) throw hy("动态资料正在追平历史，本轮仍使用原世界书。可在设置中立即更新。");
-			await N(e, r, t);
+			if (r.catchingUp && r.processed.length && r.entries.some(My) && U(e, r).length) throw hy("动态资料正在追平历史，本轮仍使用原世界书。可在设置中立即更新。");
+			await P(e, r, t);
 			let o = new Set(i.entries.filter((e) => e.constant).map((e) => e.uid)), s = new Set(i.entries.filter(xy).map((e) => e.uid)), c = r.entries.filter((e) => yy(e) && e.managed && e.kind !== "rule" && !s.has(e.uid) && !o.has(e.uid)), u = e.chat.map(Oy), d = e.chat.slice(-8).map((e) => ({
 				role: e.is_user ? "user" : "assistant",
 				content: ne(e.mes, l()).slice(-6e3)
@@ -50299,7 +50420,7 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 					}
 				}
 			}
-			if (t(), u.length !== e.chat.length || u.some((t, n) => t !== Oy(e.chat[n])) || (await M(e, r, t), t(), u.length !== e.chat.length || u.some((t, n) => t !== Oy(e.chat[n])))) throw bA();
+			if (t(), u.length !== e.chat.length || u.some((t, n) => t !== Oy(e.chat[n])) || (await N(e, r, t), t(), u.length !== e.chat.length || u.some((t, n) => t !== Oy(e.chat[n])))) throw bA();
 			g = {
 				target: e,
 				selected: f,
@@ -50310,12 +50431,12 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 				book: r.book,
 				selected: [...f, ...r.entries.filter((e) => yy(e) && e.managed && o.has(e.uid)).map((e) => e.uid)],
 				status: "已选材，最终发送仍受酒馆预算约束"
-			}, D();
+			}, O();
 		});
 	}
-	function W(e) {
+	function q(e) {
 		let n = g;
-		if (!(!n || n.token !== h || !o() || !T(n.target) || Sy(t.getContext()) !== n.data.book || !c(n.data.book))) {
+		if (!(!n || n.token !== h || !o() || !E(n.target) || Sy(t.getContext()) !== n.data.book || !c(n.data.book))) {
 			if (n.frame.length !== n.target.chat.length || n.frame.some((e, t) => e !== Oy(n.target.chat[t]))) {
 				g = null;
 				return;
@@ -50323,17 +50444,17 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			Fy(e, n, n.data);
 		}
 	}
-	function G() {
+	function te() {
 		x || b || !o() || (b = setTimeout(() => {
-			b = null, x || H().catch(() => {});
+			b = null, x || K().catch(() => {});
 		}, 600));
 	}
-	function K({ eventSource: e, eventTypes: t = {} }) {
+	function re({ eventSource: e, eventTypes: t = {} }) {
 		let n = (n, r) => {
 			let i = t[n];
-			i && e?.on && (e.on(i, r), C.push(() => e.removeListener?.(i, r)));
+			i && e?.on && (e.on(i, r), w.push(() => e.removeListener?.(i, r)));
 		};
-		n("WORLDINFO_ENTRIES_LOADED", W);
+		n("WORLDINFO_ENTRIES_LOADED", q);
 		for (let e of [
 			"CHAT_CHANGED",
 			"CHAT_RENAMED",
@@ -50344,20 +50465,20 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			"MESSAGE_SWIPE_DELETED",
 			"WORLDINFO_UPDATED"
 		]) n(e, () => {
-			O(), p = null, v = "", D();
+			k(), p = null, v = "", O();
 		});
 		n("GENERATION_STARTED", () => {
-			O();
-		}), n("GENERATION_STOPPED", O), n("GENERATION_ENDED", () => {
-			g = null, G();
+			k();
+		}), n("GENERATION_STOPPED", k), n("GENERATION_ENDED", () => {
+			g = null, te();
 		});
 	}
-	async function ee(e, t, n, r, i) {
+	async function J(e, t, n, r, i) {
 		let a = !1, o = (...e) => {
 			a = !0, r(...e);
 		};
 		if (await e(t, n, o, i), !a) try {
-			await U(i);
+			await ee(i);
 		} catch (e) {
 			if (g = null, e.name === "AbortError") {
 				o(!0);
@@ -50366,28 +50487,28 @@ function CA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			_ = {
 				selected: [],
 				status: `已退回原世界书：${e.message}`
-			}, u(`动态世界书本轮未启用：${e.message}`), D();
+			}, u(`动态世界书本轮未启用：${e.message}`), O();
 		}
 	}
 	return {
-		getState: E,
-		refresh: F,
-		initialize: R,
-		classify: L,
-		configure: z,
-		edit: B,
-		update: H,
-		prepare: U,
-		apply: W,
-		intercept: ee,
-		wake: G,
-		bind: K,
-		abortAll: O,
+		getState: D,
+		refresh: I,
+		initialize: z,
+		classify: R,
+		configure: B,
+		edit: V,
+		update: K,
+		prepare: ee,
+		apply: q,
+		intercept: J,
+		wake: te,
+		bind: re,
+		abortAll: k,
 		subscribe(e) {
 			return f.add(e), () => f.delete(e);
 		},
 		dispose() {
-			x = !0, O(), C.forEach((e) => e()), f.clear();
+			x = !0, k(), w.forEach((e) => e()), f.clear();
 		}
 	};
 }

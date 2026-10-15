@@ -57,6 +57,7 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
   const store = createDynamicBookStore(client), listeners = new Set();
   let cached = null, operation = null, epoch = 0, plan = null, lastSelection = null, failure = '', phase = 'idle', timer = null, disposed = false;
   let lastAutomaticAttempt = null;
+  let updateAttempt = null;
   const bindings = [];
   function capture() {
     if (!isEnabled()) throw bookError('请先启用千千结。');
@@ -69,8 +70,11 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
     try { const value = capture(); return value.key === target.key && value.chat === target.chat; } catch { return false; }
   }
   function getState() {
-    let key = null; try { key = capture().key; } catch { /* settings remain accessible without a chat */ }
-    return { phase, error: failure, data: cached?.key === key ? clone(cached.data) : null, lastSelection: lastSelection ? clone(lastSelection) : null };
+    let target = null; try { target = capture(); } catch { /* settings remain accessible without a chat */ }
+    const data = target && cached?.key === target.key ? cached.data : null;
+    return { phase, error: failure, data: data ? clone(data) : null, lastSelection: lastSelection ? clone(lastSelection) : null,
+      updateReadiness: updateReadiness(target, data),
+      lastUpdate: clone(target && updateAttempt?.key === target.key ? updateAttempt.receipt : data?.lastUpdate ?? null) };
   }
   function emit() { for (const listener of listeners) { try { listener(getState()); } catch { /* UI cannot break storage */ } } }
   function abortAll() { epoch += 1; plan = null; lastSelection = null; operation?.controller.abort(); clearTimeout(timer); timer = null; }
@@ -81,7 +85,17 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
     const guard = () => { if (op.controller.signal.aborted || op.token !== epoch || !current(target)) throw abortError(); };
     op.promise = (async () => {
       try { return await task(target, guard, op.controller.signal); }
-      catch (error) { if (current(target)) failure = error.name === 'AbortError' ? '任务已停止，已保存资料保留。' : error.message; throw error; }
+      catch (error) {
+        if (current(target)) {
+          failure = error.name === 'AbortError' ? '任务已停止，已保存资料保留。' : error.message;
+          if (kind === 'updating') {
+            const receipt = updateAttempt?.key === target.key && updateAttempt.receipt.status === 'running'
+              ? updateAttempt.receipt : newUpdateReceipt();
+            updateAttempt = { key: target.key, receipt: { ...receipt, status: error.name === 'AbortError' ? 'stopped' : 'failed', at: new Date().toISOString(), message: failure } };
+          }
+        }
+        throw error;
+      }
       finally { if (operation === op) { operation = null; phase = 'idle'; emit(); } }
     })();
     return op.promise;
@@ -160,6 +174,7 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
     if (isGenerating()) throw bookError('请等当前回复生成结束后建立副本。');
     const previous = await load(target, guard, true), book = await source(target, guard);
     const data = await createBook(target.identity.chatId, book.name, book.entries); guard();
+    updateAttempt = null;
     // Rebuild must not silently revoke the user's exclusions.
     if (previous.data?.book === book.name) for (const entry of data.entries) {
       const old = previous.data.entries.find(e => e.uid === entry.uid);
@@ -237,10 +252,14 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
     const result = await save(target, data, previous.revision, guard, signal); wake(); return result;
     });
   };
-  function pendingFloors(target, data) {
+  function pendingState(target, data) {
     const state = memoryState();
-    if (state.chatId !== target.identity.chatId || state.memorySnapshotStatus !== 'ready') return [];
-    const byIndex = new Map();
+    if (state.chatId !== target.identity.chatId || state.memorySnapshotStatus !== 'ready') return { floors: [], reason: '等待当前聊天的千千结记忆读取完成' };
+    const byIndex = new Map(), unavailable = new Map();
+    for (const floor of state.floors ?? []) {
+      if (floor.frozen || floor.inherited) unavailable.set(floor.messageIndex, '属于冻结或继承记忆，当前更新流程不读取该楼');
+      else if (floor.status !== 'ready') unavailable.set(floor.messageIndex, '摘要尚未完成，请先在记忆管理中补齐缺失');
+    }
     for (const floor of state.floors ?? []) if (floor.status === 'ready' && !floor.frozen && !floor.inherited) {
       for (const index of floor.sourceMessageIndexes ?? [floor.messageIndex]) byIndex.set(index, floor);
     }
@@ -249,15 +268,41 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       const message = target.chat[index];
       if (message.is_user) continue;
       const saved = byIndex.get(index);
-      if (!saved) break; // Never advance across a memory gap or an unconfirmed latest AI reply.
-      result.push({ index, summary: saved.summary ?? '', text: sanitizeMemoryContent(message.mes, sanitizerOptions()) });
+      if (!saved) return { floors: result, reason: `第 ${index} 楼${unavailable.get(index) ?? '尚无可用记忆，等待摘要完成；旧楼可在记忆管理中补齐缺失'}` };
+      result.push({ index, saved });
     }
-    return result;
+    return { floors: result, reason: '' };
+  }
+  function pendingFloors(target, data) {
+    return pendingState(target, data).floors.map(({ index, saved }) => ({ index, summary: saved.summary ?? '',
+      text: sanitizeMemoryContent(target.chat[index].mes, sanitizerOptions()) }));
+  }
+  function updateReadiness(target, data) {
+    if (!target) return '等待当前聊天身份准备完成';
+    if (!data) return '尚未建立或读取动态世界书副本';
+    if (!data.enabled) return '当前聊天未启用动态世界书';
+    if (operation?.kind === 'updating') return '正在检查更新条件或处理本批资料';
+    if (operation) return '等待当前动态世界书任务完成';
+    if (isGenerating()) return '等待聊天回复生成结束';
+    const memory = memoryState();
+    if (memory.memoryWorkBusy || memory.activeCse || memory.activeExtraction) return '等待千千结摘要和 CSE 任务结束';
+    if (data.entries.some(e => canReadEntry(e) && e.classification === 'pending')) return '尚未调用：请先继续分类维护权限';
+    if (!data.entries.some(canMaintain)) return '尚未调用：没有允许自动更新的条目或正文片段';
+    const pending = pendingState(target, data);
+    if (!pending.floors.length) return pending.reason ? `尚未调用：${pending.reason}`
+      : data.processed.length ? '已检查到当前可用末尾，等待新的已记忆 AI 回复' : '尚未调用：当前没有可处理的已记忆 AI 回复';
+    if (!data.automatic) return `自动更新已关闭；有 ${pending.floors.length} 楼可手动更新`;
+    if (!data.catchingUp && pending.floors.length < data.interval) return `尚未调用：已攒 ${pending.floors.length}/${data.interval} 条已记忆 AI 回复${pending.reason ? `；${pending.reason}` : ''}。可点击立即更新一批`;
+    if (updateAttempt?.key === target.key && ['failed', 'stopped'].includes(updateAttempt.receipt.status)) return '上次任务未完成，可点击立即更新一批重试';
+    return `有 ${pending.floors.length} 楼待核对，等待自动更新或点击立即更新一批`;
+  }
+  function newUpdateReceipt() {
+    return { version: 1, status: 'running', at: new Date().toISOString(), floors: [], calls: 0, responses: 0, changedEntries: 0, api: null };
   }
   async function update({ manual = false } = {}) {
-    if (operation || isGenerating()) { if (manual) throw bookError('请等当前任务结束后更新。'); return; }
+    if (operation || isGenerating()) { emit(); if (manual) throw bookError('请等当前任务结束后更新。'); return; }
     const memory = memoryState();
-    if (memory.memoryWorkBusy || memory.activeCse || memory.activeExtraction) { if (manual) throw bookError('请等千千结摘要和 CSE 处理完成。'); return; }
+    if (memory.memoryWorkBusy || memory.activeCse || memory.activeExtraction) { emit(); if (manual) throw bookError('请等千千结摘要和 CSE 处理完成。'); return; }
     return run('updating', async (target, guard, signal) => {
       const previous = await load(target, guard);
       if (!previous.data?.enabled || !manual && !previous.data.automatic) return;
@@ -275,6 +320,8 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       if (!manual && lastAutomaticAttempt === attempt) return;
       lastAutomaticAttempt = attempt;
       failure = '';
+      const receipt = newUpdateReceipt();
+      updateAttempt = { key: target.key, receipt }; emit();
       await checkedHistory(target, data, guard);
       const floors = []; let size = 0;
       for (const floor of pending.slice(0, 3)) {
@@ -283,13 +330,19 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
         floors.push(floor); size += floor.text.length;
       }
       const end = floors.at(-1).index, captured = target.chat.slice(0, end + 1).map(messageSignature);
+      receipt.floors = floors.map(floor => floor.index);
       let next = data;
       const materials = writable.map(({ uid, label, segments }) => ({ uid, label, segments: segments.filter(s => s.writable).map(({ id, text }) => ({ id, text })) }));
       for (const batch of batches(materials)) {
-        const result = jsonResult(await generateUpdate({ systemPrompt: UPDATE_PROMPT,
+        receipt.calls += 1; emit();
+        const response = await generateUpdate({ systemPrompt: UPDATE_PROMPT,
           taskMessages: [{ role: 'user', content: JSON.stringify({ entries: batch, floors }) }],
-          maxTokens: 12000, temperature: 0, signal, includeCharacterCard: false, worldInfoSource: 'none', parseMode: 'semantic' }));
+          maxTokens: 12000, temperature: 0, signal, includeCharacterCard: false, worldInfoSource: 'none', parseMode: 'semantic' });
         guard();
+        receipt.responses += 1;
+        if (response?.taskMetadata) receipt.api = { model: String(response.taskMetadata.model ?? '').slice(0, 160), sourceLabel: String(response.taskMetadata.sourceLabel ?? '').slice(0, 160) };
+        emit();
+        const result = jsonResult(response);
         if (!Array.isArray(result?.changes) || result.changes.some(c => !batch.some(e => e.uid === c.uid && e.segments.some(s => s.id === (c.segmentId ?? (e.segments.length === 1 ? e.segments[0].id : null)))))) throw bookError('模型修改了未授权或锁定片段，整批未保存。');
         next = applyChanges(next, result, floors);
       }
@@ -298,7 +351,10 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       await checkedSource(target, data, guard);
       next.processed = await witness(target.chat, end); next.catchingUp = pending.length > floors.length; guard();
       if (captured.some((value, index) => value !== messageSignature(target.chat[index]))) throw abortError();
+      const changedEntries = next.entries.filter((entry, index) => entry.content !== data.entries[index].content).length;
+      next.lastUpdate = { ...receipt, at: new Date().toISOString(), status: changedEntries ? 'updated' : 'unchanged', changedEntries };
       await save(target, next, previous.revision, guard, signal);
+      updateAttempt = { key: target.key, receipt: clone(next.lastUpdate) }; emit();
       wake();
     });
   }
