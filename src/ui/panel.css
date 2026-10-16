@@ -153,3 +153,5 @@ button:focus-visible,summary:focus-visible{outline:2px solid var(--knot);outline
 /* 覆盖摘要占整行，短操作并排；异常详情只放入按楼折叠的弹窗。 */
 .qqj-qianshi-coverage>div:first-child{grid-column:1/-1}.qqj-qianshi-coverage-actions{grid-column:1/-1;display:flex;align-items:center;flex-wrap:wrap;gap:6px}.qqj-qianshi-coverage-actions>.secondary-action{margin:0;white-space:nowrap;padding:6px 10px}
 .qqj-provider-error-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 18rem; overflow: auto; font: inherit; user-select: text; }
+
+.qqj-worldbook-diff{display:grid;gap:6px;min-width:0}.qqj-worldbook-diff-text{margin:0 0 8px;padding:10px;border:1px solid var(--line);border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.7;color:var(--ink);background:var(--paper)}.qqj-worldbook-diff-text del{color:#8a1027;background:#ffdae1;text-decoration:line-through;text-decoration-thickness:1.5px}.qqj-worldbook-diff-text ins{color:#075735;background:#cff4dd;text-decoration:underline;text-decoration-thickness:1.5px}

@@ -49,6 +49,26 @@ test('settings view wires opt-in, text editing with owner, confirmations and saf
   view.dispose(); assert.equal(listener, null);
 });
 
+test('existing history lazily highlights changes once without changing text drafts', () => {
+  const data = { chatId: 'owner', book: '书', processed: [], entries: [{
+    uid: '1', label: '关系', content: '前女友', original: '新女友', managed: true, kind: 'fact', classification: 'ready',
+    segments: [{ id: 'body', text: '前女友', writable: true }],
+    history: [{ at: '2026-10-16T10:00:00.000Z', kind: 'model', reason: '确认分手', floors: [2], before: '新女友', after: '前女友' }],
+  }] };
+  const runtime = { getState: () => ({ phase: 'idle', data }), subscribe: () => () => {} };
+  const view = createDynamicWorldbookView({ runtime, documentRef: { createElement: tag => new Node(tag) } });
+  const nodes = flatten(view.node), editor = nodes.find(n => n.tag === 'textarea'); editor.value = '未保存的草稿';
+  const record = nodes.find(n => n.tag === 'details' && n.children[0]?.textContent.includes('自动更新'));
+  assert.equal(nodes.some(n => n.tag === 'del'), false);
+  record.open = true; record.fire('toggle');
+  assert.ok(flatten(record).some(n => n.tag === 'del' && n.textContent === '新'));
+  assert.ok(flatten(record).some(n => n.tag === 'ins' && n.textContent === '前'));
+  record.open = false; record.fire('toggle'); record.open = true; record.fire('toggle');
+  assert.equal(flatten(record).filter(n => n.tag === 'del').length, 1);
+  assert.equal(editor.value, '未保存的草稿');
+  view.dispose();
+});
+
 test('excluded and source-disabled pending rows show no classification action and keep manual editing available', () => {
   const data = { chatId: 'owner-a', book: '书', processed: [], entries: [
     { uid: '1', label: '状态栏', content: '状态', original: '状态', managed: true, excluded: true, classification: 'pending', kind: 'fact', segments: [{ id: 'body', text: '状态', writable: false }], history: [] },

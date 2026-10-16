@@ -71,7 +71,7 @@ export function createPromptsSettings({ settings, documentRef = globalThis.docum
   promptEditor({ body: summaryBody, control: summaryPrompt, key: 'summaryPrompt', defaultText: DEFAULT_EXTRACTOR_GUIDANCE, label: '摘要内容要求' });
   promptEditor({ body: cseBody, control: csePrompt, key: 'csePrompt', defaultText: DEFAULT_CSE_GUIDANCE, label: 'CSE 推演要求' });
   promptEditor({ body: profileBody, control: profilePrompt, key: 'profilePrompt', defaultText: DEFAULT_PROFILE_GUIDANCE, label: '人物资料整理要求' });
-  promptEditor({ body: worldbookBody, control: worldbookPrompt, key: 'worldbookPrompt', defaultText: DEFAULT_WORLDBOOK_GUIDANCE, label: '世界书更新要求', hint: '核对记忆、对应进度的 CSE 和未隐藏对话。这里只改内容要求；输出结构、权限与证据编号由程序检查。前置处理提示词仍放在本指导之前。' });
+  promptEditor({ body: worldbookBody, control: worldbookPrompt, key: 'worldbookPrompt', defaultText: DEFAULT_WORLDBOOK_GUIDANCE, label: '世界书更新要求', hint: '用记忆、对应进度的 CSE 和未隐藏对话核对已有设定，仅局部修订改变的事实，不扩写人物档案或复制当前状态。程序检查原文定位、权限与证据编号。前置处理提示词仍放在本指导之前；旧自定义指导可点恢复默认。' });
 
   wrapperBody.append(field('保留包裹符', keepTags), field('清洗包裹符', extraTags));
   body.append(

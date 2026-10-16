@@ -8,7 +8,7 @@ const input = { scope: { fromIndex: 4, toIndex: 6 }, sources: [
   { id: 'memory:0', kind: 'background', floors: [0] },
 ] };
 const batch = [{ uid: '1', segments: [{ id: 'body', text: '旧家' }] }];
-const change = () => ({ uid: '1', segmentId: 'body', content: '新家', reason: '完成搬迁', evidenceRefs: ['memory:4', 'dialogue:5'] });
+const change = () => ({ uid: '1', segmentId: 'body', replacements: [{ before: '旧家', after: '新家' }], reason: '完成搬迁', evidenceRefs: ['memory:4', 'dialogue:5'] });
 
 test('guidance uses existing front matter and always preserves the fixed output contract', () => {
   const custom = buildWorldbookUpdatePrompt('CUSTOM_GUIDANCE', 'CUSTOM_PREFIX');
@@ -30,9 +30,42 @@ test('decision evidence is checked and floor references are derived from supplie
 });
 
 test('same-text proposals are recorded as unchanged while conflicts remain reviewable', () => {
-  const result = validateWorldbookDecision({ changes: [{ ...change(), content: '旧家' }], reviewNeeded: [{ reason: '人物说法不一致', evidenceRefs: ['memory:4'] }] }, input, batch);
+  const result = validateWorldbookDecision({ changes: [{ ...change(), replacements: [{ before: '旧家', after: '旧家' }] }], reviewNeeded: [{ reason: '人物说法不一致', evidenceRefs: ['memory:4'] }] }, input, batch);
   assert.deepEqual(result.changes, []); assert.match(result.unchangedReason, /一致/);
   assert.equal(result.reviewNeeded[0].reason, '人物说法不一致');
+});
+
+test('relation and address revisions preserve every unrelated character and field', () => {
+  const text = 'npc_a:\n  姓名: 甲\n  与乙的关系: 新女友，交往约两个月\n  职业: 模特\nnpc_b:\n  姓名: 丙\n  住所: 旧家\n';
+  const entries = [{ uid: '1', segments: [{ id: 'body', text }] }];
+  const proposal = { ...change(), replacements: [
+    { before: '与乙的关系: 新女友，交往约两个月', after: '与乙的关系: 前女友（曾交往约两个月；已分手）' },
+    { before: '住所: 旧家', after: '住所: 新家' },
+  ] };
+  const result = validateWorldbookDecision({ changes: [proposal], reviewNeeded: [] }, input, entries);
+  assert.equal(result.changes[0].content, text.replace(proposal.replacements[0].before, proposal.replacements[0].after).replace('住所: 旧家', '住所: 新家'));
+  assert.equal(result.changes[0].replacements, undefined);
+});
+
+test('unanchored additions, ambiguous anchors, overlaps and legacy full rewrites fail closed', () => {
+  const entries = [{ uid: '1', segments: [{ id: 'body', text: '甲: 旧家\n乙: 旧家\n' }] }];
+  const edits = [
+    [{ before: '', after: 'user:\n  当前状态: 酒店' }],
+    [{ before: '旧家', after: '新家' }],
+    [{ before: '不存在', after: '新家' }],
+    [{ before: '甲: 旧家', after: '甲: 新家' }, { before: '甲:', after: '乙:' }],
+  ];
+  for (const replacements of edits) assert.throws(() => validateWorldbookDecision({ changes: [{ ...change(), replacements }], reviewNeeded: [] }, input, entries), /本批未保存/);
+  assert.throws(() => validateWorldbookDecision({ changes: [{ ...change(), content: '整份重写' }], reviewNeeded: [] }, input, batch), /不能整段重写/);
+  assert.throws(() => validateWorldbookDecision({ changes: [change(), change()], reviewNeeded: [] }, input, batch), /重复/);
+});
+
+test('fixed maintenance scope remains present with custom guidance and limits CSE to evidence', () => {
+  const prompt = buildWorldbookUpdatePrompt('自定义指导', '前置内容');
+  assert.match(prompt, /已有设定的局部维护/);
+  assert.match(prompt, /不得追加新的 user\/char\/NPC 人物档案/);
+  assert.match(prompt, /不能把参考用的 CSE 状态直接变成世界书正文/);
+  assert.match(prompt, /不要返回 content 整段重写/);
 });
 
 test('merged memories are deduplicated and only the CSE snapshot at the batch boundary is used', () => {

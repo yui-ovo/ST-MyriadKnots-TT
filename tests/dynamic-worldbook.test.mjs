@@ -44,6 +44,10 @@ async function fixture(t, overrides = {}) {
       for (const change of result.jsonData.changes) {
         change.segmentId ??= 'body';
         change.evidenceRefs ??= (change.floors ?? []).map(index => input.sources.find(s => s.kind === 'memory' && s.floors.includes(index))?.id ?? `invalid:${index}`);
+        if ('content' in change) {
+          change.replacements = [{ before: input.entries.find(e => e.uid === change.uid)?.segments.find(s => s.id === change.segmentId)?.text, after: change.content }];
+          delete change.content;
+        }
       }
     }
     if (!overrides.apiTransport) return result;
@@ -81,6 +85,18 @@ async function fixture(t, overrides = {}) {
     payload() { return { characterLore: Object.values(structuredClone(book.entries)).map(entry => ({ ...entry, world: '书' })), globalLore: [], chatLore: [], personaLore: [] }; },
   };
 }
+test('raw local edit response updates only its anchor and saves full before/after history', async t => {
+  const f = await fixture(t, { rawUpdate: true, update: () => ({ jsonData: {
+    changes: [{ uid: '1', segmentId: 'body', replacements: [{ before: '旧公寓', after: '新家' }], reason: '正式搬家', evidenceRefs: ['memory:2'] }], reviewNeeded: [],
+  } }) });
+  await f.runtime.update({ manual: true });
+  const entry = f.runtime.getState().data.entries.find(e => e.uid === '1');
+  assert.equal(entry.content, '甲住在新家。');
+  assert.equal(entry.history.at(-1).before, '甲住在旧公寓。');
+  assert.equal(entry.history.at(-1).after, '甲住在新家。');
+  assert.equal(f.book.entries[1].content, '甲住在旧公寓。');
+});
+
 test('update combines memory, historical CSE and all visible completed dialogue with prompt ordering', async t => {
   const requests = [];
   const f = await fixture(t, { processing: 'PREFIX_MARKER', guidance: 'GUIDANCE_MARKER', update: request => { requests.push(request); return { jsonData: { changes: [] } }; } });

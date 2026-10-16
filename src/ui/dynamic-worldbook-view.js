@@ -1,5 +1,6 @@
 import { createSettingsDrawer } from './settings-drawer.js';
 import { canReadEntry, stableJson } from '../dynamic-worldbook.js';
+import { createWorldbookDiffView } from './worldbook-text-diff.js';
 
 export function createDynamicWorldbookView({ runtime, settings = null, documentRef = globalThis.document, confirmImpl = async () => false, open = false, onToggle } = {}) {
   const { drawer, body } = createSettingsDrawer({ documentRef, title: '动态世界书 · 自用试验', level: 'group', open, onToggle });
@@ -133,7 +134,14 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
       for (const change of [...entry.history].reverse()) {
         const record = el('details'); record.append(el('summary', `${change.at.slice(0, 19).replace('T', ' ')} · ${{ model: '自动更新', manual: '手动修改', restore: '恢复原文' }[change.kind]}`));
         record.append(el('p', `${change.reason}${change.floors.length ? ` · 来源第 ${change.floors.join('、')} 楼` : ''}`));
-        const diff = el('pre', `修改前：\n${change.before}\n\n修改后：\n${change.after}`); diff.style.whiteSpace = 'pre-wrap'; diff.style.overflowWrap = 'anywhere'; record.append(diff); history.append(record);
+        // Old records also have before/after; calculate only when opened so a
+        // large worldbook with 50 revisions per entry remains responsive.
+        let diffRendered = false;
+        record.addEventListener('toggle', () => {
+          if (!record.open || diffRendered) return;
+          diffRendered = true; record.append(createWorldbookDiffView(change.before, change.after, documentRef));
+        });
+        history.append(record);
       }
       area.append(history); content.append(details); rows.push({ details, sourceDisabled: entry.sourceDisabled === true, text: `${entry.label}\n${entry.content}`.toLowerCase() });
     }
