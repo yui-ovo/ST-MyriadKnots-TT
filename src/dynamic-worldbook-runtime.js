@@ -336,7 +336,9 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       const receipt = newUpdateReceipt();
       updateAttempt = { key: target.key, receipt }; emit();
       await checkedHistory(target, data, guard);
-      let count = Math.min(pending.length, data.catchingUp ? 3 : 20);
+      // A manual batch follows the saved size even during historical catch-up.
+      // Background catch-up stays small; merged memories remain indivisible.
+      let count = Math.min(pending.length, manual ? data.interval : data.catchingUp ? 3 : 20);
       // Never split a single merged memory across historical batches.
       while (count < pending.length && (pending[count - 1].saved.sourceMessageIndexes ?? []).includes(pending[count].index)) count++;
       const floors = pending.slice(0, count);

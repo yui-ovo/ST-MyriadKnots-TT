@@ -76,7 +76,7 @@ async function fixture(t, overrides = {}) {
   runtime.bind({ eventTypes, eventSource: { on(key, fn) { events.set(key, fn); }, removeListener(key) { events.delete(key); } } });
   if (overrides.allowed !== false && !overrides.skipSetup) {
     await runtime.initialize(); await runtime.classify(); await runtime.edit('1', { managed: true }); await runtime.edit('2', { managed: true });
-    await runtime.configure({ enabled: true, interval: 1 });
+    await runtime.configure({ enabled: true, interval: 3 });
   }
   return { runtime, book, context, warnings, events, ...storage,
     get updates() { return updates; }, get selections() { return selections; },
@@ -143,6 +143,44 @@ test('invented evidence is rejected and automatic failure hold survives reload a
   valid = true; await f.runtime.update({ manual: true });
   assert.equal(f.updates, 2); assert.equal(f.runtime.getState().data.updateHold, false);
   assert.equal(f.runtime.getState().lastUpdate.decisions[0].reason, '现状没有变化');
+});
+
+test('manual catch-up uses saved size 20, then consumes the smaller remainder in one batch', async t => {
+  const f = await fixture(t, { update: () => ({ jsonData: { changes: [] } }) });
+  f.context.chat = Array.from({ length: 50 }, (_, i) => ({ is_user: i % 2 === 1, mes: `消息${i}` }));
+  f.setState({ floors: Array.from({ length: 25 }, (_, i) => ({ status: 'ready', messageIndex: i * 2 })) });
+  await f.runtime.configure({ interval: 20, updateMode: 'manual' });
+  await f.runtime.update({ manual: true });
+  assert.deepEqual(f.runtime.getState().lastUpdate.floors, Array.from({ length: 20 }, (_, i) => i * 2));
+  assert.equal(f.updates, 1); assert.equal(f.runtime.getState().data.catchingUp, true);
+  await f.runtime.update({ manual: true });
+  assert.deepEqual(f.runtime.getState().lastUpdate.floors, [40, 42, 44, 46, 48]);
+  assert.equal(f.updates, 2); assert.equal(f.runtime.getState().data.catchingUp, false);
+  await f.runtime.update({ manual: true }); assert.equal(f.updates, 2);
+});
+
+test('manual size respects CSE gaps and can be changed to one without skipping pending floors', async t => {
+  const f = await fixture(t, { update: () => ({ jsonData: { changes: [] } }) });
+  f.context.chat = Array.from({ length: 8 }, (_, i) => ({ is_user: i % 2 === 1, mes: `消息${i}` }));
+  f.setState({ floors: [0, 2, 4, 6].map(messageIndex => ({ status: 'ready', messageIndex, ...(messageIndex === 4 ? { cse: { status: 'failed' } } : {}) })) });
+  await f.runtime.configure({ interval: 20 });
+  await f.runtime.update({ manual: true });
+  assert.deepEqual(f.runtime.getState().lastUpdate.floors, [0, 2]);
+  f.setState({ floors: [0, 2, 4, 6].map(messageIndex => ({ status: 'ready', messageIndex })) });
+  await f.runtime.configure({ interval: 1 });
+  await f.runtime.update({ manual: true });
+  assert.deepEqual(f.runtime.getState().lastUpdate.floors, [4]);
+  await f.runtime.update({ manual: true });
+  assert.deepEqual(f.runtime.getState().lastUpdate.floors, [6]);
+});
+
+test('automatic historical catch-up keeps three-floor batches even with interval twenty', async t => {
+  const f = await fixture(t, { update: () => ({ jsonData: { changes: [] } }) });
+  f.context.chat = Array.from({ length: 8 }, (_, i) => ({ is_user: i % 2 === 1, mes: `消息${i}` }));
+  f.setState({ floors: [0, 2, 4, 6].map(messageIndex => ({ status: 'ready', messageIndex })) });
+  await f.runtime.configure({ interval: 20 });
+  await f.runtime.update();
+  assert.deepEqual(f.runtime.getState().lastUpdate.floors, [0, 2, 4]);
 });
 
 test('manual and paused modes avoid automatic calls; normal interval consumes five memories in one request', async t => {

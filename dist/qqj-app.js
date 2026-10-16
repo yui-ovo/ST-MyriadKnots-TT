@@ -25214,8 +25214,8 @@ function Gy({ runtime: e, settings: t = null, documentRef: n = globalThis.docume
 			["auto", "每 N 条 AI 回复自动更新"],
 			["paused", "暂停维护（已有副本仍可使用）"]
 		], (t) => e.configure({ updateMode: t }, a.chatId)));
-		let l = c("label", "每几个已记忆 AI 回复更新一次："), f = c("input", "", "settings-input");
-		if (f.type = "number", f.min = "1", f.max = "20", f.value = String(a.interval), l.append(f, w("保存间隔", () => e.configure({ interval: Number(f.value) }, a.chatId))), u.append(l, w("手动更新／重试", () => e.update({ manual: !0 }), a.updateMode === "paused")), u.append(c("p", "达到间隔并且摘要、CSE 就绪后才调用。手动成功后从新进度重新计数；失败或中断会暂停自动更新，刷新页面不会自动重试。首次补历史每批约 3 条，追平后每批最多 20 条。", "settings-hint")), u.append(E("世界书选材方式", a.selectionMode ?? "ai", [["ai", "AI 按需选材（发送前可能调用召回 API）"], ["native", "沿用酒馆触发规则（不调用选材 AI）"]], (t) => e.configure({ selectionMode: t }, a.chatId))), u.append(c("p", "“保护”只禁止自动修改；“排除”让此条退出动态世界书的分类、选材、更新和正文替换。排除不关闭原书条目，也不阻止酒馆将原书内容交给聊天模型；已写进聊天正文的内容仍按聊天正文处理。", "settings-hint")), i.lastSelection) {
+		let l = c("label", "自动触发间隔／手动每批条数（AI 回复）："), f = c("input", "", "settings-input");
+		if (f.type = "number", f.min = "1", f.max = "20", f.value = String(a.interval), l.append(f, w("保存间隔", () => e.configure({ interval: Number(f.value) }, a.chatId))), u.append(l, w("手动更新／重试", () => e.update({ manual: !0 }), a.updateMode === "paused")), u.append(c("p", `修改数字后先保存间隔。手动每批按已保存的 ${a.interval} 条处理，补历史也一样；不足时处理实际已就绪的条数，不等待攒满。这里按 AI 回复计数，不含用户消息，合并记忆整组处理。自动补历史仍每批约 3 条，追平后达到间隔且摘要、CSE 就绪才调用，每批最多 20 条。手动成功后从新进度重新计数；失败或中断会暂停自动更新，刷新页面不会自动重试。`, "settings-hint")), u.append(E("世界书选材方式", a.selectionMode ?? "ai", [["ai", "AI 按需选材（发送前可能调用召回 API）"], ["native", "沿用酒馆触发规则（不调用选材 AI）"]], (t) => e.configure({ selectionMode: t }, a.chatId))), u.append(c("p", "“保护”只禁止自动修改；“排除”让此条退出动态世界书的分类、选材、更新和正文替换。排除不关闭原书条目，也不阻止酒馆将原书内容交给聊天模型；已写进聊天正文的内容仍按聊天正文处理。", "settings-hint")), i.lastSelection) {
 			let e = i.lastSelection.selected.map((e) => a.entries.find((t) => t.uid === e)?.label ?? e);
 			u.append(c("p", `${i.lastSelection.status}${e.length ? `：${e.join("、")}` : ""}`, "settings-hint"));
 		}
@@ -50625,7 +50625,7 @@ function jA({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 				key: t.key,
 				receipt: g
 			}, A(), await I(t, u, n);
-			let _ = Math.min(p.length, u.catchingUp ? 3 : 20);
+			let _ = Math.min(p.length, e ? u.interval : u.catchingUp ? 3 : 20);
 			for (; _ < p.length && (p[_ - 1].saved.sourceMessageIndexes ?? []).includes(p[_].index);) _++;
 			let v = p.slice(0, _), y = v.at(-1).index, x = t.chat.map(hy), S = Dy({
 				pending: v,
