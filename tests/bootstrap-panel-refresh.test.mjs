@@ -19,6 +19,7 @@ async function loadBootstrap(overrides = {}) {
     './ui/qianshi-timeline-view.js': { createQianshiTimelineView: () => null },
     './ui/storage-management-view.js': { createStorageManagementView: () => ({ mount() {}, activate: async () => ({ status: 'ready' }), deactivate() {} }) },
     './ui/dialog.js': { createDialogManager: () => ({ host: null, confirm() {}, info() {}, setAppearance() {} }) },
+    './ui/summary-comparison.js': { comparisonAfterExtraction: () => null, showSummaryComparison: () => null },
     ...overrides,
   };
   await entry.link(specifier => new SyntheticModule(Object.keys(factories[specifier]), function initialize() {

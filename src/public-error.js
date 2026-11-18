@@ -1,6 +1,7 @@
 const CHINESE_TEXT = /[\u3400-\u9fff]/u;
 
 const CODE_COPY = Object.freeze({
+  V3_MEMORY_SUMMARY_STALE: '这份摘要或当前聊天已变化，请关闭窗口后重新对比。',
   QQJ_DISABLED: '千千结当前已关闭。',
   QQJ_CONFIG: 'API 配置不完整，请检查 URL、Key 和模型。',
   QQJ_PRESET_INVALID: '所选 API 预设已失效。',

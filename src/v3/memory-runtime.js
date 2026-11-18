@@ -2294,6 +2294,9 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
     }
 
     if (operation.manualRevision) {
+      if (operation.expectedMemory && (oldTarget?.chatId !== operation.expectedMemory.chatId || oldTarget?.id !== operation.expectedMemory.memoryId)) {
+        throw errorWith('V3_MEMORY_SUMMARY_STALE', '这份摘要或当前聊天已变化，请关闭窗口后重新对比。');
+      }
       if (!oldTarget || oldTarget.chatId !== operation.manualRevisionBase.chatId
         || oldTarget.narrativeGeneration !== operation.manualRevisionBase.narrativeGeneration
         || JSON.stringify(memorySourceFloorIds(oldTarget)) !== JSON.stringify(memorySourceFloorIds(operation.manualRevisionBase))) {
@@ -3065,7 +3068,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
     if (!preparedInput) return getState();
     return extractFloorInternal(preparedInput.floor.id, { preparedInput, manualWork });
   }
-  async function reviseInternal(floorId, action, { userText = null, revisionNote = null, metadata = null } = {}) {
+  async function reviseInternal(floorId, action, { userText = null, revisionNote = null, metadata = null, expectedMemory = null } = {}) {
     if (active) throw errorWith('V3_MEMORY_BUSY', '当前记忆任务尚未结束，本次修改未保存。请保留草稿，任务结束后再保存。');
     if (action === 'edit' || action === 'editMetadata') {
       const summaryInput = action === 'edit' ? userText : metadata?.summary;
@@ -3094,6 +3097,9 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
     }
     const floor = source?.floors?.find(item => item.id === floorId), old = currentMemoryMap(source).get(floorId);
     if (!floor || !old) throw errorWith('V3_MEMORY_REVISION_UNAVAILABLE', '该楼还没有可修订的正式记忆。');
+    if (expectedMemory && (old.chatId !== expectedMemory.chatId || old.id !== expectedMemory.memoryId)) {
+      throw errorWith('V3_MEMORY_SUMMARY_STALE', '这份摘要或当前聊天已变化，请关闭窗口后重新对比。');
+    }
     if (isFrozenFloor(floorId, source)) throw errorWith('V3_MIGRATION_FLOOR_READ_ONLY', '来源聊天的已迁移楼只读，不能编辑。');
     const nowValue = nowIso(now);
     const revisionRunId = await deterministicUuid(['v3-memory-revision-run', old.id, action, nowValue, newUuid()]);
@@ -3256,7 +3262,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
     }
     if (spatialFacts) replacementData.spatialFacts = spatialFacts; else delete replacementData.spatialFacts;
     const replacement = validateFloorMemory(replacementData, { expectedChatId: old.chatId });
-    const operation = { floorId, epoch, manualRevision: true,
+    const operation = { floorId, epoch, manualRevision: true, expectedMemory,
       manualRevisionBase: old,
       manualRevisionFields: Object.keys(replacementData).filter(key => !['id', 'createdAt', 'updatedAt', 'supersedes'].includes(key)
         && JSON.stringify(old[key]) !== JSON.stringify(replacementData[key])),
@@ -3291,7 +3297,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
   const extractNext = () => runManualWork('extracting', manualWork => extractNextInternal(manualWork));
   const editSummary = (floorId, userText, revisionNote = '') => runManualWork('revising', () => reviseInternal(floorId, 'edit', { userText, revisionNote }));
   const editMemory = (floorId, metadata) => runManualWork('revising', () => reviseInternal(floorId, 'editMetadata', { metadata }));
-  const restoreAi = floorId => runManualWork('revising', () => reviseInternal(floorId, 'restoreAi'));
+  const restoreAi = (floorId, { expectedMemory = null } = {}) => runManualWork('revising', () => reviseInternal(floorId, 'restoreAi', { expectedMemory }));
   const markError = floorId => runManualWork('revising', () => reviseInternal(floorId, 'markError'));
 
   function diagnostic(floorId, { full = false } = {}) {

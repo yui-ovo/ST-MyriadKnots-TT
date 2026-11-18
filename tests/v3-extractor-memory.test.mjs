@@ -2478,6 +2478,55 @@ test('实际顺序提取从前楼 locations 提供地点名参照，但不把泛
   assert.equal(saved.floorMemories.find(item => item.floorId === second.floorId).spatialFacts, undefined);
 });
 
+test('摘要对比采用AI新版：明确选择才替换人工稿，保留人工元数据且不再调用模型', async () => {
+  let extraction = 0;
+  const h = harness({ utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+    ? { jsonData: { summary: ++extraction === 1 ? '原AI摘要' : '新AI摘要：已经搬家。' } }
+    : { jsonData: { noMaterialChange: true } } });
+  await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  await h.runtime.editMemory(floorId, { summary: '人工摘要', locations: [{ name: '人工确认的新家' }], timeText: '2026-11-19 09:00' });
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  const before = h.runtime.getState(), floor = before.floors.find(item => item.floorId === floorId);
+  assert.equal(floor.summary, '人工摘要'); assert.equal(floor.summarySource, 'user');
+  assert.equal(floor.aiSummary, '新AI摘要：已经搬家。');
+  const requestCount = h.calls.length;
+  await h.runtime.restoreAi(floorId, { expectedMemory: { chatId: before.chatId, memoryId: floor.memoryId } });
+  const current = h.runtime.getState().floors.find(item => item.floorId === floorId);
+  assert.equal(current.summary, floor.aiSummary); assert.equal(current.summarySource, 'ai');
+  assert.deepEqual(current.memory.chronology, floor.memory.chronology);
+  assert.deepEqual(current.memory.locations, floor.memory.locations);
+  assert.deepEqual(current.memory.participants, floor.memory.participants);
+  assert.equal(h.calls.length, requestCount, '采用已存AI稿无需模型调用');
+  const saved = (await h.store.readReachable({ mode: 'runtime' })).floorMemories.find(item => item.floorId === floorId);
+  assert.equal(saved.summary.effectiveSource, 'ai'); assert.equal(saved.summary.aiText, floor.aiSummary);
+});
+
+test('摘要对比采用AI新版：预览后已编辑或换聊天时拒绝旧目标', async () => {
+  const h = harness(); await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false }); await h.runtime.editSummary(floorId, '人工旧稿');
+  const state = h.runtime.getState(), expectedMemory = { chatId: state.chatId, memoryId: state.floors[0].memoryId };
+  await h.runtime.editSummary(floorId, '刚改好的人工稿');
+  await assert.rejects(h.runtime.restoreAi(floorId, { expectedMemory }), { code: 'V3_MEMORY_SUMMARY_STALE' });
+  await assert.rejects(h.runtime.restoreAi(floorId, { expectedMemory: { chatId: 'other', memoryId: h.runtime.getState().floors[0].memoryId } }), { code: 'V3_MEMORY_SUMMARY_STALE' });
+  assert.equal(h.runtime.getState().floors[0].summary, '刚改好的人工稿');
+});
+
+test('摘要对比采用AI新版：提交期间另一端重新提取，拒绝采用未经对比的新稿', async () => {
+  const h = harness(); await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false }); await h.runtime.editSummary(floorId, '人工保留稿');
+  const state = h.runtime.getState(), expectedMemory = { chatId: state.chatId, memoryId: state.floors[0].memoryId };
+  const other = harness({ sharedBackend: h.backend, sharedContext: h.context,
+    utility: () => ({ jsonData: { summary: '另一端刚生成的AI稿' } }) });
+  await other.runtime.start(); const gate = h.backend.holdNextRootPut();
+  const pending = h.runtime.restoreAi(floorId, { expectedMemory }).then(() => null, error => error.code);
+  await gate.started; await other.runtime.extractFloor(floorId, { analyzeState: false }); gate.release();
+  assert.equal(await pending, 'V3_MEMORY_SUMMARY_STALE');
+  const saved = (await h.store.readReachable({ mode: 'runtime' })).floorMemories.find(item => item.floorId === floorId);
+  assert.equal(saved.summary.userText, '人工保留稿'); assert.equal(saved.summary.effectiveSource, 'user');
+  assert.equal(saved.summary.aiText, '另一端刚生成的AI稿');
+});
+
 test('重提保留人工摘要时不从原消息恢复已清除的地点参照', async () => {
   const content = '林岚仍记得前往钟楼。';
   const rawContent = `${content}<location>东区公寓·卧室</location>`;

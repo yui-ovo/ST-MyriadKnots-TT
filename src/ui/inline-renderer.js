@@ -227,6 +227,7 @@ export function createInlineRenderer({
   const cards = new Map(), expanded = new Map(), groupExpanded = new Map(), expectedIndices = new Set(), eventBindings = [];
   let unsubscribeMemory = null, unsubscribeRecall = null;
   let showRecall = true, showMemory = true;
+  let summaryComparisonHandler = null;
   const visibleRole = role => role === 'user' ? showRecall : role === 'assistant' && showMemory;
   let palette = Object.freeze({ soft: 'currentColor', panel: 'transparent', success: '#3d6f55', error: '#b63745', knot: '#a8322f', line: 'color-mix(in srgb,currentColor 18%,transparent)' });
   let fontScale = 1, uiScale = 1, fontFamily = '', fontCssUrl = '';
@@ -274,12 +275,16 @@ export function createInlineRenderer({
     const projection = view.projection;
     if (!active || view.extracting || projection?.kind !== 'assistant' || !projection.canExtract || !projection.floorId) return;
     view.extracting = true; view.extract.disabled = true;
+    const beforeState = memoryRuntime.getState(), extractionSession = session;
     let extraction;
     try {
       const extractionTarget = memoryRuntime.captureExtractionTarget?.(projection.floorId, { messageIndex: view.messageIndex });
       extraction = extractionTarget ? memoryRuntime.extractFloor(projection.floorId, { extractionTarget }) : memoryRuntime.extractFloor(projection.floorId);
     } catch (error) { extraction = Promise.reject(error); }
-    Promise.resolve(extraction).catch(error => {
+    Promise.resolve(extraction).then(result => {
+      if (active && session === extractionSession) return summaryComparisonHandler?.({ beforeState, result, floorId: projection.floorId,
+        isCurrent: () => active && session === extractionSession });
+    }).catch(error => {
       logger?.warn?.('[qianqianjie] 楼内重新提取失败', { code: String(error?.code ?? error?.name ?? 'V3_INLINE_EXTRACT_FAILED').slice(0, 120) });
     }).finally(() => { view.extracting = false; schedule(); });
   };
@@ -573,5 +578,7 @@ export function createInlineRenderer({
   }
   function destroy() { stop(); destroyed = true; clearRetry(); removeAll(); expanded.clear(); groupExpanded.clear(); }
 
-  return Object.freeze({ start, stop, setEnabled, setAppearance, setVisibility, destroy, schedule, refresh, getDebugState: () => Object.freeze({ active, destroyed, session, cards: cards.size, observing: Boolean(observer), retrying: timer !== null, eventBindings: eventBindings.length }) });
+  return Object.freeze({ start, stop, setEnabled, setAppearance, setVisibility, destroy, schedule, refresh,
+    setSummaryComparisonHandler(handler) { summaryComparisonHandler = typeof handler === 'function' ? handler : null; },
+    getDebugState: () => Object.freeze({ active, destroyed, session, cards: cards.size, observing: Boolean(observer), retrying: timer !== null, eventBindings: eventBindings.length }) });
 }

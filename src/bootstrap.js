@@ -9,6 +9,7 @@ import { createQianshiTimelineView } from './ui/qianshi-timeline-view.js';
 import { createStorageManagementView } from './ui/storage-management-view.js';
 import { createMemoryTransferView } from './ui/memory-transfer-view.js';
 import { createDialogManager } from './ui/dialog.js';
+import { comparisonAfterExtraction, showSummaryComparison } from './ui/summary-comparison.js';
 
 export function bootstrap({
   dynamicWorldbook,
@@ -71,6 +72,12 @@ export function bootstrap({
   let panel, fab;
   const dialog = dialogFactory({ documentRef, $: globalThis.jQuery ?? globalThis.$, subscribeContextChange: subscribeDialogContextChange });
   if (dialog?.host) (documentRef.documentElement ?? documentRef.body).append(dialog.host);
+  inlineRenderer?.setSummaryComparisonHandler?.(({ beforeState, result, floorId, isCurrent }) => {
+    if (dialog.hasActive?.()) return null;
+    const target = comparisonAfterExtraction(beforeState, result, v3FoundationRuntime.getState(), floorId);
+    return showSummaryComparison({ runtime: v3FoundationRuntime, target, documentRef, isCurrent,
+      customImpl: options => dialog.custom(options) });
+  });
   const foundationView = v3FoundationViewFactory({ runtime: v3FoundationRuntime, recallRuntime: v3RecallRuntime, vectorRuntime: vectorIndex, onOpenVectorSettings: () => panel?.openVectorSettings?.(), peopleRuntime: peopleWorkspaceRuntime, timeRuntime, memoryManagement: chatMemoryManagement, sessionStateProvider, prepareSession, backendDiagnosticProvider, pluginDiagnosticProvider, pluginVersion, documentRef, confirmImpl: options => dialog.confirm(options), chooseImpl: options => dialog.choose?.(options) ?? null, infoImpl: options => dialog.info(options), customImpl: options => dialog.custom(options), cancelDialogImpl: () => dialog.cancelTop?.() });
   const peopleProfilesView = peopleProfilesViewFactory({ runtime: peopleWorkspaceRuntime, sessionStateProvider, prepareSession, documentRef, dialog });
   const qianshiTimelineView = qianshiTimelineViewFactory({ runtime: v3FoundationRuntime, documentRef, dialog });

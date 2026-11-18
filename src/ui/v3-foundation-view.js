@@ -9,6 +9,7 @@ import { publicErrorMessage, sameErrorDetails } from '../public-error.js';
 import { formatStoryTime, mainlineTimeText } from '../v3/time-engine.js';
 import { sanitizeTaskMetadata } from '../v3/safe-metadata.js';
 import { redactProviderErrorText, sanitizeCompletionDiagnostic, sanitizeProviderDiagnostic } from '../completion-diagnostic.js';
+import { summaryComparisonTarget, comparisonAfterExtraction, showSummaryComparison } from './summary-comparison.js';
 
 function text(value, fallback = '—') { return value === null || value === undefined || value === '' ? fallback : String(value); }
 
@@ -950,6 +951,16 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
       return { status: 'error', error };
     }
   }
+  async function openSummaryComparison(target) {
+    if (!target) return;
+    try {
+      const result = await showSummaryComparison({ runtime, target, customImpl, documentRef,
+        isCurrent: () => active && page === 'memories' && runtime.getState().chatId === target.chatId });
+      if (!active || runtime.getState().chatId !== target.chatId) return;
+      feedback = result === 'adopted' ? '已采用 AI 新版摘要。' : '继续使用人工版；可在本楼操作中再次对比。';
+      render(runtime.getState());
+    } catch (error) { void run('摘要对比', () => Promise.reject(error)); }
+  }
   const floorActionResult = (label, floorId, kind = 'extract') => (state, beforeState, result) => {
     const actualFloorId = kind === 'extract' ? result?.extractionFloorId ?? floorId : floorId;
     const floor = state?.floors?.find(item => item.floorId === actualFloorId);
@@ -1267,8 +1278,18 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
           let extractionTarget;
           try { if (!ranged) extractionTarget = runtime.captureExtractionTarget?.(floor.floorId); }
           catch (error) { void run('重新提取', () => Promise.reject(error)); return; }
-          if (!await Promise.resolve(confirmImpl({ title: ranged ? '重新提取整段压缩记忆' : '重新提取本楼摘要', body: `${ranged ? `${floorCopy(latest, floor)}将整体重新压缩。` : '将重新提取本楼摘要。'}已有的人物状态和其他楼不变；千事按字段保留人工修订，无法匹配时保留旧千事并提示。`, confirmText: '重新提取', cancelText: '取消' }))) { feedback = '已取消重新提取。'; render(foundationState); return; } void run('重新提取', () => extractionTarget ? runtime.extractFloor(floor.floorId, { extractionTarget }) : runtime.extractFloor(floor.floorId), { resultCopy: floorActionResult('重新提取', floor.floorId) }); });
+          if (!await Promise.resolve(confirmImpl({ title: ranged ? '重新提取整段压缩记忆' : '重新提取本楼摘要', body: `${ranged ? `${floorCopy(latest, floor)}将整体重新压缩。` : '将重新提取本楼摘要。'}若有人工摘要，成功后可对比并选择采用哪一版。已有的人物状态和其他楼不变；千事按字段保留人工修订，无法匹配时保留旧千事并提示。`, confirmText: '重新提取', cancelText: '取消' }))) { feedback = '已取消重新提取。'; render(foundationState); return; }
+          const before = runtime.getState(), comparisonGeneration = dialogGeneration;
+          const result = await run('重新提取', () => extractionTarget ? runtime.extractFloor(floor.floorId, { extractionTarget }) : runtime.extractFloor(floor.floorId), { resultCopy: floorActionResult('重新提取', floor.floorId) });
+          if (active && page === 'memories' && comparisonGeneration === dialogGeneration) void openSummaryComparison(comparisonAfterExtraction(before, result, runtime.getState(), floor.floorId));
+        });
         menuBody.append(edit, extract);
+        if (customImpl && typeof runtime.restoreAi === 'function' && summaryComparisonTarget(currentState, floor.floorId)) {
+          const compare = element('button', 'qqj-memory-menu-action', '对比人工 / AI 摘要'); compare.type = 'button'; compare.disabled = workBusy(currentState);
+          trackMemoryRowWorkControl({ node: compare, disabled: current => workBusy(current) });
+          compare.addEventListener('click', () => { actions.open = false; void openSummaryComparison(summaryComparisonTarget(runtime.getState(), floor.floorId)); });
+          menuBody.append(compare);
+        }
       } else {
         const extract = element('button', 'qqj-memory-menu-action', '提取摘要'); extract.type = 'button'; extract.disabled = workBusy(currentState) || typeof runtime.extractFloor !== 'function';
         trackMemoryRowWorkControl({ node: extract, disabled: current => workBusy(current) || typeof runtime.extractFloor !== 'function' });

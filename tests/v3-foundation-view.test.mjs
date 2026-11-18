@@ -2565,6 +2565,50 @@ test('activate 请求恢复聊天记录回执，并明确标注历史展示、�
 
 const CHAT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 
+function summaryComparisonViewHarness() {
+  let state = { status: 'ready', pluginEnabled: true, chatId: CHAT, foundationStatus: 'ready', stableCount: 1, rememberedCount: 1,
+    memorySnapshotStatus: 'ready', memorySyncStatus: 'idle', headCheckpointId: 'head', cseReady: true,
+    floors: [{ floorId: 'floor', messageIndex: 78, assistantSeq: 1, status: 'ready', memoryId: 'old', summary: '人工确认的摘要',
+      aiSummary: '原AI摘要', summarySource: 'user', memory: { chronology: [], locations: [], participants: [] }, cse: { status: 'ready' } }] };
+  const calls = [];
+  const runtime = { getState: () => state,
+    refreshStatus: async () => state, confirmLatest: async () => state,
+    extractFloor: async () => { calls.push('extract'); state = { ...state, floors: [{ ...state.floors[0], memoryId: 'new', aiSummary: '新AI摘要' }] }; return state; },
+    restoreAi: async (floorId, options) => { calls.push(['adopt', floorId, options]); state = { ...state, floors: [{ ...state.floors[0], memoryId: 'adopted', summary: state.floors[0].aiSummary, summarySource: 'ai' }] }; return state; } };
+  const container = new Node('main'), view = createV3FoundationView({ runtime, documentRef, confirmImpl: () => true });
+  view.setPage('memories'); view.mount(container);
+  const button = label => { const card = flatten(container).find(node => node.className.split(' ').includes('qqj-memory-card')); if (!card.open) openDetails(card); return flatten(container).find(node => node.textContent === label); };
+  return { runtime, view, container, calls, button, setState(value) { state = value; } };
+}
+
+test('人工摘要重新提取成功自动对比，保留后可重开采用AI稿且不重复提取', async () => {
+  const h = summaryComparisonViewHarness();
+  await h.button('重新提取').click();
+  assert.equal(activeEditorDialog.options.title, '第 78 楼 · 摘要对比');
+  assert.match(flatten(editorContent()).map(node => node.textContent).join(''), /人工版 · 当前使用.*AI 新版 · 最近提取/s);
+  assert.equal(h.runtime.getState().floors[0].summarySource, 'user');
+  cancelEditor(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.calls, ['extract']);
+  h.button('对比人工 / AI 摘要').click(); await submitEditor(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.runtime.getState().floors[0].summary, '新AI摘要');
+  assert.equal(h.runtime.getState().floors[0].summarySource, 'ai');
+  assert.deepEqual(h.calls, ['extract', ['adopt', 'floor', { expectedMemory: { chatId: CHAT, memoryId: 'new' } }]]);
+  assert.match(flatten(h.container).map(node => node.textContent).join(''), /已采用 AI 新版摘要/);
+  h.view.deactivate();
+});
+
+test('重提未保存新稿不自动对比，页面已关闭也不在后台弹窗', async () => {
+  const h = summaryComparisonViewHarness();
+  h.runtime.extractFloor = async () => h.runtime.getState();
+  await h.button('重新提取').click(); assert.equal(editorContent(), null);
+  let release;
+  h.runtime.extractFloor = () => new Promise(resolve => { release = resolve; });
+  const clicking = h.button('重新提取').click(); await new Promise(resolve => setImmediate(resolve));
+  h.view.deactivate();
+  release({ ...h.runtime.getState(), floors: [{ ...h.runtime.getState().floors[0], memoryId: 'new' }] }); await clicking;
+  assert.equal(editorContent(), null); assert.equal(h.runtime.getState().floors[0].summarySource, 'user');
+});
+
 test('三页职责分离，千结只保留摘要编辑/重提，双丝网归位人物与逐楼 CSE，管理页不混摘要', () => {
   const memory = { summaryEvidenceRefs: [], chronology: [], locations: [], participants: [], actions: [], observations: [], informationTransfers: [], privateCognition: [], commitments: [], eventFragments: [], exactAnchors: [], openLoops: [], ambiguities: [], cseSignals: [] };
   const state = {

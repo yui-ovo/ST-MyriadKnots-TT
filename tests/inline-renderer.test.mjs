@@ -1504,6 +1504,21 @@ test('重新提取按钮与折叠按钮互不影响，同次点击只调用一�
   assert.equal(view.extract.disabled, false); assert.equal(view.root, host.shadowRoot); assert.equal(view.expanded, open);
 });
 
+test('楼内重提完成后交给摘要对比入口，已切走的会话不再弹窗', async () => {
+  const state = readyState(), chat = [{ is_user: false, is_system: false, mes: 'AI正文' }];
+  const h = createHarness({ chat, memoryState: state }), comparisons = [];
+  state.floors[0].messageIndex = 0; h.chatRoot.append(messageElement(0));
+  h.renderer.setSummaryComparisonHandler(value => { comparisons.push(value); });
+  h.renderer.start(); await h.flushMicrotasks();
+  const view = h.chatRoot.querySelector('[data-qqj-inline-host="true"]').__qqjInlineCard;
+  view.extract.click(); await h.flushMicrotasks();
+  assert.equal(comparisons.length, 1); assert.equal(comparisons[0].floorId, 'floor-1');
+  assert.equal(comparisons[0].beforeState, state); assert.equal(comparisons[0].result, state); assert.equal(comparisons[0].isCurrent(), true);
+  let release; h.memoryRuntime.extractFloor = () => new Promise(resolve => { release = resolve; });
+  view.extract.click(); h.renderer.stop(); release(state); await h.flushMicrotasks();
+  assert.equal(comparisons.length, 1); assert.equal(comparisons[0].isCurrent(), false);
+});
+
 test('楼内重新提取点击当刻捕获真实DOM消息，并原样传目标见证', async () => {
   const state = readyState(), chat = [{ is_user: false, is_system: false, mes: '当前AI正文' }];
   const h = createHarness({ chat, memoryState: state });
