@@ -1,4 +1,5 @@
 import { isUuid, sha256 } from './identity.js';
+import { normalizedBookFingerprint, createSourceEntry } from './dynamic-worldbook-source.js';
 
 export const DYNAMIC_BOOK_RECORD = 'self-use-dynamic-worldbook-v1';
 const clone = value => structuredClone(value);
@@ -11,7 +12,7 @@ export function bookError(message) { return Object.assign(new Error(message), { 
 function check(condition, message = '动态世界书数据无效，已保留原记录。') { if (!condition) throw bookError(message); }
 const has = value => Array.isArray(value) ? value.length > 0 : typeof value === 'object' && value !== null ? Object.keys(value).length > 0 : Boolean(value);
 export const isSourceDisabled = entry => Boolean(entry.disable || entry.disabled || entry.enabled === false);
-export const canReadEntry = entry => !entry.excluded && !entry.sourceDisabled;
+export const canReadEntry = entry => !entry.excluded && !entry.sourceDisabled && !entry.sourceMissing && !entry.sourcePending;
 export function protectedReason(entry) {
   const content = String(entry.content ?? '');
   if (/<%|<\/?(?:script|style|iframe|UpdateVariable|JSONPatch|initvar)\b|\{\{(?!\s*(?:user|char)\s*\}\})|\b(?:getvar|setvar|stat_data|insertOrAssignVariables|z\.object)\b/iu.test(content)) return '含模板、脚本或变量指令';
@@ -38,14 +39,11 @@ export function sourceEntries(book) {
   check(new Set(entries.map(entry => entry.uid)).size === entries.length, '世界书条目编号重复。');
   return entries.sort((a, b) => a.uid.localeCompare(b.uid));
 }
-export async function bookFingerprint(entries) { return sha256(stableJson(entries)); }
+export async function bookFingerprint(entries) { return normalizedBookFingerprint(entries); }
 export async function createBook(chatId, name, source) {
-  return { schemaVersion: 2, chatId, book: name, sourceHash: await bookFingerprint(source), enabled: false, automatic: true, interval: 5,
+  return { schemaVersion: 2, chatId, book: name, sourceHashVersion: 2, sourceHash: await bookFingerprint(source), enabled: false, automatic: true, interval: 5,
     updateMode: 'auto', selectionMode: 'ai', updateHold: false,
-    catchingUp: true, processed: [], entries: source.map(entry => ({ uid: entry.uid, label: String(entry.comment || entry.key?.join('、') || `条目 ${entry.uid}`),
-      original: String(entry.content ?? ''), content: String(entry.content ?? ''), protectedReason: '', managed: !isSourceDisabled(entry), locked: false, history: [],
-      excluded: false, sourceDisabled: isSourceDisabled(entry),
-      kind: 'fact', classification: 'pending', segments: [{ id: 'body', text: String(entry.content ?? ''), writable: false }] })) };
+    catchingUp: true, processed: [], entries: source.map(createSourceEntry) };
 }
 export function validateBook(value, chatId) {
   value = clone(value);
@@ -59,6 +57,7 @@ export function validateBook(value, chatId) {
   }
   check(isUuid(chatId) && value?.schemaVersion === 2 && value.chatId === chatId && typeof value.book === 'string' && value.book.length > 0);
   check(typeof value.sourceHash === 'string' && /^[a-f0-9]{64}$/.test(value.sourceHash));
+  check(value.sourceHashVersion === undefined || value.sourceHashVersion === 2);
   check(typeof value.enabled === 'boolean' && typeof value.automatic === 'boolean' && Number.isInteger(value.interval) && value.interval >= 1 && value.interval <= 20);
   value.updateMode ??= value.automatic ? 'auto' : 'manual';
   value.selectionMode ??= 'ai'; value.updateHold ??= false;
@@ -67,12 +66,29 @@ export function validateBook(value, chatId) {
   check(typeof value.catchingUp === 'boolean');
   check(Array.isArray(value.processed) && value.processed.length <= 20000);
   value.processed.forEach((w, index) => check(w.index === index && /^[a-f0-9]{64}$/.test(w.hash)));
-  check(Array.isArray(value.entries) && value.entries.length <= 500 && new Set(value.entries.map(e => e.uid)).size === value.entries.length);
+  check(Array.isArray(value.entries) && value.entries.length <= 1000 && new Set(value.entries.map(e => e.uid)).size === value.entries.length);
   for (const entry of value.entries) {
     // New controls are additive; preserve every existing permission and edit.
     if (entry.excluded === undefined) entry.excluded = false;
     if (entry.sourceDisabled === undefined) entry.sourceDisabled = false;
+    if (entry.sourceMissing === undefined) entry.sourceMissing = false;
+    delete entry.sourcePending;
     check(typeof entry.excluded === 'boolean' && typeof entry.sourceDisabled === 'boolean');
+    check(typeof entry.sourceMissing === 'boolean');
+    if (entry.recheckFrom !== undefined) check(Number.isSafeInteger(entry.recheckFrom) && entry.recheckFrom >= 0 && entry.recheckFrom <= value.processed.length);
+    if (entry.recheckBase !== undefined) {
+      check(entry.recheckFrom !== undefined && Array.isArray(entry.recheckBase) && entry.recheckBase.length > 0 && entry.recheckBase.length <= 100
+        && entry.recheckBase.every(segment => segment && typeof segment.id === 'string' && segment.id.length > 0
+          && typeof segment.text === 'string' && typeof segment.writable === 'boolean')
+        && new Set(entry.recheckBase.map(segment => segment.id)).size === entry.recheckBase.length
+        && entry.recheckBase.map(segment => segment.text).join('').length <= 1000000);
+    }
+    if (entry.sourceMetadata !== undefined) check(entry.sourceMetadata && typeof entry.sourceMetadata === 'object' && !Array.isArray(entry.sourceMetadata)
+      && stableJson(entry.sourceMetadata).length <= 1000000);
+    if (entry.sourceConflict !== undefined) check(entry.sourceConflict && typeof entry.sourceConflict === 'object'
+      && typeof entry.sourceConflict.base === 'string' && typeof entry.sourceConflict.deleted === 'boolean'
+      && (entry.sourceConflict.deleted ? entry.sourceConflict.incoming === null && entry.sourceMissing
+        : typeof entry.sourceConflict.incoming === 'string' && entry.sourceConflict.incoming === entry.original && !entry.sourceMissing));
     check(typeof entry.uid === 'string' && typeof entry.label === 'string' && typeof entry.original === 'string' && typeof entry.content === 'string');
     check(typeof entry.protectedReason === 'string' && typeof entry.managed === 'boolean' && typeof entry.locked === 'boolean');
     check(['fact', 'rule', 'npc', 'npc_pool', 'event'].includes(entry.kind));
@@ -84,7 +100,7 @@ export function validateBook(value, chatId) {
     check(entry.kind !== 'rule' || entry.segments.every(s => !s.writable));
     check(Array.isArray(entry.history) && entry.history.length <= 50);
     for (const h of entry.history) check(typeof h.before === 'string' && typeof h.after === 'string' && typeof h.reason === 'string' && typeof h.at === 'string'
-      && ['model', 'manual', 'restore'].includes(h.kind) && Array.isArray(h.floors) && h.floors.every(Number.isSafeInteger));
+      && ['model', 'manual', 'restore', 'source'].includes(h.kind) && Array.isArray(h.floors) && h.floors.every(Number.isSafeInteger));
   }
   // Receipts keep bounded statistics and decision explanations, never whole prompts or credentials.
   if (value.lastUpdate != null) {
@@ -144,7 +160,17 @@ export function addHistory(entry, content, kind, reason, floors = []) {
   entry.history = entry.history.slice(-50);
   entry.content = content;
 }
-export const canMaintain = entry => canReadEntry(entry) && entry.managed && !entry.locked && entry.kind !== 'rule' && entry.segments.some(s => s.writable);
+export const canMaintain = entry => canReadEntry(entry) && entry.classification !== 'pending' && !entry.sourceConflict && entry.managed && !entry.locked && entry.kind !== 'rule' && entry.segments.some(s => s.writable);
+
+// Replaying an old evidence prefix may temporarily reconstruct an old state.
+// Keep sending the last complete value until that entry reaches the present.
+// Legacy partial rechecks without a snapshot stay on the native source path.
+export function entryContentForSending(entry, data) {
+  if (Number.isSafeInteger(entry.recheckFrom) && entry.recheckFrom < data.processed.length) {
+    return Array.isArray(entry.recheckBase) ? entry.recheckBase.map(segment => segment.text).join('') : null;
+  }
+  return entry.content;
+}
 
 // The model supplies boundaries, never the initial text. Ambiguous boundaries
 // retain every source byte and are sent to the user for review.
@@ -191,7 +217,7 @@ export function applyChanges(data, result, floors) {
 
 // Only modify the host's per-scan candidate copies. No writes to worldbook files or host caches.
 export function overlayCandidates(payload, plan, data) {
-  const byId = new Map(data.entries.filter(e => e.managed && canReadEntry(e)).map(e => [e.uid, e]));
+  const byId = new Map(data.entries.filter(e => e.managed && canReadEntry(e) && e.classification !== 'pending').map(e => [e.uid, e]));
   const selected = new Set(plan.selected);
   for (const name of ['globalLore', 'characterLore', 'chatLore', 'personaLore']) {
     const list = payload?.[name];
@@ -200,11 +226,13 @@ export function overlayCandidates(payload, plan, data) {
     for (const source of list) {
       const entry = source.world === data.book ? byId.get(String(source.uid)) : null;
       if (!entry || isSourceDisabled(source) || source.content !== entry.original) { updated.push(source); continue; }
+      const content = entryContentForSending(entry, data);
+      if (content === null) { updated.push(source); continue; }
       // Keep conditional entries on the host's own activation path, while still
       // using the chat-local text. Selection never overrides author conditions.
-      if (plan.mode === 'native' || nativeSelectionReason(source) || entry.kind === 'rule') { updated.push({ ...source, content: entry.content }); continue; }
+      if (plan.mode === 'native' || nativeSelectionReason(source) || entry.kind === 'rule') { updated.push({ ...source, content }); continue; }
       if (!source.constant && !selected.has(entry.uid)) continue;
-      updated.push({ ...source, content: entry.content, constant: true });
+      updated.push({ ...source, content, constant: true });
     }
     list.splice(0, list.length, ...updated);
   }

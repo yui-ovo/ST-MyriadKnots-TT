@@ -21,6 +21,7 @@ import { createMigrationDescriptor } from '../src/v3/migration-prefix.js';
 import { createPeopleWorkspaceStore } from '../src/v3/people-workspace.js';
 import { createStorageManagement } from '../src/storage-management.js';
 import { createBook, sourceEntries, DYNAMIC_BOOK_RECORD, witness, verifyWitness } from '../src/dynamic-worldbook.js';
+import { synchronizeSource } from '../src/dynamic-worldbook-source.js';
 const SOURCE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const NOW = '2026-09-05T00:00:00.000Z';
 const assistant = mes => ({ is_user: false, is_system: false, mes, swipes: [mes], swipe_id: 0 });
@@ -68,6 +69,84 @@ test('self-use import rechecks source changes after preview and skips only the i
   const result = await f.runtime.importPreview(plan); assert.equal(result.summaries, 1);
   await assert.rejects(f.backend.client.get(`chat-${IMPORTED}`, DYNAMIC_BOOK_RECORD), error => error.status === 404);
   assert.ok((await f.backend.client.get(`chat-${IMPORTED}`, 'v3-root')).data.headCheckpointId);
+});
+
+test('legacy raw-source fingerprints and normalized runtime switches remain transferable without adopting a new author baseline', async t => {
+  for (const volumes of [false, true]) for (const legacy of [false, true]) await t.test(`${volumes ? 'volumes' : 'json'} / ${legacy ? 'legacy raw hash' : 'runtime switches'}`, async () => {
+    const f = await fixture(), original = { entries: { 1: { uid: 1, comment: '住址', content: '旧居', key: ['住所'] } } };
+    const entries = sourceEntries(original), book = await createBook(SOURCE, '原书', entries);
+    book.processed = await witness(f.ctx.chat, 1);
+    book.entries[0].content = '剧情中的新居'; book.entries[0].segments[0] = { id: 'body', text: '剧情中的新居', writable: true };
+    book.entries[0].excluded = true;
+    if (legacy) {
+      // Real pre-normalization saves hashed all raw source fields together.
+      delete book.sourceHashVersion; delete book.entries[0].sourceMetadata;
+      book.sourceHash = await sha256(stableJson(entries));
+    }
+    await f.backend.client.put(`chat-${SOURCE}`, DYNAMIC_BOOK_RECORD, book, 0);
+    let files, exported;
+    if (volumes) { streamingFixture(f); files = await volumeFiles(f.runtime); }
+    else exported = await f.runtime.exportCurrent();
+    const target = await f.target(), currentBook = structuredClone(original);
+    if (!legacy) Object.assign(currentBook.entries[1], { disable: true, constant: true, displayIndex: 42, group: '', order: 100, triggers: [], extensions: { display_index: 99 } });
+    target.characters[0].data.extensions = { world: '改名后的书' }; target.loadWorldInfo = async () => currentBook;
+    const before = structuredClone(currentBook);
+    const plan = volumes ? await f.runtime.previewVolumes(files) : await f.runtime.preview(exported.text);
+    assert.match(plan.dynamic, /恢复动态副本/);
+    const result = await f.runtime.importPreview(plan); assert.equal(result.summaries, 1);
+    const restored = (await f.backend.client.get(`chat-${IMPORTED}`, DYNAMIC_BOOK_RECORD)).data;
+    assert.equal(restored.sourceHash, book.sourceHash);
+    assert.equal(restored.sourceHashVersion, book.sourceHashVersion);
+    assert.equal(restored.entries[0].content, '剧情中的新居'); assert.equal(restored.entries[0].excluded, true);
+    assert.equal(restored.entries[0].segments[0].writable, true);
+    assert.equal(await verifyWitness(target.chat, restored.processed), true);
+    assert.deepEqual(currentBook, before);
+  });
+});
+
+test('author activation-rule changes skip only the dynamic copy in JSON and volume imports', async t => {
+  for (const volumes of [false, true]) await t.test(volumes ? 'volumes' : 'json', async () => {
+    const f = await fixture(), original = { entries: { 1: { uid: 1, content: '原住址', sticky: 2 } } };
+    const book = await createBook(SOURCE, '书', sourceEntries(original));
+    await f.backend.client.put(`chat-${SOURCE}`, DYNAMIC_BOOK_RECORD, book, 0);
+    let files, exported;
+    if (volumes) { streamingFixture(f); files = await volumeFiles(f.runtime); }
+    else exported = await f.runtime.exportCurrent();
+    const target = await f.target(); target.characters[0].data.extensions = { world: '书' };
+    original.entries[1].sticky = 5; target.loadWorldInfo = async () => original;
+    const plan = volumes ? await f.runtime.previewVolumes(files) : await f.runtime.preview(exported.text);
+    assert.match(plan.dynamic, /跳过动态副本/);
+    const result = await f.runtime.importPreview(plan); assert.equal(result.summaries, 1);
+    await assert.rejects(f.backend.client.get(`chat-${IMPORTED}`, DYNAMIC_BOOK_RECORD), error => error.status === 404);
+    assert.ok((await f.backend.client.get(`chat-${IMPORTED}`, 'v3-root')).data.headCheckpointId);
+    assert.equal(original.entries[1].sticky, 5);
+  });
+});
+
+test('source conflict baselines and manual permissions survive JSON and volume migration unchanged', async t => {
+  for (const volumes of [false, true]) await t.test(volumes ? 'volumes' : 'json', async () => {
+    const f = await fixture(), original = { entries: { 1: { uid: 1, comment: '住址', content: '最初原书住址' } } };
+    let book = await createBook(SOURCE, '书', sourceEntries(original));
+    book.entries[0].content = '剧情已经搬家'; book.entries[0].segments[0] = { id: 'body', text: '剧情已经搬家', writable: true };
+    book.entries[0].classification = 'manual'; book.entries[0].locked = true;
+    original.entries[1].content = '作者修订住址';
+    book = await synchronizeSource(book, sourceEntries(original));
+    book.processed = await witness(f.ctx.chat, 1); book.entries[0].recheckFrom = 0;
+    assert.deepEqual(book.entries[0].sourceConflict, { base: '最初原书住址', incoming: '作者修订住址', deleted: false });
+    await f.backend.client.put(`chat-${SOURCE}`, DYNAMIC_BOOK_RECORD, book, 0);
+    let files, exported;
+    if (volumes) { streamingFixture(f); files = await volumeFiles(f.runtime); }
+    else exported = await f.runtime.exportCurrent();
+    const target = await f.target(); target.characters[0].data.extensions = { world: '书' }; target.loadWorldInfo = async () => original;
+    const plan = volumes ? await f.runtime.previewVolumes(files) : await f.runtime.preview(exported.text);
+    await f.runtime.importPreview(plan);
+    const restored = (await f.backend.client.get(`chat-${IMPORTED}`, DYNAMIC_BOOK_RECORD)).data;
+    assert.deepEqual(restored.entries, book.entries);
+    assert.equal(restored.entries[0].recheckFrom, 0);
+    assert.equal(await verifyWitness(target.chat, restored.processed), true);
+    assert.equal(restored.sourceHashVersion, 2);
+    assert.equal(restored.sourceHash, book.sourceHash);
+  });
 });
 
 test('legacy self-use V2 envelopes without copies remain importable with their original checksum', async () => {

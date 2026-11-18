@@ -19,7 +19,8 @@ import { createMemoryVolumes, openMemoryVolumes, MEMORY_VOLUME_BYTES } from './m
 import { openMemoryBundle } from './memory-transfer-bundle.js';
 import { validateTransferGraph, transferRecordKey } from './memory-transfer-graph.js';
 
-import { DYNAMIC_BOOK_RECORD, validateBook, primaryBook, sourceEntries, bookFingerprint, witness, verifyWitness } from './dynamic-worldbook.js';
+import { DYNAMIC_BOOK_RECORD, validateBook, primaryBook, sourceEntries, witness, verifyWitness } from './dynamic-worldbook.js';
+import { isCompatibleSource } from './dynamic-worldbook-source.js';
 
 export const MEMORY_PACKAGE_LIMIT = 64 * 1024 * 1024;
 const FORMAT = 'qqj-core-chat-memory', VERSION = 2, ROLLBACK = 'self-use-memory-transfer-rollback-v1';
@@ -407,7 +408,7 @@ export function createMemoryTransfer({ client, session, hostAdapter, isBusy = ()
     try {
       const ctx = hostAdapter.getContext(), name = primaryBook(ctx);
       const loader = ctx.loadWorldInfo ?? hostAdapter.getWorldInfoBindings?.().loadWorldInfo;
-      if (name && loader && await bookFingerprint(sourceEntries(await loader(name))) === book.sourceHash) return { name, status: '世界书一致：恢复动态副本、权限与修改记录。' };
+      if (name && loader && await isCompatibleSource(book, sourceEntries(await loader(name)))) return { name, status: '世界书一致：恢复动态副本、权限与修改记录。' };
     } catch { /* Imported core memory remains usable without a matching book. */ }
     return { name: null, status: '原世界书不同或不可读取：跳过动态副本，摘要与人物状态仍可恢复。' };
   }

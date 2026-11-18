@@ -251,6 +251,7 @@ test('book fingerprint survives native TT object-key reordering', async () => {
 });
 test('replacement never mutates original rows, keeps constant and protected material, handles book duplicates', async () => {
   const data = await createBook(CHAT, '书', sourceEntries(raw())); data.entries[2].kind = 'rule'; data.entries[0].content = '新家';
+  for (const entry of data.entries) entry.classification = 'ready';
   const original = Object.values(raw().entries).map(e => ({ ...e, world: '书' }));
   const snapshot = structuredClone(original), payload = { characterLore: [...original], globalLore: [...original], chatLore: [{ uid: 1, world: '其他书', content: '另一个人' }] };
   overlayCandidates(payload, { selected: ['1'] }, data);
@@ -304,10 +305,14 @@ test('history change stops use of updated copy until explicit rebuild', async t 
   await assert.rejects(f.runtime.prepare(), /旧楼被编辑/);
   const p = f.payload(); f.runtime.apply(p); assert.equal(p.characterLore[0].content, '甲住在旧公寓。');
 });
-test('source worldbook changes, including conditions, suspend replacement', async t => {
+test('source changes suspend only affected entries while other current copies remain usable', async t => {
   const f = await fixture(t); await f.runtime.update({ manual: true }); f.book.entries[1].sticky = 3;
-  await assert.rejects(f.runtime.prepare(), /原世界书已变化/);
-  const p = f.payload(); f.runtime.apply(p); assert.equal(p.characterLore[0].content, '甲住在旧公寓。');
+  await f.runtime.edit('2', { content: '城市已改名。' });
+  await f.runtime.prepare();
+  assert.deepEqual(f.runtime.getState().sourceStatus.updated, ['1']);
+  const p = f.payload(); f.runtime.apply(p);
+  assert.equal(p.characterLore[0].content, '甲住在旧公寓。');
+  assert.equal(p.characterLore[1].content, '城市已改名。');
 });
 test('late maintenance after switching chat cannot persist into either chat', async t => {
   let resolve; const f = await fixture(t, { update: () => new Promise(r => { resolve = r; }) });
@@ -581,9 +586,13 @@ test('classification resumes completed batches and preserves manually reviewed e
   await assert.rejects(f.runtime.classify(), /offline/);
   assert.equal(f.runtime.getState().data.entries.filter(e => e.classification === 'ready').length, 8);
   await f.runtime.configure({ enabled: true });
-  await f.runtime.prepare(); assert.equal(f.selections, 0, '未完成分类时不使用半份计划');
-  await assert.rejects(f.runtime.update({ manual: true }), /分类/);
-  assert.equal(f.updates, 0);
+  await f.runtime.prepare(); assert.equal(f.selections, 1, '已完成条目可继续使用，待分类条目仍走原书');
+  const payload = f.payload(); f.runtime.apply(payload);
+  for (const entry of f.runtime.getState().data.entries.filter(e => e.classification === 'pending')) {
+    assert.deepEqual(payload.characterLore.find(e => String(e.uid) === entry.uid), { ...f.book.entries[entry.uid], world: '书' });
+  }
+  await f.runtime.update({ manual: true });
+  assert.equal(f.updates, 1);
   await f.runtime.edit('9', { writable: false });
   await f.runtime.classify();
   assert.ok(f.runtime.getState().data.entries.every(e => e.classification !== 'pending'));
@@ -653,15 +662,17 @@ test('excluded active status entry keeps native behavior and never enters classi
   assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '5').excluded, true, '重建同一本书不会悄悄撤销排除');
 });
 
-test('excluded pending rows do not block ordinary entries and unexclusion restores the classification requirement', async t => {
+test('unexcluded pending rows await classification without blocking healthy entries', async t => {
   const f = await fixture(t, { skipSetup: true }); await f.runtime.initialize();
   for (const uid of ['2', '3', '4']) await f.runtime.edit(uid, { excluded: true });
   await f.runtime.classify(); await f.runtime.configure({ enabled: true });
   await f.runtime.prepare(); assert.equal(f.selections, 1);
   await f.runtime.update({ manual: true }); assert.equal(f.updates, 1);
   await f.runtime.edit('2', { excluded: false });
-  await assert.rejects(f.runtime.update({ manual: true }), /分类/);
-  await f.runtime.prepare(); assert.equal(f.selections, 1, '新开放的待分类资料不能直接发送');
+  await f.runtime.update({ manual: true }); assert.equal(f.updates, 1);
+  await f.runtime.prepare(); assert.equal(f.selections, 2, '普通条目继续选材');
+  const payload = f.payload(); f.runtime.apply(payload);
+  assert.deepEqual(payload.characterLore.find(e => e.uid === 2), { ...f.book.entries[2], world: '书' }, '待分类条目按原书发送');
 });
 
 test('excluding during a running classification cancels late results and does not overwrite new content', async t => {
@@ -688,5 +699,178 @@ test('new source disable invalidates an already prepared plan before application
   assert.equal(payload.characterLore[0].disable, true);
   f.book.entries[1].disable = true;
   const calls = f.selections;
-  await assert.rejects(f.runtime.prepare(), /原世界书已变化/); assert.equal(f.selections, calls);
+  await f.runtime.prepare(); assert.equal(f.selections, calls);
+  assert.equal(f.runtime.getState().sourceStatus.needsSync, false, '运行时开关不冒充作者更新');
+});
+
+test('incremental sync preserves plot conflicts, permissions and history progress without model calls', async t => {
+  const f = await fixture(t);
+  await f.runtime.update({ manual: true });
+  await f.runtime.edit('4', { excluded: true });
+  const before = f.runtime.getState().data, calls = [f.updates, f.selections];
+  f.book.entries[1].content = '甲住在作者新设定的别墅。';
+  f.book.entries[2].content = '城市已经扩建。';
+  f.book.entries[5] = { uid: 5, content: '新增配角。' };
+  delete f.book.entries[4];
+  await f.runtime.refresh();
+  assert.deepEqual(f.runtime.getState().sourceStatus.updated, ['1', '2']);
+  await f.runtime.syncSource({ expectedChatId: CHAT });
+  const data = f.runtime.getState().data;
+  assert.deepEqual(data.processed, before.processed);
+  assert.deepEqual([f.updates, f.selections], calls);
+  assert.equal(data.entries.find(e => e.uid === '1').content, '甲已经搬入新家。');
+  assert.deepEqual(data.entries.find(e => e.uid === '1').sourceConflict, {
+    base: '甲住在旧公寓。', incoming: '甲住在作者新设定的别墅。', deleted: false,
+  });
+  assert.equal(data.entries.find(e => e.uid === '2').content, '城市已经扩建。');
+  assert.equal(data.entries.find(e => e.uid === '2').classification, 'pending');
+  assert.equal(data.entries.find(e => e.uid === '4').excluded, true);
+  assert.equal(data.entries.find(e => e.uid === '4').sourceMissing, true);
+  assert.equal(data.entries.find(e => e.uid === '5').segments[0].writable, false);
+  await f.runtime.prepare();
+  const payload = f.payload(); f.runtime.apply(payload);
+  assert.equal(payload.characterLore.find(e => e.uid === 1).content, '甲已经搬入新家。');
+  assert.deepEqual(payload.characterLore.find(e => e.uid === 5), { ...f.book.entries[5], world: '书' });
+  const entry = f.runtime.getState().data.entries.find(e => e.uid === '1');
+  await f.runtime.resolveSource('1', { choice: 'keep', expectedEntry: stableJson(entry) }, CHAT);
+  assert.equal(f.runtime.getState().data.entries[0].sourceConflict, undefined);
+  assert.equal(f.runtime.getState().data.entries[0].content, '甲已经搬入新家。');
+  assert.equal(f.book.entries[1].content, '甲住在作者新设定的别墅。');
+});
+
+test('conflict decisions reject stale drafts and newly changed originals; adopting protects the new body', async t => {
+  const f = await fixture(t); await f.runtime.update({ manual: true });
+  const old = f.runtime.getState().data.entries[0];
+  f.book.entries[1].content = '作者新版正文。';
+  await f.runtime.syncSource();
+  await assert.rejects(f.runtime.resolveSource('1', { choice: 'source', expectedEntry: stableJson(old) }, CHAT), /新版本/);
+  const pending = f.runtime.getState().data.entries[0];
+  f.book.entries[1].content = '作者再次更新。';
+  await assert.rejects(f.runtime.resolveSource('1', { choice: 'source', expectedEntry: stableJson(pending) }, CHAT), /又有更新/);
+  await f.runtime.syncSource();
+  const fresh = f.runtime.getState().data.entries[0];
+  await f.runtime.resolveSource('1', { choice: 'source', expectedEntry: stableJson(fresh) }, CHAT);
+  const saved = f.runtime.getState().data.entries[0];
+  assert.equal(saved.content, '作者再次更新。');
+  assert.equal(saved.classification, 'pending');
+  assert.equal(saved.segments[0].writable, false);
+  assert.equal(saved.history.at(-1).kind, 'source');
+  assert.equal(f.runtime.getState().data.processed.length, 3);
+});
+
+test('bulk permissions commit once for exact checked IDs and reject stale or invalid mixed selections atomically', async t => {
+  const f = await fixture(t), token = ids => Object.fromEntries(f.runtime.getState().data.entries.filter(e => ids.includes(e.uid)).map(e => [e.uid, stableJson(e)]));
+  const unselected = structuredClone(f.runtime.getState().data.entries.find(e => e.uid === '4'));
+  let writes = f.writes.length;
+  await f.runtime.bulkEdit(['1', '2'], { writable: false }, CHAT, token(['1', '2']));
+  assert.equal(f.writes.length, writes + 1);
+  assert.deepEqual(f.runtime.getState().data.entries.find(e => e.uid === '4'), unselected);
+  const old = token(['1', '2']);
+  await f.runtime.edit('1', { content: '另一个页面的新内容。' });
+  writes = f.writes.length;
+  await assert.rejects(f.runtime.bulkEdit(['1', '2'], { excluded: true }, CHAT, old), /新版本/);
+  assert.equal(f.writes.length, writes);
+  await assert.rejects(f.runtime.bulkEdit(['1', '3'], { writable: true }, CHAT, token(['1', '3'])), /规则类/);
+  assert.equal(f.writes.length, writes);
+  assert.equal(f.runtime.getState().data.entries[0].segments[0].writable, false);
+  await f.runtime.bulkEdit(['1', '2'], { excluded: true }, CHAT, token(['1', '2']));
+  assert.ok(f.runtime.getState().data.entries.filter(e => ['1', '2'].includes(e.uid)).every(e => e.excluded));
+});
+
+test('newly opened entries backfill only their own historical batch without resetting established progress', async t => {
+  const requests = [];
+  const f = await fixture(t, { update: request => { requests.push(JSON.parse(request.taskMessages[0].content)); return { jsonData: { changes: [] } }; } });
+  await f.runtime.update({ manual: true });
+  const processed = structuredClone(f.runtime.getState().data.processed);
+  await f.runtime.configure({ interval: 1 });
+  f.book.entries[5] = { uid: 5, content: '新增住所。' };
+  await f.runtime.syncSource(); await f.runtime.classify();
+  assert.deepEqual(f.runtime.getState().data.processed, processed);
+  assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '5').recheckFrom, 0);
+  await f.runtime.update({ manual: true });
+  assert.deepEqual(requests.at(-1).entries.map(e => e.uid), ['5']);
+  assert.equal(requests.at(-1).scope.fromIndex, 0);
+  assert.deepEqual(f.runtime.getState().data.processed, processed);
+  assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '5').recheckFrom, 1);
+  await f.runtime.update({ manual: true });
+  assert.deepEqual(requests.at(-1).entries.map(e => e.uid), ['5']);
+  assert.equal(requests.at(-1).scope.fromIndex, 1);
+  assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '5').recheckFrom, undefined);
+  assert.deepEqual(f.runtime.getState().data.processed, processed);
+});
+
+test('source switches during an in-flight update prevent a late model result from being saved', async t => {
+  let release;
+  const f = await fixture(t, { update: () => new Promise(resolve => { release = resolve; }) });
+  const pending = f.runtime.update({ manual: true });
+  while (!release) await new Promise(resolve => setTimeout(resolve, 1));
+  f.book.entries[1].disable = true;
+  release({ jsonData: { changes: [] } });
+  await assert.rejects(pending, /原书发生变化/);
+  assert.equal(f.runtime.getState().data.processed.length, 0);
+  assert.equal(f.runtime.getState().data.updateHold, true);
+});
+
+test('selection sends stable full catalog before dialogue and restores request-local IDs', async t => {
+  const requests = [], book = raw(), uid = 'long-entry-identifier-12345678901234567890';
+  book.entries[uid] = { uid, comment: '长编号资料', key: ['不可删除关键词'], content: '完整资料'.repeat(1800) };
+  const f = await fixture(t, { book, select: request => {
+    requests.push(request); const catalog = JSON.parse(request.taskMessages[0].content);
+    return { jsonData: { selected: catalog.entries.map(e => e.uid) } };
+  } });
+  await f.runtime.prepare();
+  const first = requests.at(-1);
+  assert.equal(first.taskMessages.length, 2);
+  const sent = JSON.parse(first.taskMessages[0].content).entries.find(e => e.label === '长编号资料');
+  assert.ok(sent.uid.length < uid.length);
+  assert.equal(sent.content, book.entries[uid].content);
+  assert.deepEqual(sent.keys, book.entries[uid].key);
+  assert.ok(f.runtime.getState().lastSelection.selected.includes(uid));
+  f.context.chat.at(-1).mes = '新的用户输入。';
+  await f.runtime.prepare();
+  assert.equal(requests.at(-1).taskMessages[0].content, first.taskMessages[0].content);
+  assert.notEqual(requests.at(-1).taskMessages[1].content, first.taskMessages[1].content);
+});
+
+test('source sync and conflict resolution do not report success when storage rejects the revision', async t => {
+  const f = await fixture(t); await f.runtime.update({ manual: true });
+  f.book.entries[1].content = '作者新增住所。';
+  const put = f.client.put; let reject = true;
+  f.client.put = (...args) => reject ? Promise.reject(Object.assign(new Error('revision conflict'), { status: 409 })) : put(...args);
+  await assert.rejects(f.runtime.syncSource(), { status: 409 });
+  assert.deepEqual(f.runtime.getState().sourceStatus.updated, ['1']);
+  assert.equal(f.runtime.getState().data.entries[0].sourceConflict, undefined);
+  reject = false; await f.runtime.syncSource();
+  const entry = f.runtime.getState().data.entries[0]; reject = true;
+  await assert.rejects(f.runtime.resolveSource('1', { choice: 'keep', expectedEntry: stableJson(entry) }, CHAT), { status: 409 });
+  assert.deepEqual(f.runtime.getState().sourceStatus.conflicts, ['1']);
+  assert.ok(f.runtime.getState().data.entries[0].sourceConflict);
+});
+
+test('partial per-entry history recheck sends the stable snapshot until all old floors are checked', async t => {
+  const sent = [];
+  const f = await fixture(t, {
+    update: request => {
+      const input = JSON.parse(request.taskMessages[0].content), entry = input.entries.find(e => e.uid === '5');
+      if (!entry) return { jsonData: { changes: [] } };
+      const index = input.sources.find(s => s.kind === 'memory').floors[0];
+      return { jsonData: { changes: [{ uid: '5', content: index === 0 ? '历史中的旧住所。' : '剧情当前的新住所。', reason: '对应楼层确认', floors: [index] }] } };
+    },
+    select: request => {
+      const entries = JSON.parse(request.taskMessages[0].content).entries; sent.push(entries);
+      return { jsonData: { selected: entries.map(e => e.uid) } };
+    },
+  });
+  await f.runtime.update({ manual: true });
+  f.book.entries[5] = { uid: 5, content: '补核前的住所。' };
+  await f.runtime.syncSource(); await f.runtime.classify(); await f.runtime.configure({ interval: 1 });
+  await f.runtime.update({ manual: true });
+  assert.equal(f.runtime.getState().data.entries.find(e => e.uid === '5').content, '历史中的旧住所。');
+  await f.runtime.prepare();
+  assert.equal(sent.at(-1).find(e => e.uid === '5').content, '补核前的住所。');
+  let payload = f.payload(); f.runtime.apply(payload);
+  assert.equal(payload.characterLore.find(e => e.uid === 5).content, '补核前的住所。');
+  await f.runtime.update({ manual: true }); await f.runtime.prepare();
+  payload = f.payload(); f.runtime.apply(payload);
+  assert.equal(payload.characterLore.find(e => e.uid === 5).content, '剧情当前的新住所。');
 });
