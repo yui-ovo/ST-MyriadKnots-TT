@@ -1,3 +1,4 @@
+import { inlinePacket, inlineBlock } from './inline-memory-fixture.mjs';
 import { projectQianchuangSnapshot } from '../src/v3/qianchuang-domain.js';
 import { createPlaceWorkspaceStore } from '../src/v3/place-workspace.js';
 import { processingTransport } from './fixtures/processing-transport.mjs';
@@ -346,7 +347,7 @@ function browserStorage(initial = {}) {
   };
 }
 
-function harness({ memoryRuntimeFactory = createV3MemoryRuntime, withPlaces = false, onPlaceChanged = () => {}, placeWorldInfoProvider = null, filterWorldInfoSources = sources => sources, text = '裴晚生提醒你带伞。', initialChat = null, utility, todoReview, host = 'official', automation = { enabled: false, batchSize: 2 }, notifyUser, isMainGenerationActive, readMainGenerationState, extractorPromptGuidance, csePromptGuidance, processingPrompt, storyClockReferenceTags = '', sanitizerOptions = () => ({}), foundationRefresh, foundationFetch = undefined, hasTimeFloorReference = null, eventTypes = null, sharedBackend = null, sharedContext = null, modernAnchors = false, persistAnchors = null, readOnlyLifecycle = false, storeIdentityProvider = null, identityProjectionProvider = null, captureBusinessIdentity = null, prepareSession = null, qianshiExternalReferenceProvider = () => [], qianshiCandidatePreparer = undefined, qianshiCandidateIndexFactory = undefined, qianshiGraphProjector = undefined, failureStorage = undefined, coreRecordCache = null, now = () => new Date(NOW), foundationNow = () => new Date(NOW) } = {}) {
+function harness({ memoryRuntimeFactory = createV3MemoryRuntime, withPlaces = false, onPlaceChanged = () => {}, placeWorldInfoProvider = null, filterWorldInfoSources = sources => sources, text = '裴晚生提醒你带伞。', initialChat = null, utility, todoReview, host = 'official', automation = { enabled: false, batchSize: 2 }, summarySourceProvider = () => 'api', notifyUser, isMainGenerationActive, readMainGenerationState, extractorPromptGuidance, csePromptGuidance, processingPrompt, storyClockReferenceTags = '', sanitizerOptions = () => ({}), foundationRefresh, foundationFetch = undefined, hasTimeFloorReference = null, eventTypes = null, sharedBackend = null, sharedContext = null, modernAnchors = false, persistAnchors = null, readOnlyLifecycle = false, storeIdentityProvider = null, identityProjectionProvider = null, captureBusinessIdentity = null, prepareSession = null, qianshiExternalReferenceProvider = () => [], qianshiCandidatePreparer = undefined, qianshiCandidateIndexFactory = undefined, qianshiGraphProjector = undefined, failureStorage = undefined, coreRecordCache = null, now = () => new Date(NOW), foundationNow = () => new Date(NOW) } = {}) {
   let enabled = true;
   const handlers = new Map();
   const warnings = [];
@@ -395,7 +396,7 @@ function harness({ memoryRuntimeFactory = createV3MemoryRuntime, withPlaces = fa
   };
   const placeWorkspaceStore = withPlaces ? createPlaceWorkspaceStore({ client: backend.client }) : null;
   const placeProvider = identityProjectionProvider ?? (withPlaces ? async identity => { const value = await placeWorkspaceStore.read(identity ?? { chatId: CHAT }); return { placeWorkspace: value.data, placeWorkspaceRevision: value.revision }; } : null);
-  const runtime = memoryRuntimeFactory({ foundationRuntime, store, hostAdapter, generateAnalysisTask: generateUtilityTask, generateUtilityTask, isEnabled: () => enabled, automationSettings: () => automation, notifyUser, isMainGenerationActive, readMainGenerationState, extractorPromptGuidance: () => typeof extractorPromptGuidance === 'function' ? extractorPromptGuidance() : '', csePromptGuidance: () => typeof csePromptGuidance === 'function' ? csePromptGuidance() : '', processingPrompt: () => typeof processingPrompt === 'function' ? processingPrompt() : (processingPrompt ?? ''), storyClockReferenceTags: () => typeof storyClockReferenceTags === 'function' ? storyClockReferenceTags() : storyClockReferenceTags, sanitizerOptions: currentSanitizerOptions, persistAnchors, identityProjectionProvider: placeProvider, placeWorkspaceStore, onPlaceChanged, placeWorldInfoProvider, filterWorldInfoSources, captureBusinessIdentity, qianshiExternalReferenceProvider, ...(qianshiCandidatePreparer ? { qianshiCandidatePreparer } : {}), ...(qianshiCandidateIndexFactory ? { qianshiCandidateIndexFactory } : {}), ...(qianshiGraphProjector ? { qianshiGraphProjector } : {}), failureStorage, now, newUuid: uuidFactory(), logger: { warn(...args) { warnings.push(args); } } });
+  const runtime = memoryRuntimeFactory({ foundationRuntime, store, hostAdapter, generateAnalysisTask: generateUtilityTask, generateUtilityTask, isEnabled: () => enabled, automationSettings: () => automation, summarySourceProvider, notifyUser, isMainGenerationActive, readMainGenerationState, extractorPromptGuidance: () => typeof extractorPromptGuidance === 'function' ? extractorPromptGuidance() : '', csePromptGuidance: () => typeof csePromptGuidance === 'function' ? csePromptGuidance() : '', processingPrompt: () => typeof processingPrompt === 'function' ? processingPrompt() : (processingPrompt ?? ''), storyClockReferenceTags: () => typeof storyClockReferenceTags === 'function' ? storyClockReferenceTags() : storyClockReferenceTags, sanitizerOptions: currentSanitizerOptions, persistAnchors, identityProjectionProvider: placeProvider, placeWorkspaceStore, onPlaceChanged, placeWorldInfoProvider, filterWorldInfoSources, captureBusinessIdentity, qianshiExternalReferenceProvider, ...(qianshiCandidatePreparer ? { qianshiCandidatePreparer } : {}), ...(qianshiCandidateIndexFactory ? { qianshiCandidateIndexFactory } : {}), ...(qianshiGraphProjector ? { qianshiGraphProjector } : {}), failureStorage, now, newUuid: uuidFactory(), logger: { warn(...args) { warnings.push(args); } } });
   runtime.bind({ eventSource: context.eventSource, eventTypes: context.eventTypes });
   const emit = (name, ...args) => (handlers.get(name) ?? []).forEach(listener => listener(...args));
   return { runtime, foundationRuntime, store, backend, context, hostAdapter, placeWorkspaceStore, calls, warnings, emit, readReachableModes, snapshotCount: () => snapshotCalls,
@@ -409,6 +410,89 @@ async function waitFor(predicate, message = '等待异步状态超时') {
   }
   assert.fail(typeof message === 'function' ? message() : message);
 }
+
+test('主回复记忆：完整区块直接保存人物事件地点，CSE仍分析且不调用摘要模型', async () => {
+  const body = '裴晚生在书房提醒林岚带伞。';
+  const evidence = { source: 'canonicalContent', sourceFloorKey: 'current', exactQuote: body };
+  const packet = inlinePacket({
+    locations: [{ name: '书房', change: 'present', people: ['裴晚生', '林岚'] }],
+    spatialFacts: { places: [{ key: 'place-mention-1', name: '书房', identity: 'new', ...evidence }], containments: [],
+      positions: [{ subject: '裴晚生', placeKey: 'place-mention-1', status: 'confirmed', ...evidence }] },
+    qianshi: { events: [{ key: 'event-1', sourceFloorKey: 'current', title: '提醒带伞', description: body, status: 'occurred', actionStatus: 'completed', matter: false, people: ['裴晚生', '林岚'], links: [] }], order: [] },
+  });
+  const h = harness({ initialChat: [user('继续'), assistant(body + inlineBlock(packet)), user('后续')], summarySourceProvider: () => 'inline' });
+  await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId);
+  const floor = h.runtime.getState().floors[0];
+  assert.equal(floor.summary, packet.summary); assert.equal(floor.api.source, 'main-reply'); assert.equal(floor.api.transportAttempts, 0);
+  assert.equal(h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, 0);
+  assert.equal(h.calls.length, 1, '只有CSE请求');
+  assert.equal(floor.memory.qianshiDelta.status, 'ready'); assert.equal(floor.memory.qianshiDelta.events.length, 1);
+  assert.equal(floor.memory.spatialFacts.positions.length, 1);
+  assert.ok(['ready', 'noChange'].includes(floor.cse.status));
+  assert.doesNotMatch(floor.memory.sourceCanonicalContent ?? '', /qqj_memory|"version"/u);
+  const cold = await h.store.readReachable({ mode: 'runtime' }); assert.equal(cold.floorMemories[0].summary.aiText, packet.summary);
+  const reference = h.runtime.getInlineMemoryReference(); assert.ok(reference.knownPeople.some(person => person.name === '裴晚生'));
+  assert.equal(h.runtime.getInlineMemoryReference('swipe'), null);
+});
+
+test('主回复记忆：自动模式仅缺失时调用API，格式错误和只读模式缺失不花摘要请求', async () => {
+  for (const [mode, suffix, expectedCalls, expectedCode] of [
+    ['auto', '', 1, null], ['inline', '', 0, 'V3_INLINE_MEMORY_MISSING'],
+    ['auto', '<qqj_memory>{bad}</qqj_memory>', 0, 'V3_INLINE_MEMORY_INVALID'],
+    ['auto', inlineBlock({ version: 1, summary: '缺字段' }), 0, 'V3_INLINE_MEMORY_INCOMPLETE'],
+  ]) {
+    const h = harness({ text: '裴晚生提醒你带伞。' + suffix, summarySourceProvider: () => mode });
+    await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+    assert.equal(h.calls.length, expectedCalls);
+    assert.equal(h.runtime.getState().lastExtractorError?.code ?? null, expectedCode);
+    if (expectedCode) assert.equal(h.runtime.getState().floors[0].memoryId, null);
+  }
+});
+
+test('主回复记忆：切换来源和单楼覆盖不重做旧楼，人工摘要保留并提供新的AI稿', async () => {
+  let mode = 'inline';
+  const h = harness({ text: '裴晚生提醒你带伞。' + inlineBlock(inlinePacket()), summarySourceProvider: () => mode });
+  await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  await h.runtime.editSummary(floorId, '人工确认稿');
+  const savedId = h.runtime.getState().floors[0].memoryId; mode = 'api';
+  assert.equal(h.runtime.getState().floors[0].memoryId, savedId);
+  await h.runtime.extractFloor(floorId, { analyzeState: false, summarySource: 'inline' });
+  assert.equal(h.calls.length, 0); assert.equal(h.runtime.getState().floors[0].summary, '人工确认稿');
+  assert.equal(h.runtime.getState().floors[0].aiSummary, inlinePacket().summary);
+  await h.runtime.extractFloor(floorId, { analyzeState: false, summarySource: 'api' });
+  assert.equal(h.calls.length, 1); assert.equal(h.runtime.getState().floors[0].summary, '人工确认稿');
+  assert.notEqual(h.runtime.getState().floors[0].api.source, 'main-reply');
+});
+
+test('主回复记忆：提供稳定旧事项引用，下一楼进展映射回原事项', async () => {
+  const event = { key: 'event-1', sourceFloorKey: 'current', title: '带伞计划', description: '裴晚生计划带伞出门。', status: 'planned', actionStatus: 'planned', matter: true, people: ['裴晚生'], links: [] };
+  const h = harness({ initialChat: [user('继续'), assistant(event.description + inlineBlock(inlinePacket({ qianshi: { events: [event], order: [] } }))), user('接着完成带伞计划')], summarySourceProvider: () => 'inline' });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const first = h.runtime.getState().floors[0].memory.qianshiDelta.events[0];
+  const reference = h.runtime.getInlineMemoryReference();
+  assert.equal(reference.qianshiCandidates[0].ref, `matter:${first.matterId}`);
+  const personRef = reference.knownPeople.find(person => person.name === '裴晚生').ref;
+  const packet = inlinePacket({ people: [{ name: '裴晚生', presence: 'present', sameAsEntityKey: personRef }],
+    qianshi: { events: [{ ...event, title: '带伞出门', description: '裴晚生带伞出门，带伞计划已完成。', status: 'completed', actionStatus: 'completed', links: [{ candidateKey: reference.qianshiCandidates[0].ref, kind: 'progress' }] }], order: [] } });
+  h.context.chat.push(assistant(packet.qianshi.events[0].description + inlineBlock(packet)), user('继续'));
+  await h.foundationRuntime.reconcile('inline-next'); await h.runtime.refreshStatus();
+  const nextFloor = h.runtime.getState().floors.at(-1);
+  await h.runtime.extractFloor(nextFloor.floorId, { analyzeState: false });
+  const current = h.runtime.getState().floors.at(-1).memory;
+  assert.equal(current.qianshiDelta.status, 'ready'); assert.equal(current.qianshiDelta.events[0].matterId, first.matterId);
+  assert.equal(current.qianshiDelta.events[0].updatesMatter, true); assert.equal(h.calls.length, 0);
+});
+
+test('主回复记忆：错误旧事项引用留下待核状态，不伪造关系或旧楼编号', async () => {
+  const packet = inlinePacket({ qianshi: { events: [{ key: 'event-1', sourceFloorKey: 'current', title: '继续某件事', description: '提醒带伞', status: 'inProgress', matter: true, people: ['裴晚生'], links: [{ candidateKey: 'matter:does-not-exist', kind: 'progress' }] }], order: [] } });
+  const h = harness({ text: '裴晚生提醒你带伞。' + inlineBlock(packet), summarySourceProvider: () => 'inline' });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const memory = h.runtime.getState().floors[0].memory;
+  assert.equal(memory.summary.aiText, packet.summary); assert.notEqual(memory.qianshiDelta.status, 'ready');
+  assert.equal(memory.qianshiDelta.events.length, 0); assert.equal(h.calls.length, 0);
+});
 
 test('人工摘要保存后等待 CSE 时保持摘要可用并展示 CSE 阶段', async t => {
   for (const outcome of ['success', 'timeout']) await t.test(outcome, async () => {

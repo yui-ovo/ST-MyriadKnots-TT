@@ -555,7 +555,7 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
     if (!floor) return;
     const userEdited = floor.summarySource === 'user' && floor.status === 'ready';
     view.card.className = `qqj-memory-card status-${floor.status}`;
-    view.statusNode.textContent = running ? workPhaseCopy(state) : floor.sourceUnavailable ? '来源待核' : userEdited ? '人工修订' : statusCopy(floor.status);
+    view.statusNode.textContent = running ? workPhaseCopy(state) : floor.sourceUnavailable ? '来源待核' : userEdited ? '人工修订' : floor.status === 'ready' && floor.api?.source === 'main-reply' ? '主回复摘要' : statusCopy(floor.status);
     view.statusNode.className = `v3-memory-status${userEdited ? ' is-user' : ''}`;
   };
   const updateMemoryFloorStatuses = state => {
@@ -1208,7 +1208,7 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
     const memory = floor.memory;
     const times = floorTimeDisplay(memory, floor) || '时间未明确';
     const timeNode = element('span', 'qqj-floor-time', times); timeNode.setAttribute('title', times);
-    const floorStatus = floor.frozen ? '来源归档 · 只读' : floor.sourceUnavailable ? '来源待核' : floor.summarySource === 'user' && floor.status === 'ready' ? '人工修订' : statusCopy(floor.status);
+    const floorStatus = floor.frozen ? '来源归档 · 只读' : floor.sourceUnavailable ? '来源待核' : floor.summarySource === 'user' && floor.status === 'ready' ? '人工修订' : floor.status === 'ready' && floor.api?.source === 'main-reply' ? '主回复摘要' : statusCopy(floor.status);
     const statusNode = element('span', `v3-memory-status${floor.summarySource === 'user' && floor.status === 'ready' ? ' is-user' : ''}`, floorStatus);
     const chevron = element('span', 'qqj-memory-chevron'); chevron.setAttribute('aria-hidden', 'true');
     const numberNode = element('strong', 'qqj-floor-number', title);
@@ -1301,7 +1301,28 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
         });
         menuBody.append(extract);
       }
+      if (!floor.frozen && typeof runtime.extractFloor === 'function') {
+        for (const [source, label] of [['inline', '读取本楼主回复记忆'], ['api', '使用摘要 API 重提']]) {
+          const sourceButton = element('button', 'qqj-memory-menu-action', label); sourceButton.type = 'button'; sourceButton.disabled = workBusy(currentState);
+          trackMemoryRowWorkControl({ node: sourceButton, disabled: current => workBusy(current) });
+          sourceButton.addEventListener('click', async () => {
+            const before = runtime.getState();
+            let extractionTarget;
+            try { if ((floor.sourceFloorIds?.length ?? 0) <= 1) extractionTarget = runtime.captureExtractionTarget?.(floor.floorId); }
+            catch (error) { void run(label, () => Promise.reject(error)); return; }
+            if (!await confirmImpl({ title: label, body: '只处理这一楼；已有人工摘要保留，成功后可对比选择。', confirmText: '继续', cancelText: '取消' })) return;
+            if (runtime.getState().chatId !== before.chatId) return;
+            const generation = dialogGeneration;
+            const result = await run(label, () => runtime.extractFloor(floor.floorId, { summarySource: source, ...(extractionTarget ? { extractionTarget } : {}) }), { resultCopy: floorActionResult(label, floor.floorId) });
+            if (active && page === 'memories' && generation === dialogGeneration) void openSummaryComparison(comparisonAfterExtraction(before, result, runtime.getState(), floor.floorId));
+          });
+          menuBody.append(sourceButton);
+        }
+      }
       actions.append(menuToggle, menuBody); body.append(actions);
+      if (floor.api?.source === 'main-reply' && memory?.qianshiDelta?.status && memory.qianshiDelta.status !== 'ready') {
+        body.append(element('p', 'settings-hint', `主回复摘要已保存，千事${memory.qianshiDelta.status === 'partial' ? '部分完成' : '待补齐'}：${memory.qianshiDelta.reason || '请查看千事处理状态，或使用摘要 API 重提。'}`));
+      }
       if (floor.error) body.append(element('p', 'v3-foundation-feedback error', floor.error));
       card.append(body);
     };

@@ -23,6 +23,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   apiMode: 'auto',
   selectedSevenDaysPresetId: '',
   summaryPresetId: '',
+  summarySource: 'api',
   recallPresetId: '',
   worldbookPresetId: '',
   vectorEnabled: false,
@@ -236,6 +237,7 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (own(patch, 'apiAdditionalParams')) parseAdditionalParams(patch.apiAdditionalParams);
     const settings = get();
     if (own(patch, 'pluginEnabled')) settings.pluginEnabled = patch.pluginEnabled !== false;
+    if (own(patch, 'summarySource')) settings.summarySource = ['api', 'inline', 'auto'].includes(patch.summarySource) ? patch.summarySource : 'api';
     if (own(patch, 'coreCacheEnabled')) settings.coreCacheEnabled = patch.coreCacheEnabled !== false;
     if (own(patch, 'timeEvolutionEnabled')) settings.timeEvolutionEnabled = patch.timeEvolutionEnabled === true;
     if (own(patch, 'qianchuangBasemaps')) settings.qianchuangBasemaps = normalizeQianchuangBasemaps(patch.qianchuangBasemaps);

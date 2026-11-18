@@ -1,3 +1,4 @@
+import { createInlineMemoryBridge } from './src/inline-memory-bridge.js';
 import { startQianchuangMapCatalog } from './src/qianchuang-map-catalog.js';
 import { QIANCHUANG_MAP_ASSETS } from './src/qianchuang-map-assets.js';
 import { CITY_MAPS } from './src/ui/qianchuang-city-maps.js';
@@ -305,6 +306,7 @@ const v3MemoryRuntime = createV3MemoryRuntime({
   isMainGenerationActive: isMemoryWorkBlocked,
   readMainGenerationState,
   extractorPromptGuidance: summaryPrompt,
+  summarySourceProvider: () => settings.get().summarySource,
   csePromptGuidance: csePrompt,
   processingPrompt,
   storyClockReferenceTags: () => settings.get().storyClockReferenceTags,
@@ -453,6 +455,7 @@ const createHistoricalRebuild = options => runHistoricalRebuildTask({
   generateUtilityTask: taskRouter.generateUtilityTask,
   automationSettings: () => ({ enabled: false, batchSize: 1 }),
   extractorPromptGuidance: summaryPrompt,
+  summarySourceProvider: () => settings.get().summarySource,
   csePromptGuidance: csePrompt,
   processingPrompt,
   storyClockReferenceTags: () => settings.get().storyClockReferenceTags,
@@ -469,6 +472,7 @@ const createHistoricalRebuild = options => runHistoricalRebuildTask({
   persistAnchors: persistMessageFloorAnchors,
   fetchImpl: globalThis.fetch,
 });
+const inlineMemoryBridge = createInlineMemoryBridge({ hostAdapter, memoryRuntime: v3MemoryRuntime, settings });
 const inlineRenderer = createInlineRenderer({ memoryRuntime: v3MemoryRuntime, recallRuntime: v3RecallRuntime, hostAdapter });
 const chatMemoryManagement = createChatMemoryManagement({
   contextProvider,
@@ -591,7 +595,16 @@ globalThis.addEventListener?.('beforeunload', publicQianshiBridgeMount.cleanup, 
 globalThis.addEventListener?.('beforeunload', autoHideController.dispose, { once: true });
 globalThis.addEventListener?.('beforeunload', inlineRenderer.destroy, { once: true });
 globalThis.addEventListener?.('beforeunload', storageManagement.dispose, { once: true });
-globalThis.qqj_v3_recall_interceptor = (coreChat, contextSize, abort, type) => dynamicWorldbook.intercept(v3RecallRuntime.intercept, coreChat, contextSize, abort, type);
+globalThis.qqj_v3_recall_interceptor = async (coreChat, contextSize, abort, type) => {
+  inlineMemoryBridge.clear();
+  const initialChat = hostAdapter.snapshot().chatId;
+  let aborted = false;
+  const result = await dynamicWorldbook.intercept(v3RecallRuntime.intercept, coreChat, contextSize, (...args) => { aborted = true; return abort?.(...args); }, type);
+  if (!aborted && initialChat === hostAdapter.snapshot().chatId) {
+    try { inlineMemoryBridge.prepare(type); } catch { inlineMemoryBridge.clear(); }
+  }
+  return result;
+};
 // Static map preparation stays outside chat/model/storage work.
 const startQianchuangMaps = () => startQianchuangMapCatalog({ genericAssets: QIANCHUANG_MAP_ASSETS, cityAssets: CITY_MAPS,
   sanitizeSvg: svg => DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } }),
@@ -701,8 +714,8 @@ ui = bootstrap({
 });
 lifecycle = createPluginLifecycle({
   session,
-  aborters: [taskRouter, apiTools, peopleTaskRouter, peopleWorkspaceRuntime, vectorIndex, vectorApi, dynamicWorldbook],
-  contextAborters: [taskRouter, apiTools, vectorIndex, vectorApi, dynamicWorldbook],
+  aborters: [inlineMemoryBridge, taskRouter, apiTools, peopleTaskRouter, peopleWorkspaceRuntime, vectorIndex, vectorApi, dynamicWorldbook],
+  contextAborters: [inlineMemoryBridge, taskRouter, apiTools, vectorIndex, vectorApi, dynamicWorldbook],
   isEnabled: settings.isEnabled,
   getUi: () => ui,
   onPrepared: async ({ result, isCurrent, explicitEnable }) => {

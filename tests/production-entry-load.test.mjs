@@ -1329,6 +1329,10 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   define('./src/v3/recall-runtime.js', { createV3RecallRuntime: options => { v3RecallOptions = options; v3RecallRuntime = { bind() {}, async setEnabled(value) { runtimeEnables.push(`recall:${value}`); }, async intercept() {}, invalidate(reason) { recallInvalidations.push(reason); }, getState: () => ({}), getPromptSnapshot: () => null }; return v3RecallRuntime; } });
   define('./src/v3/auto-hide.js', { createAutoHideController: options => { autoHideOptions = options; return { applySettings() {}, stop() {}, dispose() {} }; } });
   define('./src/ui/inline-renderer.js', { createInlineRenderer: options => { inlineRendererOptions = options; return { setEnabled(value) { inlineEnabled.push(value); }, destroy() {} }; } });
+  const inlineMemoryCalls = [];
+  let inlineMemoryOptions;
+  const inlineMemoryBridge = { clear() { inlineMemoryCalls.push('clear'); }, prepare(type) { inlineMemoryCalls.push(type); }, abortAll() {} };
+  define('./src/inline-memory-bridge.js', { createInlineMemoryBridge: options => { inlineMemoryOptions = options; return inlineMemoryBridge; } });
   let peopleWorkspaceState = { status: 'ready', chatId: 'test',
     profilesByEntityId: { 'awake-id': { name: '在场人物', birthday: '1月1日', aliases: '人工称呼', manualFields: ['aliases'] }, 'sleep-id': { name: '休眠人物', birthday: '2月2日' }, 'old-id': { name: '旧身份', birthday: '3月3日' }, 'deleted-id': { name: '已删除', birthday: '4月4日' } },
     identityRedirectsByEntityId: { 'old-id': 'awake-id' }, deletedEntityIds: ['deleted-id'], revision: 1, people: [{ entityId: 'awake-id' }] };
@@ -1611,14 +1615,16 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   assert.equal(typeof sessionOptions.contextProvider, 'function');
   assert.ok(sessionOptions.identityCoordinator);
   assert.ok(lifecycleOptions.session);
-  assert.equal(lifecycleOptions.aborters.length, 7);
+  assert.equal(lifecycleOptions.aborters.length, 8);
+  assert.ok(lifecycleOptions.aborters.includes(inlineMemoryBridge));
   assert.ok(lifecycleOptions.aborters.includes(dynamicBookRuntime));
   assert.equal(taskRouters.length, 2);
   assert.equal(taskRouters[0].options.resolver, taskRouters[1].options.resolver);
   assert.equal(taskRouters[0].options.compactClient, taskRouters[1].options.compactClient);
   assert.equal(taskRouters[0].options.isEnabled, taskRouters[1].options.isEnabled);
   assert.ok(lifecycleOptions.aborters.includes(taskRouters[1].router));
-  assert.equal(lifecycleOptions.contextAborters.length, 5);
+  assert.equal(lifecycleOptions.contextAborters.length, 6);
+  assert.ok(lifecycleOptions.contextAborters.includes(inlineMemoryBridge));
   assert.ok(lifecycleOptions.contextAborters.includes(taskRouters[0].router));
   assert.equal(lifecycleOptions.contextAborters.includes(taskRouters[1].router), false);
   assert.equal(lifecycleOptions.contextAborters.includes(peopleWorkspaceRuntime), false);
@@ -1724,6 +1730,18 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   assert.equal(Object.hasOwn(v3RecallOptions, 'historicalMaintenance'), false);
   assert.equal(typeof v3RecallOptions.realtimeOrigin, 'function');
   assert.equal(typeof context.qqj_v3_recall_interceptor, 'function');
+  assert.equal(inlineMemoryOptions.memoryRuntime, v3MemoryRuntime);
+  productionSettings.summarySource = 'inline';
+  assert.equal(v3MemoryOptions.summarySourceProvider(), 'inline');
+  productionSettings.summarySource = 'api';
+  assert.equal(v3MemoryOptions.summarySourceProvider(), 'api');
+  await context.qqj_v3_recall_interceptor([], 8192, () => {}, 'normal');
+  assert.deepEqual(inlineMemoryCalls, ['clear', 'normal']);
+  const savedIntercept = dynamicBookRuntime.intercept;
+  dynamicBookRuntime.intercept = (_recall, _chat, _size, abort) => abort(true);
+  await context.qqj_v3_recall_interceptor([], 8192, () => {}, 'normal');
+  assert.deepEqual(inlineMemoryCalls, ['clear', 'normal', 'clear'], '中止生成后不得残留主回复参考');
+  dynamicBookRuntime.intercept = savedIntercept;
   assert.equal(dynamicBookOptions.generateUpdate, worldbookTask);
   assert.equal(dynamicBookOptions.processingPrompt(), '  破限接线\n');
   productionSettings.worldbookPrompt = '世界书测试指导';

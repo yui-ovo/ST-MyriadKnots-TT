@@ -2597,6 +2597,22 @@ test('人工摘要重新提取成功自动对比，保留后可重开采用AI稿
   h.view.deactivate();
 });
 
+test('单楼摘要来源按钮传入明确来源与固定目标，人工稿仍需对比确认', async t => {
+  for (const [label, source] of [['读取本楼主回复记忆', 'inline'], ['使用摘要 API 重提', 'api']]) await t.test(source, async () => {
+    const h = summaryComparisonViewHarness(), captured = { floorId: 'floor', messageIndex: 78 };
+    const extract = h.runtime.extractFloor;
+    let received;
+    h.runtime.captureExtractionTarget = () => captured;
+    h.runtime.extractFloor = async (floorId, options) => { received = { floorId, options }; return extract(); };
+    await h.button(label).click();
+    assert.deepEqual(received, { floorId: 'floor', options: { summarySource: source, extractionTarget: captured } });
+    assert.equal(h.runtime.getState().floors[0].summary, '人工确认的摘要');
+    assert.equal(activeEditorDialog.options.title, '第 78 楼 · 摘要对比');
+    cancelEditor(); await new Promise(resolve => setImmediate(resolve));
+    h.view.deactivate();
+  });
+});
+
 test('重提未保存新稿不自动对比，页面已关闭也不在后台弹窗', async () => {
   const h = summaryComparisonViewHarness();
   h.runtime.extractFloor = async () => h.runtime.getState();

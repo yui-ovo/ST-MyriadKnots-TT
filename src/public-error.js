@@ -1,6 +1,10 @@
 const CHINESE_TEXT = /[\u3400-\u9fff]/u;
 
 const CODE_COPY = Object.freeze({
+  V3_INLINE_MEMORY_INVALID: '本楼记忆区块格式不正确或不完整，未保存；可修正后重读，或使用摘要 API 重提。',
+  V3_INLINE_MEMORY_INCOMPLETE: '本楼记忆区块缺少结构化字段，未保存；请使用配套预设提示词，或使用摘要 API 重提。',
+  V3_INLINE_MEMORY_MISSING: '本楼没有配套记忆区块；开启预设条目只影响后续回复，本楼可使用摘要 API 重提。',
+  V3_INLINE_MEMORY_AGGREGATE: '主回复记忆按单楼读取，整段压缩请使用摘要 API。',
   V3_MEMORY_SUMMARY_STALE: '这份摘要或当前聊天已变化，请关闭窗口后重新对比。',
   QQJ_DISABLED: '千千结当前已关闭。',
   QQJ_CONFIG: 'API 配置不完整，请检查 URL、Key 和模型。',

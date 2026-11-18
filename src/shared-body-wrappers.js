@@ -128,7 +128,7 @@ export function sanitizeStoryBody(raw, options = {}) {
   if (!raw) return '';
   const keep = new Set(normalizeWrapperRules(options.keepTags ?? 'content'));
   const extra = new Set(normalizeWrapperRules(options.extraTags ?? ''));
-  let text = String(raw), htmlContext = false;
+  let text = String(raw).replace(/<qqj_memory\b[^>]*>[\s\S]*?(?:<\/qqj_memory\s*>|$)/giu, ''), htmlContext = false;
   const htmlFormatting = options.htmlFormatting === true;
   if (htmlFormatting) {
     const protectedFence = [...keep, ...extra].some(rule => { const pair = literalRule(rule); return pair && text.trim().startsWith(pair.start) && text.trim().endsWith(pair.end); });

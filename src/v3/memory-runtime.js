@@ -17,6 +17,8 @@ import { createCheckpointInputFingerprints, deterministicUuid, scanAssistantCand
 import { validateFoundationCheckpoint, validateFoundationRoot, validateFoundationRun, V3_INDEX_LAYOUT_FLOOR_ORDER } from './foundation-schema.js';
 import { validateQianshiDelta } from './qianshi-schema.js';
 import { buildExtractorSystemPrompt, buildHighFloorExtractorSystemPrompt, runExtractorRequest, createExtractorEnvelope, inferCanonicalCurrentTime, EXTRACTOR_PROMPT_VERSION, EXTRACTOR_VERSION, QIANSHI_LIFECYCLE_GUIDANCE, QIANSHI_OUTPUT_CAPACITY_GUIDANCE } from './extractor.js';
+import { chooseInlineMemory, inlineCandidateRef, normalizeSummarySource } from '../inline-memory-format.js';
+import { compileInlineMemory } from './inline-memory.js';
 import { collectFloorMemoryEntityIds, collectStateDeltaEntityIds, memorySourceFloorIds, validateEntityRecord, validateFloorMemory } from './memory-schema.js';
 import { sanitizeDiagnosticValue, sanitizeSensitiveText, sanitizeTaskMetadata } from './safe-metadata.js';
 import { createCseRuntime } from './cse-runtime.js';
@@ -448,7 +450,7 @@ export function createQianshiEventLookup(readSnapshot = createQianshiSnapshotMem
   };
 }
 
-export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, generateAnalysisTask, generateUtilityTask, isEnabled = true, automationSettings = () => ({ enabled: false, batchSize: 1 }), notifyUser = null, isMainGenerationActive = () => false, readMainGenerationState = null, onQianshiEventDeleted = () => {}, extractorPromptGuidance = () => '', csePromptGuidance = () => '', processingPrompt = () => '', storyClockReferenceTags = () => '', storyCalendarProvider = () => null, filterWorldInfoSources = sources => sources, sanitizerOptions = () => ({}), persistAnchors = null, identityProjectionProvider = null, placeWorkspaceStore = null, placeWorldInfoProvider = null, onPlaceChanged = () => {}, qianshiExternalReferenceProvider = () => [], captureBusinessIdentity = null, storeForIdentity = null, qianshiCandidatePreparer = prepareQianshiCandidates, qianshiCandidateIndexFactory = createQianshiCandidateIndex, qianshiGraphProjector = projectQianshiGraph, failureStorage = undefined, now = () => new Date(), newUuid = newIdentityUuid, logger = console } = {}) {
+export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, generateAnalysisTask, generateUtilityTask, isEnabled = true, automationSettings = () => ({ enabled: false, batchSize: 1 }), summarySourceProvider = () => 'api', notifyUser = null, isMainGenerationActive = () => false, readMainGenerationState = null, onQianshiEventDeleted = () => {}, extractorPromptGuidance = () => '', csePromptGuidance = () => '', processingPrompt = () => '', storyClockReferenceTags = () => '', storyCalendarProvider = () => null, filterWorldInfoSources = sources => sources, sanitizerOptions = () => ({}), persistAnchors = null, identityProjectionProvider = null, placeWorkspaceStore = null, placeWorldInfoProvider = null, onPlaceChanged = () => {}, qianshiExternalReferenceProvider = () => [], captureBusinessIdentity = null, storeForIdentity = null, qianshiCandidatePreparer = prepareQianshiCandidates, qianshiCandidateIndexFactory = createQianshiCandidateIndex, qianshiGraphProjector = projectQianshiGraph, failureStorage = undefined, now = () => new Date(), newUuid = newIdentityUuid, logger = console } = {}) {
   if (!foundationRuntime || ['start', 'refreshStatus', 'confirmLatest', 'setEnabled', 'bind', 'getState'].some(name => typeof foundationRuntime[name] !== 'function')) throw new TypeError('V3 memory foundation runtime 无效');
   if (!store || ['readReachable', 'readRecord', 'putRecord', 'commitRoot', 'recordKey', 'invalidate'].some(name => typeof store[name] !== 'function')) throw new TypeError('V3 memory store 无效');
   if (typeof generateAnalysisTask !== 'function') throw new TypeError('V3 memory analysis route 无效');
@@ -2947,7 +2949,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
     catch (error) { throw markPreparationFailure(error, prepareStep); }
   }
 
-  async function extractFloorInternal(floorId, { analyzeState = true, preparedInput = null, manualWork, aggregate = false, floorIds = null, extractionTarget = null } = {}) {
+  async function extractFloorInternal(floorId, { analyzeState = true, preparedInput = null, manualWork, aggregate = false, floorIds = null, extractionTarget = null, summarySource = null } = {}) {
     if (!enabled()) return notify();
     if (isFrozenFloor(floorId)) throw errorWith('V3_MIGRATION_FLOOR_READ_ONLY', '来源聊天的已迁移楼只读，不能重新提取。');
     if (active) return getState();
@@ -2959,10 +2961,11 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
     if (!prepared) return getState();
     const { source, floor, oldMemory, sourceRawFingerprint, sourceClock, userIdentity, promptGuidanceSnapshot, processingPromptSnapshot, dependencySnapshot, expectedScope, scopedEntities, envelope, semanticInputFingerprint: preparedSemanticInputFingerprint, qianshiDependency } = prepared;
     aggregate ||= prepared.aggregate === true;
+    const selectedSummarySource = normalizeSummarySource(summarySource ?? (typeof summarySourceProvider === 'function' ? summarySourceProvider() : summarySourceProvider));
     const currentProcessing = typeof processingPrompt === 'function' ? processingPrompt() : processingPrompt;
     const currentProcessingFingerprint = `sha256:${await sha256(resolveSharedProcessingPrompt(currentProcessing))}`;
     let pending = pendingResults.get(floor.id) ?? null;
-    if (pending && (!sameExtractorDependency(pending.dependencySnapshot, dependencySnapshot)
+    if (pending && (pending.summarySource !== selectedSummarySource || !sameExtractorDependency(pending.dependencySnapshot, dependencySnapshot)
       || pending.chatId !== source.root.chatId || pending.narrativeGeneration !== source.root.narrativeGeneration
       || pending.sourceRawFingerprint !== sourceRawFingerprint
       || (pending.processingPromptFingerprint ? pending.processingPromptFingerprint !== currentProcessingFingerprint : pending.processingPrompt !== String(currentProcessing ?? '')))) {
@@ -2991,7 +2994,10 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
       operation.dependencyBoundaryMessageIndex = Math.max(...operation.dependencySnapshot.floorDependencies
         .map(item => item.hostLocator.messageIndex));
       operation.hostIdentity = generationIdentity(hostAdapter.snapshot());
-      result = pending?.result ?? await runExtractorRequest({ generateUtilityTask, envelope, floor, existingEntities: scopedEntities, now: nowIso(now), supersedes: oldMemory?.id ?? null, preservedSummary: oldMemory?.summary?.effectiveSource === 'user' ? oldMemory.summary : null, expectedScope, promptGuidance: promptGuidanceSnapshot, processingPrompt: processingPromptSnapshot, aggregate, signal: operation.controller.signal, transportBudget: operation.transportBudget });
+      const inlinePacket = pending ? null : chooseInlineMemory(prepared.selectedRawContent, selectedSummarySource, aggregate);
+      const extractionOptions = { envelope, floor, existingEntities: scopedEntities, now: nowIso(now), supersedes: oldMemory?.id ?? null, preservedSummary: oldMemory?.summary?.effectiveSource === 'user' ? oldMemory.summary : null, expectedScope };
+      result = pending?.result ?? (inlinePacket ? await compileInlineMemory({ ...extractionOptions, packet: inlinePacket })
+        : await runExtractorRequest({ ...extractionOptions, generateUtilityTask, promptGuidance: promptGuidanceSnapshot, processingPrompt: processingPromptSnapshot, aggregate, signal: operation.controller.signal, transportBudget: operation.transportBudget }));
       operation.identityResult = result;
       const samePlaceSources = result.placeUnavailable && oldMemory && oldMemory.sourceRawFingerprint === result.memory.sourceRawFingerprint
         && oldMemory.sourceCanonicalContent === result.memory.sourceCanonicalContent
@@ -3036,7 +3042,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
       }
       if (result && !summaryCommitted && (!extractionTarget || !operation.rootCommitAttempted || operation.rootCommitConflict)
         && error?.name !== 'AbortError' && !STALE_MEMORY_CODES.has(error?.code)) {
-        rememberPendingResult(floor.id, { chatId: source.root.chatId, narrativeGeneration: source.root.narrativeGeneration, sourceRawFingerprint, processingPromptFingerprint: result.metadata?.processingPromptFingerprint ?? currentProcessingFingerprint, dependencySnapshot: operation.dependencySnapshot, runId: operation.runId, startedAt: operation.startedAt, commitTimestamp: operation.commitTimestamp, commitTimestampVersionKey: operation.commitTimestampVersionKey, preflightTiming: operation.preflightTiming, semanticInputFingerprint: operation.semanticInputFingerprint, qianshiDependency: operation.qianshiDependency, qianshiUnavailable: operation.qianshiUnavailable, result });
+        rememberPendingResult(floor.id, { summarySource: selectedSummarySource, chatId: source.root.chatId, narrativeGeneration: source.root.narrativeGeneration, sourceRawFingerprint, processingPromptFingerprint: result.metadata?.processingPromptFingerprint ?? currentProcessingFingerprint, dependencySnapshot: operation.dependencySnapshot, runId: operation.runId, startedAt: operation.startedAt, commitTimestamp: operation.commitTimestamp, commitTimestampVersionKey: operation.commitTimestampVersionKey, preflightTiming: operation.preflightTiming, semanticInputFingerprint: operation.semanticInputFingerprint, qianshiDependency: operation.qianshiDependency, qianshiUnavailable: operation.qianshiUnavailable, result });
       } else if (summaryCommitted || extractionTarget && operation.rootCommitAttempted || error?.name === 'AbortError' || STALE_MEMORY_CODES.has(error?.code)) pendingResults.delete(floor.id);
       if (error?.name !== 'AbortError' && !STALE_MEMORY_CODES.has(error?.code)) await persistFailure(operation, error, source);
       else {
@@ -3294,6 +3300,23 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
       return { ...result, extractionFloorId: floorId };
     });
   };
+  function getInlineMemoryReference(type = 'normal') {
+    if (!enabled() || !reachable?.root || !['normal', undefined, null].includes(type)) return null;
+    const snapshot = hostAdapter.snapshot(), target = captureTargetIdentity();
+    const liveChatId = target?.chatId ?? snapshot.context?.chatMetadata?.qianqianjie?.chatId;
+    if (liveChatId !== reachable.root.chatId) return null;
+    const directory = buildEntityIdentityDirectory({ entities: reachable.entities, identityProjection });
+    const names = kind => directory.filter(entry => entry.entity.entityType === kind).slice(-80).map(entry => ({
+      ref: `${kind === 'person' ? 'person' : 'place'}:${entry.entity.id}`, name: entry.displayName, aliases: entry.labels.slice(0, 8) }));
+    const query = snapshot.chat.filter(message => message.is_system !== true).slice(-3).map(message => sanitizeMemoryContent(message.mes, sanitizerOptions())).join('\n').slice(-12000);
+    let candidates = [];
+    try {
+      const source = { ...reachable, calendar: storyCalendarProvider(reachable.root.chatId) };
+      const prepared = qianshiCandidatePreparer(source, { canonicalContent: query, identityProjection, characterBudget: 6000 });
+      candidates = prepared.request.map(item => { const { key, ...fields } = item; return { ...fields, ref: inlineCandidateRef(prepared.bindings.find(binding => binding.key === key)) }; });
+    } catch { /* Missing references do not invent links; the reply can still record new events. */ }
+    return { knownPeople: names('person'), knownPlaces: names('place'), qianshiCandidates: candidates };
+  }
   const extractNext = () => runManualWork('extracting', manualWork => extractNextInternal(manualWork));
   const editSummary = (floorId, userText, revisionNote = '') => runManualWork('revising', () => reviseInternal(floorId, 'edit', { userText, revisionNote }));
   const editMemory = (floorId, metadata) => runManualWork('revising', () => reviseInternal(floorId, 'editMetadata', { metadata }));
@@ -6221,6 +6244,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
   return Object.freeze({ subscribeActivity: activity.subscribeActivity, bind, start, setEnabled, refreshAutomation, startHistoricalRebuild, resetLiveMigrationMemoriesForRebuild, pauseHistoricalRebuild, retryAutomation, rebuildCse, resumeCseRebuild, pauseCseRebuild, invalidate, refreshStatus, prepareCurrent, confirmLatest, confirmConsecutiveAssistants, setMemoryExcluded, extractNext, captureExtractionTarget, extractFloor, analyzeNextState, retryStateAnalysis, correctSubjectState, editSummary, editMemory, restoreAi, markError, copySafeDiagnostic, copyFullDiagnostic, shouldBlockMainGeneration, allowsRealtimeTailFromEmpty, setIdentityProjection, captureBusinessIdentity: captureTargetIdentity,
     getCurrentSubjectStates: entityIds => cseRuntime.getCurrentSubjectStates(entityIds),
     getQianchuangSnapshot, getPlaceEditContext, savePlace, attachPlaceChildren, createPlace, organizePlaces, deletePlace: (entityId, context) => savePlace(entityId, {}, context, { remove: true }),
+    getInlineMemoryReference,
     getQianshiSnapshot: () => structuredClone(qianshiSnapshot()), getQianshiStatus: qianshiStatus,
     getQianshiSnapshotVersion: qianshiSnapshotVersion, getQianshiEditPeople, canEditQianshiEventText, createQianshiTodo, editQianshiEventText, deleteQianshiEvent,
     // Deletion identities need the current Core only, without people/place directory preparation.

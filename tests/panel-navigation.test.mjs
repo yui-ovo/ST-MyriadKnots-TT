@@ -83,6 +83,7 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   let wrapperMounts = 0, wrapperDisposals = 0;
   const modules = {
     './dynamic-worldbook-view.js': { createDynamicWorldbookView: () => ({ node: new Node(), dispose() {} }) },
+    '../inline-memory-prompt.js': { INLINE_MEMORY_PROMPT: 'fixture summary prompt' },
     './plugin-updates-view.js': { createPluginUpdatesView: () => ({ controls: new Node(), noticeRow: new Node(), feedback: new Node(), dispose() {} }) },
     './panel.html?raw': { default: '' }, './panel.css?inline': { default: '' },
     './scrollbar-style.js': { scrollbarCss },
@@ -449,6 +450,9 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   assert.equal(autoHideInput?.checked, false); assert.equal(keepInput?.value, '3'); assert.equal(keepInput?.className, 'settings-input settings-num');
   assert.equal(memoryControls.find(node => node.className === 'qqj-auto-hide-row')?.children[0]?.textContent, '保留历史 AI 楼数');
   assert.equal(memoryControls.some(node => node.drawerTitle === '时间推演'), false, '设置仅保普通开关，不再有时间抽屉');
+  const sourceSelect = memoryControls.flatMap(flatten).find(node => node.attributes?.['aria-label'] === '摘要来源');
+  assert.equal(sourceSelect.value, 'api'); assert.deepEqual(Array.from(sourceSelect.children, item => item.value), ['api', 'inline', 'auto']);
+  assert.equal(memoryControls.flatMap(flatten).find(node => node.attributes?.['aria-label'] === '预设摘要提示词').readOnly, true);
   const timeToggle = memoryControls.find(node => node.id === 'qqj-settings-time');
   assert.equal(timeToggle.tag, 'label'); assert.equal(timeToggle.children[0].textContent, '时间推演');
   assert.equal(timeToggle.children.at(-1).tag, 'input', '时间文字左/开关右');
@@ -458,7 +462,7 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   assert.match(panelCss, /\.qqj-settings-management \.qqj-view-heading>p:not\(\.qqj-page-health\)\{display:none\}/u, '嵌入管理页仅隐藏说明，读取状态保持可见');
   assert.match(panelCss, /#qqj-settings-time,#qqj-settings-auto-hide,#qqj-settings-core-cache\{justify-content:space-between\}/u);
   const memoryHints = memoryControls.filter(node => node.className === 'settings-hint');
-  assert.match(memoryHints[0]?.textContent ?? '', /身体状态、周期与期限.*AI 正文.*摘要 API.*当前楼.*近期事项/u);
+  assert.match(memoryHints.find(node => /身体状态、周期与期限/u.test(node.textContent))?.textContent ?? '', /身体状态、周期与期限.*AI 正文.*摘要 API.*当前楼.*近期事项/u);
   assert.match(memoryHints.find(node => /推算时间间隔/u.test(node.textContent))?.textContent ?? '', /推算时间间隔.*当前聊天/u);
   const timeInput = timeToggle.children.find(node => node.tag === 'input');
   let stoppedToggleClick = 0;
