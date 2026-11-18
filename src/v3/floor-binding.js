@@ -4,25 +4,61 @@ const sameLocator = (left, right) => left?.messageIndex === right?.messageIndex
 
 const contentOf = floor => floor?.content ?? {};
 
+function addPair(index, first, second, value) {
+  let secondIndex = index.get(first);
+  if (!secondIndex) index.set(first, secondIndex = new Map());
+  let values = secondIndex.get(second);
+  if (!values) secondIndex.set(second, values = []);
+  values.push(value);
+}
+
+function pairValues(index, first, second) {
+  return index.get(first)?.get(second) ?? [];
+}
+
+function addLocator(index, locator, value) {
+  let bySwipe = index.get(locator?.messageIndex);
+  if (!bySwipe) index.set(locator?.messageIndex, bySwipe = new Map());
+  let bySelectedSwipe = bySwipe.get(locator?.swipeId);
+  if (!bySelectedSwipe) bySwipe.set(locator?.swipeId, bySelectedSwipe = new Map());
+  let values = bySelectedSwipe.get(locator?.selectedSwipeIndex);
+  if (!values) bySelectedSwipe.set(locator?.selectedSwipeIndex, values = []);
+  values.push(value);
+}
+
+function locatorValues(index, locator) {
+  return index.get(locator?.messageIndex)?.get(locator?.swipeId)?.get(locator?.selectedSwipeIndex) ?? [];
+}
+
 /**
  * Prove a one-to-one mapping between persisted floors and current host candidates.
  * Valid anchors are reserved first, then unanchored candidates may use the same
- * locator with the same canonical body or exact raw body, or a globally unique
- * raw+canonical pair.
+ * locator with the same canonical body or exact raw body, or a unique
+ * raw+canonical pair among the remaining unbound floors and candidates.
  */
 export function matchFloorCandidates(floors = [], candidates = []) {
   const floorList = Array.isArray(floors) ? floors : [];
   const candidateList = Array.isArray(candidates) ? candidates : [];
   const floorById = new Map(floorList.map((floor, floorIndex) => [floor?.id, { floor, floorIndex }]));
+  const floorsByLocator = new Map();
+  const floorsByFingerprint = new Map();
+  const candidatesByFingerprint = new Map();
+  floorList.forEach((floor, floorIndex) => {
+    addLocator(floorsByLocator, floor?.hostLocator, { floor, floorIndex });
+    addPair(floorsByFingerprint, contentOf(floor).rawFingerprint, contentOf(floor).canonicalFingerprint, { floor, floorIndex });
+  });
+  candidateList.forEach((candidate, candidateIndex) => {
+    addPair(candidatesByFingerprint, candidate?.rawFingerprint, candidate?.canonicalFingerprint, { candidate, candidateIndex });
+  });
   const floorMatches = new Map();
   const candidateMatches = new Map();
   let issue = null;
+  const issues = [], conflictedFloors = new Set();
 
   const fail = (code, candidateIndex, floorIndex = null) => {
-    if (issue) return;
     const candidate = candidateList[candidateIndex] ?? null;
     const floor = floorIndex === null ? null : floorList[floorIndex] ?? null;
-    issue = Object.freeze({
+    const detail = Object.freeze({
       code,
       candidateIndex,
       floorIndex,
@@ -30,6 +66,16 @@ export function matchFloorCandidates(floors = [], candidates = []) {
       assistantSeq: floor?.assistantSeq ?? candidate?.assistantSeq ?? null,
       messageIndex: candidate?.hostLocator?.messageIndex ?? floor?.hostLocator?.messageIndex ?? null,
     });
+    issue ??= detail;
+    issues.push(detail);
+  };
+  const rejectDuplicate = (code, candidateIndex, floorIndex) => {
+    const previous = floorMatches.get(floorIndex);
+    if (previous?.kind === 'archive' && candidateList[candidateIndex]?.archiveCandidate !== true) { fail(code, candidateIndex, floorIndex); return; }
+    if (previous) candidateMatches.delete(previous.candidateIndex);
+    floorMatches.delete(floorIndex);
+    conflictedFloors.add(floorIndex);
+    fail(code, candidateIndex, floorIndex);
   };
   const bind = (candidateIndex, floorIndex, kind) => {
     if (candidateMatches.has(candidateIndex) || floorMatches.has(floorIndex)) {
@@ -61,7 +107,7 @@ export function matchFloorCandidates(floors = [], candidates = []) {
     if (candidate?.archiveCandidate === true) {
       const target = floorById.get(candidate.archiveFloorId);
       if (!target) { fail('archiveFloorMissing', candidateIndex); continue; }
-      if (floorMatches.has(target.floorIndex)) { fail('duplicateBinding', candidateIndex, target.floorIndex); continue; }
+      if (floorMatches.has(target.floorIndex) || conflictedFloors.has(target.floorIndex)) { rejectDuplicate('duplicateBinding', candidateIndex, target.floorIndex); continue; }
       bind(candidateIndex, target.floorIndex, 'archive');
       continue;
     }
@@ -70,16 +116,15 @@ export function matchFloorCandidates(floors = [], candidates = []) {
     if (marker?.status !== 'valid') { fail('markerRejected', candidateIndex); continue; }
     const target = floorById.get(marker.anchor?.floorId);
     if (!target) { fail('markerConflict', candidateIndex); continue; }
-    if (floorMatches.has(target.floorIndex)) { fail('duplicateMarker', candidateIndex, target.floorIndex); continue; }
+    if (floorMatches.has(target.floorIndex) || conflictedFloors.has(target.floorIndex)) { rejectDuplicate('duplicateMarker', candidateIndex, target.floorIndex); continue; }
     bind(candidateIndex, target.floorIndex, 'marker');
   }
 
   for (const [candidateIndex, candidate] of candidateList.entries()) {
     if (candidate?.archiveCandidate === true) continue;
     if (candidateMatches.has(candidateIndex) || candidate?.messageAnchor?.status !== 'none') continue;
-    const matches = floorList
-      .map((floor, floorIndex) => ({ floor, floorIndex }))
-      .filter(({ floor, floorIndex }) => !floorMatches.has(floorIndex)
+    const matches = locatorValues(floorsByLocator, candidate?.hostLocator)
+      .filter(({ floor, floorIndex }) => !floorMatches.has(floorIndex) && !conflictedFloors.has(floorIndex)
         && sameLocator(floor?.hostLocator, candidate?.hostLocator)
         && (contentOf(floor).canonicalFingerprint === candidate?.canonicalFingerprint
           || contentOf(floor).rawFingerprint === candidate?.rawFingerprint));
@@ -94,15 +139,15 @@ export function matchFloorCandidates(floors = [], candidates = []) {
   for (const [candidateIndex, candidate] of candidateList.entries()) {
     if (candidate?.archiveCandidate === true) continue;
     if (candidateMatches.has(candidateIndex) || candidate?.messageAnchor?.status !== 'none') continue;
-    const matches = floorList
-      .map((floor, floorIndex) => ({ floor, floorIndex }))
-      .filter(({ floor, floorIndex }) => !floorMatches.has(floorIndex)
+    const matches = pairValues(floorsByFingerprint, candidate?.rawFingerprint, candidate?.canonicalFingerprint)
+      .filter(({ floor, floorIndex }) => !floorMatches.has(floorIndex) && !conflictedFloors.has(floorIndex)
         && contentOf(floor).rawFingerprint === candidate?.rawFingerprint
         && contentOf(floor).canonicalFingerprint === candidate?.canonicalFingerprint);
-    const competingCandidates = matches.length ? candidateList.filter((value, index) => !candidateMatches.has(index)
-      && value?.messageAnchor?.status === 'none'
-      && value.rawFingerprint === candidate.rawFingerprint
-      && value.canonicalFingerprint === candidate.canonicalFingerprint) : [];
+    const competingCandidates = matches.length ? pairValues(candidatesByFingerprint, candidate?.rawFingerprint, candidate?.canonicalFingerprint)
+      .filter(({ candidate: value, candidateIndex: index }) => !candidateMatches.has(index)
+        && value?.messageAnchor?.status === 'none'
+        && value.rawFingerprint === candidate.rawFingerprint
+        && value.canonicalFingerprint === candidate.canonicalFingerprint) : [];
     if (matches.length === 1 && competingCandidates.length === 1) bind(candidateIndex, matches[0].floorIndex, 'uniqueFingerprint');
     else if (matches.length > 0) fail('ambiguousFingerprint', candidateIndex);
   }
@@ -113,6 +158,17 @@ export function matchFloorCandidates(floors = [], candidates = []) {
     floorMatches,
     unmatchedCandidateIndexes: Object.freeze(candidateList.map((_, index) => index).filter(index => !candidateMatches.has(index))),
     unmatchedFloorIndexes: Object.freeze(floorList.map((_, index) => index).filter(index => !floorMatches.has(index))),
-    issue,
+    issue, issues: Object.freeze(issues),
   });
+}
+
+
+export function unregisteredTailCandidates(floors, candidates, bindings = matchFloorCandidates(floors, candidates)) {
+  const last = floors.length ? bindings.floorMatches.get(floors.length - 1) : null;
+  if (floors.length && !last) return [];
+  const ordered = [...bindings.floorMatches.values()].sort((left, right) => left.floorIndex - right.floorIndex);
+  if (ordered.some((match, index) => index > 0 && match.candidateIndex <= ordered[index - 1].candidateIndex)) return [];
+  const rejected = new Set(bindings.issues.map(issue => issue.candidateIndex));
+  return bindings.unmatchedCandidateIndexes.filter(index => index > (last?.candidateIndex ?? -1) && !rejected.has(index)
+    && candidates[index]?.archiveCandidate !== true && candidates[index]?.messageAnchor?.status === 'none').map(index => candidates[index]);
 }

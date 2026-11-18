@@ -1,0 +1,4708 @@
+{
+  "schemaVersion": 1,
+  "description": "City sheets: separate static real-city backgrounds; source projection metadata retained.",
+  "cities": [
+    {
+      "id": "seoul",
+      "level": "city",
+      "countryId": "south-korea",
+      "label": "首尔",
+      "country": "韩国",
+      "bounds": [
+        126.8396875129661,
+        37.430000000000014,
+        127.1803124870339,
+        37.699999999999996
+      ],
+      "coverage": "主要建成区：钟路、龙山、江南、松坡及汉江两岸；不含完整首尔市界。",
+      "center": [
+        126.9977851,
+        37.568295
+      ],
+      "width": 896,
+      "height": 896,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 150714.19406112764,
+        "translate": [
+          -333646.58690291643,
+          107211.59052059698
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "seoul.svg",
+      "bytes": 769406,
+      "gzipBytes": 286378,
+      "sha256": "d204963e2dfa414722a9bac306b300d4348bcd60608bb9944afee5db36c81628",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "e3d366d14cbe094cf9c114bd963fe5d64a3e0d9d8be6ac913a7432822fa8e17a",
+          "snapshot": "2026-10-31T16:29:43Z",
+          "capturedSources": [
+            {
+              "rawFile": "source.osm.json",
+              "captureFile": "capture.json",
+              "queryFile": "query.overpassql"
+            }
+          ]
+        },
+        "land": {
+          "name": "Natural Earth 1:10 million land polygons",
+          "license": "public domain",
+          "url": "https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-land/",
+          "rawSha256": "e547d749445eaa0964aba76738090ec88f5e63c4585122170f98c67a7ea922dc"
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 23081,
+        "roads": 19615,
+        "water": 159,
+        "parks": 1010,
+        "relationOuterRings": 161,
+        "relationInnerRings": 255,
+        "omittedTinyPolygons": 2345,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": []
+      },
+      "aliases": [
+        "首尔",
+        "首爾",
+        "首尔特别市",
+        "首爾特別市",
+        "서울",
+        "서울특별시",
+        "Seoul",
+        "汉城",
+        "漢城",
+        "汉城市",
+        "漢城市",
+        "서울시",
+        "Hanseong",
+        "Seoul City"
+      ],
+      "slots": [
+        [
+          46.09375,
+          92.41
+        ],
+        [
+          26.5625,
+          29.91
+        ],
+        [
+          71.763393,
+          71.21
+        ],
+        [
+          28.236607,
+          70.65
+        ],
+        [
+          71.205357,
+          35.49
+        ],
+        [
+          72.879464,
+          92.97
+        ],
+        [
+          26.5625,
+          7.03
+        ],
+        [
+          24.888393,
+          91.85
+        ],
+        [
+          27.120536,
+          50
+        ],
+        [
+          94.084821,
+          67.86
+        ],
+        [
+          46.651786,
+          31.58
+        ],
+        [
+          52.790179,
+          71.21
+        ],
+        [
+          77.901786,
+          53.91
+        ],
+        [
+          80.691964,
+          22.1
+        ],
+        [
+          62.834821,
+          58.37
+        ],
+        [
+          14.84375,
+          41.63
+        ],
+        [
+          39.955357,
+          62.83
+        ],
+        [
+          59.486607,
+          90.18
+        ],
+        [
+          84.040179,
+          40.51
+        ],
+        [
+          58.928571,
+          41.07
+        ],
+        [
+          35.491071,
+          39.4
+        ],
+        [
+          61.71875,
+          26.56
+        ],
+        [
+          85.15625,
+          92.41
+        ],
+        [
+          67.299107,
+          81.81
+        ],
+        [
+          13.727679,
+          67.3
+        ],
+        [
+          89.620536,
+          57.81
+        ],
+        [
+          66.741071,
+          48.33
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 2.566964,
+            "y": 14.02,
+            "w": 24.553572,
+            "h": 5
+          },
+          "slots": [
+            [
+              26.5625,
+              29.91
+            ],
+            [
+              26.5625,
+              7.03
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 44.419643,
+            "y": 10.67,
+            "w": 24.553571,
+            "h": 5
+          },
+          "slots": [
+            [
+              46.651786,
+              31.58
+            ],
+            [
+              61.71875,
+              26.56
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 72.321429,
+            "y": 9.55,
+            "w": 24.553571,
+            "h": 5
+          },
+          "slots": [
+            [
+              80.691964,
+              22.1
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 0.6,
+            "y": 50.85,
+            "w": 21.498214,
+            "h": 5
+          },
+          "slots": [
+            [
+              27.120536,
+              50
+            ],
+            [
+              14.84375,
+              41.63
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 37.165179,
+            "y": 49.17,
+            "w": 24.553571,
+            "h": 5
+          },
+          "slots": [
+            [
+              62.834821,
+              58.37
+            ],
+            [
+              39.955357,
+              62.83
+            ],
+            [
+              58.928571,
+              41.07
+            ],
+            [
+              35.491071,
+              39.4
+            ],
+            [
+              66.741071,
+              48.33
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 77.901786,
+            "y": 45.83,
+            "w": 21.498214,
+            "h": 5
+          },
+          "slots": [
+            [
+              71.205357,
+              35.49
+            ],
+            [
+              77.901786,
+              53.91
+            ],
+            [
+              84.040179,
+              40.51
+            ],
+            [
+              89.620536,
+              57.81
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 5.915179,
+            "y": 75.96,
+            "w": 24.553571,
+            "h": 5
+          },
+          "slots": [
+            [
+              28.236607,
+              70.65
+            ],
+            [
+              24.888393,
+              91.85
+            ],
+            [
+              13.727679,
+              67.3
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 39.397321,
+            "y": 79.87,
+            "w": 24.553572,
+            "h": 5
+          },
+          "slots": [
+            [
+              46.09375,
+              92.41
+            ],
+            [
+              52.790179,
+              71.21
+            ],
+            [
+              59.486607,
+              90.18
+            ],
+            [
+              67.299107,
+              81.81
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 71.205357,
+            "y": 75.96,
+            "w": 24.553572,
+            "h": 5
+          },
+          "slots": [
+            [
+              71.763393,
+              71.21
+            ],
+            [
+              72.879464,
+              92.97
+            ],
+            [
+              94.084821,
+              67.86
+            ],
+            [
+              85.15625,
+              92.41
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 896,
+        "crop": [
+          52,
+          0,
+          896
+        ],
+        "originalBounds": [
+          126.82,
+          37.43,
+          127.2,
+          37.7
+        ]
+      }
+    },
+    {
+      "id": "beijing",
+      "level": "city",
+      "countryId": "china",
+      "label": "北京",
+      "country": "中国",
+      "bounds": [
+        116.15,
+        39.74337701196427,
+        116.64999999999999,
+        40.12676149094872
+      ],
+      "coverage": "中心城区与主要建成区；不含远郊行政范围。",
+      "center": [
+        116.39420089260611,
+        39.901720309862675
+      ],
+      "width": 1000,
+      "height": 1000,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 114591.55902616587,
+        "translate": [
+          -232300.00000000247,
+          87754.26501954494
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "beijing.svg",
+      "bytes": 647969,
+      "gzipBytes": 236414,
+      "sha256": "ffa6bb3a1060651f1886a240e24b896855ec85c1627acfd0d211612d24e31c48",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "ca03520dbc1aa3b4f9fc15b142999bf668e373d7a7831fabb6e480ed9a8a676d",
+          "snapshot": "2026-10-31T16:37:50Z",
+          "capturedSources": [
+            {
+              "layer": "roads",
+              "rawFile": "roads/source.osm.json",
+              "rawSha256": "f0f98dacefac82050f3a6829035c6f1830f982f879a1586e153553893cd817f4",
+              "captureFile": "roads/capture.json",
+              "queryFile": "roads/query.overpassql",
+              "snapshot": "2026-10-31T16:37:50Z"
+            },
+            {
+              "layer": "water",
+              "rawFile": "water/source.osm.json",
+              "rawSha256": "e5223506ad26641423b41a5d0c1d7d51c1ed713c5beccf266c997d48388f972f",
+              "captureFile": "water/capture.json",
+              "queryFile": "water/query.overpassql",
+              "snapshot": "2026-10-31T16:38:53Z"
+            }
+          ]
+        },
+        "land": {
+          "name": "Natural Earth 1:10 million land polygons",
+          "license": "public domain",
+          "url": "https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-land/",
+          "rawSha256": "e547d749445eaa0964aba76738090ec88f5e63c4585122170f98c67a7ea922dc"
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 19350,
+        "roads": 18009,
+        "water": 590,
+        "parks": 0,
+        "relationOuterRings": 159,
+        "relationInnerRings": 270,
+        "omittedTinyPolygons": 760,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": [
+          {
+            "id": 13372029,
+            "kind": "water",
+            "reason": "source inner ring is outside all outer rings",
+            "unownedHoles": 1
+          },
+          {
+            "id": 19229870,
+            "kind": "water",
+            "reason": "source has no closed outer ring",
+            "unownedHoles": 1
+          },
+          {
+            "id": 20072063,
+            "kind": "water",
+            "reason": "source has no closed outer ring",
+            "unownedHoles": 1
+          }
+        ]
+      },
+      "aliases": [
+        "北京",
+        "北京市",
+        "Beijing",
+        "Peking",
+        "北平",
+        "北平市",
+        "燕京",
+        "Beiping",
+        "Peiping"
+      ],
+      "slots": [
+        [
+          7,
+          54.29726
+        ],
+        [
+          27,
+          27.79562
+        ],
+        [
+          74,
+          29.2991
+        ],
+        [
+          29,
+          74.30252
+        ],
+        [
+          67.5,
+          73.79762
+        ],
+        [
+          51.5,
+          26.79704
+        ],
+        [
+          29.5,
+          6.803
+        ],
+        [
+          89,
+          76.29968
+        ],
+        [
+          8,
+          75.3011
+        ],
+        [
+          48,
+          69.2984
+        ],
+        [
+          92.5,
+          23.2964
+        ],
+        [
+          29,
+          93.80288
+        ],
+        [
+          7.5,
+          22.29782
+        ],
+        [
+          68,
+          94.29656
+        ],
+        [
+          14,
+          38.29754
+        ],
+        [
+          38.5,
+          38.29754
+        ],
+        [
+          61.5,
+          38.29754
+        ],
+        [
+          88.5,
+          39.29612
+        ],
+        [
+          79.5,
+          64.79918
+        ],
+        [
+          63.5,
+          17.30492
+        ],
+        [
+          39,
+          18.3035
+        ],
+        [
+          18.5,
+          63.8006
+        ],
+        [
+          35.5,
+          61.29854
+        ],
+        [
+          59.5,
+          60.29996
+        ],
+        [
+          40,
+          84.80444
+        ],
+        [
+          92.5,
+          87.29528
+        ],
+        [
+          77.5,
+          42.79676
+        ],
+        [
+          51,
+          38.80244
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 8,
+            "y": 12.49154,
+            "w": 22,
+            "h": 5.61
+          },
+          "slots": [
+            [
+              27,
+              27.79562
+            ],
+            [
+              29.5,
+              6.803
+            ],
+            [
+              7.5,
+              22.29782
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 39.5,
+            "y": 2.49452,
+            "w": 22,
+            "h": 5.61
+          },
+          "slots": [
+            [
+              51.5,
+              26.79704
+            ],
+            [
+              63.5,
+              17.30492
+            ],
+            [
+              39,
+              18.3035
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 70,
+            "y": 12.99644,
+            "w": 22,
+            "h": 5.61
+          },
+          "slots": [
+            [
+              74,
+              29.2991
+            ],
+            [
+              92.5,
+              23.2964
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 16,
+            "y": 45.99446,
+            "w": 22,
+            "h": 5.61
+          },
+          "slots": [
+            [
+              7,
+              54.29726
+            ],
+            [
+              14,
+              38.29754
+            ],
+            [
+              18.5,
+              63.8006
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 38.5,
+            "y": 46.99304,
+            "w": 22,
+            "h": 5.61
+          },
+          "slots": [
+            [
+              38.5,
+              38.29754
+            ],
+            [
+              61.5,
+              38.29754
+            ],
+            [
+              35.5,
+              61.29854
+            ],
+            [
+              59.5,
+              60.29996
+            ],
+            [
+              51,
+              38.80244
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 70.5,
+            "y": 51.49226,
+            "w": 22,
+            "h": 5.61
+          },
+          "slots": [
+            [
+              88.5,
+              39.29612
+            ],
+            [
+              79.5,
+              64.79918
+            ],
+            [
+              77.5,
+              42.79676
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 3,
+            "y": 83.4917,
+            "w": 22,
+            "h": 5.61
+          },
+          "slots": [
+            [
+              29,
+              74.30252
+            ],
+            [
+              8,
+              75.3011
+            ],
+            [
+              29,
+              93.80288
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 43,
+            "y": 79.99106,
+            "w": 22,
+            "h": 5.61
+          },
+          "slots": [
+            [
+              48,
+              69.2984
+            ],
+            [
+              40,
+              84.80444
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 66,
+            "y": 81.49454,
+            "w": 22,
+            "h": 5.61
+          },
+          "slots": [
+            [
+              67.5,
+              73.79762
+            ],
+            [
+              89,
+              76.29968
+            ],
+            [
+              68,
+              94.29656
+            ],
+            [
+              92.5,
+              87.29528
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 1122,
+        "crop": [
+          0,
+          61,
+          1000
+        ],
+        "originalBounds": [
+          116.15,
+          39.72,
+          116.65,
+          40.15
+        ]
+      }
+    },
+    {
+      "id": "shanghai",
+      "level": "city",
+      "countryId": "china",
+      "label": "上海",
+      "country": "中国",
+      "bounds": [
+        121.24268,
+        30.97989837064258,
+        121.75732000000002,
+        31.420101157681472
+      ],
+      "coverage": "中心城区、浦东主要建成区及黄浦江两岸；不含完整市界与崇明。",
+      "center": [
+        121.4345588,
+        31.2183983
+      ],
+      "width": 919,
+      "height": 919,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 102313.89198764444,
+        "translate": [
+          -216504.7857142803,
+          59151.30719213247
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "shanghai.svg",
+      "bytes": 1030460,
+      "gzipBytes": 376416,
+      "sha256": "16cc1ffd12527d2a3ab2b6e0b42b281540a8148f6778ea36c155a4fddf474a4d",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "64b707034ff9dac22206ce22221ff36381f6842eceb50deb2dbc0e0c43677d46",
+          "snapshot": "2026-10-31T16:40:58Z",
+          "capturedSources": [
+            {
+              "layer": "roads",
+              "rawFile": "roads/source.osm.json",
+              "rawSha256": "e29697f31f5be8545d2a7b803bb0c6f7e2d1602e8048bd3a8e279ad0ce4c5b4d",
+              "captureFile": "roads/capture.json",
+              "queryFile": "roads/query.overpassql",
+              "snapshot": "2026-10-31T16:40:58Z"
+            },
+            {
+              "layer": "water",
+              "rawFile": "water/source.osm.json",
+              "rawSha256": "bdba3ef98334875d9223895787a6c253f346760d1a7171a36e471a760ebdd953",
+              "captureFile": "water/capture.json",
+              "queryFile": "water/query.overpassql",
+              "snapshot": "2026-10-31T16:42:00Z"
+            }
+          ]
+        },
+        "land": {
+          "name": "Natural Earth 1:10 million land polygons",
+          "license": "public domain",
+          "url": "https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-land/",
+          "rawSha256": "e547d749445eaa0964aba76738090ec88f5e63c4585122170f98c67a7ea922dc"
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 33283,
+        "roads": 31119,
+        "water": 807,
+        "parks": 0,
+        "relationOuterRings": 147,
+        "relationInnerRings": 274,
+        "omittedTinyPolygons": 1365,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": []
+      },
+      "aliases": [
+        "上海",
+        "上海市",
+        "Shanghai",
+        "魔都",
+        "申城",
+        "Shanghai City"
+      ],
+      "slots": [
+        [
+          94.069641,
+          89.77
+        ],
+        [
+          45.647443,
+          7.62
+        ],
+        [
+          41.838955,
+          87.6
+        ],
+        [
+          70.674646,
+          26.66
+        ],
+        [
+          30.957563,
+          32.1
+        ],
+        [
+          23.884657,
+          69.1
+        ],
+        [
+          89.173014,
+          69.1
+        ],
+        [
+          50.54407,
+          28.29
+        ],
+        [
+          22.252448,
+          90.86
+        ],
+        [
+          31.501632,
+          51.14
+        ],
+        [
+          45.647443,
+          68.55
+        ],
+        [
+          89.173014,
+          31.01
+        ],
+        [
+          76.115343,
+          89.77
+        ],
+        [
+          59.249184,
+          88.68
+        ],
+        [
+          63.601741,
+          59.85
+        ],
+        [
+          17.899891,
+          24.48
+        ],
+        [
+          61.425462,
+          38.08
+        ],
+        [
+          39.118607,
+          20.13
+        ],
+        [
+          18.443961,
+          38.63
+        ],
+        [
+          82.100109,
+          57.13
+        ],
+        [
+          19.5321,
+          56.58
+        ],
+        [
+          35.31012,
+          76.17
+        ],
+        [
+          34.76605,
+          63.11
+        ],
+        [
+          41.294886,
+          37
+        ],
+        [
+          74.483134,
+          37
+        ],
+        [
+          73.394995,
+          64.2
+        ],
+        [
+          28.237214,
+          21.22
+        ],
+        [
+          57.072905,
+          69.1
+        ],
+        [
+          9.194777,
+          58.76
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 2.121872,
+            "y": 11.65,
+            "w": 23.939064,
+            "h": 5
+          },
+          "slots": [
+            [
+              30.957563,
+              32.1
+            ],
+            [
+              17.899891,
+              24.48
+            ],
+            [
+              28.237214,
+              21.22
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 47.823721,
+            "y": 13.28,
+            "w": 23.939065,
+            "h": 5
+          },
+          "slots": [
+            [
+              45.647443,
+              7.62
+            ],
+            [
+              50.54407,
+              28.29
+            ],
+            [
+              39.118607,
+              20.13
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 77.203482,
+            "y": 5.66,
+            "w": 22.196518,
+            "h": 5
+          },
+          "slots": [
+            [
+              70.674646,
+              26.66
+            ],
+            [
+              89.173014,
+              31.01
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 0.6,
+            "y": 45.92,
+            "w": 22.196518,
+            "h": 5
+          },
+          "slots": [
+            [
+              31.501632,
+              51.14
+            ],
+            [
+              18.443961,
+              38.63
+            ],
+            [
+              19.5321,
+              56.58
+            ],
+            [
+              9.194777,
+              58.76
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 39.662677,
+            "y": 48.1,
+            "w": 23.939064,
+            "h": 5
+          },
+          "slots": [
+            [
+              63.601741,
+              59.85
+            ],
+            [
+              61.425462,
+              38.08
+            ],
+            [
+              34.76605,
+              63.11
+            ],
+            [
+              41.294886,
+              37
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 72.306855,
+            "y": 40.48,
+            "w": 23.939064,
+            "h": 5
+          },
+          "slots": [
+            [
+              82.100109,
+              57.13
+            ],
+            [
+              74.483134,
+              37
+            ],
+            [
+              73.394995,
+              64.2
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 2.121872,
+            "y": 76.93,
+            "w": 23.939064,
+            "h": 5
+          },
+          "slots": [
+            [
+              23.884657,
+              69.1
+            ],
+            [
+              22.252448,
+              90.86
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 40.206746,
+            "y": 76.39,
+            "w": 23.939065,
+            "h": 5
+          },
+          "slots": [
+            [
+              41.838955,
+              87.6
+            ],
+            [
+              45.647443,
+              68.55
+            ],
+            [
+              59.249184,
+              88.68
+            ],
+            [
+              35.31012,
+              76.17
+            ],
+            [
+              57.072905,
+              69.1
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 69.042437,
+            "y": 75.85,
+            "w": 23.939065,
+            "h": 5
+          },
+          "slots": [
+            [
+              94.069641,
+              89.77
+            ],
+            [
+              89.173014,
+              69.1
+            ],
+            [
+              76.115343,
+              89.77
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 919,
+        "crop": [
+          40.5,
+          0,
+          919
+        ],
+        "originalBounds": [
+          121.22,
+          30.98,
+          121.78,
+          31.42
+        ]
+      }
+    },
+    {
+      "id": "guangzhou",
+      "level": "city",
+      "countryId": "china",
+      "label": "广州",
+      "country": "中国",
+      "bounds": [
+        113.10242000000002,
+        22.949940275577607,
+        113.53758,
+        23.350059546384195
+      ],
+      "coverage": "中心城区、番禺北部和珠江沿岸；不含完整市界。",
+      "center": [
+        113.26178516712943,
+        23.12472343296695
+      ],
+      "width": 946,
+      "height": 946,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 124556.04241974714,
+        "translate": [
+          -245874.82608696242,
+          52227.41929606643
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "guangzhou.svg",
+      "bytes": 896617,
+      "gzipBytes": 329347,
+      "sha256": "3d224d5f4cae0e8d59054491949ea7de58435e866831de059011ca495fd38409",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "5069ccfa49110c2bde6dd86be4a650c8ad01f3f284e53de3c9b063c2ba730aa1",
+          "snapshot": "2026-10-31T16:44:01Z",
+          "capturedSources": [
+            {
+              "layer": "roads",
+              "rawFile": "roads/source.osm.json",
+              "rawSha256": "f4540b280d06b3f9580b0160b45c1f5d9a3e9a1e04b83dd2517712195c7cbbd1",
+              "captureFile": "roads/capture.json",
+              "queryFile": "roads/query.overpassql",
+              "snapshot": "2026-10-31T16:44:01Z"
+            },
+            {
+              "layer": "water",
+              "rawFile": "water/source.osm.json",
+              "rawSha256": "a24662fce028b4d519e9a2cc167e61bb16382d814d37decfde93f39008b3acf1",
+              "captureFile": "water/capture.json",
+              "queryFile": "water/query.overpassql",
+              "snapshot": "2026-10-31T16:44:01Z"
+            }
+          ]
+        },
+        "land": {
+          "name": "Natural Earth 1:10 million land polygons",
+          "license": "public domain",
+          "url": "https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-land/",
+          "rawSha256": "e547d749445eaa0964aba76738090ec88f5e63c4585122170f98c67a7ea922dc"
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 28388,
+        "roads": 24657,
+        "water": 1125,
+        "parks": 0,
+        "relationOuterRings": 143,
+        "relationInnerRings": 211,
+        "omittedTinyPolygons": 2608,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": [
+          {
+            "id": 21021991,
+            "kind": "water",
+            "reason": "source inner ring is outside all outer rings",
+            "unownedHoles": 1
+          },
+          {
+            "id": 21021992,
+            "kind": "water",
+            "reason": "source inner ring is outside all outer rings",
+            "unownedHoles": 1
+          }
+        ]
+      },
+      "aliases": [
+        "广州",
+        "广州市",
+        "廣州",
+        "廣州市",
+        "Guangzhou",
+        "Canton",
+        "羊城",
+        "穗城",
+        "Guangzhou City"
+      ],
+      "slots": [
+        [
+          90.697674,
+          7.08
+        ],
+        [
+          89.640592,
+          91.65
+        ],
+        [
+          94.926004,
+          49.37
+        ],
+        [
+          46.300211,
+          91.12
+        ],
+        [
+          26.215645,
+          27.7
+        ],
+        [
+          71.67019,
+          32.98
+        ],
+        [
+          65.327696,
+          71.56
+        ],
+        [
+          25.687104,
+          73.15
+        ],
+        [
+          5.073996,
+          28.22
+        ],
+        [
+          92.811839,
+          28.22
+        ],
+        [
+          25.687104,
+          7.08
+        ],
+        [
+          67.44186,
+          92.71
+        ],
+        [
+          5.073996,
+          70.51
+        ],
+        [
+          29.386892,
+          53.59
+        ],
+        [
+          46.300211,
+          68.39
+        ],
+        [
+          45.243129,
+          27.7
+        ],
+        [
+          93.868922,
+          64.69
+        ],
+        [
+          36.257928,
+          39.85
+        ],
+        [
+          59.513742,
+          24
+        ],
+        [
+          16.701903,
+          62.05
+        ],
+        [
+          60.042283,
+          57.29
+        ],
+        [
+          82.769556,
+          41.97
+        ],
+        [
+          58.985201,
+          37.21
+        ],
+        [
+          20.401691,
+          42.49
+        ],
+        [
+          35.729387,
+          18.71
+        ],
+        [
+          37.315011,
+          77.38
+        ],
+        [
+          73.255814,
+          82.66
+        ],
+        [
+          36.786469,
+          62.58
+        ],
+        [
+          35.200846,
+          92.71
+        ],
+        [
+          64.799154,
+          47.25
+        ],
+        [
+          79.598309,
+          8.14
+        ],
+        [
+          15.116279,
+          32.98
+        ],
+        [
+          36.257928,
+          7.61
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 8.245243,
+            "y": 15.15,
+            "w": 23.255814,
+            "h": 5
+          },
+          "slots": [
+            [
+              26.215645,
+              27.7
+            ],
+            [
+              5.073996,
+              28.22
+            ],
+            [
+              25.687104,
+              7.08
+            ],
+            [
+              15.116279,
+              32.98
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 45.77167,
+            "y": 9.87,
+            "w": 23.255814,
+            "h": 5
+          },
+          "slots": [
+            [
+              45.243129,
+              27.7
+            ],
+            [
+              59.513742,
+              24
+            ],
+            [
+              35.729387,
+              18.71
+            ],
+            [
+              36.257928,
+              7.61
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 76.427061,
+            "y": 15.15,
+            "w": 22.972939,
+            "h": 5
+          },
+          "slots": [
+            [
+              90.697674,
+              7.08
+            ],
+            [
+              71.67019,
+              32.98
+            ],
+            [
+              92.811839,
+              28.22
+            ],
+            [
+              79.598309,
+              8.14
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 0.6,
+            "y": 46.87,
+            "w": 22.972939,
+            "h": 5
+          },
+          "slots": [
+            [
+              29.386892,
+              53.59
+            ],
+            [
+              16.701903,
+              62.05
+            ],
+            [
+              20.401691,
+              42.49
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 36.786469,
+            "y": 46.87,
+            "w": 23.255814,
+            "h": 5
+          },
+          "slots": [
+            [
+              36.257928,
+              39.85
+            ],
+            [
+              60.042283,
+              57.29
+            ],
+            [
+              58.985201,
+              37.21
+            ],
+            [
+              36.786469,
+              62.58
+            ],
+            [
+              64.799154,
+              47.25
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 74.312896,
+            "y": 53.74,
+            "w": 23.255814,
+            "h": 5
+          },
+          "slots": [
+            [
+              94.926004,
+              49.37
+            ],
+            [
+              93.868922,
+              64.69
+            ],
+            [
+              82.769556,
+              41.97
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 0.6,
+            "y": 87.56,
+            "w": 22.972939,
+            "h": 5
+          },
+          "slots": [
+            [
+              25.687104,
+              73.15
+            ],
+            [
+              5.073996,
+              70.51
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 44.714588,
+            "y": 79.64,
+            "w": 23.255814,
+            "h": 5
+          },
+          "slots": [
+            [
+              46.300211,
+              91.12
+            ],
+            [
+              65.327696,
+              71.56
+            ],
+            [
+              67.44186,
+              92.71
+            ],
+            [
+              46.300211,
+              68.39
+            ],
+            [
+              37.315011,
+              77.38
+            ],
+            [
+              35.200846,
+              92.71
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 70.613108,
+            "y": 72.76,
+            "w": 23.255814,
+            "h": 5
+          },
+          "slots": [
+            [
+              89.640592,
+              91.65
+            ],
+            [
+              73.255814,
+              82.66
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 946,
+        "crop": [
+          27,
+          0,
+          946
+        ],
+        "originalBounds": [
+          113.09,
+          22.95,
+          113.55,
+          23.35
+        ]
+      }
+    },
+    {
+      "id": "tokyo",
+      "level": "city",
+      "countryId": "japan",
+      "label": "东京",
+      "country": "日本",
+      "bounds": [
+        139.49134,
+        35.479920882466665,
+        140.00866000000005,
+        35.90007870195615
+      ],
+      "coverage": "东京主要建成区、东京湾北部及相邻都市圈局部；不含完整东京都界。",
+      "center": [
+        139.7494616,
+        35.6869628
+      ],
+      "width": 958,
+      "height": 958,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 106103.29539459255,
+        "translate": [
+          -258317.29629628576,
+          71314.27351614303
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "tokyo.svg",
+      "bytes": 741045,
+      "gzipBytes": 273922,
+      "sha256": "928da4326b298ea9084b6aee00a078b6eedc0d7848841189845daa4fb7fb6f29",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "36549ad17240929d1cff86ece975ad55a508ae70790b09b0bb01257c85a440f9",
+          "snapshot": "2026-10-31T16:48:05Z",
+          "capturedSources": [
+            {
+              "layer": "roads-major",
+              "rawFile": "roads-major/source.osm.json",
+              "rawSha256": "cbfc1819ce23227a179eda30005cd6bf1612b5620bb7c2d0571e4ad817495c6d",
+              "captureFile": "roads-major/capture.json",
+              "queryFile": "roads-major/query.overpassql",
+              "snapshot": "2026-10-31T16:48:05Z"
+            },
+            {
+              "layer": "roads-secondary",
+              "rawFile": "roads-secondary/source.osm.json",
+              "rawSha256": "46a65445e5a13cf58c1faf9a967d09cd3588d0a247af77742e2d04a9c65df965",
+              "captureFile": "roads-secondary/capture.json",
+              "queryFile": "roads-secondary/query.overpassql",
+              "snapshot": "2026-10-31T16:50:06Z"
+            },
+            {
+              "layer": "water",
+              "rawFile": "water/source.osm.json",
+              "rawSha256": "3b4e93f7a9c706023fef146e24b10ec3f0e2b4e140797c7107edca04fd7fc2b1",
+              "captureFile": "water/capture.json",
+              "queryFile": "water/query.overpassql",
+              "snapshot": "2026-10-31T16:51:06Z"
+            }
+          ]
+        },
+        "land": {
+          "name": "Natural Earth 1:10 million land polygons",
+          "license": "public domain",
+          "url": "https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-land/",
+          "rawSha256": "e547d749445eaa0964aba76738090ec88f5e63c4585122170f98c67a7ea922dc"
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 25962,
+        "roads": 22408,
+        "water": 454,
+        "parks": 0,
+        "relationOuterRings": 267,
+        "relationInnerRings": 314,
+        "omittedTinyPolygons": 3139,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": []
+      },
+      "aliases": [
+        "东京",
+        "東京",
+        "东京都",
+        "東京都",
+        "Tokyo",
+        "江户",
+        "江戶",
+        "江戸",
+        "Edo",
+        "Tokio",
+        "Tokyo Metropolis",
+        "とうきょう",
+        "トウキョウ"
+      ],
+      "slots": [
+        [
+          93.841336,
+          8.66
+        ],
+        [
+          5.114823,
+          89.56
+        ],
+        [
+          5.114823,
+          7.1
+        ],
+        [
+          55.741127,
+          91.65
+        ],
+        [
+          45.824635,
+          7.62
+        ],
+        [
+          91.753653,
+          48.85
+        ],
+        [
+          31.210856,
+          71.29
+        ],
+        [
+          70.876827,
+          27.97
+        ],
+        [
+          25.469729,
+          26.41
+        ],
+        [
+          71.398747,
+          59.81
+        ],
+        [
+          26.51357,
+          92.69
+        ],
+        [
+          72.964509,
+          7.1
+        ],
+        [
+          10.334029,
+          68.68
+        ],
+        [
+          51.043841,
+          27.97
+        ],
+        [
+          52.087683,
+          72.86
+        ],
+        [
+          5.114823,
+          26.93
+        ],
+        [
+          94.363257,
+          29.02
+        ],
+        [
+          23.903967,
+          8.66
+        ],
+        [
+          65.135699,
+          43.63
+        ],
+        [
+          37.473904,
+          36.85
+        ],
+        [
+          42.17119,
+          61.38
+        ],
+        [
+          41.127349,
+          90.08
+        ],
+        [
+          81.31524,
+          38.41
+        ],
+        [
+          16.597077,
+          36.85
+        ],
+        [
+          21.816284,
+          62.42
+        ],
+        [
+          27.035491,
+          40.5
+        ],
+        [
+          82.881002,
+          59.81
+        ],
+        [
+          34.864301,
+          10.23
+        ],
+        [
+          60.960334,
+          31.63
+        ],
+        [
+          6.680585,
+          58.77
+        ],
+        [
+          47.912317,
+          37.89
+        ],
+        [
+          5.114823,
+          37.89
+        ],
+        [
+          5.114823,
+          78.6
+        ],
+        [
+          83.402923,
+          7.1
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 1.983299,
+            "y": 14.51,
+            "w": 22.964509,
+            "h": 5
+          },
+          "slots": [
+            [
+              5.114823,
+              7.1
+            ],
+            [
+              25.469729,
+              26.41
+            ],
+            [
+              5.114823,
+              26.93
+            ],
+            [
+              23.903967,
+              8.66
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 37.995825,
+            "y": 14.51,
+            "w": 22.964509,
+            "h": 5
+          },
+          "slots": [
+            [
+              45.824635,
+              7.62
+            ],
+            [
+              51.043841,
+              27.97
+            ],
+            [
+              34.864301,
+              10.23
+            ],
+            [
+              60.960334,
+              31.63
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 71.398747,
+            "y": 16.6,
+            "w": 22.96451,
+            "h": 5
+          },
+          "slots": [
+            [
+              93.841336,
+              8.66
+            ],
+            [
+              70.876827,
+              27.97
+            ],
+            [
+              72.964509,
+              7.1
+            ],
+            [
+              94.363257,
+              29.02
+            ],
+            [
+              83.402923,
+              7.1
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 6.158664,
+            "y": 50.01,
+            "w": 22.964509,
+            "h": 5
+          },
+          "slots": [
+            [
+              16.597077,
+              36.85
+            ],
+            [
+              21.816284,
+              62.42
+            ],
+            [
+              27.035491,
+              40.5
+            ],
+            [
+              6.680585,
+              58.77
+            ],
+            [
+              5.114823,
+              37.89
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 37.473904,
+            "y": 45.83,
+            "w": 22.964509,
+            "h": 5
+          },
+          "slots": [
+            [
+              65.135699,
+              43.63
+            ],
+            [
+              37.473904,
+              36.85
+            ],
+            [
+              42.17119,
+              61.38
+            ],
+            [
+              47.912317,
+              37.89
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 66.179541,
+            "y": 47.4,
+            "w": 22.964509,
+            "h": 5
+          },
+          "slots": [
+            [
+              91.753653,
+              48.85
+            ],
+            [
+              71.398747,
+              59.81
+            ],
+            [
+              81.31524,
+              38.41
+            ],
+            [
+              82.881002,
+              59.81
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 8.246347,
+            "y": 77.67,
+            "w": 22.964509,
+            "h": 5
+          },
+          "slots": [
+            [
+              5.114823,
+              89.56
+            ],
+            [
+              31.210856,
+              71.29
+            ],
+            [
+              26.51357,
+              92.69
+            ],
+            [
+              10.334029,
+              68.68
+            ],
+            [
+              5.114823,
+              78.6
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 30.688935,
+            "y": 76.1,
+            "w": 22.96451,
+            "h": 5
+          },
+          "slots": [
+            [
+              55.741127,
+              91.65
+            ],
+            [
+              52.087683,
+              72.86
+            ],
+            [
+              41.127349,
+              90.08
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 958,
+        "crop": [
+          21,
+          0,
+          958
+        ],
+        "originalBounds": [
+          139.48,
+          35.48,
+          140.02,
+          35.9
+        ]
+      }
+    },
+    {
+      "id": "new-york",
+      "level": "city",
+      "countryId": "united-states",
+      "label": "纽约",
+      "country": "美国",
+      "bounds": [
+        -74.2700794479052,
+        40.49134646819011,
+        -73.67992055209477,
+        40.938662575116304
+      ],
+      "coverage": "纽约主要建成区及邻近新泽西滨岸；不含完整都市圈。",
+      "center": [
+        -73.99571754361698,
+        40.72156174972766
+      ],
+      "width": 1000,
+      "height": 1000,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 97085.34416718695,
+        "translate": [
+          125847.5979522683,
+          76158.12702363636
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "new-york.svg",
+      "bytes": 1469581,
+      "gzipBytes": 541292,
+      "sha256": "459631c9d33a4200e90d162b373e4257eba0978cfa93ccd6d5eae4ab7c6521f2",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "b24a618ffbd8385553ea806b134e06c10a9532a7fccf33c9d723c66e676e7192",
+          "snapshot": "2026-10-31T16:53:06Z",
+          "capturedSources": [
+            {
+              "layer": "roads-major",
+              "rawFile": "roads-major/source.osm.json",
+              "rawSha256": "bd4918c6e80db61410192f4e246b7dd5894b9f52ccd11f26bc951b04cf423c59",
+              "captureFile": "roads-major/capture.json",
+              "queryFile": "roads-major/query.overpassql",
+              "snapshot": "2026-10-31T16:53:06Z"
+            },
+            {
+              "layer": "roads-secondary",
+              "rawFile": "roads-secondary/source.osm.json",
+              "rawSha256": "5bb6cd5c837daf44f9d377fd0912f2c91e1532beed5920f25acc722ed24c1039",
+              "captureFile": "roads-secondary/capture.json",
+              "queryFile": "roads-secondary/query.overpassql",
+              "snapshot": "2026-10-31T16:53:06Z"
+            },
+            {
+              "layer": "water-ways",
+              "rawFile": "water-ways/source.osm.json",
+              "rawSha256": "8424fe55f50c1b46476c15f8842f66ff3b58981bc8b443ac45d963c9c8c0328d",
+              "captureFile": "water-ways/capture.json",
+              "queryFile": "water-ways/query.overpassql",
+              "snapshot": "2026-10-31T16:58:06Z"
+            },
+            {
+              "layer": "water-relations",
+              "rawFile": "water-relations/source.osm.json",
+              "rawSha256": "d7d21e55f2f86b92ce97e7d99136143e95b811e21fa2510a05cb3493c00d3988",
+              "captureFile": "water-relations/capture.json",
+              "queryFile": "water-relations/query.overpassql",
+              "snapshot": "2026-10-31T16:59:10Z"
+            }
+          ]
+        },
+        "land": {
+          "name": "Natural Earth 1:10 million land polygons",
+          "license": "public domain",
+          "url": "https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-land/",
+          "rawSha256": "e547d749445eaa0964aba76738090ec88f5e63c4585122170f98c67a7ea922dc"
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 47828,
+        "roads": 45615,
+        "water": 389,
+        "parks": 0,
+        "relationOuterRings": 136,
+        "relationInnerRings": 186,
+        "omittedTinyPolygons": 1834,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": []
+      },
+      "aliases": [
+        "纽约",
+        "紐約",
+        "纽约市",
+        "紐約市",
+        "New York",
+        "New York City",
+        "NYC",
+        "大苹果",
+        "大蘋果",
+        "Big Apple",
+        "The Big Apple",
+        "N.Y.C.",
+        "纽约城",
+        "紐約城",
+        "NewYork"
+      ],
+      "slots": [
+        [
+          7,
+          6.80236
+        ],
+        [
+          9,
+          90.80336
+        ],
+        [
+          91.5,
+          77.30284
+        ],
+        [
+          91,
+          41.2981
+        ],
+        [
+          24,
+          28.30058
+        ],
+        [
+          23,
+          70.80408
+        ],
+        [
+          75,
+          59.79844
+        ],
+        [
+          62.5,
+          27.30464
+        ],
+        [
+          32,
+          51.29774
+        ],
+        [
+          43,
+          32.7974
+        ],
+        [
+          25.5,
+          6.80236
+        ],
+        [
+          69.5,
+          43.30004
+        ],
+        [
+          92.5,
+          58.2995
+        ],
+        [
+          64.5,
+          78.80178
+        ],
+        [
+          7,
+          31.80146
+        ],
+        [
+          7,
+          64.79826
+        ],
+        [
+          55.5,
+          65.30126
+        ],
+        [
+          22,
+          41.8011
+        ],
+        [
+          71.5,
+          17.305
+        ],
+        [
+          41,
+          67.79614
+        ],
+        [
+          79.5,
+          34.79934
+        ],
+        [
+          7,
+          78.29878
+        ],
+        [
+          18,
+          58.8025
+        ],
+        [
+          32,
+          18.30094
+        ],
+        [
+          90,
+          27.30464
+        ],
+        [
+          63,
+          56.29756
+        ],
+        [
+          33,
+          76.79984
+        ],
+        [
+          46,
+          57.7965
+        ],
+        [
+          35.5,
+          40.7951
+        ],
+        [
+          84,
+          66.2972
+        ],
+        [
+          60,
+          38.80322
+        ],
+        [
+          46.5,
+          22.79776
+        ],
+        [
+          28.5,
+          61.29738
+        ],
+        [
+          65.5,
+          66.2972
+        ],
+        [
+          75,
+          26.29864
+        ],
+        [
+          35,
+          6.80236
+        ],
+        [
+          35.5,
+          27.30464
+        ],
+        [
+          13,
+          38.80322
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 3.5,
+            "y": 15.28294,
+            "w": 22,
+            "h": 5.03
+          },
+          "slots": [
+            [
+              7,
+              6.80236
+            ],
+            [
+              24,
+              28.30058
+            ],
+            [
+              25.5,
+              6.80236
+            ],
+            [
+              7,
+              31.80146
+            ],
+            [
+              32,
+              18.30094
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 42.5,
+            "y": 9.28718,
+            "w": 22,
+            "h": 5.03
+          },
+          "slots": [
+            [
+              62.5,
+              27.30464
+            ],
+            [
+              43,
+              32.7974
+            ],
+            [
+              46.5,
+              22.79776
+            ],
+            [
+              35,
+              6.80236
+            ],
+            [
+              35.5,
+              27.30464
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 69.5,
+            "y": 4.28736,
+            "w": 22,
+            "h": 5.03
+          },
+          "slots": [
+            [
+              71.5,
+              17.305
+            ],
+            [
+              90,
+              27.30464
+            ],
+            [
+              75,
+              26.29864
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 3,
+            "y": 46.28786,
+            "w": 22,
+            "h": 5.03
+          },
+          "slots": [
+            [
+              32,
+              51.29774
+            ],
+            [
+              7,
+              64.79826
+            ],
+            [
+              22,
+              41.8011
+            ],
+            [
+              18,
+              58.8025
+            ],
+            [
+              28.5,
+              61.29738
+            ],
+            [
+              13,
+              38.80322
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 42.5,
+            "y": 46.7808,
+            "w": 22,
+            "h": 5.03
+          },
+          "slots": [
+            [
+              55.5,
+              65.30126
+            ],
+            [
+              63,
+              56.29756
+            ],
+            [
+              46,
+              57.7965
+            ],
+            [
+              35.5,
+              40.7951
+            ],
+            [
+              60,
+              38.80322
+            ],
+            [
+              65.5,
+              66.2972
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 71,
+            "y": 47.2838,
+            "w": 22,
+            "h": 5.03
+          },
+          "slots": [
+            [
+              91,
+              41.2981
+            ],
+            [
+              75,
+              59.79844
+            ],
+            [
+              69.5,
+              43.30004
+            ],
+            [
+              92.5,
+              58.2995
+            ],
+            [
+              79.5,
+              34.79934
+            ],
+            [
+              84,
+              66.2972
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 13.5,
+            "y": 84.28448,
+            "w": 22,
+            "h": 5.03
+          },
+          "slots": [
+            [
+              9,
+              90.80336
+            ],
+            [
+              23,
+              70.80408
+            ],
+            [
+              7,
+              78.29878
+            ],
+            [
+              33,
+              76.79984
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 36,
+            "y": 77.28272,
+            "w": 22,
+            "h": 5.03
+          },
+          "slots": [
+            [
+              64.5,
+              78.80178
+            ],
+            [
+              41,
+              67.79614
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 1006,
+        "crop": [
+          0,
+          3,
+          1000
+        ],
+        "originalBounds": [
+          -74.27,
+          40.49,
+          -73.68,
+          40.94
+        ]
+      }
+    },
+    {
+      "id": "los-angeles",
+      "level": "city",
+      "countryId": "united-states",
+      "label": "洛杉矶",
+      "country": "美国",
+      "bounds": [
+        -118.65775000000001,
+        33.699928543098366,
+        -117.98225,
+        34.260070987655894
+      ],
+      "coverage": "洛杉矶主要建成区、圣莫尼卡海岸及港区；不含完整都市圈。",
+      "center": [
+        -118.23198647223317,
+        34.049219260337075
+      ],
+      "width": 965,
+      "height": 965,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 81851.11359011492,
+        "translate": [
+          169511.0714285659,
+          52150.75564184764
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "los-angeles.svg",
+      "bytes": 2622852,
+      "gzipBytes": 832453,
+      "sha256": "b0e98fa630a831f66c7a21758642ac94e133dfcf26671bfaae38dd191557808d",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "f08f9b2cf97b884c39519ff1ff17ce7775876d7c672f49ef8f56d971623aba25",
+          "snapshot": "2026-10-31T17:00:15Z",
+          "capturedSources": [
+            {
+              "layer": "roads",
+              "rawFile": "roads/source.osm.json",
+              "rawSha256": "99b190ca062e08fe289dec4e413e50b0a73cfe8a221411caa63c9fd996af95b8",
+              "captureFile": "roads/capture.json",
+              "queryFile": "roads/query.overpassql",
+              "snapshot": "2026-10-31T17:00:15Z"
+            },
+            {
+              "layer": "water",
+              "rawFile": "water/source.osm.json",
+              "rawSha256": "4a16cd16791ef24c0c4afab75905c6d20c767d932e25690ae52d09dcce8988ee",
+              "captureFile": "water/capture.json",
+              "queryFile": "water/query.overpassql",
+              "snapshot": "2026-10-31T17:02:20Z"
+            }
+          ]
+        },
+        "land": {
+          "name": "Natural Earth 1:10 million land polygons",
+          "license": "public domain",
+          "url": "https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-land/",
+          "rawSha256": "e547d749445eaa0964aba76738090ec88f5e63c4585122170f98c67a7ea922dc"
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 86622,
+        "roads": 85336,
+        "water": 247,
+        "parks": 0,
+        "relationOuterRings": 78,
+        "relationInnerRings": 63,
+        "omittedTinyPolygons": 1058,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": []
+      },
+      "aliases": [
+        "洛杉矶",
+        "洛杉磯",
+        "洛杉矶市",
+        "洛杉磯市",
+        "Los Angeles",
+        "LA",
+        "洛城",
+        "罗省",
+        "羅省",
+        "L.A.",
+        "City of Los Angeles"
+      ],
+      "slots": [
+        [
+          6.994819,
+          8.08
+        ],
+        [
+          93.005181,
+          90.98
+        ],
+        [
+          94.041451,
+          20
+        ],
+        [
+          38.082902,
+          90.98
+        ],
+        [
+          19.430052,
+          39.17
+        ],
+        [
+          64.507772,
+          78.55
+        ],
+        [
+          68.134715,
+          29.33
+        ],
+        [
+          41.709845,
+          69.74
+        ],
+        [
+          70.207254,
+          7.05
+        ],
+        [
+          42.746114,
+          30.88
+        ],
+        [
+          67.098446,
+          57.31
+        ],
+        [
+          82.642487,
+          74.92
+        ],
+        [
+          94.041451,
+          38.13
+        ],
+        [
+          5.958549,
+          26.74
+        ],
+        [
+          33.419689,
+          48.5
+        ],
+        [
+          53.108808,
+          88.91
+        ],
+        [
+          77.46114,
+          41.24
+        ],
+        [
+          55.181347,
+          22.07
+        ],
+        [
+          62.435233,
+          43.83
+        ],
+        [
+          57.253886,
+          66.11
+        ],
+        [
+          91.968912,
+          65.6
+        ],
+        [
+          19.948187,
+          7.56
+        ],
+        [
+          29.792746,
+          31.4
+        ],
+        [
+          83.160622,
+          30.88
+        ],
+        [
+          40.673575,
+          57.82
+        ],
+        [
+          77.46114,
+          63.01
+        ],
+        [
+          37.046632,
+          21.55
+        ],
+        [
+          7.512953,
+          38.13
+        ],
+        [
+          44.300518,
+          41.24
+        ],
+        [
+          70.725389,
+          70.78
+        ],
+        [
+          57.772021,
+          31.4
+        ],
+        [
+          86.787565,
+          43.83
+        ],
+        [
+          35.492228,
+          39.17
+        ],
+        [
+          47.927461,
+          63.01
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 3.367876,
+            "y": 15.95,
+            "w": 22.797927,
+            "h": 5
+          },
+          "slots": [
+            [
+              6.994819,
+              8.08
+            ],
+            [
+              5.958549,
+              26.74
+            ],
+            [
+              19.948187,
+              7.56
+            ],
+            [
+              29.792746,
+              31.4
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 36.528497,
+            "y": 6.62,
+            "w": 22.797928,
+            "h": 5
+          },
+          "slots": [
+            [
+              42.746114,
+              30.88
+            ],
+            [
+              55.181347,
+              22.07
+            ],
+            [
+              37.046632,
+              21.55
+            ],
+            [
+              57.772021,
+              31.4
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 68.65285,
+            "y": 14.91,
+            "w": 22.797927,
+            "h": 5
+          },
+          "slots": [
+            [
+              94.041451,
+              20
+            ],
+            [
+              68.134715,
+              29.33
+            ],
+            [
+              70.207254,
+              7.05
+            ],
+            [
+              83.160622,
+              30.88
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 38.601036,
+            "y": 47.55,
+            "w": 22.797928,
+            "h": 5
+          },
+          "slots": [
+            [
+              67.098446,
+              57.31
+            ],
+            [
+              33.419689,
+              48.5
+            ],
+            [
+              62.435233,
+              43.83
+            ],
+            [
+              57.253886,
+              66.11
+            ],
+            [
+              40.673575,
+              57.82
+            ],
+            [
+              44.300518,
+              41.24
+            ],
+            [
+              35.492228,
+              39.17
+            ],
+            [
+              47.927461,
+              63.01
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 74.352332,
+            "y": 52.22,
+            "w": 22.797927,
+            "h": 5
+          },
+          "slots": [
+            [
+              94.041451,
+              38.13
+            ],
+            [
+              77.46114,
+              41.24
+            ],
+            [
+              91.968912,
+              65.6
+            ],
+            [
+              77.46114,
+              63.01
+            ],
+            [
+              86.787565,
+              43.83
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 36.528497,
+            "y": 76.57,
+            "w": 22.797928,
+            "h": 5
+          },
+          "slots": [
+            [
+              38.082902,
+              90.98
+            ],
+            [
+              64.507772,
+              78.55
+            ],
+            [
+              41.709845,
+              69.74
+            ],
+            [
+              53.108808,
+              88.91
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 74.352332,
+            "y": 81.75,
+            "w": 22.797927,
+            "h": 5
+          },
+          "slots": [
+            [
+              93.005181,
+              90.98
+            ],
+            [
+              82.642487,
+              74.92
+            ],
+            [
+              70.725389,
+              70.78
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 965,
+        "crop": [
+          17.5,
+          0,
+          965
+        ],
+        "originalBounds": [
+          -118.67,
+          33.7,
+          -117.97,
+          34.26
+        ]
+      }
+    },
+    {
+      "id": "chongqing",
+      "level": "city",
+      "countryId": "china",
+      "label": "重庆",
+      "country": "中国",
+      "bounds": [
+        106.43000000000004,
+        29.449968993231277,
+        106.66000000000001,
+        29.650051703838983
+      ],
+      "coverage": "长江与嘉陵江交汇主城、渝中半岛和两岸建成区；不含整个直辖市范围。",
+      "center": [
+        106.5930358,
+        29.5669229
+      ],
+      "width": 1000,
+      "height": 1000,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 249112.08483950605,
+        "translate": [
+          -462739.13043481554,
+          135084.984950715
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "chongqing.svg",
+      "bytes": 355054,
+      "gzipBytes": 137132,
+      "sha256": "62135b31e3629bb02827e78288988cd74ee014dfaa34ae3f50f8bb76f0a311f5",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "436e4876cc483c6cfec42418465a433545493ef73673b7445121fd44c6114e79",
+          "snapshot": "2026-11-02T17:01:30Z",
+          "capturedSources": [
+            {
+              "layer": "roads",
+              "rawFile": "roads/source.osm.json",
+              "rawSha256": "8557cf8fdda38d1a66cb169ce958e541f6c07af8876892c995b6318558f4da44",
+              "captureFile": "roads/capture.json",
+              "queryFile": "roads/query.overpassql",
+              "snapshot": "2026-11-02T17:01:30Z"
+            },
+            {
+              "layer": "water",
+              "rawFile": "water/source.osm.json",
+              "rawSha256": "1a109e1094a075e348750d8e91e4ed1a2c6cca45f4f79bb48f9c0afa67029082",
+              "captureFile": "water/capture.json",
+              "queryFile": "water/query.overpassql",
+              "snapshot": "2026-11-02T17:03:36Z"
+            }
+          ]
+        },
+        "land": {
+          "name": "Natural Earth 1:10 million land polygons",
+          "license": "public domain",
+          "url": "https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-land/",
+          "rawSha256": "e547d749445eaa0964aba76738090ec88f5e63c4585122170f98c67a7ea922dc"
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 8826,
+        "roads": 8620,
+        "water": 159,
+        "parks": 0,
+        "relationOuterRings": 10,
+        "relationInnerRings": 16,
+        "omittedTinyPolygons": 47,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": []
+      },
+      "license": "© OpenStreetMap contributors · ODbL 1.0；Natural Earth public domain。",
+      "aliases": [
+        "重庆",
+        "重庆市",
+        "重慶",
+        "重慶市",
+        "Chongqing",
+        "山城",
+        "渝都"
+      ],
+      "slots": [
+        [
+          8.642,
+          94.6732
+        ],
+        [
+          91.399,
+          87.6046
+        ],
+        [
+          91.481,
+          11.7596
+        ],
+        [
+          39.881,
+          49.5138
+        ],
+        [
+          49.888,
+          93.4181
+        ],
+        [
+          78.1,
+          49.4533
+        ],
+        [
+          10.488,
+          12.7111
+        ],
+        [
+          8.505,
+          53.9259
+        ],
+        [
+          68.649,
+          22.6441
+        ],
+        [
+          40.027,
+          26.9517
+        ],
+        [
+          60.042,
+          71.4665
+        ],
+        [
+          37.844,
+          71.4192
+        ],
+        [
+          16.697,
+          33.3493
+        ],
+        [
+          11.095,
+          74.3298
+        ],
+        [
+          87.273,
+          68.513
+        ],
+        [
+          58.983,
+          44.5451
+        ],
+        [
+          86.396,
+          31.4793
+        ],
+        [
+          75.064,
+          94.891
+        ],
+        [
+          24.237,
+          55.9026
+        ],
+        [
+          25.635,
+          19.0328
+        ],
+        [
+          54.367,
+          26.1784
+        ],
+        [
+          91.46,
+          50.4114
+        ],
+        [
+          24.519,
+          72.9339
+        ],
+        [
+          73.054,
+          36.3039
+        ],
+        [
+          73.046,
+          68.0719
+        ],
+        [
+          62.477,
+          93.1079
+        ],
+        [
+          79.401,
+          82.7558
+        ],
+        [
+          28.4,
+          35.4844
+        ],
+        [
+          79.931,
+          18.5114
+        ],
+        [
+          47.193,
+          38.2619
+        ],
+        [
+          37.623,
+          15.8505
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 11.3,
+            "y": 25.3,
+            "w": 20,
+            "h": 5.5
+          },
+          "slots": [
+            [
+              10.488,
+              12.7111
+            ],
+            [
+              16.697,
+              33.3493
+            ],
+            [
+              25.635,
+              19.0328
+            ],
+            [
+              28.4,
+              35.4844
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 40,
+            "y": 16.2,
+            "w": 20,
+            "h": 5.5
+          },
+          "slots": [
+            [
+              40.027,
+              26.9517
+            ],
+            [
+              54.367,
+              26.1784
+            ],
+            [
+              47.193,
+              38.2619
+            ],
+            [
+              37.623,
+              15.8505
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 67.3,
+            "y": 7.1,
+            "w": 20,
+            "h": 5.5
+          },
+          "slots": [
+            [
+              91.481,
+              11.7596
+            ],
+            [
+              68.649,
+              22.6441
+            ],
+            [
+              86.396,
+              31.4793
+            ],
+            [
+              79.931,
+              18.5114
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 14.1,
+            "y": 59.6,
+            "w": 20,
+            "h": 5.5
+          },
+          "slots": [
+            [
+              8.505,
+              53.9259
+            ],
+            [
+              24.237,
+              55.9026
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 47.7,
+            "y": 54.7,
+            "w": 20,
+            "h": 5.5
+          },
+          "slots": [
+            [
+              39.881,
+              49.5138
+            ],
+            [
+              58.983,
+              44.5451
+            ],
+            [
+              73.054,
+              36.3039
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 69.4,
+            "y": 60.3,
+            "w": 20,
+            "h": 5.5
+          },
+          "slots": [
+            [
+              78.1,
+              49.4533
+            ],
+            [
+              87.273,
+              68.513
+            ],
+            [
+              91.46,
+              50.4114
+            ],
+            [
+              73.046,
+              68.0719
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 16.2,
+            "y": 75.7,
+            "w": 20,
+            "h": 5.5
+          },
+          "slots": [
+            [
+              8.642,
+              94.6732
+            ],
+            [
+              37.844,
+              71.4192
+            ],
+            [
+              11.095,
+              74.3298
+            ],
+            [
+              24.519,
+              72.9339
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 52.6,
+            "y": 82,
+            "w": 20,
+            "h": 5.5
+          },
+          "slots": [
+            [
+              49.888,
+              93.4181
+            ],
+            [
+              75.064,
+              94.891
+            ],
+            [
+              62.477,
+              93.1079
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 60.3,
+            "y": 73.6,
+            "w": 20,
+            "h": 5.5
+          },
+          "slots": [
+            [
+              91.399,
+              87.6046
+            ],
+            [
+              60.042,
+              71.4665
+            ],
+            [
+              79.401,
+              82.7558
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 1100,
+        "crop": [
+          0,
+          50,
+          1000
+        ],
+        "originalBounds": [
+          106.43,
+          29.44,
+          106.66,
+          29.66
+        ]
+      }
+    },
+    {
+      "id": "hong-kong",
+      "level": "city",
+      "countryId": "china",
+      "label": "香港",
+      "country": "中国",
+      "bounds": [
+        114.02069929560413,
+        22.189999999999994,
+        114.2693007043959,
+        22.420000000000005
+      ],
+      "coverage": "港岛、九龙、维多利亚港及南部新界局部；不含完整离岛。",
+      "center": [
+        114.1830635,
+        22.3069268
+      ],
+      "width": 994,
+      "height": 994,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 229089.63031544434,
+        "translate": [
+          -455896.75316266896,
+          92022.75035895625
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "hong-kong.svg",
+      "bytes": 940654,
+      "gzipBytes": 334846,
+      "sha256": "23db58a8a46999394bfbc5553352a1802ee8ac8e04e03d0936b45b56531e89b8",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "4144bc1cac13f59c1af68f55da376e09bb92be8e84369159054621b3fc52aba4",
+          "snapshot": "2026-11-02T17:03:36Z",
+          "capturedSources": [
+            {
+              "layer": "roads",
+              "rawFile": "roads/source.osm.json",
+              "rawSha256": "5e90dc50b9a742097d5b231ca5aacf311a88eff839adf8a3978f2f3a6ceb35fb",
+              "captureFile": "roads/capture.json",
+              "queryFile": "roads/query.overpassql",
+              "snapshot": "2026-11-02T17:03:36Z"
+            },
+            {
+              "layer": "water",
+              "rawFile": "water/source.osm.json",
+              "rawSha256": "063f76d1e416699b361b4e3a7f1bcad5307141f42d6df4b937d61e2db03cf338",
+              "captureFile": "water/capture.json",
+              "queryFile": "water/query.overpassql",
+              "snapshot": "2026-11-02T17:04:36Z"
+            }
+          ]
+        },
+        "land": {
+          "name": "OpenStreetMap detailed coastline",
+          "license": "ODbL-1.0",
+          "url": "https://wiki.openstreetmap.org/wiki/Tag:natural%3Dcoastline",
+          "rawSha256": "eb1ee3ed055af55b3740d169ae4c68c749562c8b09e7bd643259b6d3a29f72e6",
+          "captureFile": "coastline/capture.json",
+          "processingReport": "coastline/land-derived.json",
+          "processing": "Original directed coastline way endpoints joined without reversal; actual segment/frame intersections retained; planar faces close solely along crop frame; land side follows OSM land-left. No interior chord closure."
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 18158,
+        "roads": 17570,
+        "water": 100,
+        "parks": 0,
+        "relationOuterRings": 40,
+        "relationInnerRings": 43,
+        "omittedTinyPolygons": 486,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": []
+      },
+      "license": "© OpenStreetMap contributors · ODbL 1.0（道路、水体、真实海岸）；Natural Earth城市中心 public domain。",
+      "aliases": [
+        "香港",
+        "香港特别行政区",
+        "香港特別行政區",
+        "Hong Kong",
+        "港城",
+        "香江",
+        "HK",
+        "H.K.",
+        "Hong Kong SAR",
+        "Hong Kong Special Administrative Region"
+      ],
+      "slots": [
+        [
+          78.78169,
+          8.741
+        ],
+        [
+          76.255533,
+          87.087
+        ],
+        [
+          8.251509,
+          41.19
+        ],
+        [
+          56.795775,
+          47.92
+        ],
+        [
+          91.714286,
+          44.133
+        ],
+        [
+          44.531187,
+          16.214
+        ],
+        [
+          49.957746,
+          73.818
+        ],
+        [
+          34.774648,
+          38.345
+        ],
+        [
+          84.660966,
+          65.588
+        ],
+        [
+          71.148893,
+          29.146
+        ],
+        [
+          10.573441,
+          22.577
+        ],
+        [
+          67.314889,
+          67.845
+        ],
+        [
+          91.48994,
+          28.227
+        ],
+        [
+          76.306841,
+          44.794
+        ],
+        [
+          54.613682,
+          30.633
+        ],
+        [
+          31.783702,
+          11.332
+        ],
+        [
+          58.631791,
+          18.159
+        ],
+        [
+          31.933602,
+          26.01
+        ],
+        [
+          70.739437,
+          56.356
+        ],
+        [
+          45.828974,
+          42.688
+        ],
+        [
+          88.963783,
+          54.796
+        ],
+        [
+          47.260563,
+          57.825
+        ],
+        [
+          44.607646,
+          30.246
+        ],
+        [
+          66.580483,
+          41.374
+        ],
+        [
+          69.414487,
+          77.254
+        ],
+        [
+          15.432596,
+          31.852
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 12.474849,
+            "y": 15.492958,
+            "w": 20.120724,
+            "h": 5.030181
+          },
+          "slots": [
+            [
+              8.251509,
+              41.19
+            ],
+            [
+              10.573441,
+              22.577
+            ],
+            [
+              31.933602,
+              26.01
+            ],
+            [
+              15.432596,
+              31.852
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 44.16499,
+            "y": 33.098592,
+            "w": 20.120724,
+            "h": 5.030181
+          },
+          "slots": [
+            [
+              56.795775,
+              47.92
+            ],
+            [
+              54.613682,
+              30.633
+            ],
+            [
+              45.828974,
+              42.688
+            ],
+            [
+              66.580483,
+              41.374
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 67.404427,
+            "y": 19.71831,
+            "w": 20.120724,
+            "h": 5.030181
+          },
+          "slots": [
+            [
+              78.78169,
+              8.741
+            ],
+            [
+              71.148893,
+              29.146
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 40.643863,
+            "y": 59.859155,
+            "w": 20.120725,
+            "h": 5.030181
+          },
+          "slots": [
+            [
+              49.957746,
+              73.818
+            ],
+            [
+              47.260563,
+              57.825
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 62.474849,
+            "y": 59.859155,
+            "w": 20.120724,
+            "h": 5.030181
+          },
+          "slots": [
+            [
+              76.255533,
+              87.087
+            ],
+            [
+              84.660966,
+              65.588
+            ],
+            [
+              67.314889,
+              67.845
+            ],
+            [
+              70.739437,
+              56.356
+            ],
+            [
+              88.963783,
+              54.796
+            ],
+            [
+              69.414487,
+              77.254
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 70.221328,
+            "y": 33.802817,
+            "w": 20.120724,
+            "h": 5.030181
+          },
+          "slots": [
+            [
+              91.714286,
+              44.133
+            ],
+            [
+              91.48994,
+              28.227
+            ],
+            [
+              76.306841,
+              44.794
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 37.826962,
+            "y": 21.830986,
+            "w": 16.096579,
+            "h": 5.030181
+          },
+          "slots": [
+            [
+              34.774648,
+              38.345
+            ],
+            [
+              44.607646,
+              30.246
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 54.024145,
+            "y": 10.56338,
+            "w": 16.096579,
+            "h": 5.030181
+          },
+          "slots": [
+            [
+              58.631791,
+              18.159
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 34.305835,
+            "y": 9.15493,
+            "w": 16.096579,
+            "h": 5.030181
+          },
+          "slots": [
+            [
+              44.531187,
+              16.214
+            ],
+            [
+              31.783702,
+              11.332
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 994,
+        "crop": [
+          3,
+          0,
+          994
+        ],
+        "originalBounds": [
+          114.02,
+          22.19,
+          114.27,
+          22.42
+        ]
+      }
+    },
+    {
+      "id": "nagoya",
+      "level": "city",
+      "countryId": "japan",
+      "label": "名古屋",
+      "country": "日本",
+      "bounds": [
+        136.75995775366133,
+        34.99645743426795,
+        137.05004224633868,
+        35.233745670638676
+      ],
+      "coverage": "名古屋主要建成区、南部港区与伊势湾北端；不含整个都市圈。",
+      "center": [
+        136.9130456,
+        35.1569434
+      ],
+      "width": 1000,
+      "height": 1000,
+      "boundsOrder": "west,south,east,north",
+      "coordinateSystem": "WGS84 longitude,latitude degrees",
+      "projection": {
+        "type": "mercator",
+        "scale": 197514.1069564303,
+        "translate": [
+          -471448.7027259295,
+          129929.52602840483
+        ],
+        "rotate": [
+          0,
+          0,
+          0
+        ],
+        "center": [
+          0,
+          0
+        ],
+        "outputUnits": "SVG viewBox pixels"
+      },
+      "file": "nagoya.svg",
+      "bytes": 313739,
+      "gzipBytes": 117165,
+      "sha256": "43d6b76e2e09cd620c76c2d1cd92e2e85f1f244fa5d9edeb9f0b4dcb74565c6b",
+      "source": {
+        "osm": {
+          "attribution": "© OpenStreetMap contributors",
+          "license": "ODbL-1.0",
+          "url": "https://www.openstreetmap.org/copyright",
+          "rawSha256": "daedbf7bf49601116279c902e02a832208e973fcaab23c4cc211b2fbefa06929",
+          "snapshot": "2026-11-02T17:04:36Z",
+          "capturedSources": [
+            {
+              "layer": "roads",
+              "rawFile": "roads/source.osm.json",
+              "rawSha256": "e708032117a8783ef516ce02a44697ff9e78052a523176b1cc90737e697c1a0d",
+              "captureFile": "roads/capture.json",
+              "queryFile": "roads/query.overpassql",
+              "snapshot": "2026-11-02T17:04:36Z"
+            },
+            {
+              "layer": "water-ways",
+              "rawFile": "water-ways/source.osm.json",
+              "rawSha256": "72fb3a1b7a076bcc82504955cdb2bd66c598770c7ebbb281224d18d8edf33724",
+              "captureFile": "water-ways/capture.json",
+              "queryFile": "water-ways/query.overpassql",
+              "snapshot": "2026-11-02T17:06:35Z"
+            }
+          ]
+        },
+        "land": {
+          "name": "Natural Earth 1:10 million land polygons",
+          "license": "public domain",
+          "url": "https://www.naturalearthdata.com/downloads/10m-physical-vectors/10m-land/",
+          "rawSha256": "e547d749445eaa0964aba76738090ec88f5e63c4585122170f98c67a7ea922dc"
+        }
+      },
+      "processing": {
+        "roads": "motorway/trunk/primary/secondary/tertiary and links; no buildings or POI",
+        "simplifyToleranceSvgPixels": 0.65,
+        "polygonToleranceSvgPixels": 0.3,
+        "minimumOuterAreaSvgPixels": 3,
+        "minimumHoleAreaSvgPixels": 1.5,
+        "pathDigits": 1,
+        "relationGeometry": "joined actual member endpoints; inner rings retained; no invented closure"
+      },
+      "stats": {
+        "sourceElements": 10852,
+        "roads": 7141,
+        "water": 700,
+        "parks": 0,
+        "relationOuterRings": 0,
+        "relationInnerRings": 0,
+        "omittedTinyPolygons": 3011,
+        "unclosedRelations": [],
+        "unassignedHoles": [],
+        "excludedInvalidRelations": []
+      },
+      "coverageLimitations": [
+        "Water layer contains closed ways only; unavailable relations are not synthesized. Natural Earth supplies the sea coastline."
+      ],
+      "previewNote": "水体暂使用已取得的闭合way，海岸沿Natural Earth；relation层未纳入此预览。",
+      "license": "© OpenStreetMap contributors · ODbL 1.0；Natural Earth public domain。",
+      "aliases": [
+        "名古屋",
+        "名古屋市",
+        "Nagoya",
+        "Nagoya City",
+        "なごや",
+        "ナゴヤ"
+      ],
+      "slots": [
+        [
+          91.489,
+          15.583825
+        ],
+        [
+          16.768,
+          50.26255
+        ],
+        [
+          88.098,
+          63.397425
+        ],
+        [
+          52.421,
+          67.8711
+        ],
+        [
+          51.343,
+          34.018375
+        ],
+        [
+          18.411,
+          19.731525
+        ],
+        [
+          21.539,
+          77.8539
+        ],
+        [
+          88.999,
+          39.517175
+        ],
+        [
+          81.152,
+          87.0756
+        ],
+        [
+          44.345,
+          89.38545
+        ],
+        [
+          66.617,
+          13.25185
+        ],
+        [
+          70.11,
+          39.2384
+        ],
+        [
+          62.803,
+          88.342625
+        ],
+        [
+          36.595,
+          14.014425
+        ],
+        [
+          70.232,
+          68.90655
+        ],
+        [
+          34.627,
+          59.23055
+        ],
+        [
+          33.977,
+          40.369725
+        ],
+        [
+          53.465,
+          52.060575
+        ],
+        [
+          16.148,
+          34.955
+        ],
+        [
+          51.595,
+          7.6675
+        ],
+        [
+          72.534,
+          54.189
+        ],
+        [
+          19.759,
+          63.9889
+        ],
+        [
+          51.923,
+          20.938075
+        ],
+        [
+          8.543,
+          76.52345
+        ],
+        [
+          79.14,
+          18.979275
+        ]
+      ],
+      "groups": [
+        {
+          "labelBox": {
+            "x": 25.3,
+            "y": 25.85,
+            "w": 20,
+            "h": 7.4
+          },
+          "slots": [
+            [
+              18.411,
+              19.731525
+            ],
+            [
+              16.148,
+              34.955
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 38.6,
+            "y": 10.45,
+            "w": 20,
+            "h": 7.4
+          },
+          "slots": [
+            [
+              36.595,
+              14.014425
+            ],
+            [
+              51.595,
+              7.6675
+            ],
+            [
+              51.923,
+              20.938075
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 65.2,
+            "y": 0.6,
+            "w": 20,
+            "h": 6.75
+          },
+          "slots": [
+            [
+              91.489,
+              15.583825
+            ],
+            [
+              66.617,
+              13.25185
+            ],
+            [
+              79.14,
+              18.979275
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 27.4,
+            "y": 46.15,
+            "w": 20,
+            "h": 7.4
+          },
+          "slots": [
+            [
+              16.768,
+              50.26255
+            ],
+            [
+              21.539,
+              77.8539
+            ],
+            [
+              44.345,
+              89.38545
+            ],
+            [
+              34.627,
+              59.23055
+            ],
+            [
+              33.977,
+              40.369725
+            ],
+            [
+              19.759,
+              63.9889
+            ],
+            [
+              8.543,
+              76.52345
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 49.1,
+            "y": 42.65,
+            "w": 20,
+            "h": 7.4
+          },
+          "slots": [
+            [
+              88.098,
+              63.397425
+            ],
+            [
+              52.421,
+              67.8711
+            ],
+            [
+              81.152,
+              87.0756
+            ],
+            [
+              70.11,
+              39.2384
+            ],
+            [
+              62.803,
+              88.342625
+            ],
+            [
+              70.232,
+              68.90655
+            ],
+            [
+              53.465,
+              52.060575
+            ],
+            [
+              72.534,
+              54.189
+            ]
+          ]
+        },
+        {
+          "labelBox": {
+            "x": 52.6,
+            "y": 24.45,
+            "w": 20,
+            "h": 7.4
+          },
+          "slots": [
+            [
+              51.343,
+              34.018375
+            ],
+            [
+              88.999,
+              39.517175
+            ]
+          ]
+        }
+      ],
+      "squareViewport": {
+        "originalWidth": 1000,
+        "originalHeight": 1475,
+        "crop": [
+          0,
+          237.5,
+          1000
+        ],
+        "originalBounds": [
+          136.76,
+          34.94,
+          137.05,
+          35.29
+        ]
+      }
+    }
+  ],
+  "cityCenters": {
+    "guangzhou": {
+      "sourceName": "Guangzhou",
+      "coordinates": [
+        113.26178516712943,
+        23.12472343296695
+      ],
+      "featureId": 1159151331,
+      "source": "Natural Earth 1:10 million populated places simple",
+      "license": "public domain"
+    },
+    "seoul": {
+      "sourceName": "Seoul",
+      "coordinates": [
+        126.9977851,
+        37.568295
+      ],
+      "featureId": 1159151523,
+      "source": "Natural Earth 1:10 million populated places simple",
+      "license": "public domain"
+    },
+    "los-angeles": {
+      "sourceName": "Los Angeles",
+      "coordinates": [
+        -118.23198647223317,
+        34.049219260337075
+      ],
+      "featureId": 1159151569,
+      "source": "Natural Earth 1:10 million populated places simple",
+      "license": "public domain"
+    },
+    "new-york": {
+      "sourceName": "New York",
+      "coordinates": [
+        -73.99571754361698,
+        40.72156174972766
+      ],
+      "featureId": 1159151575,
+      "source": "Natural Earth 1:10 million populated places simple",
+      "license": "public domain"
+    },
+    "beijing": {
+      "sourceName": "Beijing",
+      "coordinates": [
+        116.39420089260611,
+        39.901720309862675
+      ],
+      "featureId": 1159151595,
+      "source": "Natural Earth 1:10 million populated places simple",
+      "license": "public domain"
+    },
+    "shanghai": {
+      "sourceName": "Shanghai",
+      "coordinates": [
+        121.4345588,
+        31.2183983
+      ],
+      "featureId": 1159151605,
+      "source": "Natural Earth 1:10 million populated places simple",
+      "license": "public domain"
+    },
+    "tokyo": {
+      "sourceName": "Tokyo",
+      "coordinates": [
+        139.7494616,
+        35.6869628
+      ],
+      "featureId": 1159151609,
+      "source": "Natural Earth 1:10 million populated places simple",
+      "license": "public domain"
+    },
+    "chongqing": {
+      "sourceName": "重庆",
+      "coordinates": [
+        106.5930358,
+        29.5669229
+      ]
+    },
+    "hong-kong": {
+      "sourceName": "香港",
+      "coordinates": [
+        114.1830635,
+        22.3069268
+      ]
+    },
+    "nagoya": {
+      "sourceName": "名古屋",
+      "coordinates": [
+        136.9130456,
+        35.1569434
+      ]
+    }
+  },
+  "cityCenterSource": {
+    "name": "Natural Earth 1:10 million populated places simple",
+    "license": "public domain",
+    "url": "https://www.naturalearthdata.com/downloads/10m-cultural-vectors/10m-populated-places/",
+    "rawSha256": "2963ee08f7743f13f37d5243acd77a2f7a510e26a36c7e04b920f1b381f2b251"
+  }
+}

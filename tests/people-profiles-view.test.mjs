@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { buildEntityIdentityDirectory } from '../src/v3/entity-identity.js';
 import { createChatSession } from '../src/chat-session.js';
-import { createPeopleProfilesView } from '../src/ui/people-profiles-view.js';
+import { createPeopleProfilesView as createPeopleProfilesViewImpl } from '../src/ui/people-profiles-view.js';
 import { createPeopleWorkspaceStore, createPeopleWorkspaceRuntime, PEOPLE_WORKSPACE_RECORD_ID } from '../src/v3/people-workspace.js';
 
 const A = '11111111-1111-4111-8111-111111111111';
@@ -32,13 +33,18 @@ function dialogHarness() {
   return {
     dialog: {
       async confirm(options) { confirms.push(options); return true; },
-      custom(options) { return new Promise(resolve => { active = { ...options, resolve }; }); },
+      custom(options) { return new Promise(resolve => { active = { ...options, resolve, error: null }; }); },
       cancelTop() { if (!active) return false; const current = active; active = null; current.onClose?.(); current.resolve(null); return true; },
     },
     get active() { return active; },
     confirms,
-    async submit() { const current = active; const value = await current.submit(); active = null; current.onClose?.(); current.resolve(value); return value; },
+    async submit() { const current = active; try { const value = await current.submit(); if (active === current) { active = null; current.onClose?.(); current.resolve(value); } return value; } catch (error) { current.error = error; return false; } },
   };
+}
+function createPeopleProfilesView(options = {}) {
+  const dialogs = options.dialog ? null : dialogHarness();
+  const view = createPeopleProfilesViewImpl({ ...options, dialog: options.dialog ?? dialogs.dialog });
+  return { ...view, testDialogs: dialogs };
 }
 const documentRef = { activeElement: null, createElement: tag => new Node(tag) };
 function eventDocument() {
@@ -54,8 +60,13 @@ function eventDocument() {
 }
 const flatten = node => [node, ...node.children.flatMap(flatten)];
 const visible = node => flatten(node).map(item => item.textContent).filter(Boolean).join('|');
+const editorContent = view => view.testDialogs?.active?.content ?? null;
+const editorField = (view, label) => fieldControl(editorContent(view), label);
+const saveEditor = view => view.testDialogs.submit();
+const cancelEditor = view => view.testDialogs.dialog.cancelTop();
 function person(entityId, name, selected, profile = null, appearanceCount = 1) {
-  return { entityId, displayName: profile?.name || name, entityDisplayName: name, aliases: [`${name}别名`], selected, profiled: Boolean(profile), profile, appearanceCount };
+  const aliases = buildEntityIdentityDirectory({ entities: [{ id: entityId, entityType: 'person', displayName: name, aliases: [{ name: `${name}别名` }] }], identityProjection: { profilesByEntityId: profile ? { [entityId]: profile } : {} } })[0].aliases;
+  return { entityId, displayName: profile?.name || name, entityDisplayName: name, aliases, selected, profiled: Boolean(profile), profile, appearanceCount };
 }
 function runtimeHarness({ profile = null, profiles = null, selected = [A], failSave = false, generatedProfile = null, generateGate = null, generationReport = null, archivedProfileHistory = [] } = {}) {
   const initialProfiles = profiles ?? (profile ? { [A]: profile } : {});
@@ -72,8 +83,8 @@ function runtimeHarness({ profile = null, profiles = null, selected = [A], failS
     async setPersonOrderEntityIds(ids) { calls.order.push([...ids]); const rank = new Map(ids.map((id, index) => [id, index])); state = { ...state, personOrderEntityIds: [...ids], people: [...state.people].sort((left, right) => (rank.get(left.entityId) ?? ids.length) - (rank.get(right.entityId) ?? ids.length)) }; return emit(); },
     async saveProfile(entityId, fields, options = {}) {
       calls.save.push([entityId, structuredClone(fields), structuredClone(options)]); if (failSave) throw new Error('CAS失败');
-      const saved = { entityId, ...fields, manualFields: options.manualFields ?? [], source: 'manual', createdAt: '2026-09-06T00:00:00.000Z', updatedAt: '2026-09-06T00:00:00.000Z' };
-      state = { ...state, profilesByEntityId: { ...state.profilesByEntityId, [entityId]: saved }, people: state.people.map(item => item.entityId === entityId ? { ...item, displayName: saved.name || item.entityDisplayName, profiled: true, profile: saved } : item), unprofiledSelectedCount: state.people.filter(item => item.selected && item.entityId !== entityId && !item.profiled).length }; return emit();
+      const saved = { ...state.profilesByEntityId[entityId], entityId, ...fields, manualFields: [...new Set([...(state.profilesByEntityId[entityId]?.manualFields ?? []), ...(options.manualFields ?? [])])], source: 'manual', createdAt: '2026-09-06T00:00:00.000Z', updatedAt: '2026-09-06T00:00:00.000Z' };
+      state = { ...state, profilesByEntityId: { ...state.profilesByEntityId, [entityId]: saved }, people: state.people.map(item => item.entityId === entityId ? { ...item, ...person(entityId, item.entityDisplayName, item.selected, saved, item.appearanceCount) } : item), unprofiledSelectedCount: state.people.filter(item => item.selected && item.entityId !== entityId && !item.profiled).length }; return emit();
     },
     async generateMissingProfiles() {
       calls.generate += 1; if (generateGate) await generateGate;
@@ -112,7 +123,7 @@ async function waitFor(predicate, message = '等待条件超时') {
 test('千人首次打开等待既有身份认领，成功后清除读取中且不重复认领', async () => {
   let release, claims = 0, refreshes = 0;
   const gate = new Promise(resolve => { release = resolve; });
-  const context = { characterId: 0, chatId: '新聊天', characters: [{ avatar: 'char.png' }], userAvatar: 'me.png', chatMetadata: { qianqianjie: { schemaVersion: 2, chatId: CHAT } }, async saveMetadata() {} };
+  const context = { characterId: 0, chatId: '新聊天', characters: [{ name: '角色', avatar: 'char.png' }], userAvatar: 'me.png', chatMetadata: { qianqianjie: { schemaVersion: 2, chatId: CHAT } }, async saveMetadata() {} };
   const session = createChatSession({ contextProvider: () => context, identityCoordinator: { async prepare() { claims += 1; await gate; return CHAT; } } });
   const pending = session.prepare();
   const h = runtimeHarness();
@@ -127,7 +138,7 @@ test('千人首次打开等待既有身份认领，成功后清除读取中且�
   assert.match(visible(container), /正在读取当前聊天/); assert.doesNotMatch(visible(container), /读取失败/);
   release(); await activation;
   assert.equal(refreshes, 1); assert.equal(claims, 1);
-  assert.match(visible(container), /人物资料读取完成/); assert.doesNotMatch(visible(container), /正在读取|读取失败/);
+  assert.doesNotMatch(visible(container), /人物资料读取完成|正在读取|读取失败/);
 });
 
 test('千人身份准备失败保留真实错误，已有错误不自动重试', async () => {
@@ -139,9 +150,33 @@ test('千人身份准备失败保留真实错误，已有错误不自动重试',
     const view = createPeopleProfilesView({ runtime: h.runtime, documentRef, sessionStateProvider: () => ({ status, error }), prepareSession: async () => { prepares += 1; throw error; } });
     view.mount(container); assert.equal((await view.activate()).status, 'error');
     assert.equal(refreshes, 0); assert.equal(prepares, status === 'preparing' ? 1 : 0);
-    assert.match(visible(container), /读取失败：后端身份绑定写入失败/);
+    assert.match(visible(container), /聊天身份准备失败：后端身份绑定写入失败/);
     assert.doesNotMatch(visible(container), /人物资料读取完成/);
   }
+});
+
+test('千人首次打开时idle只显示待记录，不读取未建立身份的工作区', async () => {
+  const h = runtimeHarness(); let refreshes = 0, prepares = 0;
+  h.runtime.refresh = async () => { refreshes += 1; return h.state; };
+  const container = new Node('main');
+  const view = createPeopleProfilesView({ runtime: h.runtime, documentRef, sessionStateProvider: () => ({ status: 'idle' }),
+    prepareSession: async () => { prepares += 1; return { status: 'idle' }; } });
+  view.mount(container);
+  assert.deepEqual(await view.activate(), { status: 'uninitialized' });
+  assert.equal(prepares, 1);
+  assert.equal(refreshes, 0);
+  assert.match(visible(container), /尚未开始记录，继续对话后可开始记录/u);
+  assert.doesNotMatch(visible(container), /读取失败/u);
+});
+
+test('千人身份准备错误缺少具体说明时给简短重试提示', async () => {
+  const h = runtimeHarness();
+  const container = new Node('main');
+  const view = createPeopleProfilesView({ runtime: h.runtime, documentRef, sessionStateProvider: () => ({ status: 'idle' }),
+    prepareSession: async () => { throw new Error(''); } });
+  view.mount(container);
+  assert.equal((await view.activate()).status, 'error');
+  assert.match(visible(container), /聊天身份准备失败：当前聊天身份准备失败，请稍后重试。/u);
 });
 
 test('千人等待身份时离开页面或身份已过期，不迟到读取人物', async () => {
@@ -164,7 +199,7 @@ test('千人复用后台读取时不提前报成功，完成或失败后更新�
     view.mount(container); await view.activate();
     assert.match(visible(container), /正在读取当前聊天/); assert.doesNotMatch(visible(container), /人物资料读取完成/);
     h.emitState({ ...h.state, active: null, status: failed ? 'error' : 'ready', lastError: failed ? new Error('后端读取失败') : null });
-    assert.match(visible(container), failed ? /读取失败：后端读取失败/ : /人物资料读取完成/);
+    if(failed)assert.match(visible(container),/需要处理.*后端读取失败/);else assert.doesNotMatch(visible(container),/人物资料读取完成/);
     assert.doesNotMatch(visible(container), /正在读取当前聊天/);
   }
 });
@@ -200,28 +235,45 @@ function trueRuntimeHarness() {
     sourcePermissions: { filterCandidates: ({ candidates }) => candidates }, contextProvider: () => ({ chat: [] }), now: () => new Date('2026-09-06T00:00:00.000Z'),
   });
   return {
-    runtime, records, calls,
+    runtime, records, calls, entities,
     blockNextPut() { let release; control.gate = new Promise(resolve => { release = resolve; }); return release; },
     failNextPut() { control.failNextPut = true; },
     switchChat(chatId) { identity = { ...identity, chatId, hostChatId: `host-${chatId}` }; runtime.invalidate(); },
   };
 }
 
-test('真实 activate 完成后不回画旧 loading，更多人物选择仍可用', async () => {
+test('真实 activate 完成后不回画旧 loading或被动成功提示，更多人物选择仍可用', async () => {
   const h = trueRuntimeHarness(); await h.runtime.refresh();
   const container = new Node('main'), view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container); await view.activate();
   assert.equal(h.runtime.getState().status, 'ready');
   assert.equal(flatten(container).filter(node => node.className === 'qqj-page-status').length, 1);
-  assert.match(visible(container), /人物资料读取完成/);
+  assert.doesNotMatch(visible(container), /人物资料读取完成/);
   assert.equal(flatten(container).some(node => node.textContent === '整理'), false, '工具栏不显示群体整档入口');
   flatten(container).find(node => node.textContent === '更多人物（2）').click();
-  assert.match(visible(container), /人物资料读取完成/, '切换人物选择视图后保留最近一次真实反馈');
+  assert.doesNotMatch(visible(container), /人物资料读取完成/, '切换人物选择视图不恢复被动读取成功提示');
   const choose = flatten(container).filter(node => node.textContent === '设为重要'); assert.equal(choose.length, 2); assert.equal(choose.every(node => node.disabled === false), true);
   choose[0].click(); await waitFor(() => h.runtime.getState().selectedEntityIds.includes(A));
   assert.equal(flatten(container).find(node => node.textContent === '设为重要')?.disabled, false, '再次绘制更多人物仍保持可选择');
 });
 
-test('千人页横向切换只显示一份常显资料，草稿跨人物保留且移出当前后选择邻位', async () => {
+test('千人被动打开与订阅读取只用健康条，健康反馈hidden且无空白文字',async()=>{
+  const h=runtimeHarness(),container=new Node('main'),view=createPeopleProfilesView({runtime:h.runtime,documentRef});
+  const feedback=()=>flatten(container).find(node=>node.className.split(' ').includes('v3-foundation-feedback'));
+  const quiet=()=>{assert.equal(feedback().hidden,true);assert.equal(feedback().textContent,'');const status=flatten(container).find(node=>node.className==='qqj-page-status');assert.equal(status.children[0].className.includes('qqj-page-health'),true);assert.equal(status.children[1],feedback());};
+  view.mount(container);quiet();await view.activate();quiet();view.deactivate();await view.activate();quiet();
+  h.emitState({...h.state,active:{kind:'loading'},status:'loading'});quiet();assert.match(flatten(container).find(node=>node.className.includes('qqj-page-health')).textContent,/正在读取/);
+  h.emitState({...h.state,active:null,status:'ready'});quiet();
+  h.emitState({...h.state,chatId:CHAT_B});quiet();await view.activate();quiet();view.deactivate();
+});
+
+test('千人独立读取失败不因健康状态被隐藏',async()=>{
+  const h=runtimeHarness(),container=new Node('main');h.runtime.refresh=async()=>{throw new Error('独立人物原图读取失败');};
+  const view=createPeopleProfilesView({runtime:h.runtime,documentRef});view.mount(container);await view.activate();
+  const feedback=flatten(container).find(node=>node.className.split(' ').includes('v3-foundation-feedback'));
+  assert.equal(feedback.hidden,false);assert.match(feedback.textContent,/读取失败：独立人物原图读取失败/);view.deactivate();
+});
+
+test('千人页横向切换只显示一份常显资料，资料编辑使用独立弹窗且取消丢弃草稿', async () => {
   const menuDocument = eventDocument();
   const h = runtimeHarness({ selected: [A, B] }), container = new Node('main'); const view = createPeopleProfilesView({ runtime: h.runtime, documentRef: menuDocument }); view.mount(container);
   assert.equal(flatten(container).filter(node => node.className === 'qqj-profile-card').length, 1);
@@ -229,23 +281,27 @@ test('千人页横向切换只显示一份常显资料，草稿跨人物保留�
   assert.deepEqual(tabs.map(node => node.attributes.title), ['甲', '乙'], '截断显示仍保留完整姓名提示');
   assert.equal(tabs[0].attributes['aria-selected'], 'true'); assert.match(visible(container), /甲.*别名 · 甲别名/);
   const summary = flatten(container).find(node => node.className === 'qqj-profile-summary');
-  assert.deepEqual(summary.children.map(node => node.className), ['qqj-profile-mark has-alias', 'qqj-profile-identity', 'qqj-profile-badges']);
+  assert.deepEqual(summary.children.map(node => node.className), ['qqj-profile-mark', 'qqj-profile-identity']);
   assert.match(summary.children[0].innerHTML, /<svg[\s\S]*?<path/, '档案标记应复用千千结自己的结形图标');
-  assert.match(visible(summary.children[1]), /甲.*别名 · 甲别名/); assert.match(visible(summary.children[2]), /待建档/); assert.doesNotMatch(visible(container), /推荐/);
+  assert.deepEqual(summary.children[1].children.map(node => node.className), ['qqj-profile-title-row', 'qqj-profile-alias']);
+  assert.deepEqual(summary.children[1].children[0].children.map(node => node.className), ['', 'qqj-profile-badges']);
+  assert.match(visible(summary.children[1]), /甲.*待建档.*别名 · 甲别名/); assert.doesNotMatch(visible(container), /推荐/);
   assert.deepEqual(flatten(container).filter(node => node.className?.includes?.('qqj-profile-section')).map(node => node.children[0].textContent), [], '空资料板块不显示');
-  assert.deepEqual(flatten(container).find(node => node.className === 'qqj-profile-menu-pop').children.map(node => node.textContent), ['整理当前资料', '编辑资料', '上传头像', '', '移出关注', '', '合并到其他人物', '删除人物']);
+  assert.deepEqual(flatten(container).find(node => node.className === 'qqj-profile-menu-pop').children.map(node => node.textContent), ['整理当前资料', '编辑资料', '上传头像', '生成头像', '', '移出关注', '', '合并到其他人物', '删除人物']);
   const profileMenu = flatten(container).find(node => node.className === 'qqj-profile-menu');
   profileMenu.open = true; menuDocument.click({ target: profileMenu.children[0], composedPath: () => [profileMenu.children[0], profileMenu] }); assert.equal(profileMenu.open, true, '千人菜单内部点击不提前关闭');
   menuDocument.click({ target: container, composedPath: () => [container] }); assert.equal(profileMenu.open, false, '千人菜单点击外部后关闭');
   flatten(container).find(node => node.textContent === '编辑资料').click();
-  assert.deepEqual(flatten(container).find(node => node.className.includes('qqj-profile-save-row')).children.map(node => node.textContent), ['保存资料', '取消']);
-  assert.equal(fieldControl(container, '姓名').value, '甲');
-  const notes = fieldControl(container, '补充资料'); notes.value = '甲的未保存草稿'; notes.fire('input');
-  tabs[1].click(); assert.match(visible(container), /乙.*别名 · 乙别名/); assert.equal(flatten(container).some(node => node.className === 'settings-input'), false);
-  flatten(container).find(node => node.textContent === '编辑资料').click(); const bNotes = fieldControl(container, '补充资料'); bNotes.value = '取消的草稿'; bNotes.fire('input');
-  flatten(container).find(node => node.textContent === '取消').click(); assert.doesNotMatch(visible(container), /取消的草稿/); assert.match(visible(container), /编辑资料/);
-  flatten(container).find(node => node.textContent === '甲').click(); assert.equal(fieldControl(container, '补充资料').value, '甲的未保存草稿');
-  flatten(container).find(node => node.textContent === '取消').click();
+  const editor = editorContent(view);
+  assert.ok(editor); assert.equal(flatten(container).some(node => node.className.includes('qqj-profile-form')), false, '阅读页不包含编辑表单');
+  assert.equal(editor.className, 'qqj-editor-dialog qqj-profile-form');
+  assert.equal(editorField(view, '姓名').value, '甲');
+  const notes = editorField(view, '补充资料'); notes.value = '甲的未保存草稿'; notes.fire('input');
+  cancelEditor(view); assert.doesNotMatch(visible(container), /甲的未保存草稿/); assert.match(visible(container), /编辑资料/);
+  tabs[1].click(); assert.match(visible(container), /乙.*别名 · 乙别名/);
+  flatten(container).find(node => node.textContent === '编辑资料').click();
+  assert.equal(editorField(view, '补充资料').value, '', '另一人物打开自己的已保存资料'); cancelEditor(view);
+  flatten(container).find(node => node.textContent === '甲').click();
   flatten(flatten(container).find(node => node.className === 'qqj-profile-menu-pop')).find(node => node.textContent === '移出关注').click(); await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(h.calls.select.at(-1), [B]); assert.match(visible(container), /乙.*别名 · 乙别名/);
   view.deactivate(); assert.equal(menuDocument.clickListenerCount(), 0, '页面停用时清理外部点击监听');
@@ -277,6 +333,57 @@ test('千人人名横条同聊天同成员重绘与排序保留位置，切聊�
   assert.equal(flatten(container).find(node => node.className === 'qqj-profile-switcher').scrollLeft, 0, '切聊天必须重置横向位置');
 });
 
+test('相同人物展示状态通知复用页面和编辑输入节点', () => {
+  const h = runtimeHarness({ selected: [A] }), container = new Node('main');
+  const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
+  flatten(container).find(node => node.textContent === '编辑资料').click();
+  const input = editorField(view, '补充资料');
+  input.value = '尚未保存的草稿'; input.fire('input'); input.focus();
+  const page = container.children[0];
+  h.emitState({ ...h.state });
+  assert.equal(container.children[0], page, '无展示差异的通知不替换整页');
+  assert.equal(editorField(view, '补充资料'), input, '编辑中的输入节点保持原样');
+  assert.equal(documentRef.activeElement, input, '焦点留在原输入框');
+  assert.equal(input.value, '尚未保存的草稿');
+});
+
+test('无变化通知保留已注册菜单，同状态重新挂载恢复页面并重建菜单注册', async () => {
+  const menuDocument = eventDocument(), h = runtimeHarness({ selected: [A] }), container = new Node('main');
+  const view = createPeopleProfilesView({ runtime: h.runtime, documentRef: menuDocument }); view.mount(container);
+  const menu = flatten(container).find(node => node.className === 'qqj-profile-menu'); menu.open = true;
+  h.emitState({ ...h.state });
+  menuDocument.click({ target: container, composedPath: () => [container] });
+  assert.equal(menu.open, false, '无变化通知不清理原菜单的外部点击注册');
+  container.replaceChildren(); view.mount(container);
+  assert.ok(container.children.length, '宿主清空后同容器重新挂载会补回页面');
+  const nextContainer = new Node('main'); view.mount(nextContainer);
+  assert.ok(nextContainer.children.length, '同状态挂载到新容器也会绘制页面');
+  view.deactivate();
+  assert.equal(menuDocument.clickListenerCount(), 0, '停用会释放菜单点击监听');
+  await view.activate();
+  const reopenedMenu = flatten(nextContainer).find(node => node.className === 'qqj-profile-menu');
+  assert.ok(reopenedMenu, '重新打开会按当前状态重建菜单');
+  reopenedMenu.open = true;
+  menuDocument.click({ target: nextContainer, composedPath: () => [nextContainer] });
+  assert.equal(reopenedMenu.open, false, '停用后重新打开仍注册菜单外点关闭');
+});
+
+test('人物资料未变化时状态进度只更新状态区和按钮，不替换编辑输入', () => {
+  const h = runtimeHarness({ selected: [A] }), container = new Node('main');
+  const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
+  flatten(container).find(node => node.textContent === '编辑资料').click();
+  const input = editorField(view, '补充资料'); input.focus();
+  const page = container.children[0];
+  h.emitState({ ...h.state, status: 'savingProfile', active: { kind: 'savingProfile' } });
+  assert.equal(container.children[0], page, '处理状态更新不重建人物编辑页');
+  assert.equal(editorField(view, '补充资料'), input, '输入控件保持同一节点');
+  assert.equal(input.disabled, false, '状态通知不禁用独立编辑窗中的草稿输入');
+  assert.match(visible(container), /正在保存人物资料/);
+  h.emitState({ ...h.state, status: 'ready', active: null });
+  assert.equal(editorField(view, '补充资料'), input);
+  assert.equal(input.disabled, false);
+});
+
 test('更多人物入口固定在顶部并切换为独立选择视图，零选择仍可进入', async () => {
   const h = runtimeHarness({ selected: [] }), container = new Node('main'); const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
   assert.match(visible(container), /尚未选择重要人物.*更多人物（2）/); assert.equal(flatten(container).some(node => node.className === 'qqj-profile-card'), false);
@@ -285,6 +392,21 @@ test('更多人物入口固定在顶部并切换为独立选择视图，零选�
   flatten(container).find(node => node.textContent === '设为重要').click(); await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(h.calls.select.at(-1), [A]); assert.match(visible(container), /已选重要.*移出关注/); assert.match(visible(container), /返回资料/);
   flatten(container).find(node => node.textContent === '返回资料').click(); assert.match(visible(container), /甲.*别名 · 甲别名/);
+});
+
+test('更多人物同行搜索本地匹配显示名原名别名，输入不重建且刷新保查询、换聊清空', async () => {
+  const h=runtimeHarness({selected:[]}),container=new Node('main'),view=createPeopleProfilesView({runtime:h.runtime,documentRef});view.mount(container);
+  flatten(container).find(node=>node.textContent==='更多人物（2）').click();
+  const search=()=>flatten(container).find(node=>node.className.split(' ').includes('qqj-profile-picker-search'));
+  assert.ok(search());const originalSearch=search(),page=container.children[0];originalSearch.focus();originalSearch.value='甲别名';originalSearch.fire('input');
+  const rows=()=>flatten(container).filter(node=>node.className==='qqj-more-person-row'&&!node.hidden);
+  assert.equal(rows().length,1);assert.match(visible(rows()[0]),/甲/u);assert.equal(container.children[0],page);assert.equal(search(),originalSearch);
+  rows()[0].children[1].children[0].click();await new Promise(resolve=>setImmediate(resolve));assert.equal(search().value,'甲别名');assert.deepEqual(h.calls.select.at(-1),[A]);
+  search().value='不匹配';search().fire('input');assert.equal(rows().length,0);assert.ok(flatten(container).find(node=>node.textContent==='没有匹配的人物。'&&!node.hidden));
+  search().value='';search().fire('input');assert.deepEqual(rows().map(row=>row.children[0].children[0].textContent),['甲','乙']);
+  const composing=search();composing.focus();composing.fire('compositionstart');composing.value='乙';composing.fire('input',{isComposing:true});composing.getRootNode=()=>({activeElement:composing});documentRef.activeElement=new Node('shadow-host');h.emitState({...h.state,revision:2,people:[...h.state.people]});assert.equal(search(),composing,'组合输入中不替换输入框');composing.fire('compositionend');assert.equal(search().value,'乙');assert.equal(rows().length,1);
+  h.emitState({...h.state,chatId:CHAT_B,revision:1});flatten(container).find(node=>node.textContent==='更多人物（1）').click();assert.equal(search().value,'');assert.equal(rows().length,2);
+  assert.equal(h.calls.generate,0);assert.equal(h.calls.save.length,0);
 });
 
 test('更多人物排序复用标准弹窗，拖动保存一次且取消不写', async () => {
@@ -335,10 +457,10 @@ test('投影姓名别名只填表单不算建档，首次保存与主动清空�
   const h = runtimeHarness(), container = new Node('main'); const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
   assert.equal(h.state.profilesByEntityId[A], undefined);
   flatten(container).find(node => node.textContent === '编辑资料').click();
-  const controls = flatten(container).filter(node => node.className === 'settings-input');
-  assert.equal(fieldControl(container, '姓名').value, '甲'); assert.equal(fieldControl(container, '别名').value, '甲别名');
+  const controls = flatten(editorContent(view)).filter(node => node.className === 'settings-input');
+  assert.equal(editorField(view, '姓名').value, '甲'); assert.equal(editorField(view, '别名').value, '甲别名');
   controls.forEach(control => { control.value = ''; control.fire('input'); });
-  flatten(container).find(node => node.textContent === '保存资料').click(); await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve));
+  await saveEditor(view);
   assert.equal(h.calls.save.length, 1); assert.equal(Object.values(h.calls.save[0][1]).every(value => value === ''), true); assert.deepEqual(h.calls.save[0][2].manualFields.sort(), ['aliases', 'name']);
   assert.match(visible(container), /已建档/);
 });
@@ -347,51 +469,107 @@ test('已有资料无改动在 view 层零保存，失败则保留用户草稿�
   const profile = { entityId: A, name: '人工甲', aliases: '', background: '', appearance: '', personality: '', notes: '已有说明', source: 'manual', createdAt: '2026-09-06T00:00:00.000Z', updatedAt: '2026-09-06T00:00:00.000Z' };
   const h = runtimeHarness({ profile }), container = new Node('main'); const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
   flatten(container).find(node => node.textContent === '编辑资料').click();
-  flatten(container).find(node => node.textContent === '保存资料').click(); await new Promise(resolve => setImmediate(resolve));
-  assert.equal(h.calls.save.length, 0); assert.match(visible(container), /未修改内容/); assert.match(visible(container), /编辑资料/); assert.equal(flatten(container).some(node => node.tag === 'textarea'), false);
-  const failing = runtimeHarness({ profile, failSave: true }), failedContainer = new Node('main'); createPeopleProfilesView({ runtime: failing.runtime, documentRef }).mount(failedContainer);
+  await saveEditor(view);
+  assert.equal(h.calls.save.length, 0); assert.equal(flatten(container).find(node=>node.className.split(' ').includes('v3-foundation-feedback')).hidden,true); assert.match(visible(container), /编辑资料/); assert.equal(editorContent(view), null);
+  const failing = runtimeHarness({ profile, failSave: true }), failedContainer = new Node('main'); const failedView = createPeopleProfilesView({ runtime: failing.runtime, documentRef }); failedView.mount(failedContainer);
   flatten(failedContainer).find(node => node.textContent === '编辑资料').click();
-  const notes = fieldControl(failedContainer, '补充资料'); notes.value = '失败也要保留'; notes.fire('input');
-  flatten(failedContainer).find(node => node.textContent === '保存资料').click(); await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve));
-  assert.equal(fieldControl(failedContainer, '补充资料').value, '失败也要保留'); assert.match(visible(failedContainer), /保存失败：CAS失败/);
+  const notes = editorField(failedView, '补充资料'); notes.value = '失败也要保留'; notes.fire('input');
+  await saveEditor(failedView);
+  assert.equal(editorField(failedView, '补充资料').value, '失败也要保留'); assert.match(failedView.testDialogs.active.error?.message ?? '', /保存失败：CAS失败/u);
+});
+
+test('已保存的干净草稿采用最新档案，未保存和保存中输入保持原样', async () => {
+  const profile = { entityId: A, name: '旧姓名', occupation: '旧职业', aliases: '', background: '', appearance: '', personality: '', notes: '保留的人工资料', nsfw: '', manualFields: [], source: 'manual' };
+  const updateProfile = (h, changes) => {
+    const updated = { ...h.state.profilesByEntityId[A], ...changes };
+    h.emitState({ ...h.state, revision: h.state.revision + 1,
+      profilesByEntityId: { ...h.state.profilesByEntityId, [A]: updated },
+      people: h.state.people.map(person => person.entityId === A
+        ? { ...person, displayName: updated.name, profile: updated, profiled: true }
+        : person) });
+  };
+
+  const clean = runtimeHarness({ profile }), cleanContainer = new Node('main');
+  const cleanView = createPeopleProfilesView({ runtime: clean.runtime, documentRef }); cleanView.mount(cleanContainer);
+  flatten(cleanContainer).find(node => node.textContent === '编辑资料').click();
+  const notes = editorField(cleanView, '补充资料'); notes.value = '用户补充的人工资料'; notes.fire('input');
+  await saveEditor(cleanView);
+  await waitFor(() => clean.calls.save.length === 1 && visible(cleanContainer).includes('已保存'));
+  updateProfile(clean, { name: '新姓名', occupation: '新职业' });
+  assert.match(visible(cleanContainer), /新姓名/); assert.match(visible(cleanContainer), /新职业/);
+  flatten(cleanContainer).find(node => node.textContent === '编辑资料').click();
+  assert.equal(editorField(cleanView, '姓名').value, '新姓名');
+  assert.equal(editorField(cleanView, '职业').value, '新职业');
+  assert.equal(editorField(cleanView, '补充资料').value, '用户补充的人工资料'); cancelEditor(cleanView);
+
+  const dirty = runtimeHarness({ profile }), dirtyContainer = new Node('main');
+  const dirtyView = createPeopleProfilesView({ runtime: dirty.runtime, documentRef }); dirtyView.mount(dirtyContainer);
+  flatten(dirtyContainer).find(node => node.textContent === '编辑资料').click();
+  const dirtyNotes = editorField(dirtyView, '补充资料'); dirtyNotes.value = '尚未保存的输入'; dirtyNotes.fire('input');
+  updateProfile(dirty, { name: '更新后的姓名', occupation: '更新后的职业' });
+  assert.equal(editorField(dirtyView, '姓名').value, '旧姓名');
+  assert.equal(editorField(dirtyView, '职业').value, '旧职业');
+  assert.equal(editorField(dirtyView, '补充资料').value, '尚未保存的输入'); cancelEditor(dirtyView);
+
+  let releaseSave;
+  const saveGate = new Promise(resolve => { releaseSave = resolve; });
+  const saving = runtimeHarness({ profile, failSave: true }), savingContainer = new Node('main');
+  let markSaveStarted; const saveStarted = new Promise(resolve => { markSaveStarted = resolve; });
+  const saveImmediately = saving.runtime.saveProfile.bind(saving.runtime);
+  saving.runtime.saveProfile = async (...args) => { markSaveStarted(); await saveGate; return saveImmediately(...args); };
+  const savingView = createPeopleProfilesView({ runtime: saving.runtime, documentRef }); savingView.mount(savingContainer);
+  flatten(savingContainer).find(node => node.textContent === '编辑资料').click();
+  const savingNotes = editorField(savingView, '补充资料'); savingNotes.value = '保存中的输入'; savingNotes.fire('input');
+  const savingOperation = saveEditor(savingView); await saveStarted;
+  updateProfile(saving, { name: '保存期间更新姓名', occupation: '保存期间更新职业' });
+  assert.equal(editorField(savingView, '姓名').value, '旧姓名');
+  assert.equal(editorField(savingView, '职业').value, '旧职业');
+  assert.equal(editorField(savingView, '补充资料').value, '保存中的输入');
+  releaseSave();
+  await savingOperation;
+  assert.equal(editorField(savingView, '补充资料').value, '保存中的输入');
+  assert.match(savingView.testDialogs.active.error?.message ?? '', /保存失败：CAS失败/u);
 });
 
 test('长人物资料只在阅读视图按句分行，编辑与保存仍保留原文', async () => {
   const rawNotes = '候选甲；候选乙;候选丙。丁”接续\n已有换行，网址 https://example.test/a.b、小数 1.25 不拆、顿号不拆；他说“可以。”下一句；他说“可以。”';
   const profile = { entityId: A, name: '甲', aliases: '', gender: '女性；无需换行', age: '30', birthday: '', species: '', notes: rawNotes, source: 'manual', createdAt: '2026-09-06T00:00:00.000Z', updatedAt: '2026-09-06T00:00:00.000Z' };
-  const h = runtimeHarness({ profile }), container = new Node('main'); createPeopleProfilesView({ runtime: h.runtime, documentRef }).mount(container);
+  const h = runtimeHarness({ profile }), container = new Node('main'); const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
   const readRow = field => flatten(container).find(node => node.className === `qqj-profile-read-row qqj-profile-read-${field}`);
   assert.equal(readRow('notes').children[1].textContent, '候选甲；\n候选乙;\n候选丙。\n丁”接续\n已有换行，网址 https://example.test/a.b、小数 1.25 不拆、顿号不拆；\n他说“可以。”\n下一句；\n他说“可以。”');
   assert.equal(readRow('gender').children[1].textContent, '女性；无需换行', '短 input 字段保持原样');
 
   flatten(container).find(node => node.textContent === '编辑资料').click();
-  assert.equal(fieldControl(container, '补充资料').value, rawNotes, 'textarea 编辑值仍为原始资料');
-  const age = fieldControl(container, '年龄'); age.value = '31'; age.fire('input');
-  flatten(container).find(node => node.textContent === '保存资料').click();
+  assert.equal(editorField(view, '补充资料').value, rawNotes, 'textarea 编辑值仍为原始资料');
+  const age = editorField(view, '年龄'); age.value = '31'; age.fire('input');
+  await saveEditor(view);
   await waitFor(() => h.calls.save.length === 1 && visible(container).includes('已保存'));
-  assert.equal(h.calls.save[0][1].notes, rawNotes, '保存 payload 不包含展示用换行');
+  assert.ok(!Object.hasOwn(h.calls.save[0][1], 'notes'), '未改的长正文不重复提交');
+  assert.equal(h.state.profilesByEntityId[A].notes, rawNotes, '保存后仍保留原文而非展示换行');
   assert.equal(readRow('notes').children[1].textContent, '候选甲；\n候选乙;\n候选丙。\n丁”接续\n已有换行，网址 https://example.test/a.b、小数 1.25 不拆、顿号不拆；\n他说“可以。”\n下一句；\n他说“可以。”');
 });
 
-test('人物资料保存栏属于完整编辑器，成功回到当前人物卡而失败保持位置', async () => {
+test('人物资料弹窗保存失败保留内容，成功后回到当前人物卡且不滚动阅读页', async () => {
   const profile = { entityId: A, name: '甲', aliases: '', gender: '', age: '', birthday: '', species: '', notes: '', appearance: '', background: '', personality: '', nsfw: '', manualFields: [], source: 'manual', createdAt: '2026-09-06T00:00:00.000Z', updatedAt: '2026-09-06T00:00:00.000Z' };
   const runCase = async failSave => {
     const h = runtimeHarness({ profile, failSave }), scroller = new Node('div'), container = new Node('main'); scroller.className = 'body'; scroller.scrollTop = 40; scroller.rect = { top: 10, bottom: 410, height: 400 }; scroller.append(container);
-    createPeopleProfilesView({ runtime: h.runtime, documentRef }).mount(container);
+    const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
     flatten(container).find(node => node.textContent === '编辑资料').click();
-    assert.ok(flatten(container).find(node => node.className.includes('qqj-profile-form') && node.className.includes('qqj-manual-editor')));
-    assert.ok(flatten(container).find(node => node.className.includes('qqj-profile-save-row') && node.className.includes('qqj-manual-save-bar')));
-    const name = fieldControl(container, '姓名'); name.value = '新甲'; name.fire('input'); flatten(container).find(node => node.textContent === '保存资料').click();
-    await waitFor(() => failSave ? visible(container).includes('保存失败') : h.calls.save.length === 1 && !flatten(container).some(node => node.textContent === '保存中…'));
-    return { scroller, container };
+    assert.ok(editorContent(view)?.className.includes('qqj-profile-form'));
+    assert.equal(flatten(container).some(node => node.className.includes('qqj-profile-form')), false, '表单不嵌入阅读页');
+    const name = editorField(view, '姓名'); name.value = '新甲'; name.fire('input'); await saveEditor(view);
+    if (failSave) assert.match(view.testDialogs.active.error?.message ?? '', /保存失败/u);
+    else await waitFor(() => h.calls.save.length === 1);
+    return { scroller, container, view };
   };
-  const success = await runCase(false); assert.equal(success.scroller.scrollTop, 150);
-  const failure = await runCase(true); assert.equal(failure.scroller.scrollTop, 40); assert.match(visible(failure.container), /保存失败/);
+  const success = await runCase(false); assert.equal(success.scroller.scrollTop, 40);
+  const failure = await runCase(true); assert.equal(failure.scroller.scrollTop, 40); assert.equal(editorField(failure.view, '姓名').value, '新甲');
 });
 
-test('基础资料四项按紧凑行分组且空字段隐藏；头像弹窗裁剪独立保存并保留文字草稿', async () => {
-  const profile = { entityId: A, name: '无别名人物', aliases: '', gender: '女', age: '28', birthday: '3月8日', species: '人类', background: '旧背景', appearance: '', personality: '', notes: '旧补充', source: 'manual', createdAt: '2026-09-06T00:00:00.000Z', updatedAt: '2026-09-06T00:00:00.000Z' };
-  const h = runtimeHarness({ profile }), canvasDraws = [];
+test('基础资料按紧凑行分组且空值与纯人类隐藏；头像完整预览与主动裁剪独立保存', async () => {
+  const profile = { entityId: A, name: '无别名人物', aliases: '', manualFields: ['aliases'], gender: '女', age: '28', birthday: '3月8日', species: '人类', background: '旧背景', appearance: '', personality: '', notes: '旧补充', source: 'manual', createdAt: '2026-09-06T00:00:00.000Z', updatedAt: '2026-09-06T00:00:00.000Z' };
+  const h = runtimeHarness({ profile }), canvasDraws = [], avatarOptions=[];
+  const saveAvatar=h.runtime.saveAvatar;h.runtime.saveAvatar=async(...args)=>{avatarOptions.push(args[2]);return saveAvatar(...args);};
   const avatarDocument = {
     activeElement: null,
     createElement(tag) {
@@ -399,8 +577,8 @@ test('基础资料四项按紧凑行分组且空字段隐藏；头像弹窗裁�
       return { width: 0, height: 0, getContext: () => ({ clearRect() {}, drawImage(...args) { canvasDraws.push(args); } }), toDataURL: () => 'data:image/webp;base64,AAAA' };
     },
   };
-  let revoked = 0, sequence = 0;
-  const urlApi = { createObjectURL: () => `blob:${++sequence}`, revokeObjectURL: () => { revoked += 1; } };
+  let revoked = 0, sequence = 0;const originals=[];
+  const urlApi = { createObjectURL: original => { originals.push(original);return `blob:${++sequence}`; }, revokeObjectURL: () => { revoked += 1; } };
   const imageFactory = () => ({ naturalWidth: 800, naturalHeight: 600, onload: null, onerror: null, _src: '', set src(value) { this._src = value; if (value) queueMicrotask(() => this.onload?.()); }, get src() { return this._src; } });
   const dialogs = dialogHarness();
   const container = new Node('main'), view = createPeopleProfilesView({ runtime: h.runtime, dialog: dialogs.dialog, documentRef: avatarDocument, imageFactory, urlApi }); view.mount(container);
@@ -408,15 +586,30 @@ test('基础资料四项按紧凑行分组且空字段隐藏；头像弹窗裁�
   assert.equal(flatten(container).some(node => node.className === 'qqj-profile-alias'), false, '无别名不保留空行');
   assert.deepEqual(flatten(container).filter(node => String(node.className).includes('qqj-profile-section')).map(node => node.children[0].textContent), ['基础信息', '身份']);
   const basic = flatten(container).find(node => node.className.includes('qqj-profile-section-basic'));
-  assert.deepEqual(basic.children.slice(1).map(node => node.className), ['qqj-profile-read-row qqj-profile-read-gender', 'qqj-profile-read-row qqj-profile-read-age', 'qqj-profile-read-row qqj-profile-read-birthday', 'qqj-profile-read-row qqj-profile-read-species', 'qqj-profile-read-row qqj-profile-read-notes']);
+  assert.deepEqual(basic.children.slice(1).map(node => node.className), ['qqj-profile-read-row qqj-profile-read-gender', 'qqj-profile-read-row qqj-profile-read-age', 'qqj-profile-read-row qqj-profile-read-birthday', 'qqj-profile-read-row qqj-profile-read-notes']);
   assert.doesNotMatch(visible(container), /NSFW/);
-  flatten(container).find(node => node.textContent === '编辑资料').click(); const notes = fieldControl(container, '补充资料'); notes.value = '尚未保存的文字'; notes.fire('input');
+  const longName='一位姓名很长的合成人物', longAliases='别名一、别名二、别名三、别名四、别名五';
+  h.emitState({...h.state,people:h.state.people.map(person=>person.entityId===A?{...person,displayName:longName,aliases:longAliases.split('、'),profile:{...person.profile,name:longName,aliases:longAliases}}:person)});
+  const header=flatten(container).find(node=>node.className==='qqj-profile-summary');
+  assert.equal(header.children[0].className,'qqj-profile-mark');
+  assert.equal(header.children[1].children[1].textContent,`别名 · ${longAliases}`,'完整别名独占标题行下方，不与状态菜单共占一行');
+  assert.equal(flatten(header).find(node=>node.tag==='h2').textContent,longName);
+  h.emitState({...h.state,people:h.state.people.map(person=>person.entityId===A?{...person,displayName:profile.name,aliases:[],profile}:person)});
+  flatten(container).find(node => node.textContent === '编辑资料').click(); const notes = fieldControl(dialogs.active.content, '补充资料'); notes.value = '尚未保存的文字'; notes.fire('input'); dialogs.dialog.cancelTop();
   let file = flatten(container).find(node => node.className === 'qqj-avatar-file'); file.fire('change', { target: { files: [{ type: 'image/png', size: 1024 }], value: 'chosen' } }); await new Promise(resolve => setImmediate(resolve));
-  assert.equal(dialogs.active.title, '裁剪头像'); assert.ok(flatten(dialogs.active.content).find(node => node.className === 'qqj-avatar-crop-frame')); assert.equal(fieldControl(container, '补充资料').value, '尚未保存的文字');
+  assert.equal(dialogs.active.title, '头像预览'); assert.ok(flatten(dialogs.active.content).find(node => node.className === 'qqj-avatar-preview-frame')); assert.equal(flatten(container).some(node => node.className.includes('qqj-profile-form')), false, '头像裁剪不嵌套在资料编辑窗中');
   dialogs.dialog.cancelTop(); assert.equal(revoked, 1); assert.equal(h.calls.avatar.length, 0);
-  file = flatten(container).find(node => node.className === 'qqj-avatar-file'); file.fire('change', { target: { files: [{ type: 'image/webp', size: 2048 }], value: 'chosen' } }); await new Promise(resolve => setImmediate(resolve));
+  file = flatten(container).find(node => node.className === 'qqj-avatar-file'); const originalFile={type:'image/webp',size:2048};file.fire('change', { target: { files: [originalFile], value: 'chosen' } }); await new Promise(resolve => setImmediate(resolve));
+  const content=dialogs.active.content, image=flatten(content).find(node=>node.className==='qqj-avatar-preview-image');
+  const download=flatten(content).find(node=>node.tag==='a'&&node.textContent==='保存原图');assert.equal(download.href,'blob:2');assert.equal(download.download,'头像原图.webp');assert.equal(originals[1],originalFile,'下载地址对应输入原文件，未经canvas重编码');
+  assert.equal(canvasDraws.length,0,'预览和原图下载不经过canvas');download.click();assert.equal(canvasDraws.length,0);
+  const toggle=flatten(content).find(node=>node.tag==='button'&&node.textContent==='裁剪');toggle.click();assert.ok(flatten(content).some(node=>node.className==='qqj-avatar-crop-frame'));
+  const zoom=flatten(content).find(node=>node.type==='range');zoom.value='2';zoom.fire('input');toggle.click();assert.ok(flatten(content).some(node=>node.className==='qqj-avatar-preview-frame'));assert.equal(image.src,'blob:2');
   await dialogs.submit(); await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(h.calls.avatar[0], [A, 'data:image/webp;base64,AAAA']); assert.equal(canvasDraws.length, 1); assert.equal(fieldControl(container, '补充资料').value, '尚未保存的文字'); assert.equal(revoked, 2);
+  assert.deepEqual(canvasDraws[0].slice(1),[0,0,512,384],'回完整图后保存原图比例，不沿用裁剪参数');
+  file = flatten(container).find(node => node.className === 'qqj-avatar-file'); file.fire('change',{target:{files:[{type:'image/png',size:100}],value:'chosen'}}); await new Promise(resolve=>setImmediate(resolve));
+  flatten(dialogs.active.content).find(node=>node.tag==='button'&&node.textContent==='裁剪').click();await dialogs.submit();assert.ok(Math.abs(canvasDraws[1][1]+85.33333333333333)<1e-9);assert.equal(canvasDraws[1][2],0);assert.ok(Math.abs(canvasDraws[1][3]-682.6666666666666)<1e-9);assert.equal(canvasDraws[1][4],512);
+  assert.equal(avatarOptions[0].generated,false);assert.deepEqual(h.calls.avatar[0], [A, 'data:image/webp;base64,AAAA']); assert.equal(canvasDraws.length, 2); assert.equal(revoked, 3);
   view.deactivate();
 });
 
@@ -438,11 +631,13 @@ test('人物整理沿用 runtime 总批次进度并随批次推进更新', () =>
   assert.doesNotMatch(visible(container), /第 3\/11 批/);
 });
 
-test('人物整理报告准确显示实际送入世界书条目数，包括零条', async () => {
-  const h = runtimeHarness({ profile: { name: '旧档' }, generationReport: { saved: 1, requested: 1, worldInfoMatched: 2 } }), container = new Node('main');
+test('人物整理报告准确显示未更新数量与实际送入世界书条目数，包括零条', async () => {
+  const h = runtimeHarness({ profile: { name: '旧档' }, generationReport: { saved: 1, requested: 1, skipped: 1, worldInfoMatched: 2 } }), container = new Node('main');
   createPeopleProfilesView({ runtime: h.runtime, documentRef }).mount(container);
   flatten(container).find(node => node.textContent === '重新整理资料').click();
   await waitFor(() => visible(container).includes('送入世界书 2 项'));
+  assert.match(visible(container), /未更新 1 位/u);
+  assert.doesNotMatch(visible(container), /并发跳过/u);
   assert.doesNotMatch(visible(container), /命中世界书|未命中相关世界书/u);
 
   const empty = runtimeHarness({ profile: { name: '旧档' }, generationReport: { saved: 1, requested: 1, worldInfoMatched: 0 } }), other = new Node('main');
@@ -455,60 +650,314 @@ test('真实 runtime 与 view 完成修改保存、新建档、no-op 与失败�
   const h = trueRuntimeHarness(); await h.runtime.refresh(); await h.runtime.setSelectedEntityIds([A, B]);
   const container = new Node('main'), view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
   flatten(container).find(node => node.textContent === '编辑资料').click();
-  let notes = fieldControl(container, '补充资料'); notes.value = '人工说明'; notes.fire('input');
-  flatten(container).find(node => node.textContent === '保存资料').click();
-  assert.match(visible(container), /保存中…/);
+  let notes = editorField(view, '补充资料'); notes.value = '人工说明'; notes.fire('input');
+  await saveEditor(view);
   await waitFor(() => visible(container).includes('已保存'), '真实修改保存未完成');
-  assert.equal(flatten(container).some(node => node.tag === 'textarea'), false, '保存成功回到阅读状态');
+  assert.equal(editorContent(view), null, '保存成功关闭弹窗并回到阅读状态');
   let stored = h.records.get(`chat-${CHAT}/${PEOPLE_WORKSPACE_RECORD_ID}`); assert.equal(stored.data.profilesByEntityId[A].notes, '人工说明'); assert.equal(stored.data.profilesByEntityId[A].source, 'manual');
   const puts = h.calls.filter(call => call[0] === 'put').length;
   flatten(container).find(node => node.textContent === '编辑资料').click();
-  flatten(container).find(node => node.textContent === '保存资料').click(); assert.match(visible(container), /未修改内容/);
-  assert.equal(flatten(container).some(node => node.tag === 'textarea'), false, 'no-op 回到阅读状态');
+  await saveEditor(view); assert.equal(editorContent(view), null, 'no-op 关闭弹窗');
   assert.equal(h.calls.filter(call => call[0] === 'put').length, puts, '已有资料 no-op 不写存储');
 
   flatten(container).find(node => node.textContent === '乙').click();
   flatten(container).find(node => node.textContent === '编辑资料').click();
-  flatten(container).find(node => node.textContent === '保存资料').click(); await waitFor(() => visible(container).includes('已保存'), '投影资料首次保存未建档');
+  await saveEditor(view); await waitFor(() => h.records.get(`chat-${CHAT}/${PEOPLE_WORKSPACE_RECORD_ID}`)?.data.profilesByEntityId[B], '投影资料首次保存未建档');
   stored = h.records.get(`chat-${CHAT}/${PEOPLE_WORKSPACE_RECORD_ID}`); assert.equal(stored.data.profilesByEntityId[B].name, '乙'); assert.equal(stored.data.profilesByEntityId[B].source, 'manual');
-  h.failNextPut(); flatten(container).find(node => node.textContent === '编辑资料').click(); notes = fieldControl(container, '补充资料'); notes.value = '失败草稿'; notes.fire('input');
-  flatten(container).find(node => node.textContent === '保存资料').click(); await waitFor(() => visible(container).includes('保存失败：模拟保存失败'));
-  assert.equal(fieldControl(container, '补充资料').value, '失败草稿'); assert.ok(flatten(container).find(node => node.textContent === '保存资料'));
+  h.failNextPut(); flatten(container).find(node => node.textContent === '编辑资料').click(); notes = editorField(view, '补充资料'); notes.value = '失败草稿'; notes.fire('input');
+  await saveEditor(view);
+  assert.equal(editorField(view, '补充资料').value, '失败草稿'); assert.match(view.testDialogs.active.error?.message ?? '', /保存失败：模拟保存失败/u);
 });
 
-test('真实保存跨人物及停用重开保持归属，切聊天后的迟到结果不清新草稿', async () => {
+test('真实人物资料保存后停用重开仍保持归属，取消不写另一人物草稿', async () => {
   const h = trueRuntimeHarness(); await h.runtime.refresh(); await h.runtime.setSelectedEntityIds([A, B]);
   const container = new Node('main'), view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
   flatten(container).find(node => node.textContent === '编辑资料').click();
-  let release = h.blockNextPut(), notes = fieldControl(container, '补充资料'); notes.value = '甲等待保存'; notes.fire('input');
-  flatten(container).find(node => node.textContent === '保存资料').click(); flatten(container).find(node => node.textContent === '乙').click();
-  assert.equal(flatten(container).find(node => node.textContent === '编辑资料').disabled, true, '另一人物在真实保存未完成时显示忙状态'); view.deactivate(); release();
-  await waitFor(() => h.records.get(`chat-${CHAT}/${PEOPLE_WORKSPACE_RECORD_ID}`)?.data.profilesByEntityId[A]?.notes === '甲等待保存');
-  view.mount(container); await view.activate(); flatten(container).find(node => node.textContent === '编辑资料').click();
-  notes = fieldControl(container, '补充资料'); notes.value = '乙未保存'; notes.fire('input');
-  flatten(container).find(node => node.textContent === '甲').click(); assert.match(visible(container), /已保存/);
-  flatten(container).find(node => node.textContent === '乙').click(); assert.equal(fieldControl(container, '补充资料').value, '乙未保存');
-  flatten(container).find(node => node.textContent === '甲').click();
-
-  release = h.blockNextPut(); flatten(container).find(node => node.textContent === '编辑资料').click(); notes = fieldControl(container, '补充资料'); notes.value = '旧聊天迟到'; notes.fire('input');
-  const oldPutCount = h.calls.filter(call => call[0] === 'put').length; flatten(container).find(node => node.textContent === '保存资料').click();
-  await waitFor(() => h.calls.filter(call => call[0] === 'put').length > oldPutCount, '旧聊天保存未进入受控 PUT');
-  h.switchChat(CHAT_B); await h.runtime.refresh(); await h.runtime.setSelectedEntityIds([A]); view.render(h.runtime.getState()); flatten(container).find(node => node.textContent === '编辑资料').click();
-  notes = fieldControl(container, '补充资料'); notes.value = '新聊天草稿'; notes.fire('input'); release();
-  await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve));
-  assert.equal(fieldControl(container, '补充资料').value, '新聊天草稿');
-  assert.equal(h.records.get(`chat-${CHAT_B}/${PEOPLE_WORKSPACE_RECORD_ID}`).data.profilesByEntityId[A], undefined, '迟到旧保存不得写新聊天');
+  const notes = editorField(view, '补充资料'); notes.value = '甲的人工说明'; notes.fire('input'); await saveEditor(view);
+  assert.equal(h.records.get(`chat-${CHAT}/${PEOPLE_WORKSPACE_RECORD_ID}`).data.profilesByEntityId[A].notes, '甲的人工说明');
+  view.deactivate(); view.mount(container); await view.activate();
+  flatten(container).find(node => node.textContent === '乙').click(); flatten(container).find(node => node.textContent === '编辑资料').click();
+  const secondNotes = editorField(view, '补充资料'); secondNotes.value = '乙未保存'; secondNotes.fire('input'); cancelEditor(view);
+  assert.equal(h.records.get(`chat-${CHAT}/${PEOPLE_WORKSPACE_RECORD_ID}`).data.profilesByEntityId[B], undefined, '取消不写入另一人物资料');
 });
 
 test('搬家后人物详情按需只读显示冻结旧资料，不提供编辑入口', async () => {
   const current = { name: '甲新名', notes: 'B当前资料' };
-  const archived = { name: '甲旧名', notes: 'A冻结资料' };
+  const archived = { name: '甲旧名', aliases: '冻结旧称', notes: 'A冻结资料' };
   const h = runtimeHarness({ profile: current, archivedProfileHistory: [{ entityId: A, sourceChatId: 'source-chat', sourceRevision: 7, profile: archived }] });
   const container = new Node('main'), view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container); await view.activate();
   assert.match(visible(container), /甲新名/); assert.doesNotMatch(visible(container), /甲旧名/);
   flatten(container).find(node => node.textContent === '查看搬家前资料（只读）').click();
   await waitFor(() => visible(container).includes('A冻结资料'));
   assert.match(visible(container), /搬家前资料 1 · 甲旧名/);
+  assert.match(visible(container), /冻结旧称/);
   const archive = flatten(container).find(node => node.className === 'qqj-profile-archive-entry');
   assert.ok(archive); assert.doesNotMatch(visible(archive), /编辑|保存资料|删除人物|整理当前资料/);
+});
+
+
+test('有效别名：真实编辑框展示累计全集并保存删回旧三项', async () => {
+  const h = trueRuntimeHarness();
+  h.entities[0].aliases = Array.from({ length: 50 }, (_, i) => ({ name: `累计别名${i + 1}` }));
+  await h.runtime.refresh();
+  await h.runtime.saveProfile(A, { name: '甲', aliases: '简称一、简称二、简称三', notes: '已有资料' }, { manualFields: [] });
+  await h.runtime.setSelectedEntityIds([A]);
+  const container = new Node('main'), view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
+  flatten(container).find(node => node.textContent === '编辑资料').click();
+  assert.equal(editorField(view, '别名').value.split('、').length, 50);
+  const notes = editorField(view, '补充资料'); notes.value = '仅改说明'; notes.fire('input');
+  await saveEditor(view);
+  assert.ok(!h.runtime.getState().profilesByEntityId[A].manualFields.includes('aliases'));
+  assert.equal(h.runtime.getState().profilesByEntityId[A].aliases, '简称一、简称二、简称三');
+  flatten(container).find(node => node.textContent === '编辑资料').click();
+  const aliases = editorField(view, '别名'); aliases.value = '简称一、简称二、简称三'; aliases.fire('input');
+  await saveEditor(view);
+  assert.deepEqual(h.runtime.getState().people.find(p => p.entityId === A).aliases, ['简称一', '简称二', '简称三']);
+  assert.ok(h.runtime.getState().profilesByEntityId[A].manualFields.includes('aliases'));
+  view.deactivate();
+});
+
+test('生成头像走现有裁剪确认，库项不唯一需显式选择且取消或失败保旧头像', async () => {
+  const h=runtimeHarness(), generated=[], saves=[]; let selectedIndex=0, fail=false;
+  const saveAvatar=h.runtime.saveAvatar;h.runtime.saveAvatar=async(...args)=>{saves.push(args);return saveAvatar(...args);};
+  const characters=[{name:'甲',tag:'appearance-a',nl:'外貌甲'},{name:'同名甲',tag:'appearance-b',nl:'外貌乙'}];
+  h.emitState({...h.state,people:h.state.people.map(person=>({...person,avatar:person.entityId===A?'data:image/webp;base64,T0xE':null}))});
+  h.runtime.prepareAvatarGeneration=()=>({characters,selectedIndex});
+  h.runtime.generateAvatar=async(entityId,{character})=>{generated.push([entityId,character]);if(fail)throw new Error('生图通道未配置');return {dataUrl:'data:image/png;base64,AAAA',galleryCharacterName:'发起卡A'};};
+  let revoked=0;
+  const imageFactory=()=>({naturalWidth:800,naturalHeight:600,set src(value){if(value)queueMicrotask(()=>this.onload?.());},onload:null,onerror:null});
+  const doc={createElement:tag=>tag==='canvas'?{getContext:()=>({clearRect(){},drawImage(){}}),toDataURL:()=> 'data:image/webp;base64,Q1JPUA=='}:new Node(tag)};
+  const dialogs=dialogHarness(), container=new Node('main');
+  const view=createPeopleProfilesView({runtime:h.runtime,dialog:dialogs.dialog,documentRef:doc,imageFactory,urlApi:{createObjectURL:()=> 'blob:generated',revokeObjectURL:()=>{revoked++;}}});view.mount(container);
+  const generate=()=>{const button=flatten(container).find(node=>node.tag==='button'&&node.textContent==='生成头像');assert.ok(button,'人物菜单应有明确生成入口');button.click();};
+  generate();await waitFor(()=>dialogs.active?.title==='头像预览');assert.equal(generated.length,1);assert.equal(h.calls.avatar.length,0);dialogs.dialog.cancelTop();assert.equal(revoked,1);
+  assert.equal(h.runtime.getState().people.find(person=>person.entityId===A).avatar,'data:image/webp;base64,T0xE');
+  characters[0]={...characters[0],scope:'global'};characters[1]={...characters[1],name:'甲',scope:'global'};
+  selectedIndex=null;generate();await waitFor(()=>dialogs.active?.title==='选择柏宝绘角色');assert.equal(generated.length,1);
+  assert.ok(visible(dialogs.active.content).includes('外貌甲'));assert.ok(visible(dialogs.active.content).includes('外貌乙'));
+  const select=flatten(dialogs.active.content).find(node=>node.className==='qqj-inline-select');select.value='1';await dialogs.submit();
+  await waitFor(()=>dialogs.active?.title==='头像预览');assert.equal(generated.length,2);assert.deepEqual(generated[1],[A,characters[1]]);
+  flatten(dialogs.active.content).find(node=>node.tag==='button'&&node.textContent==='裁剪').click();
+  await dialogs.submit();assert.equal(saves[0][2].generated,true);assert.equal(saves[0][2].galleryCharacterName,'发起卡A');assert.equal(saves[0][2].crop.aspectRatio,1);assert.deepEqual(h.calls.avatar,[[A,'data:image/webp;base64,Q1JPUA==']]);assert.equal(revoked,2);assert.equal(h.runtime.getState().people.find(person=>person.entityId===B).avatar,null);
+  selectedIndex=0;fail=true;generate();await waitFor(()=>visible(container).includes('生图通道未配置'));assert.equal(h.calls.avatar.length,1);assert.equal(dialogs.active,null);
+  let finish;h.runtime.generateAvatar=()=>new Promise(resolve=>{finish=resolve;});generate();view.deactivate();finish({dataUrl:'data:image/png;base64,AAAA'});await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(dialogs.active,null,'正常关闭千人页后不再打开新裁剪窗');assert.equal(h.calls.avatar.length,1);
+});
+
+test('头像确认先呈现处理状态再编码，延迟保存与失败重试保持原图', async () => {
+  const h = runtimeHarness(), frames = [], encoded = [];let resolveSave, rejectSave, released = 0;
+  h.runtime.saveAvatar = async (id, data) => { h.calls.avatar.push([id, data]);await new Promise((resolve,reject)=>{resolveSave=resolve;rejectSave=reject;}); };
+  const doc = { defaultView: { requestAnimationFrame: callback => frames.push(callback) }, createElement: tag => tag === 'canvas'
+    ? { getContext:()=>({clearRect(){},drawImage(){encoded.push('draw');}}),toDataURL:()=> 'data:image/webp;base64,AAAA' } : new Node(tag) };
+  const imageFactory = () => ({ naturalWidth:800,naturalHeight:600,set src(value){if(value)queueMicrotask(()=>this.onload?.());} });
+  const dialogs = dialogHarness(), container = new Node('main');
+  const view = createPeopleProfilesView({runtime:h.runtime,dialog:dialogs.dialog,documentRef:doc,imageFactory,urlApi:{createObjectURL:()=> 'blob:original',revokeObjectURL:()=>{released++;}}});view.mount(container);
+  flatten(container).find(node=>node.className==='qqj-avatar-file').fire('change',{target:{files:[{type:'image/png',size:100}],value:'chosen'}});
+  await waitFor(()=>dialogs.active?.title==='头像预览');const content=dialogs.active.content,toggle=flatten(content).find(node=>node.tag==='button'&&node.textContent==='裁剪');
+  const first=dialogs.submit();assert.match(visible(content),/正在处理头像/);assert.equal(toggle.disabled,true);assert.equal(content.attributes['aria-busy'],'true');assert.equal(encoded.length,0);
+  assert.equal(frames.length,1);frames.shift()();assert.equal(encoded.length,0);frames.shift()();await waitFor(()=>h.calls.avatar.length===1);
+  assert.match(visible(content),/正在保存头像/);assert.equal(toggle.disabled,true);assert.equal(released,0);
+  rejectSave(new Error('头像保存失败'));assert.equal(await first,false);assert.match(dialogs.active.error.message,/头像保存失败/);assert.equal(dialogs.active.content,content);
+  assert.equal(toggle.disabled,false);assert.equal(content.attributes['aria-busy'],'false');assert.equal(released,0);
+  const second=dialogs.submit();frames.shift()();frames.shift()();await waitFor(()=>h.calls.avatar.length===2);resolveSave();await second;await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(dialogs.active,null);assert.equal(released,1);assert.match(visible(container),/头像已保存/);
+  flatten(container).find(node=>node.className==='qqj-avatar-file').fire('change',{target:{files:[{type:'image/png',size:100}],value:'again'}});
+  await waitFor(()=>dialogs.active?.title==='头像预览');const cancelled=dialogs.submit();frames.shift()();dialogs.dialog.cancelTop();frames.shift()();await cancelled;
+  assert.equal(h.calls.avatar.length,2,'正常取消预览后，不启动尚未开始的保存');assert.equal(encoded.length,2,'已取消的待绘制提交不再编码');assert.equal(released,2);view.deactivate();
+});
+
+test('点击已存头像懒看完整图与下载，旧头像仍只显示原有小图',async()=>{
+  for(const original of [true,false]){
+    const h=runtimeHarness();const source={path:'/user/images/qqj-avatars/qqj-avatar-view.png',mimeType:'image/png',crop:{aspectRatio:1,zoom:2,offsetX:5,offsetY:0}};
+    h.emitState({...h.state,people:h.state.people.map(p=>p.entityId===A?{...p,avatar:'data:image/webp;base64,QUFB',...(original?{avatarSource:source}:{})}:p)});
+    const dialogs=dialogHarness(),container=new Node('main');const view=createPeopleProfilesView({runtime:h.runtime,dialog:dialogs.dialog,documentRef});view.mount(container);
+    flatten(container).find(node=>String(node.className).startsWith('qqj-profile-mark')).click();
+    assert.equal(dialogs.active?.title,'头像大图');const image=flatten(dialogs.active.content).find(node=>node.tag==='img');
+    assert.equal(image.src,original?source.path:'data:image/webp;base64,QUFB');assert.equal(image.className,'qqj-avatar-preview-image');
+    const download=flatten(dialogs.active.content).find(node=>node.tag==='a');assert.equal(download.href,image.src);assert.equal(h.calls.avatar.length,0);
+    dialogs.dialog.cancelTop();assert.equal(image.src,'');view.deactivate();
+  }
+});
+
+test('旧人物操作完成或失败只反馈原页，不覆盖B人物页面', async t => {
+  for (const outcome of ['success', 'failure']) await t.test(outcome, async () => {
+    const h = runtimeHarness(), container = new Node('main'); let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const original = structuredClone(h.state);
+    h.runtime.regenerateProfile = async () => { await gate; if (outcome === 'failure') throw new Error('A旧任务失败');
+      return { ...original, lastGenerationReport: { requested: 1, saved: 1 } }; };
+    const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
+    flatten(container).find(node => node.tag === 'button' && node.textContent === '整理当前资料').click();
+    h.emitState({ ...h.state, chatId: CHAT_B, people: [person(C, 'B人物', true)], selectedEntityIds: [C] });
+    release(); await new Promise(resolve => setImmediate(resolve));
+    assert.match(visible(container), /B人物/); assert.doesNotMatch(visible(container), /保存 1\/1|A旧任务失败|整理当前资料完成/u);
+    view.deactivate();
+  });
+});
+
+test('人物资料真实保存后切到B只略过旧页接回，弹窗仍返回成功', async () => {
+  const h = runtimeHarness(), container = new Node('main'); let release;
+  h.runtime.saveProfile = async () => { await new Promise(resolve => { release = resolve; }); return { ...h.state, chatId: CHAT }; };
+  const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
+  flatten(container).find(node => node.tag === 'button' && node.textContent === '编辑资料').click();
+  const pending = saveEditor(view);
+  h.emitState({ ...h.state, chatId: CHAT_B, people: [person(C, 'B人物', true)], selectedEntityIds: [C] });
+  release(); assert.equal(await pending, true); assert.match(visible(container), /B人物/); view.deactivate();
+});
+
+test('头像确认已保存后页面B仅停止旧预览接回，不把持久成功报成失败', async () => {
+  const h = runtimeHarness(), container = new Node('main'), dialogs = dialogHarness(); let release, started;
+  const began = new Promise(resolve => { started = resolve; });
+  h.runtime.saveAvatar = async () => { started(); await new Promise(resolve => { release = resolve; }); return { chatId: CHAT }; };
+  const doc = { createElement: tag => tag === 'canvas' ? { getContext: () => ({ clearRect() {}, drawImage() {} }), toDataURL: () => 'data:image/png;base64,AAAA' } : new Node(tag) };
+  const imageFactory = () => ({ naturalWidth: 100, naturalHeight: 100, set src(value) { if (value) queueMicrotask(() => this.onload?.()); } });
+  const view = createPeopleProfilesView({ runtime: h.runtime, dialog: dialogs.dialog, documentRef: doc, imageFactory,
+    urlApi: { createObjectURL: () => 'blob:source', revokeObjectURL() {} } }); view.mount(container);
+  flatten(container).find(node => node.className === 'qqj-avatar-file').fire('change', { target: { files: [{ type: 'image/png', size: 1 }] } });
+  await waitFor(() => dialogs.active?.title === '头像预览');
+  const pending = dialogs.submit(); await began;
+  h.emitState({ ...h.state, chatId: CHAT_B, people: [person(C, 'B人物', true)], selectedEntityIds: [C] });
+  release(); assert.equal(await pending, true); assert.match(visible(container), /B人物/); view.deactivate();
+});
+
+test('人物合并与排序原目标已保存后不在B回画旧页或抛假失败', async t => {
+  for (const kind of ['merge', 'order']) await t.test(kind, async () => {
+    const h = runtimeHarness({ selected: [A, B] }), container = new Node('main'), dialogs = dialogHarness(); let release, started;
+    const began = new Promise(resolve => { started = resolve; }), before = structuredClone(h.state);
+    h.runtime[kind === 'merge' ? 'mergePeople' : 'setPersonOrderEntityIds'] = async () => { started(); await new Promise(resolve => { release = resolve; }); return before; };
+    const view = createPeopleProfilesView({ runtime: h.runtime, documentRef, dialog: dialogs.dialog }); view.mount(container);
+    if (kind === 'merge') flatten(container).find(node => node.textContent === '合并到其他人物').click();
+    else { flatten(container).find(node => node.textContent === '更多人物（0）').click(); flatten(container).find(node => node.textContent === '排序').click(); }
+    const pending = dialogs.submit(); await began;
+    h.emitState({ ...h.state, chatId: CHAT_B, people: [person(C, 'B人物', true)], selectedEntityIds: [C] });
+    release(); assert.equal(await pending, true);
+    assert.match(visible(container), /B人物/); assert.doesNotMatch(visible(container), /人物已合并|人物顺序已保存/u); view.deactivate();
+  });
+});
+
+test('人物activate的A读取迟到成功或失败都不回画已展示的B', async t => {
+  for (const outcome of ['success', 'failure']) await t.test(outcome, async () => {
+    const h = runtimeHarness(), container = new Node('main'), before = structuredClone(h.state); let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    h.runtime.refresh = async () => { await gate; if (outcome === 'failure') throw new Error('A迟到读取失败'); return before; };
+    const view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
+    const pending = view.activate();
+    h.emitState({ ...h.state, chatId: CHAT_B, people: [person(C, 'B正常人物', true)], selectedEntityIds: [C] });
+    release(); await pending;
+    assert.match(visible(container), /B正常人物/u); assert.doesNotMatch(visible(container), /A迟到读取失败|读取失败/u); view.deactivate();
+  });
+});
+
+
+test('纯人类只在当前及归档阅读隐藏，编辑仍保原值且可改为非人种族', async () => {
+  for (const species of [' 人类 ', 'HuMaN']) {
+    const profile = { name: '甲', species, bloodType: 'AB型', mbti: 'INFJ' };
+    const archived = { name: '旧甲', species, zodiac: '天秤座', skills: '钟表修理' };
+    const h = runtimeHarness({ profile, archivedProfileHistory: [{ entityId: A, sourceChatId: 'old-chat', sourceRevision: 2, profile: archived }] });
+    const container = new Node('main'), view = createPeopleProfilesView({ runtime: h.runtime, documentRef });
+    view.mount(container); await view.activate();
+    assert.equal(flatten(container).some(node => node.className.includes('qqj-profile-read-species')), false, '纯人类不占当前阅读行');
+    assert.match(visible(container), /血型\|AB型/);
+    assert.match(visible(container), /MBTI\|INFJ/);
+    flatten(container).find(node => node.textContent === '查看搬家前资料（只读）').click();
+    await waitFor(() => visible(container).includes('旧甲'));
+    const archive = flatten(container).find(node => node.className === 'qqj-profile-archive-entry');
+    assert.equal(flatten(archive).some(node => node.className.includes('qqj-profile-read-species')), false, '归档与当前阅读同样隐藏');
+    assert.match(visible(archive), /星座\|天秤座/);
+    assert.match(visible(archive), /技能与能力\|钟表修理/);
+    assert.equal(profile.species, species); assert.equal(archived.species, species);
+    flatten(container).find(node => node.textContent === '编辑资料').click();
+    assert.equal(editorField(view, '种族').value, species, '阅读过滤不改编辑值');
+    assert.equal(editorField(view, '血型').value, 'AB型');
+    assert.equal(editorField(view, 'MBTI').value, 'INFJ');
+    const speciesInput = editorField(view, '种族'), bloodInput = editorField(view, '血型');
+    speciesInput.value = '精灵'; speciesInput.fire('input');
+    bloodInput.value = 'O型'; bloodInput.fire('input');
+    await saveEditor(view);
+    assert.equal(h.calls.save[0][1].species, '精灵');
+    assert.equal(h.calls.save[0][1].bloodType, 'O型');
+    assert.ok(h.calls.save[0][2].manualFields.includes('bloodType'));
+    const current = flatten(container).find(node => node.className === 'qqj-profile-reading');
+    assert.match(visible(current), /种族\|精灵/);
+    assert.match(visible(current), /血型\|O型/);
+    view.deactivate();
+  }
+});
+
+test('种族有非人或混血改造细节时，当前与归档阅读均保留完整值', async () => {
+  for (const species of ['精灵', '半人类', '人类（改造者）', 'human hybrid']) {
+    const h = runtimeHarness({ profile: { name: '甲', species }, archivedProfileHistory: [{ entityId: A, profile: { name: '旧甲', species } }] });
+    const container = new Node('main'), view = createPeopleProfilesView({ runtime: h.runtime, documentRef });
+    view.mount(container); await view.activate();
+    const row = flatten(container).find(node => node.className.includes('qqj-profile-read-species'));
+    assert.ok(row); assert.equal(row.children[1].textContent, species);
+    flatten(container).find(node => node.textContent === '查看搬家前资料（只读）').click();
+    await waitFor(() => visible(container).includes('旧甲'));
+    const archive = flatten(container).find(node => node.className === 'qqj-profile-archive-entry');
+    assert.equal(flatten(archive).find(node => node.className.includes('qqj-profile-read-species')).children[1].textContent, species);
+    view.deactivate();
+  }
+});
+
+test('各分类阅读先短标签再短结果，长值整行；当前与归档一致且编辑和原文不变',async()=>{
+ const profile={name:'合成人物',gender:'女',age:'25岁',birthday:'2000年11月05日',bloodType:'AB型',zodiac:'天蝎座',species:'人类',notes:'稳定事实',
+  height:'170cm',weight:'55kg',build:'纤瘦',face:'清秀',hair:'黑色短发',eyes:'深棕色',distinctiveFeatures:'右肩有一片形状独特且已有多年的纹身印记。',
+  occupation:'跨国集团的高级研究负责人兼任项目管理顾问',organization:'夜航',nationality:'中国',birthplace:'上海',residence:'长期居住在上海西郊一处有旧花园的独栋住宅',background:'少年时期曾多次迁居，后来长期在本地求学并从事研究。',identityRelations:'兄长：甲\n妹妹：乙',languages:'中、英',skills:'绘画',
+  personality:'做决定前会反复比较已有信息，熟悉的人面前更加放松。',conduct:'温柔；谨慎',expression:'简短',likes:'音乐',dislikes:'强光',principles:'守信',mbti:'INFJ-A',enneagram:'5w6',alignment:'中立善良'};
+ const original=structuredClone(profile),h=runtimeHarness({profile,archivedProfileHistory:[{entityId:A,profile:structuredClone(profile)}]}),container=new Node('main'),view=createPeopleProfilesView({runtime:h.runtime,documentRef});view.mount(container);await view.activate();
+ const rows=(root,key)=>flatten(root).find(n=>n.className.split(' ').includes(`qqj-profile-section-${key}`)).children.filter(n=>n.className.split(' ').includes('qqj-profile-read-row'));
+ const keys=(root,key)=>rows(root,key).map(n=>n.className.match(/qqj-profile-read-([^ ]+)$/)[1]);
+ const reading=flatten(container).find(n=>n.className==='qqj-profile-reading');
+ const expected={basic:['gender','age','bloodType','zodiac','notes','birthday'],appearance:['height','weight','build','face','hair','eyes','distinctiveFeatures'],identity:['organization','nationality','birthplace','languages','skills','occupation','background','identityRelations','residence'],personality:['mbti','enneagram','alignment','expression','likes','dislikes','principles','personality','conduct']};
+ for(const [key,order] of Object.entries(expected))assert.deepEqual(keys(reading,key),order,key);
+ const row=field=>flatten(reading).find(n=>n.className===`qqj-profile-read-row qqj-profile-read-${field}`);
+ for(const field of ['gender','age','bloodType','zodiac','notes','face','eyes','languages','mbti','enneagram','alignment'])assert.equal(row(field).attributes['data-qqj-profile-layout'],'compact',field);
+ for(const field of ['birthday','occupation','residence','identityRelations','personality','conduct','skills','principles'])assert.equal(row(field).attributes['data-qqj-profile-layout'],'wide',field);
+ assert.match(row('identityRelations').children[1].textContent,/兄长：甲\n妹妹：乙/);assert.match(row('personality').children[1].textContent,/做决定前会反复比较已有信息/);assert.equal(row('conduct').children[1].textContent,'温柔；\n谨慎');
+ flatten(container).find(n=>n.textContent==='查看搬家前资料（只读）').click();await waitFor(()=>flatten(container).some(n=>n.className==='qqj-profile-archive-entry'));const archive=flatten(container).find(n=>n.className==='qqj-profile-archive-entry');
+ for(const [key,order] of Object.entries(expected)){assert.deepEqual(keys(archive,key),order,`archive ${key}`);assert.deepEqual(rows(archive,key).map(n=>n.attributes['data-qqj-profile-layout']),rows(reading,key).map(n=>n.attributes['data-qqj-profile-layout']));}
+ flatten(container).find(n=>n.textContent==='编辑资料').click();assert.equal(editorField(view,'生日').value,original.birthday);assert.equal(editorField(view,'重要身份关系').value,original.identityRelations);assert.equal(editorField(view,'核心性格').value,original.personality);assert.equal(editorField(view,'处事方式').value,'温柔；谨慎');assert.equal(editorField(view,'种族').value,'人类');
+ const personalityGroup=flatten(editorContent(view)).find(n=>n.className.includes('qqj-profile-form-group')&&n.children[0]?.textContent==='性格');assert.deepEqual(personalityGroup.children.filter(n=>n.tag==='label').map(n=>n.children[0].textContent),['核心性格','处事方式','表达习惯','喜好','厌恶','原则与底线','MBTI','九型人格','道德阵营']);cancelEditor(view);
+ assert.deepEqual(profile,original);assert.equal(h.calls.save.length,0);assert.equal(h.calls.generate,0);assert.equal(h.calls.regenerate.length,0);view.deactivate();
+});
+
+test('千人读取失败由健康条单槽呈现，订阅快路不重复技术长文',()=>{
+ const h=runtimeHarness(),container=new Node('main'),view=createPeopleProfilesView({runtime:h.runtime,documentRef});view.mount(container);
+ h.emitState({...h.state,active:{kind:'loading'}});
+ h.emitState({...h.state,active:null,lastError:{code:'BACKEND_TIMEOUT',message:'读取记忆超时；请到记忆管理复制状态诊断反馈。'}});
+ const nodes=flatten(container).filter(n=>!n.hidden);assert.doesNotMatch(nodes.map(n=>n.textContent).join('|'),/复制状态诊断.*反馈/);assert.equal(nodes.filter(n=>String(n.textContent).includes('记忆存储请求超时')).length,1);view.deactivate();
+});
+
+test('千人整理按钮同次失败单槽但保操作回执，不与独立旧错合并',async()=>{
+ for(const same of [true,false]){
+ const h=runtimeHarness(),container=new Node('main'),view=createPeopleProfilesView({runtime:h.runtime,documentRef});const failure=Object.assign(new Error('本次后端读取失败'),{code:'BACKEND_TIMEOUT'});
+ h.runtime.regenerateProfile=async()=>{h.emitState({...h.state,lastError:{code:'BACKEND_TIMEOUT',message:same?failure.message:'另一项旧任务失败'}});throw failure;};view.mount(container);
+ await flatten(container).find(n=>n.tag==='button'&&n.textContent==='整理当前资料').click();await waitFor(()=>visible(container).includes('失败')||visible(container).includes('未完成'));
+ await new Promise(resolve=>setImmediate(resolve));const count=flatten(container).filter(n=>!n.hidden&&String(n.textContent).includes('记忆存储请求超时')).length;assert.equal(count,same?1:2,'相同短句的两次不同原始错误不可互吞');if(same)assert.match(visible(container),/整理.*未完成/);view.deactivate();
+ }
+});
+
+
+test('第二批人物编辑窗只提交实际修改，原字段基线保留并发职业与失败草稿', async () => {
+  const h = trueRuntimeHarness(); await h.runtime.refresh(); await h.runtime.setSelectedEntityIds([A]);
+  await h.runtime.saveProfile(A, { name: '甲', notes: '原备注', occupation: '旧职业' }, { manualFields: ['notes'] });
+  const container = new Node('main'), view = createPeopleProfilesView({ runtime: h.runtime, documentRef }); view.mount(container);
+  flatten(container).find(node => node.textContent === '编辑资料').click();
+  let notes = editorField(view, '补充资料'); notes.value = '人工备注'; notes.fire('input');
+  const key = `chat-${CHAT}/${PEOPLE_WORKSPACE_RECORD_ID}`;
+  const update = (field, value) => {
+    const record = structuredClone(h.records.get(key)); record.revision++;
+    record.data.profilesByEntityId[A][field] = value; h.records.set(key, record);
+  };
+  update('occupation', '后台新职业');
+  h.runtime.invalidate(); await h.runtime.refresh(); await saveEditor(view);
+  assert.equal(h.records.get(key).data.profilesByEntityId[A].notes, '人工备注');
+  assert.equal(h.records.get(key).data.profilesByEntityId[A].occupation, '后台新职业');
+  flatten(container).find(node => node.textContent === '编辑资料').click();
+  notes = editorField(view, '补充资料'); notes.value = '未保存旧窗'; notes.fire('input');
+  update('notes', '另一人工备注'); h.runtime.invalidate(); await h.runtime.refresh();
+  await saveEditor(view);
+  assert.equal(editorField(view, '补充资料').value, '未保存旧窗');
+  assert.match(view.testDialogs.active.error?.message ?? '', /人工字段.*更新/u);
+  assert.equal(h.records.get(key).data.profilesByEntityId[A].notes, '另一人工备注');
 });

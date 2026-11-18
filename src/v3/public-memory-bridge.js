@@ -1,6 +1,9 @@
+import { cseQuantificationFields } from './cse-quantification.js';
+import { identityBriefFields } from './identity-brief.js';
 import { formatChronologyAnchor, projectRecallSource, readRecallSource } from './recall-source.js';
 import { PEOPLE_PROFILE_FIELDS } from './people-profile-fields.js';
 import { publicErrorMessage } from '../public-error.js';
+import { buildPublicContext } from './public-context.js';
 
 export const QQJ_PUBLIC_MEMORY_BRIDGE_KEY = 'qqj_v3_public_bridge_v1';
 
@@ -48,7 +51,7 @@ export function formatPublicMemoryProjection(source) {
   const entityById = new Map(entities.map(entity => [entity.entityId, entity]));
   const lines = [
     '<qqj_memory_context>',
-    '以下是千千结已经正式保存的长期记忆与人物状态，只作剧情参考；与当前正文冲突时以正文为准。',
+    '以下是千千结已经正式保存的长期记忆与人物状态。人工校准为最高依据。自动资料结合其来源与当前剧情理解。',
   ];
 
   const people = entities.filter(entity => entity.entityType === 'person' && entity.displayName);
@@ -143,7 +146,7 @@ const sameReachableRoot = (value, rootResult) => rootResult?.status === 'ready'
   && rootResult.data?.narrativeGeneration === value?.root?.narrativeGeneration
   && rootResult.data?.sourceSnapshotFingerprint === value?.root?.sourceSnapshotFingerprint;
 
-const publicStateItem = value => ({
+const publicStateItem = (value, category) => ({
   id: value?.id ?? null,
   text: value?.text ?? '',
   visibility: value?.visibility ?? null,
@@ -153,14 +156,15 @@ const publicStateItem = value => ({
   towardDisplayName: value?.towardDisplayName ?? null,
   sourceFloorId: value?.sourceFloorId ?? null,
   sourceAssistantSeq: value?.sourceAssistantSeq ?? null,
+  ...cseQuantificationFields(value, category),
 });
 
 const publicSubject = value => ({
   subjectEntityId: value?.subjectEntityId ?? null,
   displayName: value?.displayName ?? '未知人物',
-  core: (value?.core ?? []).map(publicStateItem),
-  adaptive: (value?.adaptive ?? []).map(publicStateItem),
-  situational: (value?.situational ?? []).map(publicStateItem),
+  core: (value?.core ?? []).map(item => publicStateItem(item, 'core')),
+  adaptive: (value?.adaptive ?? []).map(item => publicStateItem(item, 'adaptive')),
+  situational: (value?.situational ?? []).map(item => publicStateItem(item, 'situational')),
 });
 
 const emptyMemorySnapshot = (status = 'not-ready', syncStatus = 'idle') => ({
@@ -172,6 +176,9 @@ const emptyMemorySnapshot = (status = 'not-ready', syncStatus = 'idle') => ({
 
 const emptyCseSnapshot = () => ({ ready: false, currentSubjects: [], floors: [] });
 const emptyPeopleSnapshot = (status = 'not-ready') => ({ status, revision: null, items: [] });
+const requestedAvatarIds = value => [...new Set((Array.isArray(value) ? value : [])
+  .filter(entityId => typeof entityId === 'string' && entityId.length > 0))];
+const emptyAvatarMap = ids => frozen(Object.fromEntries(ids.map(entityId => [entityId, null])));
 
 function publicMemorySnapshot(value, chatId) {
   if (!value || value.chatId !== chatId) return emptyMemorySnapshot();
@@ -213,8 +220,8 @@ function publicCseSnapshot(value, chatId) {
           changes: (subject.changes ?? []).map(change => ({
             category: change.category,
             action: change.action,
-            before: change.before ? publicStateItem(change.before) : null,
-            after: change.after ? publicStateItem(change.after) : null,
+            before: change.before ? publicStateItem(change.before, change.category) : null,
+            after: change.after ? publicStateItem(change.after, change.category) : null,
           })),
         })) : null,
         savedSubjects: (cse.record?.endStateSubjects ?? []).map(publicSubject),
@@ -233,11 +240,12 @@ function publicPeopleSnapshot(value, chatId) {
       displayName: person.displayName,
       entityDisplayName: person.entityDisplayName,
       aliases: person.aliases ?? [],
+      ...identityBriefFields(person),
       specialRole: person.specialRole ?? null,
       selected: person.selected === true,
       profiled: person.profiled === true,
       profile: person.profile ? {
-        ...Object.fromEntries(PEOPLE_PROFILE_FIELDS.map(field => [field, person.profile[field] ?? ''])),
+        ...Object.fromEntries(PEOPLE_PROFILE_FIELDS.map(field => [field, field === 'aliases' ? (person.aliases ?? []).join('、') : person.profile[field] ?? ''])),
         manualFields: person.profile.manualFields ?? [],
         source: person.profile.source ?? null,
         createdAt: person.profile.createdAt ?? null,
@@ -247,7 +255,7 @@ function publicPeopleSnapshot(value, chatId) {
   };
 }
 
-export function createPublicMemoryBridge({ session, store, hostAdapter, foundationRuntime = null, memoryRuntime = null, peopleRuntime = null, recallRuntime = null, isEnabled = true, sanitizerOptions = () => ({}), identityProjectionProvider = null, readSource = readRecallSource } = {}) {
+export function createPublicMemoryBridge({ session, store, hostAdapter, foundationRuntime = null, memoryRuntime = null, peopleRuntime = null, recallRuntime = null, isEnabled = true, sanitizerOptions = () => ({}), identityProjectionProvider = null, readWorldInfoProvider = null, readSource = readRecallSource } = {}) {
   if (!session || typeof session.identity !== 'function' || typeof session.getState !== 'function') throw new TypeError('公共记忆桥 session 无效');
   if (!store || typeof store.readReachable !== 'function') throw new TypeError('公共记忆桥 store 无效');
   if (!hostAdapter || typeof hostAdapter.snapshot !== 'function') throw new TypeError('公共记忆桥 hostAdapter 无效');
@@ -271,7 +279,7 @@ export function createPublicMemoryBridge({ session, store, hostAdapter, foundati
     try {
       const hostSnapshot = hostAdapter.snapshot();
       const currentSanitizerOptions = typeof sanitizerOptions === 'function' ? sanitizerOptions() : sanitizerOptions;
-      const identityProjectionValue = typeof identityProjectionProvider === 'function' ? await identityProjectionProvider() : null;
+      const identityProjectionValue = typeof identityProjectionProvider === 'function' ? await identityProjectionProvider(before, { allowUnavailable: true }) : null;
       const identityProjection = identityProjectionValue?.data ?? identityProjectionValue;
       const foundationSnapshot = completeFoundationSnapshot(foundationRuntime);
       let source = null;
@@ -315,20 +323,18 @@ export function createPublicMemoryBridge({ session, store, hostAdapter, foundati
   function getSnapshot() {
     const status = localStatus();
     if (status.status !== 'ready') return status;
-    try {
-      const memoryState = typeof memoryRuntime?.getState === 'function' ? memoryRuntime.getState() : null;
-      const peopleState = typeof peopleRuntime?.getState === 'function' ? peopleRuntime.getState() : null;
-      return structuredClone({
-        status: 'ready',
-        identity: status.identity,
-        memory: publicMemorySnapshot(memoryState, status.identity.qqjChatId),
-        cse: publicCseSnapshot(memoryState, status.identity.qqjChatId),
-        people: publicPeopleSnapshot(peopleState, status.identity.qqjChatId),
-      });
-    } catch (error) {
-      return frozen({ status: 'error', message: publicErrorMessage(error, { fallback: '千千结快照读取失败。' }), identity: status.identity });
-    }
+    let memoryState = null, memoryFailed = false;
+    try { memoryState = typeof memoryRuntime?.getState === 'function' ? memoryRuntime.getState() : null; }
+    catch { memoryFailed = true; }
+    const partition = (project, empty) => { try { return structuredClone(project()); } catch { return empty(); } };
+    return frozen({
+      status: 'ready', identity: status.identity,
+      memory: partition(() => memoryFailed ? emptyMemorySnapshot('error') : publicMemorySnapshot(memoryState, status.identity.qqjChatId), () => emptyMemorySnapshot('error')),
+      cse: partition(() => publicCseSnapshot(memoryState, status.identity.qqjChatId), emptyCseSnapshot),
+      people: partition(() => publicPeopleSnapshot(typeof peopleRuntime?.getState === 'function' ? peopleRuntime.getState() : null, status.identity.qqjChatId), () => emptyPeopleSnapshot('error')),
+    });
   }
+
   function getPromptSnapshot() {
     const status = localStatus();
     if (status.status !== 'ready') return status;
@@ -347,7 +353,95 @@ export function createPublicMemoryBridge({ session, store, hostAdapter, foundati
       return frozen({ status: 'error', scope: 'latest-prepared', message: publicErrorMessage(error, { fallback: '千千结当前记忆材料读取失败。' }), identity: status.identity, recall: frozen({ text: '' }), prequel: frozen({ text: '' }) });
     }
   }
-  return frozen({ schemaVersion: 1, kind: 'qqj-public-memory-bridge', getStatus: localStatus, readMemory, getPromptSnapshot, getSnapshot });
+  function getPeopleSnapshot() {
+    const status = localStatus();
+    if (status.status !== 'ready') return frozen({ ...status, people: emptyPeopleSnapshot(status.status) });
+    try {
+      const value = typeof peopleRuntime?.getState === 'function' ? peopleRuntime.getState() : null;
+      return structuredClone({ status: 'ready', identity: status.identity, people: publicPeopleSnapshot(value, status.identity.qqjChatId) });
+    } catch (error) {
+      return frozen({ status: 'error', message: publicErrorMessage(error, { fallback: '千千结人物资料读取失败。' }), identity: status.identity, people: emptyPeopleSnapshot('error') });
+    }
+  }
+  function getPeopleAvatars(entityIds = []) {
+    const ids = requestedAvatarIds(entityIds);
+    const empty = emptyAvatarMap(ids);
+    const status = localStatus();
+    if (status.status !== 'ready') return frozen({ ...status, avatarsByEntityId: empty });
+    try {
+      const value = typeof peopleRuntime?.getPeopleAvatars === 'function'
+        ? peopleRuntime.getPeopleAvatars(ids)
+        : null;
+      if (value?.status !== 'ready' || value.chatId !== status.identity.qqjChatId) {
+        const runtimeStatus = ['disabled', 'not-ready'].includes(value?.status) ? value.status : 'not-ready';
+        return frozen({ status: runtimeStatus, message: '当前人物头像尚未加载。', identity: status.identity, avatarsByEntityId: empty });
+      }
+      const avatarsByEntityId = frozen(Object.fromEntries(ids.map(entityId => {
+        const avatar = value.avatarsByEntityId?.[entityId];
+        return [entityId, typeof avatar === 'string' ? avatar : null];
+      })));
+      return frozen({ status: 'ready', identity: status.identity, avatarsByEntityId });
+    } catch (error) {
+      return frozen({ status: 'error', message: publicErrorMessage(error, { fallback: '千千结人物头像读取失败。' }), identity: status.identity, avatarsByEntityId: empty });
+    }
+  }
+  async function readWorldInfo() {
+    const status = localStatus();
+    if (status.status !== 'ready') return status;
+    if (typeof readWorldInfoProvider !== 'function') return frozen({ status: 'unavailable', message: '当前版本暂不支持读取千千结允许使用的世界书。', identity: status.identity, worldbook: [] });
+    try {
+      const before = session.identity();
+      const value = await readWorldInfoProvider();
+      const after = localStatus();
+      if (after.status !== 'ready') return frozen({ ...after, worldbook: [] });
+      if (!sameIdentity(before, session.identity())) return frozen({ status: 'stale', message: '读取期间当前聊天已变化。', identity: after.identity, worldbook: [] });
+      if (value?.status && value.status !== 'ready') return frozen({ status: value.status, message: value.message ?? '千千结世界书尚未准备好。', identity: status.identity, worldbook: [] });
+      const worldbook = (Array.isArray(value?.worldbook) ? value.worldbook : Array.isArray(value) ? value : []).map(entry => ({
+        uid: String(entry?.uid ?? ''), comment: String(entry?.comment ?? ''), keys: Array.isArray(entry?.keys) ? entry.keys.map(String) : [],
+        content: String(entry?.content ?? ''), constant: entry?.constant === true, position: entry?.position ?? null,
+      })).filter(entry => entry.uid && entry.content);
+      return structuredClone({ status: worldbook.length ? 'ready' : 'empty', identity: status.identity, worldbook });
+    } catch (error) {
+      return frozen({ status: 'error', message: publicErrorMessage(error, { fallback: '千千结世界书读取失败。' }), identity: status.identity, worldbook: [] });
+    }
+  }
+  async function readContext({
+    query = '', focusQuery = '', entityIds = [], participantNames = [],
+    maxCharacters = 12000, maxSummaries = null, summaryCharacters = null, recentSummaries = 0,
+  } = {}) {
+    const empty = state => ({ ...state, anchor: null, routerText: '', actors: [], coverage: { partial: false, selectedCharacters: 0, maxCharacters: 0 } });
+    const status = localStatus();
+    if (status.status !== 'ready') return empty(status);
+    try {
+      const before = session.identity();
+      let reachable = completeFoundationSnapshot(foundationRuntime);
+      let inspected;
+      if (!reachable && typeof foundationRuntime?.inspect === 'function') {
+        inspected = await foundationRuntime.inspect('publicContext', { allowCached: true });
+        const after = localStatus();
+        if (after.status !== 'ready') return empty(after);
+        if (!sameIdentity(before, session.identity())) return empty({ status: 'stale', message: '读取期间当前聊天身份已变化。', identity: after.identity });
+        reachable = completeFoundationSnapshot(foundationRuntime);
+      }
+      if (!reachable) return empty(inspected?.status === 'error'
+        ? { status: 'error', message: inspected.lastError || '千千结已存记忆读取失败。', identity: status.identity }
+        : { status: 'not-ready', message: '千千结记忆尚未准备好。', identity: status.identity });
+      if (reachable.root.chatId !== before.chatId) return empty({ status: 'stale', message: '已存记忆与当前聊天身份不匹配。', identity: status.identity });
+      let peopleState;
+      try { peopleState = typeof peopleRuntime?.getState === 'function' ? peopleRuntime.getState() : null; }
+      catch { peopleState = { status: 'error', people: [] }; }
+      const requested = Array.isArray(entityIds) ? entityIds.filter(id => typeof id === 'string').slice(0, 100) : [];
+      const result = buildPublicContext({ reachable, peopleState, identity: status.identity,
+        currentStateProvider: ids => typeof memoryRuntime?.getCurrentSubjectStates === 'function'
+          ? memoryRuntime.getCurrentSubjectStates(ids) : { status: 'not-ready', subjects: [] },
+        query: String(query ?? '').slice(0, 8000), focusQuery, entityIds: requested, participantNames,
+        maxCharacters, maxSummaries, summaryCharacters, recentSummaries });
+      return result;
+    } catch (error) {
+      return frozen({ status: 'error', message: publicErrorMessage(error, { fallback: '千千结人物记忆读取失败。' }), identity: status.identity, anchor: null, routerText: '', actors: [], coverage: { partial: false, selectedCharacters: 0, maxCharacters: 0 } });
+    }
+  }
+  return frozen({ schemaVersion: 1, kind: 'qqj-public-memory-bridge', getStatus: localStatus, readMemory, getPromptSnapshot, getSnapshot, getPeopleSnapshot, getPeopleAvatars, readWorldInfo, readContext });
 }
 
 export function installPublicMemoryBridge({ globalRef = globalThis, ...options } = {}) {

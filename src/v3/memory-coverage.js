@@ -2,11 +2,15 @@ import { filterReachableDeltas } from './cse-engine.js';
 import { memorySourceFloorIds } from './memory-schema.js';
 import { isHostNarratorMessage, scanAssistantCandidates, selectAssistantMessage } from './foundation-domain.js';
 import { inspectMessageFloorAnchor } from './message-floor-anchor.js';
-import { matchFloorCandidates } from './floor-binding.js';
+import { matchFloorCandidates, unregisteredTailCandidates } from './floor-binding.js';
 import { migrationPartition, partitionScannedCandidates } from './migration-prefix.js';
+import { isMemoryExcludedFloor, isMemoryExcludedMessage } from './memory-exclusion.js';
 
 export const RECENT_VISIBLE_AI_FLOORS = 3;
 const HOST_GUARD = Symbol('qqjCoverageHostGuard');
+const HOST_BINDINGS = Symbol('qqjCoverageHostBindings');
+
+export const memoryCoverageHostBindings = readiness => readiness?.[HOST_BINDINGS] ?? null;
 
 const currentChatId = snapshot => String(snapshot?.context?.chatMetadata?.qianqianjie?.chatId ?? '').trim();
 const visibleAssistant = message => message
@@ -42,11 +46,13 @@ export function diagnosticsWithRealtimeOrigin(diagnostics, realtimeOrigin = null
 }
 
 function captureHostGuard(snapshot, hostCandidates, hostProof = null) {
+  if (!hostProof) return null;
+  const confirmed = new Set([...hostProof.candidateByFloorId.values(), ...hostProof.unregistered]);
   const expectedFloorByCandidate = new Map();
   for (const [floorId, candidate] of hostProof?.candidateByFloorId ?? []) expectedFloorByCandidate.set(candidate, floorId);
   return Object.freeze({
     chatId: currentChatId(snapshot),
-    candidates: Object.freeze(hostCandidates.filter(candidate => candidate.archiveCandidate !== true).map(candidate => Object.freeze({
+    candidates: Object.freeze(hostCandidates.filter(candidate => candidate.archiveCandidate !== true && confirmed.has(candidate)).map(candidate => Object.freeze({
       messageIndex: candidate.hostLocator.messageIndex,
       swipeId: candidate.hostLocator.swipeId,
       selectedSwipeIndex: candidate.hostLocator.selectedSwipeIndex,
@@ -55,6 +61,7 @@ function captureHostGuard(snapshot, hostCandidates, hostProof = null) {
       floorId: candidate.messageAnchor?.status === 'valid' ? candidate.messageAnchor.anchor.floorId : null,
       expectedFloorId: expectedFloorByCandidate.get(candidate) ?? null,
       anchorStatus: candidate.messageAnchor?.status ?? 'invalid',
+      memoryExcluded: candidate.memoryExcluded === true,
       visible: visibleAssistant(snapshot.chat?.[candidate.hostLocator.messageIndex]),
     }))),
   });
@@ -63,16 +70,21 @@ function captureHostGuard(snapshot, hostCandidates, hostProof = null) {
 export function coverageHostGuardCurrent(readiness, snapshot) {
   const guard = readiness?.[HOST_GUARD];
   if (!guard || guard.chatId !== currentChatId(snapshot) || !Array.isArray(guard.candidates) || !Array.isArray(snapshot?.chat)) return false;
-  const currentFloorIds = new Set();
+  const currentFloorIds = new Map();
+  for (const message of snapshot.chat) {
+    if (message?.is_user !== false || isHostNarratorMessage(message) || message.is_system === true && message.extra?.type) continue;
+    const anchor = inspectMessageFloorAnchor(message, guard.chatId);
+    if (anchor.status === 'valid') currentFloorIds.set(anchor.anchor.floorId, (currentFloorIds.get(anchor.anchor.floorId) ?? 0) + 1);
+  }
   return guard.candidates.every(expected => {
     const current = snapshot.chat[expected.messageIndex];
     const selected = selectAssistantMessage(current);
     const anchor = inspectMessageFloorAnchor(current, guard.chatId);
     if (!selected || selected.swipeId !== expected.swipeId || selected.selectedSwipeIndex !== expected.selectedSwipeIndex
-      || visibleAssistant(current) !== expected.visible || !['none', 'valid'].includes(anchor.status)) return false;
+      || visibleAssistant(current) !== expected.visible || isMemoryExcludedMessage(current) !== expected.memoryExcluded
+      || !['none', 'valid'].includes(anchor.status)) return false;
     if (anchor.status === 'valid') {
-      if (currentFloorIds.has(anchor.anchor.floorId)) return false;
-      currentFloorIds.add(anchor.anchor.floorId);
+      if (currentFloorIds.get(anchor.anchor.floorId) !== 1) return false;
     }
     if (expected.anchorStatus === 'valid') return anchor.status === 'valid' && anchor.anchor.floorId === expected.floorId;
     if (selected.rawContent !== expected.rawContent) return false;
@@ -91,32 +103,26 @@ function activeMemoriesByFloor(reachable) {
   return new Map([...groups].filter(([, values]) => values.length === 1).map(([floorId, values]) => [floorId, values[0]]));
 }
 
-function recentVisibleIndexes(chat) {
-  const indexes = new Set();
-  for (let index = chat.length - 1; index >= 0 && indexes.size < RECENT_VISIBLE_AI_FLOORS; index -= 1) {
-    if (visibleAssistant(chat[index])) indexes.add(index);
-  }
-  return indexes;
-}
-
 function hostCoverageProof(reachable, snapshot, hostCandidates) {
   if (!reachable?.root?.chatId || currentChatId(snapshot) !== reachable.root.chatId || !Array.isArray(hostCandidates)) return null;
   const bindings = matchFloorCandidates(reachable.floors ?? [], hostCandidates);
-  if (bindings.issue || bindings.unmatchedFloorIndexes.length) return null;
-  const matchedCandidates = new Set(bindings.matches.map(match => match.candidate));
+  const matches = bindings.matches;
   const candidateByFloorId = new Map();
-  for (const match of bindings.matches) candidateByFloorId.set(match.floor.id, match.candidate);
-  const liveCandidates = hostCandidates.filter(candidate => candidate.archiveCandidate !== true);
-  const unregistered = liveCandidates.filter(candidate => !matchedCandidates.has(candidate));
-  if (unregistered.some(candidate => candidate.messageAnchor?.status !== 'none')) return null;
-  const lastMatchedIndex = Math.max(-1, ...[...matchedCandidates].filter(candidate => candidate.archiveCandidate !== true).map(candidate => candidate.hostLocator.messageIndex));
-  if (unregistered.some(candidate => candidate.hostLocator.messageIndex <= lastMatchedIndex)) return null;
-  return Object.freeze({ unregistered: Object.freeze(unregistered), candidateByFloorId });
+  for (const match of matches) candidateByFloorId.set(match.floor.id, match.candidate);
+  const unmatchedFloorIds = Object.freeze((reachable.floors ?? []).filter(floor => !candidateByFloorId.has(floor.id)).map(floor => floor.id));
+  const unregistered = unregisteredTailCandidates(reachable.floors ?? [], hostCandidates, bindings)
+    .filter(candidate => candidate.memoryExcluded !== true);
+  return Object.freeze({ unregistered: Object.freeze(unregistered), candidateByFloorId, unmatchedFloorIds });
 }
 
 export function assessMemoryCoverage({ reachable, snapshot, hostCandidates, realtimeOrigin = false } = {}) {
   const hostProof = reachable?.root && Array.isArray(reachable.floors) ? hostCoverageProof(reachable, snapshot, hostCandidates) : null;
-  const floors = migrationPartition(reachable).liveFloors;
+  const partition = migrationPartition(reachable);
+  const floors = partition.liveFloors.filter(floor => (!hostProof || hostProof.candidateByFloorId.has(floor.id)) && hostProof?.candidateByFloorId.get(floor.id)?.canonicalContent !== '' && !isMemoryExcludedFloor(
+    hostProof?.candidateByFloorId.has(floor.id) ? { ...floor, hostLocator: hostProof.candidateByFloorId.get(floor.id).hostLocator } : floor,
+    snapshot?.chat, reachable?.checkpoint, {
+    frozen: partition.isFrozenFloor(floor.id),
+  }));
   if (!hostProof) {
     return Object.freeze({ status: 'unknown', completed: 0, total: floors.length, nextAssistantSeq: null, pendingFloorIds: Object.freeze([]), realtimeProtected: false, hasPartialWork: false, summaryStatus: 'unknown', summaryCompleted: 0, summaryNextAssistantSeq: null, summaryPendingFloorIds: Object.freeze([]), summaryMissingFloorIds: Object.freeze([]), visibleSummaryFloorIds: Object.freeze([]), summaryRealtimeProtected: false, summaryHasPartialWork: false });
   }
@@ -124,7 +130,7 @@ export function assessMemoryCoverage({ reachable, snapshot, hostCandidates, real
   const unregisteredSummaryRefs = Object.freeze(hostProof.unregistered.map((candidate, offset) => Object.freeze({
     floorId: `host-tail:${candidate.hostLocator.messageIndex}:${candidate.rawFingerprint}`,
     floorMemoryId: null,
-    assistantSeq: nextAssistantSeq + offset,
+    assistantSeq: candidate.assistantSeq ?? nextAssistantSeq + offset,
     hostLocator: Object.freeze({ ...candidate.hostLocator }),
     rawFingerprint: candidate.rawFingerprint,
     canonicalFingerprint: candidate.canonicalFingerprint,
@@ -144,7 +150,9 @@ export function assessMemoryCoverage({ reachable, snapshot, hostCandidates, real
     ...floors.filter(floor => visibleAssistant(snapshot.chat[hostProof.candidateByFloorId.get(floor.id)?.hostLocator.messageIndex])).map(floor => floor.id),
     ...unregisteredSummaryRefs.filter(ref => visibleAssistant(snapshot.chat[ref.hostLocator.messageIndex])).map(ref => ref.floorId),
   ]);
-  const recent = recentVisibleIndexes(snapshot.chat);
+  const eligibleRecent = hostCandidates.filter(candidate => candidate.archiveCandidate !== true && candidate.memoryExcluded !== true
+    && visibleAssistant(snapshot.chat[candidate.hostLocator.messageIndex])).slice(-RECENT_VISIBLE_AI_FLOORS);
+  const recent = new Set(eligibleRecent.map(candidate => candidate.hostLocator.messageIndex));
   // A contiguous missing suffix may be protected as live work; a gap followed by saved floors remains historical debt.
   const summaryRealtimeProtected = summaryPending.length > 0 && (realtimeOrigin === true
     || summaryCompleted > 0
@@ -152,7 +160,8 @@ export function assessMemoryCoverage({ reachable, snapshot, hostCandidates, real
   const firstSummaryGap = floors.findIndex(floor => !memoryByFloor.has(floor.id));
   const summaryHasPartialWork = firstSummaryGap >= 0 && floors.slice(firstSummaryGap + 1).some(floor => memoryByFloor.has(floor.id));
   const branchRebuild = reachable.run?.mode === 'branchReplay';
-  const summaryStatus = !summaryPending.length && !unregisteredSummaryRefs.length
+  const partial = hostProof.unmatchedFloorIds.length > 0;
+  const summaryStatus = partial ? 'historicalDebt' : !summaryPending.length && !unregisteredSummaryRefs.length
     ? 'caughtUp'
     : (summaryCompleted > 0 || realtimeOrigin === true) && (summaryRealtimeProtected || unregisteredSummaryRefs.length > 0) && !summaryHasPartialWork && !branchRebuild ? 'realtimeTail' : 'historicalDebt';
   let deltaByFloor;
@@ -167,11 +176,11 @@ export function assessMemoryCoverage({ reachable, snapshot, hostCandidates, real
   }
   const completed = floors.filter(floor => memoryByFloor.has(floor.id) && deltaByFloor.has(floor.id)).length;
   const pending = floors.filter(floor => !memoryByFloor.has(floor.id) || !deltaByFloor.has(floor.id));
-  if (!pending.length && !unregisteredSummaryRefs.length) return Object.freeze({ status: 'caughtUp', hostConfirmed: true, completed, total: floors.length, nextAssistantSeq: null, pendingFloorIds: Object.freeze([]), realtimeProtected: false, hasPartialWork: false, summaryStatus: 'caughtUp', summaryCompleted, summaryNextAssistantSeq: null, summaryPendingFloorIds: Object.freeze([]), summaryMissingFloorIds, visibleSummaryFloorIds, summaryRealtimeProtected: false, summaryHasPartialWork: false, unregisteredSummaryRefs });
+  if (!partial && !pending.length && !unregisteredSummaryRefs.length) return Object.freeze({ status: 'caughtUp', hostConfirmed: true, completed, total: floors.length, nextAssistantSeq: null, pendingFloorIds: Object.freeze([]), realtimeProtected: false, hasPartialWork: false, summaryStatus: 'caughtUp', summaryCompleted, summaryNextAssistantSeq: null, summaryPendingFloorIds: Object.freeze([]), summaryMissingFloorIds, visibleSummaryFloorIds, summaryRealtimeProtected: false, summaryHasPartialWork: false, unregisteredSummaryRefs });
   const realtimeProtected = realtimeOrigin === true
     || pending.every(floor => recent.has(floor.hostLocator.messageIndex) && visibleAssistant(snapshot.chat[floor.hostLocator.messageIndex]));
   const hasPartialWork = pending.some(floor => memoryByFloor.has(floor.id) || deltaByFloor.has(floor.id));
-  const status = (completed > 0 || realtimeOrigin === true) && realtimeProtected && !hasPartialWork && !branchRebuild ? 'realtimeTail' : 'historicalDebt';
+  const status = !partial && (completed > 0 || realtimeOrigin === true) && realtimeProtected && !hasPartialWork && !branchRebuild ? 'realtimeTail' : 'historicalDebt';
   return Object.freeze({ status, hostConfirmed: true, completed, total: floors.length, nextAssistantSeq: pending[0]?.assistantSeq ?? unregisteredSummaryRefs[0]?.assistantSeq ?? null, pendingFloorIds: Object.freeze([...pending.map(floor => floor.id), ...unregisteredSummaryRefs.map(ref => ref.floorId)]), realtimeProtected, hasPartialWork, summaryStatus, summaryCompleted, summaryNextAssistantSeq: summaryPending[0]?.assistantSeq ?? unregisteredSummaryRefs[0]?.assistantSeq ?? null, summaryPendingFloorIds, summaryMissingFloorIds, visibleSummaryFloorIds, summaryRealtimeProtected, summaryHasPartialWork, unregisteredSummaryRefs });
 }
 
@@ -181,9 +190,10 @@ export async function assessMemoryCoverageFromHost({ reachable, snapshot, saniti
     const scanned = await scanAssistantCandidates(snapshot?.chat, { sanitizerOptions, chatId, captureRawContent: captureGuard });
     const hostCandidates = partitionScannedCandidates(reachable, snapshot?.chat, chatId, scanned).all;
     const coverage = assessMemoryCoverage({ reachable, snapshot, hostCandidates, realtimeOrigin });
-    if (!captureGuard) return coverage;
-    const guarded = { ...coverage };
-    Object.defineProperty(guarded, HOST_GUARD, { value: captureHostGuard(snapshot, hostCandidates, hostCoverageProof(reachable, snapshot, hostCandidates)) });
+    const bindings = hostCoverageProof(reachable, snapshot, hostCandidates);
+    const guarded = { ...coverage, ...(bindings?.unmatchedFloorIds.length ? { unmatchedFloorIds: bindings.unmatchedFloorIds } : {}) };
+    Object.defineProperty(guarded, HOST_BINDINGS, { value: bindings });
+    if (captureGuard) Object.defineProperty(guarded, HOST_GUARD, { value: captureHostGuard(snapshot, hostCandidates, bindings) });
     return Object.freeze(guarded);
   } catch {
     const unknown = { status: 'unknown', completed: 0, total: reachable?.floors?.length ?? 0, nextAssistantSeq: null, pendingFloorIds: Object.freeze([]), realtimeProtected: false, hasPartialWork: false, summaryStatus: 'unknown', summaryCompleted: 0, summaryNextAssistantSeq: null, summaryPendingFloorIds: Object.freeze([]), summaryMissingFloorIds: Object.freeze([]), visibleSummaryFloorIds: Object.freeze([]), summaryRealtimeProtected: false, summaryHasPartialWork: false };

@@ -5,9 +5,10 @@ import { API_BASE } from './constants.js';
 const STORAGE_NAMESPACE = 'qqj-bainiao-v1';
 const LOCKS = Symbol.for('qqj.bainiao.tt.locks.v1');
 const error = (status, message) => Object.assign(new Error(message), { status });
-const copy = value => JSON.parse(JSON.stringify(value));
 const abort = signal => { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError'); };
 const encoder = new TextEncoder();
+const BATCH_WRITE_LIMIT = 64, BATCH_WRITE_BYTES = 1048576, WRITE_CONCURRENCY = 4;
+const compareText = (left, right) => left < right ? -1 : left > right ? 1 : 0;
 
 // Rust JSON maps may reorder object fields. Upstream fingerprints include their
 // insertion order, so carry the complete JS serialization across the native ABI.
@@ -119,21 +120,20 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
     if (result?.found !== true) throw error(500, 'Invalid storage response');
     return unpack(result.value, namespace, collection, recordId);
   };
-  const scan = async (store, table, namespace, collection, signal) => {
-    const keys = await store.listKeys({ namespace: STORAGE_NAMESPACE, table });
-    if (!Array.isArray(keys)) throw error(500, 'Invalid storage listing');
-    const slots = [];
-    for (const key of keys) {
-      // Native reads cannot be cancelled once submitted, but cancellation must stop the next read.
-      abort(signal);
-      const slot = await read(store, table, key, namespace, collection);
-      abort(signal);
-      if (!slot || key !== await keyFor(slot.recordId) || table !== await tableFor(namespace, slot.collection)) throw error(500, 'Stored record identity mismatch');
-      slots.push({ table, key, slot });
-    }
-    return slots;
+  const emptySlot = (namespace, collection, recordId) => ({ format: 'qqj-tt-record-v1', namespace, collection, recordId, current: null, trash: [] });
+  const saveSlot = async (store, table, key, slot, body, signal) => {
+    const expected = revision(body?.expectedRevision), actual = slot.current?.revision ?? 0;
+    if (actual !== expected) throw error(409, 'Revision conflict');
+    if (!Object.hasOwn(body, 'data') || actual === Number.MAX_SAFE_INTEGER) throw error(400, 'Invalid record data or revision');
+    const timestamp = new Date().toISOString();
+    const generationId = slot.current?.generationId ?? globalRef.SillyTavern?.getContext?.()?.uuidv4?.() ?? globalRef.crypto?.randomUUID?.();
+    if (!generationId) throw error(500, 'UUID unavailable');
+    slot.current = { schemaVersion: 1, revision: actual + 1, generationId,
+      createdAt: slot.current?.createdAt ?? timestamp, updatedAt: timestamp, data: body.data };
+    abort(signal);
+    await store.setJson({ ...options(table, key), value: encodeSlot(slot) });
+    return slot.current;
   };
-
   const dispatch = async (url, init) => {
     if (typeof url !== 'string' || !url.startsWith(`${API_BASE}/v1/`)) throw error(400, 'Unsupported local backend URL');
     const parts = url.slice(`${API_BASE}/v1/`.length).split('/').map(value => {
@@ -148,29 +148,176 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
       await store.listTables({ namespace: STORAGE_NAMESPACE });
       return { ok: true, plugin: { id: 'st-bainiaodata', name: 'Bainiao Data (TT)', version: '0.1.0-tt.3' },
         api: { current: 1, supported: [1] }, storage: { scope: 'tauritavern-data-root', envelopeSchemaVersion: 1 },
-        capabilities: { records: true, recordList: true, optimisticRevision: true, atomicReplace: true, trash: true,
-          trashRestore: true, permanentDelete: true, pagination: false, batchTransactions: false, trashGc: false },
+        capabilities: { records: true, recordList: true, recordBatchRead: true, recordBatchWrite: true, optimisticRevision: true, atomicReplace: true, trash: true,
+          trashRestore: true, permanentDelete: true, trashGc: true, pagination: false, batchTransactions: false },
         adapter: { version: 3, revisionScope: 'single-app-runtime' } };
     }
     const namespace = segment(parts[1]);
     if (namespace === 'system-trash') throw error(400, 'Reserved namespace');
-    // Namespace lock also protects collection/trash scans against concurrent mutation.
-    return locked(globalRef, `${STORAGE_NAMESPACE}:${namespace}`, async () => {
+    const lockName = `${STORAGE_NAMESPACE}:${namespace}`;
+    if (parts[0] === 'records' && parts.length === 3 && method === 'GET') {
+      const records = [];
+      // Release the shared queue between native records so other chats can load.
+      for await (const record of fetch.iterRecords(namespace, segment(parts[2]), { signal })) records.push(record);
+      return records.sort((a, b) => a.recordId.localeCompare(b.recordId));
+    }
+    if (parts[0] === 'record-batch' && parts.length === 3) {
+      if (method === 'PUT') {
+        if (typeof init.body !== 'string' || encoder.encode(init.body).length > BATCH_WRITE_BYTES) throw error(400, 'Batch exceeds 1MiB');
+        let body;
+        try { body = JSON.parse(init.body); } catch { throw error(400, 'Invalid JSON'); }
+        if (!Array.isArray(body?.records) || body.records.length < 1 || body.records.length > BATCH_WRITE_LIMIT) throw error(400, 'Invalid batch');
+        const collection = segment(parts[2]);
+        const records = body.records.map(item => {
+          if (!item || !Object.hasOwn(item, 'data')) throw error(400, 'Invalid record data');
+          return { recordId: segment(item.recordId), expectedRevision: revision(item.expectedRevision), data: item.data };
+        });
+        if (new Set(records.map(item => item.recordId)).size !== records.length) throw error(400, 'Duplicate record ID');
+        return locked(globalRef, lockName, async () => {
+          abort(signal);
+          const table = await tableFor(namespace, collection), results = new Array(records.length);
+          let cursor = 0;
+          async function worker() {
+            while (cursor < records.length) {
+              abort(signal);
+              const index = cursor++, item = records[index];
+              try {
+                const key = await keyFor(item.recordId);
+                abort(signal);
+                const slot = await read(store, table, key, namespace, collection, item.recordId) ?? emptySlot(namespace, collection, item.recordId);
+                abort(signal);
+                results[index] = { recordId: item.recordId, status: 200, envelope: await saveSlot(store, table, key, slot, item, signal) };
+              } catch (cause) {
+                abort(signal);
+                const status = [400, 409].includes(cause?.status) ? cause.status : 500;
+                results[index] = { recordId: item.recordId, status, error: status === 409 ? 'revision_conflict' : 'storage_error',
+                  message: status === 409 ? 'Revision conflict' : 'Unable to save record' };
+              }
+            }
+          }
+          // Submitted native writes cannot be cancelled; drain every worker before releasing the namespace queue.
+          const workers = await Promise.allSettled(Array.from({ length: Math.min(WRITE_CONCURRENCY, records.length) }, worker));
+          abort(signal);
+          const failed = workers.find(item => item.status === 'rejected');
+          if (failed) throw failed.reason;
+          return results;
+        });
+      }
+      if (method !== 'POST') throw error(405, 'Unsupported method');
+      let body;
+      try { body = JSON.parse(init.body); } catch { throw error(400, 'Invalid JSON'); }
+      if (!Array.isArray(body?.recordIds) || body.recordIds.length < 1 || body.recordIds.length > 64) throw error(400, 'Invalid recordIds');
+      const ids = body.recordIds.map(segment), collection = segment(parts[2]);
+      const table = await tableFor(namespace, collection), results = new Array(ids.length);
+      for (let start = 0; start < ids.length; start += 8) {
+        abort(signal);
+        // Let queued roots/writes run between groups, never during native reads.
+        await locked(globalRef, lockName, async () => {
+          abort(signal);
+          const workers = await Promise.allSettled(ids.slice(start, start + 8).map(async (recordId, offset) => {
+            abort(signal);
+            const index = start + offset;
+            try {
+              const key = await keyFor(recordId);
+              abort(signal);
+              const slot = await read(store, table, key, namespace, collection, recordId);
+              abort(signal);
+              results[index] = slot?.current ? { recordId, status: 200, envelope: slot.current }
+                : { recordId, status: 404, error: 'not_found', message: 'Record not found' };
+            } catch {
+              abort(signal);
+              results[index] = { recordId, status: 500, error: 'storage_error', message: 'Unable to read record' };
+            }
+          }));
+          // Submitted reads must all finish before a copying write can enter.
+          abort(signal);
+          const failed = workers.find(worker => worker.status === 'rejected');
+          if (failed) throw failed.reason;
+        });
+      }
+      return results;
+    }
+    // Native replacement can fall back to copy; reads must still wait for writes.
+    return locked(globalRef, lockName, async () => {
       abort(signal);
       const permanent = parts.length === 5 && parts[4] === 'permanent';
+      const collectExpired = parts[0] === 'trash' && parts.length === 3 && parts[2] === 'collect-expired';
+      if (collectExpired) {
+        if (method !== 'POST') throw error(405, 'Unsupported method');
+        let body;
+        try { body = JSON.parse(init.body); } catch { throw error(400, 'Invalid JSON'); }
+        const limit = body?.limit ?? 32;
+        const cursor = body?.cursor ?? null;
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 32) throw error(400, 'Invalid collection limit');
+        if (cursor !== null && (!cursor || typeof cursor !== 'object' || Array.isArray(cursor))) throw error(400, 'Invalid collection cursor');
+        const afterTable = cursor === null ? null : segment(cursor.table);
+        const afterKey = cursor === null ? null : segment(cursor.key);
+        const tables = await store.listTables({ namespace: STORAGE_NAMESPACE });
+        if (!Array.isArray(tables)) throw error(500, 'Invalid storage listing');
+        let scanned = 0, deleted = 0, failed = 0, nextCursor = null, hasMore = false;
+        const orderedTables = [...tables].map(segment).sort(compareText);
+        outer: for (const table of orderedTables) {
+          if (afterTable !== null && compareText(table, afterTable) < 0) continue;
+          const listedKeys = await store.listKeys({ namespace: STORAGE_NAMESPACE, table });
+          if (!Array.isArray(listedKeys)) throw error(500, 'Invalid storage listing');
+          const keys = [...listedKeys].map(segment).sort(compareText);
+          for (const key of keys) {
+            if (afterTable !== null && (compareText(table, afterTable) < 0 || (table === afterTable && compareText(key, afterKey) <= 0))) continue;
+            if (scanned >= limit) { hasMore = true; break outer; }
+            abort(signal);
+            let found;
+            try { found = await store.tryGetJson(options(table, key)); }
+            catch (failure) {
+              scanned += 1;
+              nextCursor = { table, key };
+              if (signal?.aborted || failure?.name === 'AbortError') throw failure;
+              failed += 1;
+              continue;
+            }
+            abort(signal);
+            scanned += 1;
+            nextCursor = { table, key };
+            if (found?.found === false) continue;
+            if (found?.found !== true) { failed += 1; continue; }
+            let slot, legacy;
+            try { ({ slot, legacy } = decodeSlot(found.value)); }
+            catch { failed += 1; continue; }
+            if (slot?.namespace !== namespace) continue;
+            try {
+              validateSlot(slot, namespace);
+              if (key !== await keyFor(slot.recordId) || table !== await tableFor(namespace, slot.collection)) throw error(500, 'Stored record identity mismatch');
+            } catch { failed += 1; continue; }
+            if (legacy) {
+              await recoverLegacyIndex(slot.current?.data);
+              for (const item of slot.trash) await recoverLegacyIndex(item.envelope.data);
+            }
+            const expired = [], retained = [];
+            for (const item of slot.trash) {
+              const expiresAt = Date.parse(item.expiresAt);
+              if (!Number.isFinite(expiresAt)) { failed += 1; retained.push(item); }
+              else if (expiresAt <= Date.now()) expired.push(item);
+              else retained.push(item);
+            }
+            if (!expired.length) continue;
+            const nextSlot = { ...slot, trash: retained };
+            abort(signal);
+            try {
+              if (nextSlot.current || nextSlot.trash.length) await store.setJson({ ...options(table, key), value: encodeSlot(nextSlot) });
+              else await store.deleteJson(options(table, key));
+              deleted += expired.length;
+            } catch { failed += expired.length; }
+          }
+        }
+        return { scanned, deleted, failed, nextCursor: hasMore ? nextCursor : null, complete: !hasMore };
+      }
       if (parts[0] === 'records' && ([3, 4].includes(parts.length) || permanent)) {
         if (permanent && method !== 'DELETE') throw error(405, 'Unsupported method');
         const collection = segment(parts[2]);
         const table = await tableFor(namespace, collection);
-        if (parts.length === 3 && method === 'GET') {
-          const slots = await scan(store, table, namespace, collection, signal);
-          return slots.filter(({ slot }) => slot.current).map(({ slot }) => ({ recordId: slot.recordId, ...slot.current }))
-            .sort((a, b) => a.recordId.localeCompare(b.recordId));
-        }
         const recordId = segment(parts[3]);
         const key = await keyFor(recordId);
         const slot = await read(store, table, key, namespace, collection, recordId)
-          ?? { format: 'qqj-tt-record-v1', namespace, collection, recordId, current: null, trash: [] };
+          ?? emptySlot(namespace, collection, recordId);
         if (method === 'GET') {
           if (!slot.current) throw error(404, 'Record not found');
           return slot.current;
@@ -178,6 +325,7 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
         if (!['PUT', 'DELETE'].includes(method)) throw error(405, 'Unsupported method');
         let body;
         try { body = JSON.parse(init.body); } catch { throw error(400, 'Invalid JSON'); }
+        if (method === 'PUT') return saveSlot(store, table, key, slot, body, signal);
         const expected = revision(body?.expectedRevision);
         if (method === 'DELETE' && !slot.current) throw error(404, 'Record not found');
         const actual = slot.current?.revision ?? 0;
@@ -192,26 +340,16 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
           return { permanentlyDeleted: true, deletedRevision: actual };
         }
         const timestamp = new Date().toISOString();
-        let result;
-        if (method === 'PUT') {
-          if (!Object.hasOwn(body, 'data') || actual === Number.MAX_SAFE_INTEGER) throw error(400, 'Invalid record data or revision');
-          const generationId = slot.current?.generationId ?? globalRef.SillyTavern?.getContext?.()?.uuidv4?.() ?? globalRef.crypto?.randomUUID?.();
-          if (!generationId) throw error(500, 'UUID unavailable');
-          slot.current = { schemaVersion: 1, revision: actual + 1, generationId,
-            createdAt: slot.current?.createdAt ?? timestamp, updatedAt: timestamp, data: body.data };
-          result = slot.current;
-        } else {
-          const current = slot.current;
-          const trashId = `${current.generationId}-${current.revision}`;
-          const trash = { trashId, namespace, collection, recordId, generationId: current.generationId, revision: current.revision,
-            originalPath: `${namespace}/${collection}/${recordId}.json`, deletedAt: timestamp, deletedRevision: current.revision,
-            expiresAt: new Date(Date.now() + 30 * 86400000).toISOString(), envelope: current };
-          const existing = slot.trash.find(item => item.trashId === trashId);
-          if (existing && JSON.stringify(existing.envelope) !== JSON.stringify(current)) throw error(409, 'Trash conflict');
-          if (!existing) slot.trash.push(trash);
-          slot.current = null;
-          result = { trashId, deletedAt: (existing ?? trash).deletedAt, deletedRevision: current.revision };
-        }
+        const current = slot.current;
+        const trashId = `${current.generationId}-${current.revision}`;
+        const trash = { trashId, namespace, collection, recordId, generationId: current.generationId, revision: current.revision,
+          originalPath: `${namespace}/${collection}/${recordId}.json`, deletedAt: timestamp, deletedRevision: current.revision,
+          expiresAt: new Date(Date.now() + 30 * 86400000).toISOString(), envelope: current };
+        const existing = slot.trash.find(item => item.trashId === trashId);
+        if (existing && JSON.stringify(existing.envelope) !== JSON.stringify(current)) throw error(409, 'Trash conflict');
+        if (!existing) slot.trash.push(trash);
+        slot.current = null;
+        const result = { trashId, deletedAt: (existing ?? trash).deletedAt, deletedRevision: current.revision };
         // Current record and deleted generations live in ONE file: delete cannot
         // lose data between a separate trash write and an unlink on iOS suspension.
         abort(signal);
@@ -255,15 +393,56 @@ export function createTauriBackendFetch({ globalRef = globalThis } = {}) {
       throw error(404, 'Unsupported local backend route');
     });
   };
-  return async (url, init = {}) => {
+  const fetch = async (url, init = {}) => {
     try {
       // Native writes already submitted cannot be cancelled. Keep their lock
       // until completion even if the caller times out, as with an HTTP write.
-      const value = copy(await abortable(() => dispatch(url, init), init.signal));
+      // Native reads and request bodies are freshly parsed JSON; their values
+      // already belong to this request, without another full serialization.
+      const value = await abortable(() => dispatch(url, init), init.signal);
       return { ok: true, status: 200, json: async () => value };
     } catch (cause) {
       if (!Number.isInteger(cause?.status)) throw cause;
       return { ok: false, status: cause.status, json: async () => ({ message: cause.message }) };
     }
   };
+  // Only the key list survives between reads; consumers never hold the namespace lock.
+  fetch.iterRecords = (rawNamespace, rawCollection, { signal: outerSignal } = {}) => {
+    const namespace = segment(rawNamespace), collection = segment(rawCollection);
+    if (namespace === 'system-trash') throw error(400, 'Reserved namespace');
+    const lockName = `${STORAGE_NAMESPACE}:${namespace}`;
+    let store, table, keys, position = 0, closed = false;
+    return {
+      [Symbol.asyncIterator]() { return this; },
+      async next(signal = outerSignal) {
+        return abortable(async () => {
+          if (closed) return { done: true };
+          abort(outerSignal); abort(signal);
+          store ??= await ready(); table ??= await tableFor(namespace, collection);
+          if (!keys) keys = await locked(globalRef, lockName, async () => {
+            abort(outerSignal); abort(signal);
+            const listed = await store.listKeys({ namespace: STORAGE_NAMESPACE, table });
+            abort(outerSignal); abort(signal);
+            if (!Array.isArray(listed)) throw error(500, 'Invalid storage listing');
+            return listed;
+          });
+          while (position < keys.length) {
+            const key = keys[position++];
+            const record = await locked(globalRef, lockName, async () => {
+              abort(outerSignal); abort(signal);
+              const slot = await read(store, table, key, namespace, collection);
+              abort(outerSignal); abort(signal);
+              if (!slot || key !== await keyFor(slot.recordId) || table !== await tableFor(namespace, slot.collection)) throw error(500, 'Stored record identity mismatch');
+              return slot.current ? { recordId: slot.recordId, ...slot.current } : null;
+            });
+            if (record) return { done: false, value: record };
+          }
+          closed = true; keys = null;
+          return { done: true };
+        }, signal);
+      },
+      async return() { closed = true; keys = null; return { done: true }; },
+    };
+  };
+  return fetch;
 }

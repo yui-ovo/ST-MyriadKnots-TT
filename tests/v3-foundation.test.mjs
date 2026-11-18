@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { createBackendClient } from '../src/backend-client.js';
+import { createTauriBackendFetch } from '../src/tauri-backend.js';
 import { createHostAdapter } from '../src/v3/host-adapter.js';
 import { createFoundationStore, reverseRefCandidateKeys } from '../src/v3/foundation-store.js';
 import { buildFoundationIndexes, createFoundationRuntime, validatePreparedFoundation } from '../src/v3/foundation-runtime.js';
-import { deterministicUuid, foundationInputSnapshot, reverseRefShardPrefix, scanAssistantCandidates } from '../src/v3/foundation-domain.js';
+import { createCheckpointInputFingerprints, deterministicUuid, foundationInputSnapshot, reverseRefShardPrefix, scanAssistantCandidates } from '../src/v3/foundation-domain.js';
 import { sha256 } from '../src/identity.js';
 import { entityIndexKey } from '../src/v3/memory-schema.js';
 import { createChatSession } from '../src/chat-session.js';
@@ -13,6 +15,93 @@ import { createV3MemoryRuntime } from '../src/v3/memory-runtime.js';
 
 const CHAT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OTHER_CHAT = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+test('buildFoundationIndexes 复用同聊天同代且 entries 不变的 floorOrder immutable record', async () => {
+  const floors = [
+    { id: '11111111-1111-4111-8111-111111111111', hostLocator: { messageIndex: 1, swipeId: 0, selectedSwipeIndex: 0 } },
+    { id: '22222222-2222-4222-8222-222222222222', hostLocator: { messageIndex: 3, swipeId: 1, selectedSwipeIndex: 1 } },
+  ];
+  const generation = '99999999-9999-4999-8999-999999999999';
+  const first = await buildFoundationIndexes({ chatId: CHAT, narrativeGeneration: generation, checkpointId: '33333333-3333-4333-8333-333333333333', floors, candidates: [], now: '2026-09-02T00:00:00.000Z' });
+  const reused = await buildFoundationIndexes({ chatId: CHAT, narrativeGeneration: generation, checkpointId: '44444444-4444-4444-8444-444444444444', floors, candidates: [], existingIndexes: first, now: '2026-09-02T00:00:01.000Z' });
+  assert.deepEqual(reused, first, 'unchanged floorOrder records keep their immutable identity and key');
+  const changed = await buildFoundationIndexes({ chatId: CHAT, narrativeGeneration: generation, checkpointId: '55555555-5555-4555-8555-555555555555', floors, candidates: [{ hostLocator: floors[0].hostLocator }, { hostLocator: { ...floors[1].hostLocator, messageIndex: 4 } }], existingIndexes: first, now: '2026-09-02T00:00:02.000Z' });
+  assert.notEqual(changed[0].id, first[0].id, 'locator change must create a new index');
+  const wrongChat = await buildFoundationIndexes({ chatId: OTHER_CHAT, narrativeGeneration: generation, checkpointId: '66666666-6666-4666-8666-666666666666', floors, existingIndexes: first, now: '2026-09-02T00:00:03.000Z' });
+  assert.notEqual(wrongChat[0].id, first[0].id, 'index reuse must not cross chat ownership');
+});
+
+test('buildFoundationIndexes 复用128分片且generation变化时不复用', async () => {
+  const floors = Array.from({ length: 129 }, (_, index) => ({
+    id: `${String(index + 1).padStart(8, '0')}-1111-4111-8111-111111111111`,
+    hostLocator: { messageIndex: index * 2 + 1, swipeId: 0, selectedSwipeIndex: 0 },
+  }));
+  const generation = 'aaaaaaaa-1111-4111-8111-111111111111';
+  const first = await buildFoundationIndexes({ chatId: CHAT, narrativeGeneration: generation, checkpointId: '77777777-7777-4777-8777-777777777777', floors, now: '2026-09-02T00:00:00.000Z' });
+  assert.equal(first.length, 2);
+  const reused = await buildFoundationIndexes({ chatId: CHAT, narrativeGeneration: generation, checkpointId: '88888888-8888-4888-8888-888888888888', floors, existingIndexes: first, now: '2026-09-02T00:00:01.000Z' });
+  assert.deepEqual(reused.map(index => index.id), first.map(index => index.id));
+  const changedTail = floors.map((floor, index) => index === floors.length - 1 ? { ...floor, hostLocator: { ...floor.hostLocator, messageIndex: 999 } } : floor);
+  const changed = await buildFoundationIndexes({ chatId: CHAT, narrativeGeneration: generation, checkpointId: '99999999-9999-4999-8999-999999999999', floors: changedTail, existingIndexes: first, now: '2026-09-02T00:00:02.000Z' });
+  assert.equal(changed[0].id, first[0].id);
+  assert.notEqual(changed[1].id, first[1].id);
+  const changedGeneration = await buildFoundationIndexes({ chatId: CHAT, narrativeGeneration: 'bbbbbbbb-2222-4222-8222-222222222222', checkpointId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', floors, existingIndexes: first, now: '2026-09-02T00:00:03.000Z' });
+  assert.ok(changedGeneration.every((index, position) => index.id !== first[position].id));
+});
+
+test('batch foundation without capability retains four single writes and oversized content stays whole', async () => {
+  const source = harness([assistant('甲'.repeat(400000)), assistant('B'), assistant('C'), assistant('D'), assistant('E'), assistant('F')]);
+  await source.runtime.start(); const records = [...source.backend.records.values()].map(item => item.data).filter(item => item.recordType === 'floor').sort((left, right) => left.assistantSeq - right.assistantSeq);
+  assert.equal(records[0].content.canonicalContent.length, 400000);
+  assert.ok(Buffer.byteLength(JSON.stringify(records[0])) > 1048576);
+  const target = backendHarness(); let active = 0, maxActive = 0, batchCalls = 0;
+  const put = target.client.put;
+  target.client.put = async (...args) => { active++; maxActive = Math.max(maxActive, active); try { await new Promise(resolve => setTimeout(resolve, 2)); return await put(...args); } finally { active--; } };
+  target.client.putMany = async (_collection, writes) => { batchCalls++; assert.ok(Buffer.byteLength(JSON.stringify({ records: writes })) <= 1048576); return null; };
+  const store = createFoundationStore({ client: target.client, contextProvider: () => ({ chatId: CHAT }) });
+  const saved = await store.putRecords(records); assert.equal(saved.length, records.length); assert.ok(saved.every(item => item.status === 'saved'));
+  assert.ok(maxActive <= 4); assert.ok(maxActive > 1); assert.equal(batchCalls, 1, '超大首条跳过批接口，其余原单写');
+  assert.equal(target.records.get(`chat-${CHAT}/${store.recordKey(records[0])}`).data.content.canonicalContent, records[0].content.canonicalContent);
+});
+test('batch foundation keeps acknowledged successes before a same-package failure and stages their cache', async () => {
+  const source = harness(); await source.runtime.start();
+  const sourceRecords = [...source.backend.records.values()].map(item => item.data);
+  const root = sourceRecords.find(item => item.recordType === 'root');
+  const checkpoint = sourceRecords.find(item => item.recordType === 'checkpoint' && item.id === root.headCheckpointId);
+  const records = sourceRecords.filter(item => !['root', 'checkpoint'].includes(item.recordType));
+  const failed = records.find(item => item.recordType === 'floor'), target = backendHarness();
+  let published = [];
+  const store = createFoundationStore({ client: target.client, contextProvider: () => ({ chatId: CHAT }), coreRecordCache: {
+    scopeFor: async () => ({}), captureIdentityVersion: () => 0, publish: async (_scope, _witness, staged) => { published = staged; },
+  } });
+  target.client.putMany = async (collection, writes) => Promise.all(writes.map(async item => item.data.id === failed.id
+    ? { recordId: item.recordId, status: 500, error: 'storage_error', message: 'Unable to save record' }
+    : { recordId: item.recordId, status: 200, envelope: await target.client.put(collection, item.recordId, item.data, 0) }));
+  await assert.rejects(store.putRecords(records), error => error.status === 500);
+  await store.putRecord(checkpoint);
+  target.calls.length = 0;
+  assert.equal(target.records.has(`chat-${CHAT}/v3-root`), false);
+  await store.putRecord(failed); const committed = await store.commitRoot(root, 0);
+  for (const floor of records.filter(item => item.recordType === 'floor' && item.id !== failed.id)) assert.equal(target.calls.some(call => call[0] === 'get' && call[2] === store.recordKey(floor)), false, '其它已确认floor不回读');
+  assert.equal(committed.status, 'saved'); assert.equal(published.filter(item => item.envelope.data.recordType === 'floor').length, checkpoint.producedRefs.floors.length);
+});
+
+test('batch foundation confirms each byte-sized package before a later HTTP failure', async () => {
+  const source = harness([assistant('甲'.repeat(200000)), assistant('乙'.repeat(200000)), assistant('尾楼')]); await source.runtime.start();
+  const all = [...source.backend.records.values()].map(item => item.data), root = all.find(item => item.recordType === 'root');
+  const floors = all.filter(item => item.recordType === 'floor'), target = backendHarness(); let batches = 0;
+  const store = createFoundationStore({ client: target.client, contextProvider: () => ({ chatId: CHAT }) });
+  target.client.putMany = async (collection, writes) => {
+    assert.ok(Buffer.byteLength(JSON.stringify({ records: writes })) <= 1048576); batches++;
+    if (batches === 2) throw Object.assign(new Error('HTTP503'), { status: 503 });
+    return Promise.all(writes.map(async item => ({ recordId: item.recordId, status: 200, envelope: await target.client.put(collection, item.recordId, item.data, 0) })));
+  };
+  await assert.rejects(store.putRecords(floors), error => error.status === 503); assert.equal(batches, 2);
+  for (const item of all.filter(item => !['floor', 'root'].includes(item.recordType))) await store.putRecord(item);
+  target.calls.length = 0; await assert.rejects(store.commitRoot(root, 0));
+  assert.equal(target.calls.some(call => call[0] === 'get' && call[2] === store.recordKey(floors[0])), false);
+  assert.equal(target.records.has(`chat-${CHAT}/v3-root`), false);
+});
 const assistant = (mes, extra = {}) => ({ is_user: false, is_system: false, mes, swipes: [mes], swipe_id: 0, extra, ...extra });
 const hiddenAssistant = mes => ({ ...assistant(mes), is_system: true, extra: {} });
 const user = mes => ({ is_user: true, is_system: false, mes, send_date: `test-user:${mes}` });
@@ -485,6 +574,87 @@ test('生产 scanner 与 foundation runtime 跳过空/假 system narrator，并�
   assert.equal(state.pending?.messageIndex, 1, 'narrator 后的 AI 无 user 时仍保持 pending');
 });
 
+test('排除标记保留原 assistantSeq，并进入稳定输入指纹', async () => {
+  const chat = [assistant('连续 AI 1', { qianqianjie_memory_excluded: true }), assistant('连续 AI 2'), user('稳定锚')];
+  const candidates = await scanAssistantCandidates(chat, { chatId: CHAT });
+  assert.deepEqual(candidates.map(item => [item.assistantSeq, item.hostLocator.messageIndex, item.memoryExcluded]), [
+    [1, 0, true], [2, 1, false],
+  ]);
+  const excludedSnapshot = await foundationInputSnapshot(candidates, 2);
+  chat[0].extra.qianqianjie_memory_excluded = false;
+  const restoredCandidates = await scanAssistantCandidates(chat, { chatId: CHAT });
+  const restoredSnapshot = await foundationInputSnapshot(restoredCandidates, 2);
+  assert.notEqual(restoredSnapshot.fingerprint, excludedSnapshot.fingerprint, '恢复标记必须让已加载的基础投影失效');
+});
+
+test('排除见证随普通后续checkpoint保存保留，恢复候选显式清除旧见证', () => {
+  const floors = [
+    { id: '11111111-1111-4111-8111-111111111111', content: { canonicalFingerprint: 'sha256:a' }, stability: {} },
+    { id: '22222222-2222-4222-8222-222222222222', content: { canonicalFingerprint: 'sha256:b' }, stability: {} },
+  ];
+  const previous = createCheckpointInputFingerprints(floors, { candidates: [{ memoryExcluded: true }, {}] });
+  const next = createCheckpointInputFingerprints(floors, { previous });
+  assert.equal(next[0].memoryExcluded, true, '后续摘要/CSE checkpoint 未重新提供候选时沿同楼 ID 保存排除见证');
+  const restored = createCheckpointInputFingerprints(floors, { candidates: [{ memoryExcluded: false }, {}], previous: next });
+  assert.equal(Object.hasOwn(restored[0], 'memoryExcluded'), false, '恢复候选明确覆盖旧 true');
+});
+
+test('连续 AI 可越过明确排除楼；恢复时保留序号并回到正常待补投影', async () => {
+  const excluded = assistant('标记楼', { qianqianjie_memory_excluded: true });
+  const next = assistant('应继续处理的楼');
+  const h = harness([excluded, next, user('稳定锚')], { modernAnchors: true });
+  let state = await h.runtime.start();
+  assert.equal(state.stableCount, 2);
+  assert.deepEqual(h.runtime.getReachable().floors.map(floor => [floor.assistantSeq, floor.hostLocator.messageIndex]), [[1, 0], [2, 1]]);
+  assert.deepEqual(h.runtime.getReachable().floorMemories, [], '排除楼不能形成空摘要或其他伪记忆');
+  delete excluded.extra.qianqianjie_memory_excluded;
+  state = await h.runtime.refreshStatus();
+  assert.equal(state.stableCount, 2);
+  assert.equal(state.lastRun.result, 'committed');
+});
+
+test('正式foundation入口允许无已保存记忆的楼排除与恢复，保留完整结构楼序', async () => {
+  const h = harness([user('提问'), assistant('先前未登记的 AI'), assistant('后续 AI'), user('继续')], { modernAnchors: true });
+  let saves = 0;
+  h.context.saveChat = async () => { saves += 1; return true; };
+  await h.runtime.start();
+  assert.equal(h.runtime.getReachable().root, null, '首个AI待下一条用户消息，仍未登记');
+  const result = await h.runtime.setMemoryExcluded(1, true);
+  assert.equal(result.status, 'persisted');
+  assert.equal(saves, 1, '点击只沿宿主保存入口写一次，不调用模型或额外存储');
+  let reachable = h.runtime.getReachable();
+  assert.deepEqual(reachable.floors.map(floor => [floor.assistantSeq, floor.hostLocator.messageIndex]), [[1, 1], [2, 2]]);
+  assert.deepEqual(reachable.floorMemories, [], '排除楼保留结构序号但不伪造摘要记录');
+  const laterMarked = await h.runtime.setMemoryExcluded(2, true);
+  assert.equal(laterMarked.status, 'persisted', '已建floor但尚无摘要仍属于未记录楼');
+  assert.equal(saves, 2);
+  const restored = await h.runtime.setMemoryExcluded(1, false);
+  assert.equal(restored.status, 'persisted');
+  assert.equal(saves, 3);
+  reachable = h.runtime.getReachable();
+  assert.deepEqual(reachable.floors.map(floor => [floor.assistantSeq, floor.hostLocator.messageIndex]), [[1, 1], [2, 2]]);
+  assert.equal((await h.runtime.setMemoryExcluded(2, false)).status, 'persisted');
+  assert.equal(saves, 4);
+});
+
+test('已有foundation楼但尚无记忆时允许排除与恢复', async () => {
+  const h = harness([assistant('已经登记的 AI'), user('后续用户')], { modernAnchors: true });
+  let saves = 0;
+  h.context.saveChat = async () => { saves += 1; return true; };
+  await h.runtime.start();
+  assert.equal(h.runtime.getReachable().floors.length, 1);
+  assert.deepEqual(h.runtime.getReachable().floorMemories, []);
+  const result = await h.runtime.setMemoryExcluded(0, true);
+  assert.equal(result.status, 'persisted');
+  assert.equal(saves, 1);
+  assert.deepEqual(h.runtime.getReachable().floors.map(floor => floor.assistantSeq), [1]);
+  assert.deepEqual(h.runtime.getReachable().floorMemories, []);
+  const restored = await h.runtime.setMemoryExcluded(0, false);
+  assert.equal(restored.status, 'persisted');
+  assert.equal(saves, 2);
+  assert.deepEqual(h.runtime.getReachable().floors.map(floor => floor.assistantSeq), [1]);
+});
+
 test('初始化时 /hide AI 与普通 AI 共用相同 stable／pending 规则', async () => {
   const hiddenStable = harness([hiddenAssistant('隐藏 stable'), assistant('普通 pending')]);
   let state = await hiddenStable.runtime.start();
@@ -620,7 +790,7 @@ test('成功 fresh read 与 adopt 清除旧读取错误，失败 adopt 不洗绿
   });
   let state = await h.runtime.inspect('failedProjection', { allowCached: false });
   assert.equal(state.status, 'error');
-  assert.equal(state.lastError, '后端数据检查失败，请稍后重试。');
+  assert.equal(state.lastError, '读取聊天记忆失败。请稍后重试；仍失败时，请到“记忆管理”页点击“复制状态诊断”反馈。');
 
   h.backend.setBeforeGet(null);
   state = await h.runtime.inspect('cacheOnly', { allowCached: true });
@@ -630,7 +800,7 @@ test('成功 fresh read 与 adopt 清除旧读取错误，失败 adopt 不洗绿
   state = await h.runtime.inspect('failedAgain', { allowCached: false });
   assert.equal(state.status, 'error');
   assert.equal(h.runtime.adoptReachable({ ...verified, root: { ...verified.root, chatId: OTHER_CHAT } }), false);
-  assert.equal(h.runtime.getState().lastError, '后端数据检查失败，请稍后重试。', '失败 adopt 不能清除读取错误');
+  assert.equal(h.runtime.getState().lastError, '读取聊天记忆失败。请稍后重试；仍失败时，请到“记忆管理”页点击“复制状态诊断”反馈。', '失败 adopt 不能清除读取错误');
 
   assert.equal(h.runtime.adoptReachable(verified), true);
   assert.equal(h.runtime.getState().status, 'ready');
@@ -673,7 +843,34 @@ test('健康缓存打开与连续 fresh 刷新只核 root，版本变化才重�
   assert.ok(graphGets().length > 0, 'root 版本变化时必须重新读取受影响的完整图');
 });
 
-test('canonical 相同的未摘要稳定编辑保留楼；标点级变化只替换本楼', async () => {
+test('正文待核且root未变时，连续inspect只核root并保留原待核原因', async t => {
+  const scenarios = [
+    { name: '新增尾楼', change: h => h.context.chat.push(assistant('D')), reason: { code: 'stableCountMismatch', assistantSeq: 3, messageIndex: 2, expectedCount: 2, actualCount: 3 }, stableCount: 3 },
+    { name: '编辑正文', change: h => { h.context.chat[0] = assistant('A 已编辑'); }, reason: { code: 'fingerprintMismatch', assistantSeq: 1, messageIndex: 0, expectedCount: 2, actualCount: 3, markerStatus: 'none', rawFingerprintMatches: false, canonicalFingerprintMatches: false, sanitizerFingerprintMatches: true }, stableCount: 2 },
+    { name: '删除尾楼', change: h => h.context.chat.pop(), reason: { code: 'stableCountMismatch', assistantSeq: 2, messageIndex: 1, expectedCount: 2, actualCount: 1 }, stableCount: 1 },
+  ];
+  for (const scenario of scenarios) for (const allowCached of [false, true]) await t.test(`${scenario.name}, allowCached=${allowCached}`, async () => {
+    const h = harness();
+    await h.runtime.start();
+    const persisted = structuredClone(h.backend.records);
+    scenario.change(h);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      h.backend.calls.length = 0;
+      const state = await h.runtime.inspect('bodyChanged', { allowCached });
+      assert.equal(state.status, 'needsReview');
+      assert.deepEqual(state.reviewReason, scenario.reason);
+      assert.equal(state.inspectedStableCount, scenario.stableCount);
+      assert.equal(state.lastError, null);
+      assert.deepEqual(h.backend.calls, [['get', `chat-${CHAT}`, 'v3-root']], '同根待核只读取root，不重读图或保存');
+    }
+    assert.deepEqual(h.backend.records, persisted);
+    h.context.chat = [assistant('A'), assistant('B'), assistant('C')];
+    assert.equal((await h.runtime.inspect('bodyRestored', { allowCached: false })).status, 'ready');
+    assert.equal(h.runtime.getState().reviewReason, null);
+  });
+});
+
+test('canonical 相同的未摘要稳定编辑保留楼；无锚正文变化只待核并保留原存档', async () => {
   const h = harness([assistant(' A '), assistant('B'), assistant('C')]);
   await h.runtime.start();
   const firstRoot = h.backend.records.get(`chat-${CHAT}/v3-root`).data;
@@ -688,9 +885,9 @@ test('canonical 相同的未摘要稳定编辑保留楼；标点级变化只替�
   assert.equal(state.status, 'ready');
   h.context.chat[0] = assistant('A！');
   state = await h.runtime.refreshStatus();
-  assert.equal(state.status, 'ready');
-  assert.equal(state.lastRun.mode, 'incremental');
-  assert.equal(state.lastRun.result, 'committed');
+  assert.equal(state.status, 'needsReview');
+  assert.deepEqual(h.runtime.getReachable().floors.map(floor => floor.id), firstCheckpoint.floorRange.floorIds);
+  assert.equal(h.runtime.getReachable().floors[0].content.canonicalContent, 'A', '无锚新对象不猜原楼身份或改写旧正文');
   assert.equal(h.backend.records.get(`chat-${CHAT}/v3-root`).data.narrativeGeneration, generation);
 });
 
@@ -974,8 +1171,8 @@ test('新布局各读模式只读楼序索引，并将其视为完整索引集',
   assert.equal(h.backend.calls.filter(call => call[0] === 'get' && call[2].startsWith('v3-index-')).length, full.checkpoint.producedRefs.indexes.length);
 });
 
-test('53 楼/15 实体同形输入在内存 backend 实测新旧索引 PUT，并对照 53 楼完整冷读 GET', async () => {
-  const h = harness(Array.from({ length: 53 }, (_, index) => assistant(`统计楼-${index + 1}`)));
+test('67 楼/15 实体同形输入在内存 backend 实测新旧索引 PUT，并对照分批冷读', async () => {
+  const h = harness(Array.from({ length: 67 }, (_, index) => assistant(`统计楼-${index + 1}`)));
   await h.runtime.start();
   await anchorLatest(h, '确认第 53 楼');
   const store = createFoundationStore({
@@ -987,8 +1184,49 @@ test('53 楼/15 实体同形输入在内存 backend 实测新旧索引 PUT，并
   const current = await store.readReachable();
   const newReadGets = h.backend.calls.filter(call => call[0] === 'get').length;
   assert.equal(current.status, 'ready');
-  assert.equal(current.floors.length, 53);
-  assert.equal(newReadGets, 57, '新布局完整冷读为 root + checkpoint + run + 53 floors + 1 floorOrder');
+  assert.equal(current.floors.length, 67);
+  assert.equal(newReadGets, 71, '逐条回落完整冷读为 root + checkpoint + run + 67 floors + 1 floorOrder');
+
+  const requests = [];
+  const batchClient = createBackendClient({ fetchImpl: async (url, options = {}) => {
+    requests.push({ url, options });
+    if (url.endsWith('/v1/health')) return { ok: true, status: 200, json: async () => ({ ok: true,
+      api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true, recordBatchRead: true } }) };
+    if (url.includes('/v1/record-batch/')) {
+      const { recordIds } = JSON.parse(options.body);
+      const collection = decodeURIComponent(url.split('/').at(-1));
+      return { ok: true, status: 200, json: async () => recordIds.map(recordId => {
+        const record = h.backend.records.get(`${collection}/${recordId}`);
+        return record
+          ? { recordId, status: 200, envelope: { schemaVersion: 1, revision: record.revision,
+            generationId: '11111111-1111-4111-8111-111111111111', createdAt: record.createdAt, updatedAt: record.createdAt,
+            data: structuredClone(record.data) } }
+          : { recordId, status: 404, error: 'not_found', message: 'Record not found' };
+      }) };
+    }
+    const parts = url.split('/');
+    const collection = decodeURIComponent(parts.at(-2)), recordId = decodeURIComponent(parts.at(-1));
+    const record = h.backend.records.get(`${collection}/${recordId}`);
+    return record
+      ? { ok: true, status: 200, json: async () => ({ schemaVersion: 1, revision: record.revision,
+        generationId: '11111111-1111-4111-8111-111111111111', createdAt: record.createdAt, updatedAt: record.createdAt,
+        data: structuredClone(record.data) }) }
+      : { ok: false, status: 404, json: async () => ({}) };
+  } });
+  const batchStore = createFoundationStore({ client: batchClient, contextProvider: () => ({ hostChatId: h.context.chatId,
+    chatId: CHAT, characterLocator: 'character.png', personaLocator: 'persona.png' }) });
+  const batchRead = await batchStore.readReachable();
+  const batchCalls = requests.filter(call => call.url.includes('/v1/record-batch/'));
+  const floorBatches = batchCalls.map(call => JSON.parse(call.options.body).recordIds).filter(ids => ids.every(id => id.startsWith('v3-floor-')));
+  assert.equal(batchRead.status, 'ready');
+  assert.equal(batchRead.floors.length, 67);
+  assert.ok(batchCalls.length >= 2, '正式冷读应批量读取楼记录和索引');
+  assert.ok(batchCalls.every(call => JSON.parse(call.options.body).recordIds.length <= 64), 'getMany 单批最多 64 条');
+  const floorBatchSizes = floorBatches.map(ids => ids.length);
+  assert.deepEqual(floorBatchSizes, [64, 3], '67 条 FloorRecord 按 64+3 分组且结果顺序保持');
+  assert.deepEqual(batchRead.floors.map(floor => floor.id), current.floors.map(floor => floor.id));
+  assert.equal(requests.filter(call => call.url.endsWith('/v1/health')).length, 1, '未预热 capability 时由真实 BackendClient 惰性协商一次');
+  assert.equal(requests.filter(call => !call.options.method && !call.url.endsWith('/v1/health')).length, 3, 'root、checkpoint、run 仍逐条读取');
 
   const entities = Array.from({ length: 15 }, (_, index) => ({
     id: `${String(index + 1).padStart(8, '0')}-dddd-4ddd-8ddd-${String(index + 1).padStart(12, '0')}`,
@@ -1010,7 +1248,6 @@ test('53 楼/15 实体同形输入在内存 backend 实测新旧索引 PUT，并
   await Promise.all(legacyIndexes.map(index => store.putRecord(index)));
   const legacyIndexPuts = h.backend.calls.filter(call => call[0] === 'put').length;
   assert.equal(newIndexPuts, 1);
-  assert.equal(legacyIndexPuts, 137);
   assert.equal(legacyIndexPuts, legacyIndexes.length);
 
   const legacy = await installLegacyIndexFixture(h);
@@ -1019,8 +1256,52 @@ test('53 楼/15 实体同形输入在内存 backend 实测新旧索引 PUT，并
   const legacyReadGets = h.backend.calls.filter(call => call[0] === 'get').length;
   assert.equal(legacyCold.status, 'ready');
   assert.equal(legacyCold.floors.length, current.floors.length);
-  assert.equal(legacyReadGets, 151);
   assert.equal(legacyReadGets, 3 + current.floors.length + legacy.indexes.length);
+});
+
+test('CSE settled 批读传输失败仍保留已保存摘要与核心记忆', async () => {
+  const h = harness([assistant('上一楼稳定摘要'), user('确认上一楼'), assistant('摘要正文应保留'), user('确认本楼')]);
+  await h.runtime.start();
+  const started = await h.runtime.refreshStatus();
+  assert.equal(started.status, 'ready');
+  const floor = h.runtime.getReachable().floors.at(-1);
+  assert.ok(floor, '夹具先建立可用稳定楼');
+  const task = async options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics'
+    ? { jsonData: { summary: '本地夹具保存的核心摘要' } }
+    : { jsonData: { noMaterialChange: true } };
+  const memoryRuntime = createV3MemoryRuntime({ foundationRuntime: h.runtime, store: h.store, hostAdapter: h.hostAdapter,
+    generateAnalysisTask: task, generateUtilityTask: task, now: () => new Date('2026-09-02T00:00:00.000Z'),
+    newUuid: uuidFactory(40000), logger: { warn() {} } });
+  await memoryRuntime.start();
+  await memoryRuntime.extractFloor(floor.id);
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(before.floorMemories.length, 1);
+  assert.equal(before.stateDeltas.length, 1, '夹具已保存对应 CSE delta');
+  const beforeMemory = before.floorMemories[0];
+  const batchCalls = [];
+  const client = {
+    get: (...args) => h.backend.client.get(...args),
+    put: (...args) => h.backend.client.put(...args),
+    async getMany(collection, recordIds) {
+      batchCalls.push(recordIds);
+      if (recordIds.some(id => id.startsWith('v3-state-delta-'))) throw new Error('simulated CSE batch transport failure');
+      return recordIds.map(recordId => {
+        const saved = h.backend.records.get(`${collection}/${recordId}`);
+        return saved ? { recordId, status: 200, envelope: { schemaVersion: 1, revision: saved.revision,
+          generationId: '11111111-1111-4111-8111-111111111111', createdAt: saved.createdAt, updatedAt: saved.createdAt,
+          data: structuredClone(saved.data) } } : { recordId, status: 404 };
+      });
+    },
+  };
+  const store = createFoundationStore({ client, contextProvider: () => ({ hostChatId: h.context.chatId, chatId: CHAT,
+    characterLocator: 'character.png', personaLocator: 'persona.png' }) });
+  const fallback = await store.readReachable({ mode: 'runtime', allowRecallCseFallback: true });
+  assert.ok(batchCalls.some(ids => ids.some(id => id.startsWith('v3-state-delta-'))), '正式 settled delta 批读触发传输错误');
+  assert.equal(fallback.status, 'ready');
+  assert.equal(fallback.cseUnavailable, true, '读取能力降级只标记 CSE 不可用');
+  assert.deepEqual(fallback.floorMemories.map(({ id, floorId, summary }) => ({ id, floorId, summary })),
+    [{ id: beforeMemory.id, floorId: beforeMemory.floorId, summary: beforeMemory.summary }]);
+  assert.equal(fallback.floorMemories[0].summary.aiText, '本地夹具保存的核心摘要');
 });
 
 test('无布局标识的旧 checkpoint 冷读按四类索引校验，首次新提交自然切换到 floorOrder-v1', async () => {
@@ -1047,6 +1328,35 @@ test('无布局标识的旧 checkpoint 冷读按四类索引校验，首次新�
   assert.equal(upgraded.checkpoint.indexLayout, 'floorOrder-v1');
   assert.ok(upgraded.indexes.every(index => index.kind === 'floorOrder'));
   assert.ok(legacy.keys.every(key => h.backend.records.has(`chat-${CHAT}/${key}`)), '旧辅助索引保留为不可达历史记录');
+});
+
+test('旧索引图的首次实际 CSE 提交重建 floorOrder，后续提交复用新索引', async () => {
+  const h = harness([assistant('旧图楼'), user('确认旧图楼'), assistant('待分析楼'), user('确认待分析楼')]);
+  await h.runtime.start();
+  const task = async options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics'
+    ? { jsonData: { summary: '旧图 CSE 回归摘要' } }
+    : { jsonData: { noMaterialChange: true } };
+  const memoryRuntime = createV3MemoryRuntime({ foundationRuntime: h.runtime, store: h.store, hostAdapter: h.hostAdapter,
+    generateAnalysisTask: task, generateUtilityTask: task, now: () => new Date('2026-09-02T00:00:00.000Z'),
+    newUuid: uuidFactory(12000), logger: { warn() {} } });
+  await memoryRuntime.start();
+  const floor = h.runtime.getReachable().floors.at(-1);
+  await memoryRuntime.extractFloor(floor.id, { analyzeState: false });
+  const legacy = await installLegacyIndexFixture(h);
+  assert.equal((await h.store.readReachable({ mode: 'runtime', bypassCache: true })).stateDeltas.length, 0);
+  const indexPuts = [];
+  h.backend.setBeforePut(({ key, data }) => { if (data?.recordType === 'index') indexPuts.push(key); });
+  const first = await memoryRuntime.retryStateAnalysis(floor.id);
+  assert.equal(first.lastCseError, null);
+  assert.ok(indexPuts.length > 0, '旧布局首次实际 CSE 提交必须写入 floorOrder 索引');
+  const upgraded = await h.store.readReachable({ mode: 'runtime', bypassCache: true });
+  assert.equal(upgraded.checkpoint.indexLayout, 'floorOrder-v1');
+  assert.ok(upgraded.indexes.every(index => index.kind === 'floorOrder'));
+  assert.ok(legacy.keys.every(key => h.backend.records.has(`chat-${CHAT}/${key}`)), '旧索引仍保留');
+  indexPuts.length = 0;
+  const second = await memoryRuntime.retryStateAnalysis(floor.id);
+  assert.equal(second.lastCseError, null);
+  assert.deepEqual(indexPuts, [], '切换 floorOrder-v1 后重复提交应复用索引');
 });
 
 test('现代 active manifest 指向缺失索引时拒绝 ready，不冒充 legacy 重封口', async () => {
@@ -1237,6 +1547,38 @@ test('CHAT_CHANGED 先于 UUID 落盘时复用 session.prepare，最终 ready �
   assert.deepEqual(unhandled, []);
 });
 
+test('AI0尚未稳定时保持待记录，首个USER稳定后继续正常地基准备，真实身份错误仍可见', async () => {
+  let session;
+  const waiting = harness([assistant('AI0 正文仍在生成')], { prepareSession: () => session.prepare() });
+  waiting.context.chatId = '';
+  session = createChatSession({ contextProvider: () => waiting.context });
+  const waitingState = await waiting.runtime.start();
+  assert.equal(waitingState.status, 'uninitialized');
+  assert.equal(waitingState.lastError, null);
+  assert.equal(waiting.backend.calls.length, 0, '宿主尚未建立聊天时不应读取记忆后端');
+
+  let currentSession;
+  const progressing = harness([assistant('AI0 正文')], { prepareSession: () => currentSession.prepare() });
+  currentSession = createChatSession({ contextProvider: () => progressing.context });
+  const initial = await progressing.runtime.start();
+  assert.equal(initial.status, 'uninitialized', '没有稳定边界时AI0正文只显示待记录状态');
+  assert.equal(initial.inspectedStableCount, 0);
+  progressing.context.chat.push(user('首个USER'));
+  const continued = await progressing.runtime.refreshStatus();
+  assert.equal(continued.status, 'ready');
+  assert.equal(continued.stableCount, 1);
+  assert.deepEqual(progressing.runtime.getReachable().floors.map(floor => floor.content.canonicalContent), ['AI0 正文']);
+
+  let failedSession;
+  const failed = harness([assistant('AI0 正文')], { prepareSession: () => failedSession.prepare() });
+  failedSession = createChatSession({ contextProvider: () => failed.context, identityCoordinator: {
+    async prepare() { throw Object.assign(new Error('聊天身份保存失败，请检查宿主聊天存档。'), { code: 'QQJ_TARGET_CHAT_SAVE_FAILED' }); },
+  } });
+  const failedState = await failed.runtime.start();
+  assert.equal(failedState.status, 'error');
+  assert.match(failedState.lastError, /聊天身份保存失败/u);
+});
+
 test('同 chat 两个并发 run 只有一个 root CAS 合法提交', async () => {
   const h = harness([assistant('A'), assistant('B'), assistant('C')]);
   const secondStore = createFoundationStore({
@@ -1271,7 +1613,7 @@ test('同 chat 两个并发 run 只有一个 root CAS 合法提交', async () =>
   assert.equal(checkpoint.floorRange.toAssistantSeq, 2);
 });
 
-test('swipe 删除：未选项不回退，未摘要当前选中项按本楼替换', async () => {
+test('swipe 删除未选项不回退，无锚当前正文替换保留原楼待核', async () => {
   const swiped = (values, selected) => ({ is_user: false, is_system: false, mes: values[selected], swipes: values, swipe_id: selected });
   const h = harness([swiped(['A0', 'A1'], 0), assistant('B'), assistant('C')]);
   await h.runtime.start();
@@ -1283,8 +1625,9 @@ test('swipe 删除：未选项不回退，未摘要当前选中项按本楼替�
   assert.equal(state.headCheckpointId, rootBefore.headCheckpointId);
   h.context.chat[0] = swiped(['A2'], 0);
   state = await h.runtime.refreshStatus();
-  assert.equal(state.lastRun.result, 'committed');
-  assert.notEqual(h.runtime.getReachable().floors[0].id, floorIdsBefore[0]);
+  assert.equal(state.status, 'needsReview');
+  assert.equal(h.runtime.getReachable().floors[0].id, floorIdsBefore[0]);
+  assert.equal(h.runtime.getReachable().floors[0].content.canonicalContent, 'A0');
   assert.equal(state.stableBoundary.floorId, rootBefore.stableBoundary.floorId);
 });
 
@@ -1370,7 +1713,7 @@ test('FloorRecord 正文与 canonicalFingerprint 必须本地互证，冷读取�
   });
   const stagedState = await stagedRuntime.start();
   assert.equal(stagedState.status, 'error');
-  assert.equal(stagedState.lastError, '后端数据处理失败，请稍后重试。');
+  assert.equal(stagedState.lastError, '处理聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。');
 });
 
 test('active checkpoint 的 committing run 冷启动幂等收敛 completed，非 active run 保持不变', async () => {
@@ -1475,7 +1818,7 @@ test('513 楼新布局只写 floorOrder 分页，冷恢复可读', async () => {
   assert.equal(recovered.floors.length, 513);
 });
 
-test('A-old/B/C 与 A-new/B/C 交错 CAS 后自动收敛，新快照 run 安全重基', async () => {
+test('A-old与无锚A-new交错CAS保赢方存档，身份待核不猜楼自动重基', async () => {
   const h = harness([assistant('A-old'), assistant('B'), assistant('C')]);
   const secondStore = createFoundationStore({
     client: h.backend.client,
@@ -1513,16 +1856,21 @@ test('A-old/B/C 与 A-new/B/C 交错 CAS 后自动收敛，新快照 run 安全�
   h.backend.setBeforePut(null);
   const reachable = await secondStore.readReachable();
   assert.equal(reachable.status, 'ready');
-  assert.equal(reachable.floors[0].content.canonicalContent, 'A-new');
+  assert.equal(reachable.floors[0].content.canonicalContent, 'A-old');
+  assert.equal(second.getState().status, 'error');
+  assert.equal(second.getState().activeRun, null);
+  assert.equal(second.getState().lastRun.phase, 'retryableError');
+  assert.match(second.getState().lastError, /记录发生冲突/u);
   assert.equal(reachable.root.sourceSnapshotFingerprint, reachable.checkpoint.sourceSnapshotFingerprint);
   const oldFloors = [...h.backend.records.values()].filter(item => item.data.recordType === 'floor' && item.data.content.canonicalContent === 'A-old');
   assert.ok(oldFloors.length > 0);
   const oldRunIds = new Set(oldFloors.map(item => item.data.processing.runId));
   const oldRuns = [...h.backend.records.values()].filter(item => item.data.recordType === 'run' && oldRunIds.has(item.data.id));
-  assert.ok(oldRuns.every(item => item.data.phase !== 'completed'), '旧输入 run 不得最终 completed');
+  assert.ok(oldRuns.length > 0, '原输入运行记录保留供诊断');
+  assert.equal(h.backend.records.get(`chat-${CHAT}/v3-run-${reachable.checkpoint.runId}`)?.data.phase, 'completed', '赢方checkpoint所引用的正式run已完成');
 });
 
-test('mutation 恰好发生在 CAS 请求在途时自动二次收敛且无未处理拒绝', async () => {
+test('CAS在途出现无锚新正文时保正式存档待核，且无未处理拒绝', async () => {
   const h = harness([assistant('A-old'), assistant('B'), assistant('C')]);
   let mutated = false;
   h.backend.setBeforePut(async ({ key }) => {
@@ -1535,14 +1883,15 @@ test('mutation 恰好发生在 CAS 请求在途时自动二次收敛且无未处
   process.on('unhandledRejection', onUnhandled);
   try {
     const state = await h.runtime.start();
-    assert.equal(state.status, 'ready');
+    assert.equal(state.status, 'needsReview');
   } finally {
     process.off('unhandledRejection', onUnhandled);
     h.backend.setBeforePut(null);
   }
   const store = createFoundationStore({ client: h.backend.client, contextProvider: () => ({ hostChatId: h.context.chatId, chatId: CHAT, characterLocator: 'character.png', personaLocator: 'persona.png' }) });
   const reachable = await store.readReachable();
-  assert.equal(reachable.floors[0].content.canonicalContent, 'A-new');
+  assert.equal(reachable.floors[0].content.canonicalContent, 'A-old');
+  assert.equal(reachable.root.sourceSnapshotFingerprint, reachable.checkpoint.sourceSnapshotFingerprint);
   assert.deepEqual(unhandled, []);
 });
 
@@ -1657,7 +2006,7 @@ test('staged floorOrder index entries 被篡改但保留旧摘要时，冷启动
   });
   const recovered = await runtime.start();
   assert.equal(recovered.status, 'error');
-  assert.equal(recovered.lastError, '待提交记录内容发生冲突。');
+  assert.equal(recovered.lastError, '聊天记忆记录与待保存内容不一致，无法继续保存。请到“记忆管理”页点击“复制状态诊断”反馈。');
   assert.equal(h.backend.records.has(`chat-${CHAT}/v3-root`), false);
   assert.equal((await store.readReachable()).status, 'uninitialized');
 });
@@ -1686,7 +2035,7 @@ test('staged checkpoint inputFingerprints 被篡改但保留旧状态摘要时�
   });
   const recovered = await runtime.start();
   assert.equal(recovered.status, 'error');
-  assert.equal(recovered.lastError, '待提交记录内容发生冲突。');
+  assert.equal(recovered.lastError, '聊天记忆记录与待保存内容不一致，无法继续保存。请到“记忆管理”页点击“复制状态诊断”反馈。');
   assert.equal(h.backend.records.has(`chat-${CHAT}/v3-root`), false);
   assert.equal((await store.readReachable()).status, 'uninitialized');
 
@@ -1704,7 +2053,7 @@ test('staged checkpoint inputFingerprints 被篡改但保留旧状态摘要时�
   });
   const proofRecovered = await proofRuntime.start();
   assert.equal(proofRecovered.status, 'error');
-  assert.equal(proofRecovered.lastError, '待提交记录内容发生冲突。');
+  assert.equal(proofRecovered.lastError, '聊天记忆记录与待保存内容不一致，无法继续保存。请到“记忆管理”页点击“复制状态诊断”反馈。');
 });
 
 test('putRecord 409 只复用完整内容等价记录，相同摘要下的不等价 floorOrder index 返回 conflict', async () => {
@@ -1737,7 +2086,7 @@ test('root CAS 前重读并校验真实落盘图，写完后被篡改的 index �
   const state = await h.runtime.start();
   assert.equal(corrupted, true);
   assert.equal(state.status, 'error');
-  assert.equal(state.lastError, '后端数据处理失败，请稍后重试。');
+  assert.equal(state.lastError, '处理聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。');
   assert.equal(h.backend.records.has(`chat-${CHAT}/v3-root`), false);
 });
 
@@ -1819,7 +2168,7 @@ test('runtime 前置校验后、真实 store commitRoot 前篡改 backing index�
   const state = await runtime.start();
   assert.equal(corrupted, true);
   assert.equal(state.status, 'error');
-  assert.equal(state.lastError, '后端数据处理失败，请稍后重试。');
+  assert.equal(state.lastError, '处理聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。');
   assert.equal(h.backend.records.has(`chat-${CHAT}/v3-root`), false);
   assert.equal((await baseStore.readReachable()).status, 'uninitialized');
 });
@@ -2317,6 +2666,7 @@ test('尾部孤儿修复拒绝无锚编辑、定位或清洗变化、错序、�
         '反例必须真实改变清洗配置指纹');
     }
     const rootBefore = structuredClone(h.backend.records.get(`chat-${CHAT}/v3-root`));
+    const originalRecords = floorIds.map(id => structuredClone(h.backend.records.get(`chat-${CHAT}/v3-floor-${id}`)));
     const markerBefore = structuredClone(mode === 'middle' ? h.context.chat[2].extra.qianqianjie_floor : next.extra.qianqianjie_floor);
     h.runtime.invalidate();
     const rejectModel = async () => { throw new Error('拒绝场景不得调用模型'); };
@@ -2327,7 +2677,12 @@ test('尾部孤儿修复拒绝无锚编辑、定位或清洗变化、错序、�
     assert.equal(saveCalls, 0, mode);
     assert.deepEqual(mode === 'middle' ? h.context.chat[2].extra.qianqianjie_floor : next.extra.qianqianjie_floor, markerBefore, mode);
     if (mode === 'sameOrphan') assert.deepEqual(h.context.chat.at(-1).extra.qianqianjie_floor, markerBefore, mode);
-    assert.deepEqual(h.backend.records.get(`chat-${CHAT}/v3-root`), rootBefore, mode);
+    const reachable = h.runtime.getReachable();
+    assert.ok(reachable.floors.every(floor => floor.id !== orphanFloorId), '坏锚不登记为当前业务楼：' + mode);
+    for (const [index, id] of floorIds.entries()) {
+      assert.ok(reachable.floors.some(floor => floor.id === id), '原存档楼保持：' + mode);
+      assert.deepEqual(h.backend.records.get(`chat-${CHAT}/v3-floor-${id}`), originalRecords[index], '原楼字节不改：' + mode);
+    }
   }
 });
 
@@ -2458,7 +2813,17 @@ test('尾孤儿保存后提交前重新读取原档；正文、标记或消息�
       generateUtilityTask: async () => { throw new Error('目标源变化不得调用模型'); }, logger: { warn() {} } });
     await memory.refreshStatus({ preferCached: false, recoverTailDeletion: true, reconcileFoundation: true });
     assert.equal(changed, true, `${change}: mutation must occur at actual-target precommit read`);
-    assert.deepEqual(h.backend.records.get(`chat-${CHAT}/v3-root`), rootBefore, `${change}: outdated staged snapshot must not commit`);
+    const reachable = h.runtime.getReachable();
+    assert.ok(reachable.floors.some(floor => floor.id === floorId && floor.content.canonicalContent === '原有楼'), `${change}: 原楼正文与身份保留`);
+    assert.ok(reachable.floors.every(floor => floor.id !== orphanFloorId), `${change}: 旧孤儿身份不得成为正式楼`);
+    if (change !== 'marker') assert.deepEqual(h.backend.records.get(`chat-${CHAT}/v3-root`), rootBefore, `${change}: 已变化正文或删除不封存旧候选`);
+    if (memory.getState().memorySyncStatus === 'syncing') await new Promise((resolve, reject) => {
+      let unsubscribe = () => {};
+      const timer = setTimeout(() => { unsubscribe(); reject(new Error(`${change}: 已触发的同步未结算`)); }, 5000);
+      const finish = () => { clearTimeout(timer); unsubscribe(); resolve(); };
+      unsubscribe = memory.subscribe(state => { if (state.memorySyncStatus !== 'syncing') finish(); });
+      if (memory.getState().memorySyncStatus !== 'syncing') finish();
+    });
     assert.notEqual(memory.getState().memorySyncStatus, 'syncing', `${change}: source changes must settle to a reviewable state`);
   }
 });
@@ -2687,7 +3052,12 @@ test('没有事件证据、错误长度、中间缺口、正文替换或切聊�
     if (mode !== 'noEvent') h.handlers.get('MESSAGE_DELETED')(mode === 'wrongLength' ? 5 : 4);
     if (mode === 'switched') { h.handlers.get('CHAT_CHANGED')(); h.setEnabled(false); }
     else await h.runtime.refreshStatus();
-    assert.deepEqual(h.backend.records.get(`chat-${CHAT}/v3-root`), root, mode);
+    if (['replaced', 'duplicateMarker', 'foreignMarker'].includes(mode)) {
+      const reachable = h.runtime.getReachable();
+      const original = h.backend.records.get(`chat-${CHAT}/v3-checkpoint-${root.data.headCheckpointId}`).data.floorRange.floorIds;
+      assert.ok(reachable.floors.every(floor => original.includes(floor.id)), mode + ': 不凭变文或坏marker猜新身份');
+      assert.equal(h.backend.records.get(`chat-${CHAT}/v3-floor-${original[0]}`).data.content.canonicalContent, 'A', '旧正文不被原位覆盖');
+    } else assert.deepEqual(h.backend.records.get(`chat-${CHAT}/v3-root`), root, mode);
   }
 });
 
@@ -2779,4 +3149,469 @@ test('清洗配置变化但前缀正文结果相同允许尾删，清洗正文�
     if (changedBody) assert.deepEqual(h.backend.records.get(`chat-${CHAT}/v3-root`), root);
     else { assert.equal(h.runtime.getState().status, 'ready'); assert.equal(h.runtime.getReachable().floors.length, 2); }
   }
+});
+
+test('只读冷核验以实际Promise发出开始结束活动，且不伪造写入run', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const h = harness([assistant('A'), user('稳定')], { scanCandidatesOverride: async (chat, options) => { await gate; return legacyScanner(chat, options); } });
+  const activity = [];
+  const unsubscribe = h.runtime.subscribeActivity(value => activity.push(value));
+  const pending = h.runtime.inspect('activity-test');
+  assert.equal(h.runtime.getActivityState().busy, true);
+  assert.equal(h.runtime.getActivityState().phase, 'inspecting');
+  assert.equal(h.runtime.getState().activeRun, null);
+  release(); await pending;
+  assert.equal(h.runtime.getActivityState().busy, false);
+  assert.equal(activity[0].busy, true);
+  assert.equal(activity.at(-1).busy, false);
+  unsubscribe();
+});
+
+test('fresh inspect读取中清旧错误且此前错误仍强制fresh，不走缓存快捷成功', async () => {
+  const h = harness([assistant('已保存的一楼'), user('确认正文')], { modernAnchors: true }); await h.runtime.start();
+  h.backend.setBeforeGet(({ key }) => { if (key === 'v3-root') throw new Error('上次读取失败'); });
+  assert.equal((await h.runtime.inspect('firstFailure', { allowCached: false })).status, 'error');
+  let release, startedResolve; const started = new Promise(resolve => { startedResolve = resolve; });
+  h.backend.setBeforeGet(async ({ key }) => { if (key === 'v3-root') { startedResolve(); await new Promise(resolve => { release = resolve; }); } });
+  const before = h.backend.calls.length;
+  const reading = h.runtime.inspect('retryWithCacheAllowed', { allowCached: true }); await started;
+  assert.equal(h.runtime.getState().lastError, null); assert.equal(h.runtime.getState().status, 'running');
+  assert.deepEqual(h.runtime.getActivityState(), { busy: true, phase: 'inspecting' });
+  h.backend.setBeforeGet(null); release(); await reading;
+  assert.equal(h.runtime.getState().status, 'ready'); assert.equal(h.runtime.getState().lastError, null);
+  assert.ok(h.backend.calls.slice(before).some(call => call[0] === 'get' && call[2] !== 'v3-root'), '此前有错跳过缓存和只核root快捷路，重新确认整图');
+});
+
+test('固定目标管理刷新外层在真实root读取中清旧错误并发布进行中', async () => {
+  const h = harness([assistant('已保存的一楼'), user('确认正文')], { modernAnchors: true }); await h.runtime.start();
+  h.backend.setBeforeGet(({ key }) => { if (key === 'v3-root') throw new Error('上轮外层读取失败'); });
+  await h.runtime.inspect('outerFailure', { allowCached: false });
+  let release, startedResolve; const started = new Promise(resolve => { startedResolve = resolve; });
+  h.backend.setBeforeGet(async ({ key }) => { if (key === 'v3-root') { startedResolve(); await new Promise(resolve => { release = resolve; }); } });
+  const reading = h.runtime.recoverOrphanTailAnchor(); await started;
+  assert.equal(h.runtime.getState().lastError, null); assert.equal(h.runtime.getState().status, 'running');
+  h.backend.setBeforeGet(null); release(); await reading;
+  assert.equal(h.runtime.getState().status, 'ready'); assert.equal(h.runtime.getState().lastError, null);
+});
+
+test('只读检查切换聊天后停止旧图的慢 TT 读取，新聊天仍能完成检查', { timeout: 15000 }, async () => {
+  const chatA = Array.from({ length: 70 }, (_, index) => [assistant(`原聊天第${index}楼`), user(`确认${index}`)]).flat();
+  const sourceA = harness(chatA, { modernAnchors: true }); await sourceA.runtime.start();
+  const sourceB = harness([assistant('新聊天正文'), user('确认新聊天')], { modernAnchors: true });
+  sourceB.setChat(sourceB.context.chat, OTHER_CHAT); await sourceB.runtime.start();
+  const tables = new Map();
+  const table = name => { if (!tables.has(name)) tables.set(name, new Map()); return tables.get(name); };
+  let releaseRead, firstFloorResolve, delayed = false;
+  const firstFloor = new Promise(resolve => { firstFloorResolve = resolve; });
+  const readGate = new Promise(resolve => { releaseRead = resolve; });
+  const readFloors = [];
+  const nativeStore = {
+    async tryGetJson({ table: name, key }) {
+      const value = table(name).get(key);
+      const slot = value?.format === 'qqj-tt-json-v2' ? JSON.parse(value.serialized) : value;
+      if (slot?.collection === `chat-${CHAT}` && slot.recordId.startsWith('v3-floor-')) {
+        readFloors.push(slot.recordId);
+        if (delayed && readFloors.length === 1) { firstFloorResolve(); await readGate; }
+      }
+      return value === undefined ? { found: false } : { found: true, value: structuredClone(value) };
+    },
+    async setJson({ table: name, key, value }) { table(name).set(key, structuredClone(value)); },
+    async deleteJson({ table: name, key }) { table(name).delete(key); },
+    async listKeys({ table: name }) { return [...table(name).keys()]; },
+    async listTables() { return [...tables.keys()]; },
+  };
+  const client = createBackendClient({ fetchImpl: createTauriBackendFetch({ globalRef: {
+    crypto: globalThis.crypto, __TAURITAVERN__: { ready: Promise.resolve(), api: { extension: { store: nativeStore } } },
+  } }) });
+  for (const source of [sourceA, sourceB]) for (const [key, record] of source.backend.records) {
+    const split = key.indexOf('/'); await client.put(key.slice(0, split), key.slice(split + 1), record.data, 0);
+  }
+  readFloors.length = 0; delayed = true;
+  let context = sourceA.context;
+  const hostAdapter = createHostAdapter({ globalRef: { SillyTavern: { getContext: () => context } } });
+  const store = createFoundationStore({ client, contextProvider: () => ({
+    hostChatId: context.chatId, chatId: context.chatMetadata.qianqianjie.chatId, characterLocator: 'character.png', personaLocator: 'persona.png',
+  }) });
+  const runtime = createFoundationRuntime({ hostAdapter, store, contextProvider: () => context, logger: { warn() {} } });
+  const oldRead = runtime.inspect('openOldChat'); await firstFloor;
+  context = sourceB.context; runtime.invalidate();
+  const newRead = runtime.inspect('openNewChat'); releaseRead();
+  await Promise.all([oldRead, newRead]);
+  assert.equal(readFloors.length, 1, '切聊后不再读取旧图尚未派发的楼层，也不继续下一批');
+  assert.equal(runtime.getState().status, 'ready');
+  assert.equal(runtime.getState().chatId, OTHER_CHAT);
+  assert.equal(runtime.getReachable().floors[0].content.canonicalContent, '新聊天正文');
+  assert.equal(client.getDiagnosticSnapshot().sinceClientCreatedRequestCounts.delete, 0);
+});
+
+test('切聊前排队的强只读刷新不在新聊天重新启动一次全图读取', async () => {
+  const h = harness([assistant('旧档正文'), user('旧档确认')], { modernAnchors: true }); await h.runtime.start();
+  const sourceB = harness([assistant('新档正文'), user('新档确认')], { modernAnchors: true });
+  sourceB.setChat(sourceB.context.chat, OTHER_CHAT); await sourceB.runtime.start();
+  for (const [key, record] of sourceB.backend.records) h.backend.records.set(key, structuredClone(record));
+  h.runtime.invalidate(); h.backend.calls.length = 0;
+  let releaseRead, startedResolve;
+  const started = new Promise(resolve => { startedResolve = resolve; });
+  const gate = new Promise(resolve => { releaseRead = resolve; });
+  h.backend.setBeforeGet(async ({ collection, key }) => {
+    if (collection === `chat-${CHAT}` && key === 'v3-root') { startedResolve(); await gate; }
+  });
+  const oldRead = h.runtime.inspect('oldCached', { allowCached: true }); await started;
+  const queuedRead = h.runtime.inspect('oldForce', { allowCached: false });
+  h.setChat(sourceB.context.chat, OTHER_CHAT); h.runtime.invalidate();
+  const newRead = h.runtime.inspect('newChat'); releaseRead();
+  await Promise.all([oldRead, queuedRead, newRead]);
+  assert.equal(h.backend.calls.filter(call => call[0] === 'get' && call[1] === `chat-${OTHER_CHAT}` && call[2] === 'v3-root').length, 1,
+    '新聊天仅执行自己的读取，旧队列不追读新档');
+  assert.equal(h.runtime.getState().status, 'ready');
+  assert.equal(h.runtime.getState().chatId, OTHER_CHAT);
+});
+
+test('排在旧聊天写入后的只读检查在切聊后不追读新聊天', async () => {
+  const sourceB = harness([assistant('新档已保存'), user('确认新档')], { modernAnchors: true });
+  sourceB.setChat(sourceB.context.chat, OTHER_CHAT); await sourceB.runtime.start();
+  const h = harness([assistant('旧档正在保存'), user('确认旧档')], { modernAnchors: true });
+  for (const [key, record] of sourceB.backend.records) h.backend.records.set(key, structuredClone(record));
+  let releaseWrite, startedResolve;
+  const started = new Promise(resolve => { startedResolve = resolve; });
+  const gate = new Promise(resolve => { releaseWrite = resolve; });
+  h.backend.setBeforePut(async ({ collection, key }) => {
+    if (collection === `chat-${CHAT}` && key === 'v3-root') { startedResolve(); await gate; }
+  });
+  const writer = h.runtime.start(); await started;
+  const queuedRead = h.runtime.inspect('waitingForOldWriter');
+  h.setChat(sourceB.context.chat, OTHER_CHAT); h.runtime.invalidate();
+  await h.runtime.inspect('newChat'); releaseWrite();
+  await Promise.all([writer, queuedRead]);
+  assert.equal(h.backend.calls.filter(call => call[0] === 'get' && call[1] === `chat-${OTHER_CHAT}` && call[2] === 'v3-root').length, 1);
+  assert.equal(h.runtime.getState().status, 'ready');
+  assert.equal(h.runtime.getState().chatId, OTHER_CHAT);
+});
+
+test('readReachable显式取消阻止后续单读或批次，且不返回半图', async () => {
+  const h = harness(Array.from({ length: 70 }, (_, index) => [assistant(`取消读取楼${index}`), user(`锚${index}`)]).flat(), { modernAnchors: true });
+  await h.runtime.start();
+  for (const batched of [false, true]) {
+    const controller = new AbortController(), reads = [], batches = [], releases = [];
+    let startedResolve;
+    const started = new Promise(resolve => { startedResolve = resolve; });
+    const client = { ...h.backend.client, async get(collection, key, options) {
+      reads.push({ key, signal: options?.signal });
+      const value = await h.backend.client.get(collection, key);
+      if (!controller.signal.aborted && key.startsWith('v3-floor-') && !key.startsWith('v3-floor-memory-')) {
+        startedResolve();
+        await new Promise(resolve => { releases.push(resolve); });
+        options?.signal?.throwIfAborted();
+      }
+      return value;
+    } };
+    if (batched) client.getMany = async (collection, keys, options) => {
+      batches.push({ keys, signal: options?.signal });
+      startedResolve();
+      if (!controller.signal.aborted) await new Promise(resolve => { releases.push(resolve); });
+      options?.signal?.throwIfAborted();
+      return Promise.all(keys.map(async recordId => ({ recordId, status: 200, envelope: await h.backend.client.get(collection, recordId) })));
+    };
+    const store = createFoundationStore({ client, contextProvider: () => ({ chatId: CHAT }) });
+    const loading = store.readReachable({ mode: 'projection', signal: controller.signal });
+    await started;
+    controller.abort('pageChanged');
+    for (const release of releases) release();
+    const result = await loading;
+    assert.equal(result.status, 'stale', batched ? '批读取消' : '单读取消');
+    assert.deepEqual(Object.keys(result), ['status'], '取消不返回半图');
+    assert.ok(reads.every(read => read.signal === controller.signal), 'root、checkpoint、run和单条读取均使用该次取消信号');
+    assert.equal(reads.some(read => read.key.startsWith('v3-index-') || read.key.startsWith('v3-floor-memory-')), false, '取消后不再读索引或记忆');
+    if (batched) { assert.equal(batches.length, 1); assert.equal(batches[0].keys.length, 64); assert.equal(batches[0].signal, controller.signal); }
+    else assert.ok(reads.filter(read => read.key.startsWith('v3-floor-')).length <= 16, '取消后不推进后续floor');
+  }
+});
+
+test('readReachable预先取消不发读取；未取消的真实后端错误仍向上传递', async () => {
+  const controller = new AbortController(); controller.abort('pageChanged');
+  let gets = 0;
+  const failure = Object.assign(new Error('storage failed'), { status: 503 });
+  const store = createFoundationStore({ client: { async get() { gets++; throw failure; }, async put() { assert.fail('只读取消不能写入'); } }, contextProvider: () => ({ chatId: CHAT }) });
+  assert.deepEqual(await store.readReachable({ signal: controller.signal }), { status: 'stale' });
+  assert.equal(gets, 0);
+  await assert.rejects(store.readReachable({ signal: new AbortController().signal }), error => error === failure);
+});
+
+test('只读检查微任务尚未启动就切聊时不把旧请求重新绑定到新聊天', async () => {
+  const sourceB = harness([assistant('新聊天原有记忆'), user('确认新档')], { modernAnchors: true });
+  sourceB.setChat(sourceB.context.chat, OTHER_CHAT); await sourceB.runtime.start();
+  const h = harness([assistant('刚离开的聊天'), user('旧档确认')], { modernAnchors: true });
+  for (const [key, record] of sourceB.backend.records) h.backend.records.set(key, structuredClone(record));
+  const oldRead = h.runtime.inspect('oldChatBeforeMicrotask');
+  h.setChat(sourceB.context.chat, OTHER_CHAT); h.runtime.invalidate();
+  const newRead = h.runtime.inspect('newChatBeforeMicrotask');
+  await Promise.all([oldRead, newRead]);
+  assert.equal(h.backend.calls.filter(call => call[0] === 'get' && call[1] === `chat-${OTHER_CHAT}` && call[2] === 'v3-root').length, 1,
+    '未启动的旧检查不应成为第二次新档检查');
+  assert.equal(h.runtime.getState().status, 'ready');
+  assert.equal(h.runtime.getState().chatId, OTHER_CHAT);
+});
+
+test('部分缓存的TT图读取仅对miss批量回源，保留命中、深校验与取消', async t => {
+  const source = harness(Array.from({ length: 67 }, (_, index) => [assistant(`缓存楼${index}`), user(`确认${index}`)]).flat(), { modernAnchors: true });
+  await source.runtime.start();
+  const memory = createV3MemoryRuntime({ foundationRuntime: source.runtime, store: source.store, hostAdapter: source.hostAdapter,
+    generateUtilityTask: async () => ({ jsonData: { summary: '保留的摘要' } }),
+    generateAnalysisTask: async () => ({ jsonData: { noMaterialChange: true } }), logger: { warn() {} } });
+  await memory.start();
+  await memory.extractFloor(memory.getState().floors[0].floorId, { analyzeState: false });
+  await memory.analyzeNextState();
+  const slots = new Map(), slotKey = options => `${options.namespace}/${options.table}/${options.key}`;
+  const nativeCalls = []; let active = 0, maximum = 0, beforeRead = null;
+  const native = {
+    async tryGetJson(options) {
+      const stored = slots.get(slotKey(options)), slot = stored?.serialized ? JSON.parse(stored.serialized) : null;
+      nativeCalls.push(slot?.recordId ?? 'missing'); active++; maximum = Math.max(maximum, active);
+      try { await beforeRead?.(slot); await new Promise(resolve => setImmediate(resolve)); return stored ? { found: true, value: structuredClone(stored) } : { found: false }; }
+      finally { active--; }
+    },
+    async setJson(options) { slots.set(slotKey(options), structuredClone(options.value)); },
+    async deleteJson() { assert.fail('只读测试不能删除正式记录'); },
+    async listKeys() { assert.fail('已知引用不能扫描整集合'); }, async listTables() { return []; },
+  };
+  const globalRef = { crypto: globalThis.crypto, __TAURITAVERN__: { ready: Promise.resolve(), api: { extension: { store: native } } } };
+  const transport = createBackendClient({ fetchImpl: createTauriBackendFetch({ globalRef }) });
+  for (const [key, record] of source.backend.records) {
+    const split = key.indexOf('/'); await transport.put(key.slice(0, split), key.slice(split + 1), record.data, 0);
+  }
+  const baseline = await createFoundationStore({ client: transport, contextProvider: () => ({ chatId: CHAT }) }).readReachable();
+  const envelopes = new Map([...slots.values()].map(value => { const slot = JSON.parse(value.serialized); return [slot.recordId, slot.current]; }));
+  const floorKeys = baseline.checkpoint.producedRefs.floors.map(id => `v3-floor-${id}`);
+  const refs = baseline.checkpoint.producedRefs;
+  const recordRefs = { floor: floorKeys, floorMemory: refs.floorMemories.map(id => `v3-floor-memory-${id}`),
+    entity: refs.entities.map(id => `v3-entity-${id}`), stateDelta: refs.stateDeltas.map(id => `v3-state-delta-${id}`), index: refs.indexes };
+  function target(mode, { bulk = true, batched = true } = {}) {
+    const cacheReads = [], cacheBatches = [], removed = [], batches = [];
+    const selected = key => {
+      const index = floorKeys.indexOf(key);
+      if (mode === 'io-failure') throw new Error('IDB unavailable');
+      if (mode === 'cse-miss' && key.startsWith('v3-state-delta-')) return null;
+      if (index >= 0 && (mode === 'missing' || (mode === 'partial' && index % 3 === 0))) return null;
+      const value = structuredClone(envelopes.get(key) ?? null);
+      if (value && mode === 'deep-corrupt' && index >= 0 && index < 2) value.data.content.canonicalContent = '被改坏的缓存正文';
+      return value;
+    };
+    const cache = { scopeFor: async () => 'scope', readManifest: async () => ({ recordRefs }),
+      async readRecord(_scope, _witness, _type, key) { cacheReads.push(key); return selected(key); },
+      async removeRecord(_scope, _witness, _type, key) { removed.push(key); },
+      ...(bulk ? { async readRecords(_scope, _witness, _type, keys) { cacheBatches.push(keys); return keys.map(selected); } } : {}),
+    };
+    const client = { get: (...args) => transport.get(...args), put: (...args) => transport.put(...args),
+      ...(batched ? { async getMany(collection, keys, options) { batches.push(keys); return transport.getMany(collection, keys, options); } } : {}) };
+    const store = createFoundationStore({ client, contextProvider: () => ({ chatId: CHAT }), coreRecordCache: cache });
+    return { store, client, cacheReads, cacheBatches, removed, batches };
+  }
+  for (const [mode, bulk] of [['hit', true], ['partial', true], ['missing', true], ['deep-corrupt', true], ['io-failure', true], ['partial', false]]) {
+    await t.test(`${mode}/${bulk ? 'readRecords' : 'legacy readRecord'}`, { timeout: 15000 }, async t => {
+      const f = target(mode, { bulk }); nativeCalls.length = 0; maximum = 0;
+      const misses = floorKeys.filter((_, index) => mode === 'missing' || mode === 'io-failure'
+        || (mode === 'partial' && index % 3 === 0) || (mode === 'deep-corrupt' && index < 2));
+      // Key hashing may finish on different ticks; hold the first miss until another native read enters.
+      const entered = new Set(); let release;
+      const gate = new Promise(resolve => { release = resolve; });
+      t.signal.addEventListener('abort', release, { once: true });
+      beforeRead = async slot => {
+        if (misses.length < 2 || !misses.includes(slot?.recordId)) return;
+        entered.add(slot.recordId); if (entered.size >= 2) release();
+        await gate;
+      };
+      let loaded;
+      try { loaded = await f.store.readReachable(); }
+      finally { release(); beforeRead = null; t.signal.removeEventListener('abort', release); }
+      assert.deepEqual(loaded, baseline);
+      const floorBatches = f.batches.filter(keys => keys.every(key => floorKeys.includes(key)));
+      assert.deepEqual(floorBatches.flat(), misses, '只有缺失或深校验失败的floor进入正式批读');
+      assert.deepEqual(nativeCalls.filter(key => floorKeys.includes(key)).sort(), [...misses].sort(), '命中floor不能重复读native');
+      assert.ok(f.batches.every(keys => keys.length <= 64));
+      if (misses.length > 1) { assert.ok(maximum > 1, '缺失正文真实并行读取'); assert.ok(maximum <= 8); }
+      if (bulk) { assert.equal(f.cacheReads.length, 0, '批取后不得再逐条读IDB'); assert.ok(f.cacheBatches.every(keys => keys.length <= 64)); }
+      else assert.equal(new Set(f.cacheReads).size, f.cacheReads.length, '旧mock也不二读同条缓存');
+      if (mode === 'deep-corrupt') assert.deepEqual(f.removed.sort(), floorKeys.slice(0, 2).sort());
+    });
+  }
+  await t.test('无getMany仍保持cache-first单读', async () => {
+    const f = target('partial', { batched: false }); nativeCalls.length = 0;
+    assert.deepEqual(await f.store.readReachable(), baseline);
+    assert.equal(nativeCalls.filter(key => floorKeys.includes(key)).length, floorKeys.filter((_, index) => index % 3 === 0).length);
+  });
+  await t.test('正式回源传输失败不重试，也不退回逐条读取', async () => {
+    const f = target('partial'), failure = Object.assign(new Error('formal store failed'), { status: 503 }); let attempts = 0;
+    f.client.getMany = async () => { attempts++; throw failure; };
+    nativeCalls.length = 0;
+    await assert.rejects(f.store.readReachable(), error => error === failure);
+    assert.equal(attempts, 1);
+    assert.equal(nativeCalls.some(key => floorKeys.includes(key)), false);
+  });
+  for (const status of [404, 500]) await t.test(`正式回源逐项${status}保留原错误语义`, async () => {
+    const f = target('partial'), getMany = f.client.getMany;
+    f.client.getMany = async (...args) => {
+      const rows = await getMany(...args);
+      return rows.map((row, index) => index ? row : { recordId: row.recordId, status, error: 'formal_error', message: 'formal read failed' });
+    };
+    await assert.rejects(f.store.readReachable(), error => status === 404 ? error.code === 'V3_STORE_FLOOR_MISSING' : error.status === 500);
+  });
+  await t.test('settled人物状态失败沿用既有cache bypass复核与记忆图fallback', async () => {
+    assert.ok(recordRefs.stateDelta.length > 0);
+    const f = target('cse-miss'), getMany = f.client.getMany, failure = Object.assign(new Error('CSE transport failed'), { status: 503 });
+    let failedBatches = 0;
+    f.client.getMany = async (collection, keys, options) => {
+      if (keys.some(key => key.startsWith('v3-state-delta-'))) { failedBatches++; throw failure; }
+      return getMany(collection, keys, options);
+    };
+    nativeCalls.length = 0;
+    const loaded = await f.store.readReachable({ allowRecallCseFallback: true });
+    assert.equal(loaded.status, 'ready'); assert.equal(loaded.cseUnavailable, true);
+    assert.deepEqual(loaded.floors, baseline.floors); assert.deepEqual(loaded.floorMemories, baseline.floorMemories);
+    assert.equal(failedBatches, 2, '图校验失败后保留原有的一次bypassCache正式复核');
+    assert.equal(nativeCalls.filter(key => floorKeys.includes(key)).length, floorKeys.length);
+  });
+  await t.test('取消停止后续批次且不返回半图', async () => {
+    const f = target('missing'), controller = new AbortController(); let announce, release;
+    const entered = new Promise(resolve => { announce = resolve; }), gate = new Promise(resolve => { release = resolve; });
+    nativeCalls.length = 0;
+    beforeRead = async slot => { if (slot?.current?.data.recordType === 'floor') { announce(); await gate; } };
+    const reading = f.store.readReachable({ signal: controller.signal });
+    try {
+      await entered; controller.abort('chat changed'); const countAtCancel = nativeCalls.length; release();
+      assert.deepEqual(await reading, { status: 'stale' });
+      assert.equal(nativeCalls.length, countAtCancel);
+      assert.equal(f.batches.filter(keys => keys.some(key => floorKeys.includes(key))).length, 1);
+    } finally { release(); await Promise.allSettled([reading]); beforeRead = null; }
+  });
+});
+
+test('HTML正文升级保可靠marker空壳身份，普通旧楼指纹不变', async () => {
+ const { sanitizeStoryBody } = await import('../src/shared-body-wrappers.js');
+ let legacy = true;
+ const chat = [assistant('```html\n<!doctype html>\n```'), user('确认空壳'), assistant('普通旧故事'), user('确认故事')];
+ const h = harness(chat, { modernAnchors: true, scanCandidatesOverride: async (source, options) => {
+  if (!legacy) return scanAssistantCandidates(source, options);
+  const seeded = source.map(message => message.is_user === false ? { ...message, mes: '旧扫描占位', swipes: ['旧扫描占位'] } : message);
+  const candidates = await scanAssistantCandidates(seeded, options);
+  return candidates.map(candidate => { const raw = source[candidate.hostLocator.messageIndex].swipes[0], canonical = sanitizeStoryBody(raw);
+   return { ...candidate, canonicalContent: canonical, rawFingerprint: `sha256:${createHash('sha256').update(raw).digest('hex')}`, canonicalFingerprint: `sha256:${createHash('sha256').update(canonical).digest('hex')}` }; });
+ } });
+ await h.runtime.start();const before = structuredClone(h.runtime.getReachable().floors);assert.equal(before.length, 2);
+ chat[0].extra.qianqianjie_floor = { schemaVersion: 1, chatId: CHAT, floorId: before[0].id };
+ chat[2].extra.qianqianjie_floor = { schemaVersion: 1, chatId: CHAT, floorId: before[1].id };
+ legacy = false;
+ const scanned = await scanAssistantCandidates(chat, { chatId: CHAT });assert.equal(scanned.length, 2);assert.equal(scanned[0].canonicalContent, '');
+ const refreshed = await h.runtime.refreshStatus();assert.equal(refreshed.status, 'ready');
+ const after = h.runtime.getReachable().floors;assert.deepEqual(after.map(f=>f.id), before.map(f=>f.id));assert.deepEqual(after.map(f=>f.content), before.map(f=>f.content));
+ assert.equal((await scanAssistantCandidates([{ ...chat[0], extra: {} }], { chatId: CHAT })).length, 0);
+ const foreign = await scanAssistantCandidates([{ ...chat[0], extra: { qianqianjie_floor: { schemaVersion: 1, chatId: OTHER_CHAT, floorId: before[0].id } } }], { chatId: CHAT });
+ assert.equal(foreign.length, 1);assert.equal(foreign[0].messageAnchor.status, 'foreign', 'foreign空壳保候选诊断，不当作本chat有效锚');
+});
+
+test('HTML正文空源手动零请求保旧摘要CSE，正常extractNext跳过未摘要空壳', async () => {
+ for (const saved of [false, true]) {
+  const chat = [assistant('旧正文可用'), user('确认首楼'), assistant('后楼递回钥匙。'), user('确认后楼')];
+  const h = harness(chat, { modernAnchors: true });await h.runtime.start();
+  const ids = h.runtime.getReachable().floors.map(floor=>floor.id);
+  for (const [index,id] of ids.entries()) chat[index*2].extra.qianqianjie_floor = { schemaVersion: 1, chatId: CHAT, floorId: id };
+  const requests=[];
+  const task=async options=>{const request=JSON.parse(options.taskMessages[0].content);requests.push(request);return {jsonData: request.task==='extractFloorSemantics'?{summary:'原有有效摘要'}:{noMaterialChange:true}};};
+  const memory=createV3MemoryRuntime({foundationRuntime:h.runtime,store:h.store,hostAdapter:h.hostAdapter,generateUtilityTask:task,generateAnalysisTask:task,now:()=>new Date('2026-09-02T00:00:00.000Z'),newUuid:uuidFactory(50000),logger:{warn(){}}});
+  await memory.start();if(saved)await memory.extractFloor(ids[0]);
+  const before=await h.store.readReachable({mode:'runtime'}),old=JSON.stringify({memories:before.floorMemories,deltas:before.stateDeltas});
+  chat[0].mes=chat[0].swipes[0]='```html\n<!doctype html>\n```';
+  await memory.refreshStatus();const count=requests.length;
+  await assert.rejects(memory.extractFloor(ids[0]),/没有可提取的正文/u);assert.equal(requests.length,count);
+  const afterDenied=await h.store.readReachable({mode:'runtime'});assert.equal(JSON.stringify({memories:afterDenied.floorMemories,deltas:afterDenied.stateDeltas}),old);
+  await memory.extractNext();const extracts=requests.slice(count).filter(request=>request.task==='extractFloorSemantics');
+  assert.equal(extracts.length,1);assert.equal(extracts[0].payload.canonicalContent,'后楼递回钥匙。');
+  const final=await h.store.readReachable({mode:'runtime'});assert.deepEqual(final.floors.map(f=>f.id),ids);
+  if(saved)assert.deepEqual(final.floorMemories.find(m=>m.floorId===ids[0]),before.floorMemories.find(m=>m.floorId===ids[0]));
+  const done=requests.length;await memory.extractNext();assert.equal(requests.length,done);
+ }
+});
+
+test('正文选择兼容宿主可见mes与未就绪swipes，有效明确回复和真实空白保持', async () => {
+  const values = [
+    { message: { ...assistant('可见正文'), swipes: [''] }, expected: '可见正文' },
+    { message: { ...assistant('可见正文'), swipes: [] }, expected: '可见正文' },
+    { message: { ...assistant('可见正文'), swipes: ['旧回复'], swipe_id: 9 }, expected: '可见正文' },
+    { message: { ...assistant('可见正文'), swipes: ['   '] }, expected: '可见正文' },
+    { message: { ...assistant('显示滞后的正文'), swipes: ['旧回复', '明确选中的回复'], swipe_id: 1 }, expected: '明确选中的回复' },
+    { message: { ...assistant('  '), swipes: ['  '], extra: { display_text: '只读派生显示' } }, expected: null },
+  ];
+  for (const { message, expected } of values) {
+    const candidates = await scanAssistantCandidates([message, user('稳定')], { captureRawContent: true });
+    assert.equal(candidates.length, expected ? 1 : 0);
+    if (expected) assert.equal(candidates[0].rawContent, expected);
+  }
+});
+
+test('局部坏楼保留原图并登记健康新尾楼，未确认的旧末楼只限制新尾资格', async () => {
+  for (const badKind of ['foreignMiddle', 'foreignLast', 'unmarkedChangedMiddle', 'unmarkedChangedConsecutive']) {
+    const badLast = badKind === 'foreignLast';
+    const h = harness([assistant('甲'), user('确认甲'), assistant('乙'), user('确认乙'), assistant('丙'), user('确认丙')], { modernAnchors: true });
+    await h.runtime.start(); const original = await h.store.readReachable({ mode: 'runtime' });
+    for (const floor of original.floors) h.context.chat[floor.hostLocator.messageIndex].extra.qianqianjie_floor = { schemaVersion: 1, chatId: CHAT, floorId: floor.id };
+    if (badKind.startsWith('unmarkedChanged')) {
+      delete h.context.chat[2].extra.qianqianjie_floor;
+      h.context.chat[2].mes = h.context.chat[2].swipes[0] = '无法绑定的已改旧正文';
+      if (badKind === 'unmarkedChangedConsecutive') h.context.chat.splice(3, 1);
+    } else {
+      h.context.chat[badLast ? 4 : 2].extra.qianqianjie_floor = { schemaVersion: 1, chatId: OTHER_CHAT, floorId: original.floors[badLast ? 2 : 1].id };
+    }
+    h.context.chat.push(assistant('健康的新尾正文'), user('确认新尾'));
+    const result = await h.runtime.refreshStatus();
+    assert.equal(result.status, 'needsReview'); assert.equal(result.activeRun, null);
+    const saved = await h.store.readReachable({ mode: 'runtime' });
+    assert.deepEqual(saved.floors.slice(0, 3).map(floor => [floor.id, floor.content]), original.floors.map(floor => [floor.id, floor.content]));
+    assert.equal(saved.floors.length, badLast ? 3 : 4);
+    if (!badLast) assert.equal(saved.floors.at(-1).content.canonicalContent, '健康的新尾正文');
+    assert.equal((await h.runtime.confirmLatest()).status, 'needsReview');
+  }
+});
+
+test('局部坏标正文清空仍保旧存档，不能被当成消息已删', async () => {
+  const h = harness([assistant('旧正文'), user('确认')], { modernAnchors: true });
+  await h.runtime.start(); const original = await h.store.readReachable({ mode: 'runtime' });
+  h.context.chatMetadata.integrity = 'complete';
+  h.context.chat[0].mes = ''; h.context.chat[0].swipes[0] = '';
+  h.context.chat[0].extra.qianqianjie_floor = { schemaVersion: 1, chatId: OTHER_CHAT, floorId: original.floors[0].id };
+  const state = await h.runtime.refreshStatus();
+  assert.equal(state.status, 'needsReview');
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(after.floors.map(floor => [floor.id, floor.content]), original.floors.map(floor => [floor.id, floor.content]));
+});
+
+test('局部坏标追加遇CAS冲突仍保原完整root与旧楼，不发布staged结果', async () => {
+  const h = harness([assistant('甲'), user('确认甲'), assistant('乙'), user('确认乙')], { modernAnchors: true });
+  await h.runtime.start(); const original = await h.store.readReachable({ mode: 'runtime' });
+  for (const floor of original.floors) h.context.chat[floor.hostLocator.messageIndex].extra.qianqianjie_floor = { schemaVersion: 1, chatId: CHAT, floorId: floor.id };
+  h.context.chat[0].extra.qianqianjie_floor.chatId = OTHER_CHAT;
+  h.context.chat.push(assistant('待追加的新尾'), user('确认新尾'));
+  h.backend.setConflictRoot(true);
+  const state = await h.runtime.refreshStatus(); assert.equal(state.status, 'conflict'); assert.equal(state.activeRun, null);
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.rootRevision, original.rootRevision); assert.deepEqual(saved.floors, original.floors);
+});
+
+test('保存期间仅楼标变坏仍保健康提交，终态使用提交后证明待核', async () => {
+  const h = harness([assistant('既有正文'), user('确认既有')], { modernAnchors: true });
+  await h.runtime.start();
+  const original = await h.store.readReachable({ mode: 'runtime' });
+  h.context.chat[0].extra.qianqianjie_floor = { schemaVersion: 1, chatId: CHAT, floorId: original.floors[0].id };
+  h.context.chat.push(assistant('健康新尾'), user('确认新尾'));
+  h.backend.setBeforePut(({ key }) => {
+    if (key === 'v3-root') h.context.chat[0].extra.qianqianjie_floor.chatId = OTHER_CHAT;
+  });
+  const state = await h.runtime.refreshStatus();
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.floors.length, 2);
+  assert.deepEqual(saved.floors[0].content, original.floors[0].content);
+  assert.equal(saved.floors.at(-1).content.canonicalContent, '健康新尾');
+  assert.equal(state.status, 'needsReview');
+  assert.equal(state.activeRun, null);
+  assert.equal(state.reviewReason.code, 'markerMismatch');
+  assert.equal(state.bindingIssues[0].code, 'markerRejected');
 });

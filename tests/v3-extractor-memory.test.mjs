@@ -1,3 +1,9 @@
+import { projectQianchuangSnapshot } from '../src/v3/qianchuang-domain.js';
+import { createPlaceWorkspaceStore } from '../src/v3/place-workspace.js';
+import { processingTransport } from './fixtures/processing-transport.mjs';
+import { describePrefixDifference } from '../src/v3/memory-prefix-diagnostic.js';
+import { planAutoHide } from '../src/v3/auto-hide.js';
+import { createPluginActivity } from '../src/plugin-activity.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -6,13 +12,16 @@ import { createFoundationStore } from '../src/v3/foundation-store.js';
 import { createIndexedDbCoreRecordCache } from '../src/v3/indexeddb-core-cache.js';
 import { buildFoundationIndexes, createFoundationRuntime, projectFoundationPrefix } from '../src/v3/foundation-runtime.js';
 import { createV3MemoryRuntime, projectMemoryPersonEntities, projectMemoryPlaceEntities } from '../src/v3/memory-runtime.js';
+import { createPublicQianshiBridge } from '../src/v3/public-qianshi-bridge.js';
 import { initializeMigrationGraph } from '../src/v3/memory-migration.js';
+import { persistMessageFloorAnchors } from '../src/v3/message-floor-anchor.js';
 import { scanAssistantCandidates } from '../src/v3/foundation-domain.js';
 import { createV3RecallRuntime } from '../src/v3/recall-runtime.js';
 import { createV3FoundationView } from '../src/ui/v3-foundation-view.js';
 import { createQianshiTimelineView } from '../src/ui/qianshi-timeline-view.js';
 import { readRecallSource } from '../src/v3/recall-source.js';
-import { historySelectionContext, selectRecall } from '../src/v3/recall-selector.js';
+import { cseSelectionContext, estimateRecallTokens, historySelectionContext, selectRecall } from '../src/v3/recall-selector.js';
+import { selectRecallWithLlm } from '../src/v3/recall-llm-selector.js';
 import { buildExtractorSystemPrompt, buildHighFloorExtractorSystemPrompt, createExtractorEnvelope, DEFAULT_EXTRACTOR_GUIDANCE, EXTRACTOR_FIXED_CONTRACT, EXTRACTOR_OUTPUT_CONTRACT, EXTRACTOR_PROMPT_VERSION, EXTRACTOR_RESPONSE_SCHEMA, EXTRACTOR_SYSTEM_PROMPT, EXTRACTOR_VERSION, inferCanonicalCurrentTime, normalizeExtractorResponse, runExtractorRequest } from '../src/v3/extractor.js';
 import { buildCseSystemPrompt, CSE_FIXED_CONTRACT, CSE_SYSTEM_PROMPT, compileCseResponse, createCseEnvelope, DEFAULT_CSE_GUIDANCE, replayCurrentState } from '../src/v3/cse-engine.js';
 import { BASE_PROCESSING_PROMPT } from '../src/internal-processing-prompt.js';
@@ -20,6 +29,9 @@ import { buildEntityIdentityDirectory, projectFloorMemoryIdentityReferences } fr
 import { projectInlineMemoryFloor } from '../src/ui/inline-projection.js';
 import { collectFloorMemoryEntityIds, collectStateDeltaEntityIds, validateEntityRecord, validateFloorMemory, validateMemoryGraph } from '../src/v3/memory-schema.js';
 import { captureFloorVariableReference } from '../src/v3/floor-variable-reference.js';
+import { readLocationReference } from '../src/v3/location-reference.js';
+import { resolveStoryClock } from '../src/story-clock.js';
+import { deterministicUuid } from '../src/v3/foundation-domain.js';
 import { createCompactApiClient } from '../src/compact-api-client.js';
 import { createTaskRouter } from '../src/api-routing.js';
 import { createChatIdentityCoordinator, CHAT_IDENTITY_COLLECTION } from '../src/chat-identity.js';
@@ -27,7 +39,8 @@ import { createChatSession } from '../src/chat-session.js';
 import { createPluginLifecycle } from '../src/plugin-lifecycle.js';
 import { applyPluginEnabledImmediately } from '../src/settings.js';
 import { createTimeRuntime, createTimeStore } from '../src/v3/time-runtime.js';
-import { createPeopleWorkspaceStore, PEOPLE_WORKSPACE_RECORD_ID } from '../src/v3/people-workspace.js';
+import { projectTime } from '../src/v3/time-engine.js';
+import { createPeopleWorkspaceStore, createPeopleWorkspaceRuntime, PEOPLE_WORKSPACE_RECORD_ID } from '../src/v3/people-workspace.js';
 import { memorySourceFloorIds } from '../src/v3/memory-schema.js';
 import { createQianshiCandidateIndex, prepareQianshiCandidates, projectQianshiGraph } from '../src/v3/qianshi-domain.js';
 import { localForageHarness } from './helpers/indexeddb-harness.mjs';
@@ -35,8 +48,24 @@ import { localForageHarness } from './helpers/indexeddb-harness.mjs';
 const CHAT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const GENERATION = '22222222-2222-4222-8222-222222222222';
 const NOW = '2026-09-02T00:00:00.000Z';
+const storedEvidenceRows=payload=>{const {columns,rows}=payload.storedPlaceEvidence;return rows.map(row=>Object.fromEntries(columns.map((key,i)=>[key,row[i]])));};
 const assistant = mes => ({ is_user: false, is_system: false, mes, swipes: [mes], swipe_id: 0 });
 const user = mes => ({ is_user: true, is_system: false, mes, send_date: `test-user:${mes}` });
+const rejudgeBatchResponse = (request, decide) => ({ jsonData: { floors: request.floors.map(floor => ({
+  floorKey: floor.floorKey, qianshi: decide({ ...floor, floor: floor.floorKey,
+    qianshiCandidates: request.qianshiCandidates.filter(candidate => floor.qianshiCandidateKeys.includes(candidate.key)) }),
+})) } });
+const assertQianshiLifecycleGuidance = prompt => {
+  assert.match(prompt, /普通临时事项.*主动结束跟进.*following:false/u);
+  assert.match(prompt, /新建 matter=true.*跨场景.*具体目标/u);
+  assert.match(prompt, /逐项检查全部旧候选/u);
+  assert.match(prompt, /保留原 status.*latestProgress.*storyTime.*scheduledTime/u);
+  assert.match(prompt, /仅调整跟进也用 progress/u);
+  assert.match(prompt, /债务、交付、长期承诺、关键伏笔.*未来约定/u);
+  assert.match(prompt, /manualStatus=true.*tracking=following/u);
+  assert.match(prompt, /局部动作结束也不关闭另一个剩余目标/u);
+  assert.match(prompt, /重要事项同样按后文明确蕴含的结果判断完成/u);
+};
 const legacyScanner = async (chat, options) => {
   const candidates = await scanAssistantCandidates(chat, options);
   return Object.freeze(candidates.map((candidate, index) => index < candidates.length - 1 || candidate.stabilityProof
@@ -52,6 +81,62 @@ test('当前时间证据读取原文状态栏，避开历史区块和不明确�
   assert.equal(inferCanonicalCurrentTime('<status_history><status>当前状态：2026年5月8日 11:00</status></status_history><p>正文</p>'), null);
   assert.deepEqual(inferCanonicalCurrentTime('<StatusBar>Date：2026年5月8日 11:00；Event：旧事发生。<b>当前状态</b>：2026年5月10日 14:30</StatusBar>'), { text: '2026年5月10日 14:30', kind: 'explicit' });
   assert.equal(inferCanonicalCurrentTime('<StatusBar>Date：2026年5月8日 11:00；Event：旧事发生</StatusBar>'), null);
+});
+
+test('新卡无QQJ身份的启动读取沿已确认uninitialized状态安静待记录', async () => {
+  for (const host of ['official', 'luker']) {
+    const context = { name1: '林岚', personaId: 'persona-linlan', characterId: 0, groupId: null, chatId: 'new-host-chat',
+      characters: [{ avatar: 'character.png' }], userAvatar: 'persona.png', chatMetadata: { qianqianjie: { schemaVersion: 1 } },
+      chat: [assistant('欢迎来到新故事。') ] };
+    const session = createChatSession({ contextProvider: () => context });
+    const h = harness({ host, sharedContext: context, initialChat: context.chat, readOnlyLifecycle: true,
+      storeIdentityProvider: () => session.identity() });
+    await h.runtime.start();
+    const state = h.runtime.getState();
+    assert.equal(h.foundationRuntime.getState().status, 'uninitialized', `${host}: ${JSON.stringify(h.foundationRuntime.getState())}`);
+    assert.equal(h.foundationRuntime.getState().inspectedStableCount, 0, `${host}: 单独AI0仍未稳定`);
+    assert.equal(state.memorySnapshotStatus, 'ready');
+    assert.equal(state.memorySyncStatus, 'idle');
+    assert.equal(state.stableCount, 0);
+    assert.equal(state.lastExtractorError, null);
+    assert.equal(h.readReachableModes.length, 0, `${host}: 已确认无身份时，不应再调用需session.identity的store.readReachable`);
+    assert.equal(h.calls.length, 0, `${host}: 尚未开始记录不写图或调用模型`);
+    await assert.rejects(h.store.readReachable({ mode: 'projection' }), { code: 'CHAT_SESSION_NOT_READY' }, `${host}: 实际身份提供器应准确报告尚未准备好`);
+    h.readReachableModes.length = 0;
+    await h.runtime.refreshStatus({ preferCached: false });
+    h.setEnabled(false); await h.runtime.setEnabled(false); h.setEnabled(true);
+    await h.runtime.setEnabled(true);
+    assert.equal(h.runtime.getState().lastExtractorError, null, `${host}: 手动启用复用foundation已确认的空状态`);
+    assert.equal(h.readReachableModes.length, 0, `${host}: 刷新和启用均不再向无身份store读取`);
+    h.context.chat.push(user('开始对话'));
+    h.emit('MESSAGE_SENT', h.context.chat.length - 1);
+    await waitFor(() => h.runtime.getState().memorySyncStatus === 'idle', `${host}: foundation订阅的待记录状态未完成`);
+    assert.equal(h.runtime.getState().lastExtractorError, null, `${host}: 首个用户楼稳定前保持正常待记录`);
+    assert.equal(h.readReachableModes.length, 0, `${host}: foundation订阅不会把已知空状态退回无身份读取`);
+
+    let recallModelCalls = 0, identityProjectionCalls = 0;
+    const recall = createV3RecallRuntime({ store: h.store, hostAdapter: h.hostAdapter,
+      prepareMemory: options => h.runtime.prepareCurrent(options), generateUtilityTask: async () => { recallModelCalls += 1; throw new Error('空记忆不得调用选择模型'); },
+      identityProjectionProvider: async () => { identityProjectionCalls += 1; return session.identity(); },
+      pluginVersion: 'test-uninitialized', now: () => new Date(NOW), logger: { warn() {} } });
+    const abortValues = [], injections = [];
+    h.context.constants = { promptTypes: { IN_CHAT: 1 }, promptRoles: { SYSTEM: 0 } };
+    h.context.setExtensionPrompt = (...args) => injections.push(args);
+    const noMemory = await h.runtime.prepareCurrent({ preferCached: false });
+    assert.equal(noMemory.status, 'uninitialized', `${host}: production式memory准备返回明确的uninitialized空状态`);
+    assert.equal(h.runtime.getQianshiSnapshot().message, '尚未开始记录，继续对话后可开始记录。', `${host}: 千事待记录是正常状态提示`);
+    assert.equal(h.readReachableModes.length, 0, `${host}: 已确认空状态时准备本身不读需身份store`);
+    const intercepted = await recall.intercept(structuredClone(h.context.chat), 8192, value => abortValues.push(value), 'normal');
+    assert.equal(intercepted.lastRecall?.status, 'skipped', `${host}: 无身份空记忆应正常跳过召回 ${JSON.stringify({ lastRecall: intercepted.lastRecall, abortValues, reads: h.readReachableModes })}`);
+    assert.deepEqual(intercepted.lastRecall?.skipReasons, ['uninitialized'], `${host}: 区分正常待记录与真实来源读取故障`);
+    assert.equal(intercepted.lastRecall?.skipReasons?.includes('emptyUserInput'), false, `${host}: 验证输入必须包含真实首条USER`);
+    assert.equal(intercepted.lastRecall?.timings?.preparationAttempts?.[0]?.status, 'uninitialized', `${host}: 诊断应保留正常待记录状态`);
+    assert.deepEqual(abortValues, [], `${host}: 正常uninitialized来源不应中止正文生成`);
+    assert.equal(identityProjectionCalls, 0, `${host}: 尚无记忆身份时不读取依赖identity的映射`);
+    assert.equal(h.readReachableModes.length, 0, `${host}: 首条USER召回不触发无身份图读取`);
+    assert.equal(recallModelCalls, 0, `${host}: 空记忆不发选择模型请求`);
+    assert.equal(injections.some(args => String(args[1] ?? '').trim()), false, `${host}: 无记忆时不注入召回正文`);
+  }
 });
 
 test('已存空间事实严格冷读且状态投影用一次floor索引解析来源楼', async () => {
@@ -81,13 +166,33 @@ test('已存空间事实严格冷读且状态投影用一次floor索引解析来
 
   h.runtime.getQianshiSnapshot();
   const originalStructuredClone = globalThis.structuredClone; let cloneCalls = 0;
-  globalThis.structuredClone = value => { cloneCalls += 1; return originalStructuredClone(value); };
+  const clonedShapes = [];
+  globalThis.structuredClone = value => { cloneCalls += 1; clonedShapes.push({ hasEvents: Array.isArray(value?.events) }); return originalStructuredClone(value); };
   try {
     const version = h.runtime.getQianshiSnapshotVersion();
     assert.ok(Number.isSafeInteger(version.projectionRevision));
     assert.equal(cloneCalls, 0, '热投影版本读取不复制千事详情');
+    const bridge = createPublicQianshiBridge({ memoryRuntime: h.runtime });
+    bridge.getStatus();
+    assert.equal(cloneCalls, 1, '状态只复制紧凑header，不复制完整事件图');
+    assert.equal(clonedShapes[0].hasEvents, false);
+    cloneCalls = 0;
+    clonedShapes.length = 0;
     h.runtime.getQianshiSnapshot();
     assert.equal(cloneCalls, 1, '公共详情仍通过structuredClone返回隔离副本');
+    cloneCalls = 0;
+    const snapshot = bridge.getSnapshot();
+    assert.equal(cloneCalls, 1, '桥直接返回runtime提供的隔离快照，不再做第二份完整复制');
+    assert.ok(Array.isArray(snapshot.events));
+    assert.equal(clonedShapes.at(-1).hasEvents, true);
+    const originalEvents = JSON.stringify(snapshot.events), originalAnchor = JSON.stringify(snapshot.anchor), originalCoverage = JSON.stringify(snapshot.coverage);
+    snapshot.events.push({ id: 'tampered' }); snapshot.anchor = { headCheckpointId: 'tampered' }; snapshot.coverage = { totalFloors: 999 };
+    cloneCalls = 0;
+    const authoritative = h.runtime.getQianshiSnapshot();
+    assert.equal(cloneCalls, 1, '重新读取权威快照只创建一份完整副本');
+    assert.equal(JSON.stringify(authoritative.events), originalEvents, '修改对外事件列表不改变runtime权威快照');
+    assert.equal(JSON.stringify(authoritative.anchor), originalAnchor, '修改对外anchor不改变runtime权威快照');
+    assert.equal(JSON.stringify(authoritative.coverage), originalCoverage, '修改对外coverage不改变runtime权威快照');
   } finally { globalThis.structuredClone = originalStructuredClone; }
 
   const reachable = h.foundationRuntime.getReachable();
@@ -123,7 +228,8 @@ test('时间状态字段按同一容器局部配对，兼容分隔的 Time 行�
   assert.equal(inferCanonicalCurrentTime('<unknown><details>[Time: 2026-09-29 | 19:20]</details></unknown>'), null);
   assert.equal(inferCanonicalCurrentTime('<unknown><think>[Time: 2026-09-29 | 19:20]</think></unknown>'), null);
   assert.equal(inferCanonicalCurrentTime('<unknown><snow><StatusBar>当前状态：2026-09-29 19:20</StatusBar></snow></unknown>'), null);
-  assert.equal(inferCanonicalCurrentTime('大陆历1686年10月4日 15:30'), null, '不截取具名纪年中的数字作为公历');
+  assert.deepEqual(inferCanonicalCurrentTime('大陆历1686年10月4日 15:30'), { text: '大陆历1686年10月4日 15:30', kind: 'explicit' }, '保留完整具名纪年，不截成公历');
+  assert.equal(projectTime('大陆历1686年10月4日 15:30').day, null, '没有确认历法时，不把具名纪年按公历计算');
   assert.deepEqual(inferCanonicalCurrentTime('<time-box><date>2026-09-29</date><time>19：20</time></time-box>'), { text: '2026-09-29 19：20', kind: 'explicit' });
   assert.deepEqual(inferCanonicalCurrentTime('<Status>[Time: 2026-09-29 | 晚上19:30]</Status>'), { text: '2026-09-29 晚上19:30', kind: 'explicit' });
   assert.deepEqual(inferCanonicalCurrentTime('<time-box><date>2026-09-29</date><time>晚上19:30</time></time-box>'), { text: '2026-09-29 晚上19:30', kind: 'explicit' });
@@ -152,15 +258,26 @@ const taskRouter = fetchImpl => {
 };
 
 function viewHarness(runtime, { navigatorRef, pluginVersion = 'test', page = 'memories' } = {}) {
+  let editor = null, editorError = null;
+  const customImpl = options => new Promise(resolve => { editorError = null; editor = { options, resolve }; });
+  const submitEditor = async () => {
+    const current = editor;
+    assert.ok(current, '实际编辑弹窗已打开');
+    try {
+      const result = await current.options.submit();
+      if (editor === current) editor = null;
+      current.options.onClose?.(); current.resolve(result); return result;
+    } catch (error) { editorError = error; return false; }
+  };
   const documentRef = { activeElement: null, createElement: tag => new ViewNode(tag) };
   class ViewNode {
     constructor(tag) { this.tag = tag; this.children = []; this.listeners = {}; this.textContent = ''; this.className = ''; this.disabled = false; this.value = ''; this.open = false; this.selectionStart = 0; this.selectionEnd = 0; this.attributes = {}; }
     append(...nodes) { for (const node of nodes) { this.children.push(node); if (node instanceof ViewNode) node.parentNode = this; } }
     replaceChildren(...nodes) { this.children = []; this.append(...nodes); }
-    addEventListener(name, handler) { this.listeners[name] = handler; }
+    addEventListener(name, handler) { (this.listeners[name] ??= []).push(handler); }
     setAttribute(name, value) { this.attributes[name] = String(value); }
-    click() { return this.listeners.click?.(); }
-    fire(name) { return this.listeners[name]?.(); }
+    click() { return this.fire('click'); }
+    fire(name) { let result; for (const handler of this.listeners[name] ?? []) result = handler({ target: this, currentTarget: this, stopPropagation() {}, preventDefault() {} }); return result; }
     focus() { documentRef.activeElement = this; }
     closest(selector) { for (let node = this; node; node = node.parentNode) if (selector.startsWith('.') && node.className.split(' ').includes(selector.slice(1))) return node; return null; }
     getBoundingClientRect() { return { top: 0, bottom: 100, height: 100 }; }
@@ -174,8 +291,9 @@ function viewHarness(runtime, { navigatorRef, pluginVersion = 'test', page = 'me
   }
   const flatten = node => [node, ...(node.children ?? []).flatMap(flatten)];
   const container = new ViewNode('main');
-  const view = createV3FoundationView({ runtime, documentRef, navigatorRef, pluginVersion }); view.setPage(page); view.mount(container);
-  return { view, container, flatten };
+  const view = createV3FoundationView({ runtime, documentRef, navigatorRef, pluginVersion, customImpl }); view.setPage(page); view.mount(container);
+  return { view, container, flatten, submitEditor, editorContent: () => editor?.options.content ?? null,
+    editorOptions: () => editor?.options ?? null, editorError: () => editorError };
 }
 
 test('人物选择投影只保留有效 person，主角色与用户仍可选择', () => {
@@ -186,6 +304,11 @@ test('人物选择投影只保留有效 person，主角色与用户仍可选择'
     { id: 'merged', entityType: 'person', displayName: '旧人物', recordStatus: 'active', status: 'merged' },
   ]);
   assert.deepEqual(people.map(item => item.entityId), ['user', 'character']);
+  const merged = projectMemoryPersonEntities([
+    { id: 'canonical', entityType: 'person', displayName: '阿禾', aliases: [{ name: '禾苗' }], specialRole: 'none', recordStatus: 'active', status: 'established' },
+    { id: 'alias', entityType: 'person', displayName: '旧名', aliases: [{ name: '小禾' }], specialRole: 'none', recordStatus: 'active', status: 'merged' },
+  ], { identityRedirectsByEntityId: { alias: 'canonical' }, deletedEntityIds: [] });
+  assert.deepEqual(merged, [{ entityId: 'canonical', memberEntityIds: ['alias', 'canonical'], displayName: '阿禾', aliases: ['禾苗', '旧名', '小禾'], specialRole: 'none' }], '已加载的别名身份投影供搜索与旧知情ID映射使用，不构建第二份人物目录');
 });
 
 function backendHarness() {
@@ -223,7 +346,7 @@ function browserStorage(initial = {}) {
   };
 }
 
-function harness({ text = '裴晚生提醒你带伞。', initialChat = null, utility, host = 'official', automation = { enabled: false, batchSize: 2 }, notifyUser, isMainGenerationActive, onAutomaticSummaryCommitted = () => {}, onMemoryBatchCommitted = () => {}, extractorPromptGuidance, csePromptGuidance, processingPrompt, storyClockReferenceTags = '', sanitizerOptions = () => ({}), foundationRefresh, foundationFetch = undefined, hasTimeFloorReference = null, eventTypes = null, sharedBackend = null, sharedContext = null, modernAnchors = false, persistAnchors = null, readOnlyLifecycle = false, identityProjectionProvider = null, captureBusinessIdentity = null, qianshiExternalReferenceProvider = () => [], qianshiCandidatePreparer = undefined, qianshiCandidateIndexFactory = undefined, failureStorage = undefined, coreRecordCache = null, now = () => new Date(NOW), foundationNow = () => new Date(NOW) } = {}) {
+function harness({ memoryRuntimeFactory = createV3MemoryRuntime, withPlaces = false, onPlaceChanged = () => {}, placeWorldInfoProvider = null, filterWorldInfoSources = sources => sources, text = '裴晚生提醒你带伞。', initialChat = null, utility, todoReview, host = 'official', automation = { enabled: false, batchSize: 2 }, notifyUser, isMainGenerationActive, readMainGenerationState, extractorPromptGuidance, csePromptGuidance, processingPrompt, storyClockReferenceTags = '', sanitizerOptions = () => ({}), foundationRefresh, foundationFetch = undefined, hasTimeFloorReference = null, eventTypes = null, sharedBackend = null, sharedContext = null, modernAnchors = false, persistAnchors = null, readOnlyLifecycle = false, storeIdentityProvider = null, identityProjectionProvider = null, captureBusinessIdentity = null, prepareSession = null, qianshiExternalReferenceProvider = () => [], qianshiCandidatePreparer = undefined, qianshiCandidateIndexFactory = undefined, qianshiGraphProjector = undefined, failureStorage = undefined, coreRecordCache = null, now = () => new Date(NOW), foundationNow = () => new Date(NOW) } = {}) {
   let enabled = true;
   const handlers = new Map();
   const warnings = [];
@@ -238,7 +361,7 @@ function harness({ text = '裴晚生提醒你带伞。', initialChat = null, uti
   let snapshotCalls = 0;
   const hostAdapter = Object.freeze({ ...baseHostAdapter, snapshot() { snapshotCalls += 1; return baseHostAdapter.snapshot(); } });
   const backend = sharedBackend ?? backendHarness();
-  const identityProvider = () => ({ hostChatId: context.chatId, chatId: context.chatMetadata.qianqianjie.chatId, characterLocator: 'character.png', personaLocator: 'persona.png' });
+  const identityProvider = storeIdentityProvider ?? (() => ({ hostChatId: context.chatId, chatId: context.chatMetadata.qianqianjie.chatId, characterLocator: 'character.png', personaLocator: 'persona.png' }));
   const baseStore = createFoundationStore({ client: backend.client, contextProvider: identityProvider, isEnabled: () => enabled, coreRecordCache });
   const readReachableModes = [];
   let readReachableGate = null;
@@ -251,7 +374,7 @@ function harness({ text = '裴晚生提醒你带伞。', initialChat = null, uti
     },
   });
   const currentSanitizerOptions = () => typeof sanitizerOptions === 'function' ? sanitizerOptions() : sanitizerOptions;
-  const foundationBase = createFoundationRuntime({ hostAdapter, store, fetchImpl: foundationFetch, hasTimeFloorReference, contextProvider: () => context, isEnabled: () => enabled, sanitizerOptions: currentSanitizerOptions, scanCandidates: modernAnchors ? scanAssistantCandidates : legacyScanner, newUuid: uuidFactory(), now: foundationNow, logger: { warn() {} } });
+  const foundationBase = createFoundationRuntime({ hostAdapter, store, fetchImpl: foundationFetch, hasTimeFloorReference, contextProvider: () => context, prepareSession, isEnabled: () => enabled, sanitizerOptions: currentSanitizerOptions, scanCandidates: modernAnchors ? scanAssistantCandidates : legacyScanner, newUuid: uuidFactory(), now: foundationNow, logger: { warn() {} } });
   const foundationRuntime = {
     ...foundationBase,
     ...(!readOnlyLifecycle ? { inspect: reason => foundationBase.reconcile(`testSetup:${reason}`) } : {}),
@@ -260,16 +383,22 @@ function harness({ text = '裴晚生提醒你带伞。', initialChat = null, uti
   const calls = [];
   const generateUtilityTask = async options => {
     calls.push(options);
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (request.task === 'reviewQianshiFollowingV1') return todoReview ? todoReview(request, options)
+      : { jsonData: { decisions: request.matters.map(matter => ({ key: matter.key, status: matter.status,
+        following: matter.following, reason: '维持当前判断。', evidenceFloorKeys: [] })) } };
     if (utility) {
       const request = JSON.parse(options.taskMessages[0].content);
       return utility(options, calls.length);
     }
     return { jsonData: { summary: '裴晚生提醒用户带伞。', people: [{ name: '裴晚生' }, { name: '你', role: 'user' }], events: [{ title: '带伞提醒', description: '裴晚生提醒用户带伞。' }] }, taskMetadata: { source: 'shared-utility', sourceLabel: '机械副 API', model: 'mock-model', finishReason: 'stop' } };
   };
-  const runtime = createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, generateAnalysisTask: generateUtilityTask, generateUtilityTask, isEnabled: () => enabled, automationSettings: () => automation, notifyUser, isMainGenerationActive, onAutomaticSummaryCommitted, onMemoryBatchCommitted, extractorPromptGuidance: () => typeof extractorPromptGuidance === 'function' ? extractorPromptGuidance() : '', csePromptGuidance: () => typeof csePromptGuidance === 'function' ? csePromptGuidance() : '', processingPrompt: () => typeof processingPrompt === 'function' ? processingPrompt() : (processingPrompt ?? ''), storyClockReferenceTags: () => typeof storyClockReferenceTags === 'function' ? storyClockReferenceTags() : storyClockReferenceTags, sanitizerOptions: currentSanitizerOptions, persistAnchors, identityProjectionProvider, captureBusinessIdentity, qianshiExternalReferenceProvider, ...(qianshiCandidatePreparer ? { qianshiCandidatePreparer } : {}), ...(qianshiCandidateIndexFactory ? { qianshiCandidateIndexFactory } : {}), failureStorage, now, newUuid: uuidFactory(), logger: { warn(...args) { warnings.push(args); } } });
+  const placeWorkspaceStore = withPlaces ? createPlaceWorkspaceStore({ client: backend.client }) : null;
+  const placeProvider = identityProjectionProvider ?? (withPlaces ? async identity => { const value = await placeWorkspaceStore.read(identity ?? { chatId: CHAT }); return { placeWorkspace: value.data, placeWorkspaceRevision: value.revision }; } : null);
+  const runtime = memoryRuntimeFactory({ foundationRuntime, store, hostAdapter, generateAnalysisTask: generateUtilityTask, generateUtilityTask, isEnabled: () => enabled, automationSettings: () => automation, notifyUser, isMainGenerationActive, readMainGenerationState, extractorPromptGuidance: () => typeof extractorPromptGuidance === 'function' ? extractorPromptGuidance() : '', csePromptGuidance: () => typeof csePromptGuidance === 'function' ? csePromptGuidance() : '', processingPrompt: () => typeof processingPrompt === 'function' ? processingPrompt() : (processingPrompt ?? ''), storyClockReferenceTags: () => typeof storyClockReferenceTags === 'function' ? storyClockReferenceTags() : storyClockReferenceTags, sanitizerOptions: currentSanitizerOptions, persistAnchors, identityProjectionProvider: placeProvider, placeWorkspaceStore, onPlaceChanged, placeWorldInfoProvider, filterWorldInfoSources, captureBusinessIdentity, qianshiExternalReferenceProvider, ...(qianshiCandidatePreparer ? { qianshiCandidatePreparer } : {}), ...(qianshiCandidateIndexFactory ? { qianshiCandidateIndexFactory } : {}), ...(qianshiGraphProjector ? { qianshiGraphProjector } : {}), failureStorage, now, newUuid: uuidFactory(), logger: { warn(...args) { warnings.push(args); } } });
   runtime.bind({ eventSource: context.eventSource, eventTypes: context.eventTypes });
   const emit = (name, ...args) => (handlers.get(name) ?? []).forEach(listener => listener(...args));
-  return { runtime, foundationRuntime, store, backend, context, hostAdapter, calls, warnings, emit, readReachableModes, snapshotCount: () => snapshotCalls,
+  return { runtime, foundationRuntime, store, backend, context, hostAdapter, placeWorkspaceStore, calls, warnings, emit, readReachableModes, snapshotCount: () => snapshotCalls,
     setReadReachableGate(value) { readReachableGate = value; }, setEnabled(value) { enabled = value; }, setAutomation(value) { automation = value; } };
 }
 
@@ -318,6 +447,68 @@ const registeredGraphCaughtUp = state => state.stableCount > 0
   && state.rebuildCompletedCount === state.stableCount
   && ['caughtUp', 'waitingRealtime'].includes(state.rebuildStatus);
 
+test('切页快照复用楼层派生，工作状态与人工摘要变化仍即时可见', async () => {
+  let release;
+  const h = harness({ initialChat: [assistant('合成人物与用户在庭院交谈。'), user('确认本楼')], utility: () => new Promise(resolve => { release = resolve; }) });
+  await h.runtime.start();
+  const idle = h.runtime.getState(), floorId = idle.floors[0].floorId;
+  assert.equal(h.runtime.getState().floors, idle.floors);
+  assert.equal(h.runtime.getState().cseFloors, idle.cseFloors);
+  h.setAutomation({ enabled: true, batchSize: 3 });
+  assert.equal(h.runtime.getState().autoMemoryEnabled, true);
+  const pending = h.runtime.extractFloor(floorId, { analyzeState: false });
+  await waitFor(() => typeof release === 'function');
+  const busy = h.runtime.getState();
+  assert.equal(busy.memoryWorkBusy, true);
+  assert.equal(busy.floors[0].status, 'running');
+  assert.notEqual(busy.floors, idle.floors);
+  release({ jsonData: { summary: '完成后的合成摘要。', people: [{ name: '合成人物' }] }, taskMetadata: { source: 'fixture', model: 'fixture-model' } });
+  await pending;
+  const completed = h.runtime.getState();
+  assert.equal(completed.memoryWorkBusy, false);
+  assert.equal(completed.floors[0].summary, '完成后的合成摘要。');
+  assert.ok(Object.isFrozen(completed.floors[0].counts));
+  assert.ok(Object.isFrozen(completed.floors[0].api));
+  assert.equal(completed.floors[0].api.model, 'fixture-model');
+  assert.throws(() => { completed.floors[0].api.model = 'polluted'; }, TypeError);
+  assert.throws(() => { completed.floors[0].counts.actions = 999; }, TypeError);
+  assert.equal(h.runtime.getState().floors, completed.floors);
+  await h.runtime.editSummary(floorId, '人工修改后的摘要。');
+  const edited = h.runtime.getState();
+  assert.notEqual(edited.floors, completed.floors);
+  assert.equal(edited.floors[0].summary, '人工修改后的摘要。');
+  assert.equal(completed.floors[0].summary, '完成后的合成摘要。');
+  const person = edited.memoryEntities.find(entity => entity.specialRole !== 'user');
+  h.runtime.setIdentityProjection({ currentNamesByEntityId: { [person.entityId]: '缓存后改名' } });
+  assert.equal(h.runtime.getState().memoryEntities.find(entity => entity.entityId === person.entityId).displayName, '缓存后改名');
+  assert.notEqual(person.displayName, '缓存后改名');
+  h.runtime.invalidate();
+  assert.equal(h.runtime.getState().floors.length, 0);
+});
+
+test('切页快照复用期间实际请求elapsed继续增长，完成后忙态立即复位', async () => {
+  let started, release;
+  const ready = new Promise(resolve => { started = resolve; });
+  const client = createCompactApiClient({ timeoutMs: () => 10000, fetchImpl: async () => ({ ok: true, json: () => new Promise(resolve => {
+    release = () => resolve({ choices: [{ message: { content: JSON.stringify({ summary: '等待后保存的摘要。' }) }, finish_reason: 'stop' }] }); started();
+  }) }) });
+  const h = harness({ initialChat: [assistant('合成等待原文'), user('确认')], utility: options => client.generateTask({ ...options,
+    config: { url: 'https://offline.test', key: 'fixture', model: 'fixture', timeoutSec: 10 } }) });
+  await h.runtime.start();
+  const pending = h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  try {
+    await ready;
+    const first = h.runtime.getState();
+    await new Promise(resolve => setTimeout(resolve, 15));
+    const next = h.runtime.getState();
+    assert.equal(next.floors, first.floors);
+    assert.equal(next.memoryWorkBusy, true);
+    assert.ok(next.extractorRequest.elapsedMs > first.extractorRequest.elapsedMs);
+  } finally { release(); await pending; }
+  assert.equal(h.runtime.getState().memoryWorkBusy, false);
+  assert.equal(h.runtime.getState().extractorRequest.outcome, 'completed');
+});
+
 async function primeRealtimeTail(h) {
   await h.runtime.start();
   assert.equal(h.calls.length, 0, 'runtime 启动只检测历史覆盖，不得调用记忆 API');
@@ -347,7 +538,79 @@ test('实时自动 CSE 提交后只核验root，不重复读取整图', async ()
   assert.equal(h.readReachableModes.length, readsAtCse, '提交图已采用；后处理只读root并复用匹配图');
 });
 
-test('1000楼 production store 含完整摘要/CSE与五类core，缓存重载和正式回源按实际GET逐类核验', async () => {
+test('人物刷新复用等价身份映射，真实合并与删除仍更新CSE和千事投影', async () => {
+  const h = harness({ text: '甲和乙在港口相遇。', utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (request.task === 'extractFloorSemantics') return { jsonData: { summary: '甲与乙在港口相遇。', people: [{ name: '甲' }, { name: '乙' }] } };
+    return { jsonData: { subjects: request.payload.trackedSubjects.map(subject => ({ subject: subject.name,
+      situational: [{ text: `${subject.name}在港口`, reason: '本楼相遇', visibility: 'observable' }] })) } };
+  } });
+  await h.runtime.start();
+  const floor = h.runtime.getState().floors[0];
+  await h.runtime.extractFloor(floor.floorId);
+  const baselineCseRecord = h.runtime.getState().cseFloors[0]?.record;
+  assert.ok(baselineCseRecord, '先通过真实memory流程建立可观察的CSE历史投影');
+  const initialSubjects = h.runtime.getState().cseSubjects;
+  assert.ok(initialSubjects.length > 0, '真实CSE历史包含可观察人物状态');
+
+  const identity = { hostChatId: h.context.chatId, chatId: CHAT, characterLocator: 'character.png', personaLocator: 'persona.png' };
+  const peopleStore = createPeopleWorkspaceStore({ client: h.backend.client });
+  const people = createPeopleWorkspaceRuntime({ store: peopleStore, session: { identity: () => identity }, foundationRuntime: h.foundationRuntime,
+    memoryRuntime: h.runtime, generateUtilityTask: async () => { throw new Error('此用例不应调用模型'); },
+    sourcePermissions: { filterCandidates: ({ candidates }) => candidates, filterWorldInfoSources: sources => sources },
+    contextProvider: () => h.context, now: () => new Date(NOW), logger: { warn() {} } });
+  const firstVersion = h.runtime.getQianshiSnapshotVersion().projectionRevision;
+  const cseBeforeNoop = h.runtime.getState().cseFloors[0].record;
+  await people.refresh({ refreshMemory: false });
+  const noOpVersion = h.runtime.getQianshiSnapshotVersion().projectionRevision;
+  const cseAfterNoop = h.runtime.getState().cseFloors[0].record;
+  assert.equal(cseAfterNoop, cseBeforeNoop, 'people refresh 的默认空映射不重建CSE历史记录');
+  assert.equal(noOpVersion, firstVersion, '等价空映射不让千事投影版本变化');
+
+  const persons = h.foundationRuntime.getReachable().entities.filter(item => item.entityType === 'person').map(item => item.id);
+  assert.ok(persons.length >= 2, '实际抽取图应含至少两个可合并人物');
+  const sourceId = initialSubjects[0].subjectEntityId;
+  const targetId = persons.find(id => id !== sourceId);
+  assert.ok(targetId, '实际图中存在可合并的第二个人物实体');
+  const secondSourceId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  const deletedA = 'ffffffff-ffff-4fff-8fff-ffffffffffff', deletedB = '99999999-9999-4999-8999-999999999999';
+  const makeWorkspace = (identityRedirectsByEntityId, deletedEntityIds = []) => ({ schemaVersion: 3, kind: 'qqj-v3-people-workspace', chatId: CHAT,
+    selectedEntityIds: [], personOrderEntityIds: [], profilesByEntityId: {}, avatarsByEntityId: {}, identityRedirectsByEntityId, deletedEntityIds,
+    profileMaterialProgressByEntityId: {}, createdAt: NOW, updatedAt: NOW });
+  const redirects = { [sourceId]: targetId, [secondSourceId]: targetId };
+  await peopleStore.put(identity, makeWorkspace(redirects, [deletedA, deletedB]), 0);
+  const beforeMergeVersion = h.runtime.getQianshiSnapshotVersion().projectionRevision;
+  await people.refresh({ refreshMemory: false });
+  const merged = h.runtime.getState();
+  assert.ok(merged.cseSubjects.length > 0, '身份映射前后均有真实CSE当前状态');
+  assert.ok(merged.cseSubjects.every(subject => subject.subjectEntityId !== sourceId), '重定向后CSE状态归并到目标人物');
+  assert.equal(merged.cseSubjects.filter(subject => subject.subjectEntityId === targetId).length, 1, '合并身份后目标只显示一次');
+  assert.ok(h.runtime.getQianshiSnapshotVersion().projectionRevision > beforeMergeVersion, '实际重定向更新千事投影');
+  const mergedRecord = merged.cseFloors[0].record;
+  assert.notEqual(mergedRecord, cseAfterNoop, '实际重定向重建CSE历史投影');
+
+  await peopleStore.put(identity, makeWorkspace({ [secondSourceId]: targetId, [sourceId]: targetId }, [deletedB, deletedA]), 1);
+  const beforeEquivalentVersion = h.runtime.getQianshiSnapshotVersion().projectionRevision;
+  await people.refresh({ refreshMemory: false });
+  assert.equal(h.runtime.getQianshiSnapshotVersion().projectionRevision, beforeEquivalentVersion, '映射键顺序和删除集合顺序变化不改变千事投影');
+  assert.equal(h.runtime.getState().cseFloors[0].record, mergedRecord, '等价的非空映射不重建CSE历史投影');
+
+  await peopleStore.put(identity, makeWorkspace(redirects, [targetId]), 2);
+  const beforeDeleteVersion = h.runtime.getQianshiSnapshotVersion().projectionRevision;
+  await people.refresh({ refreshMemory: false });
+  const deleted = h.runtime.getState();
+  assert.equal(deleted.cseSubjects.length, 0, '删除合并后的目标人物会从CSE状态移除其全部来源');
+  assert.ok(h.runtime.getQianshiSnapshotVersion().projectionRevision > beforeDeleteVersion, '实际删除更新千事投影');
+  assert.notEqual(deleted.cseFloors[0].record, mergedRecord, '实际删除重建CSE历史投影');
+
+  await peopleStore.put(identity, makeWorkspace({}), 3);
+  const beforeClearVersion = h.runtime.getQianshiSnapshotVersion().projectionRevision;
+  await people.refresh({ refreshMemory: false });
+  assert.ok(h.runtime.getState().cseSubjects.some(subject => subject.subjectEntityId === sourceId), '清空删除映射后人物状态恢复');
+  assert.ok(h.runtime.getQianshiSnapshotVersion().projectionRevision > beforeClearVersion, '清空映射仍更新千事投影');
+});
+
+test('1000楼 production store 含完整摘要/CSE与五类core，缓存重载和正式回源按实际GET逐类核验', async t => {
   const idb = localForageHarness();
   const cache = createIndexedDbCoreRecordCache({ localForage: idb.localForage, indexedDBProvider: () => idb.indexedDB,
     keyRangeProvider: () => idb.keyRange, accountHandleProvider: () => 'neutral-test-account', originProvider: () => 'https://tavern.invalid', ioTimeoutMs: 100, logger: { debug() {} } });
@@ -414,7 +677,11 @@ test('1000楼 production store 含完整摘要/CSE与五类core，缓存重载�
     return [id, { schemaVersion: 1, generationId: rootRead.generationId, revision: value.revision, createdAt: NOW, updatedAt: NOW, data: value.data }];
   }));
   const fixtureFs = await import('node:fs/promises');
-  await fixtureFs.writeFile('/tmp/qqj-v048-1000-current-reachable.json', JSON.stringify({ identity, witness, records: fixtureRecords }), { mode: 0o600 });
+  const { join } = await import('node:path');
+  const fixtureDir = await fixtureFs.mkdtemp(new URL('./.tmp-current-reachable-', import.meta.url));
+  const fixturePath = join(fixtureDir, 'qqj-v048-1000-current-reachable.json');
+  t.after(async () => { await fixtureFs.rm(fixturePath, { force: true }); await fixtureFs.rmdir(fixtureDir); });
+  await fixtureFs.writeFile(fixturePath, JSON.stringify({ identity, witness, records: fixtureRecords }), { mode: 0o600 });
   const scope = await cache.scopeFor(identity);
   for (let attempt = 0; attempt < 1000 && !await cache.readManifest(scope, witness); attempt += 1) await new Promise(resolve => setTimeout(resolve, 5));
   assert.ok(await cache.readManifest(scope, witness), '最后一次真实root版本在strict read/CAS后才发布cache manifest');
@@ -468,6 +735,18 @@ test('1000楼 production store 含完整摘要/CSE与五类core，缓存重载�
     'runtime选择的core均命中；root/checkpoint/run及baseline/currentState仍走后端');
   assert.deepEqual(countReads(), { root: 1, checkpoint: 1, run: 1, baseline: 1, 'current-state': 1,
     floor: 0, 'floor-memory': 0, entity: 0, 'state-delta': 0, index: 0 });
+
+  const cacheStatsBeforeDisabledRead = cache.getStats();
+  backendReads.length = 0;
+  const disabledCacheStore = createFoundationStore({ client: countingClient, contextProvider: () => identity, coreRecordCache: null });
+  const uncached = await disabledCacheStore.readReachable({ mode: 'runtime' });
+  assert.equal(uncached.status, 'ready');
+  assert.deepEqual(uncached.floors, formal.floors);
+  assert.deepEqual(uncached.floorMemories, formal.floorMemories);
+  assert.deepEqual(uncached.currentStates, formal.currentStates);
+  assert.deepEqual(countReads(), { root: 1, checkpoint: 1, run: 1, baseline: 1, 'current-state': 1,
+    floor: 1000, 'floor-memory': 1000, entity: 3, 'state-delta': 1000, index: runtimeIndexIds.length }, '缓存关闭时真实production Store仍从正式存储读完整1000楼runtime图');
+  assert.deepEqual(cache.getStats(), cacheStatsBeforeDisabledRead, '传入null的Store不读取、发布或维护原缓存实例');
 
   const hangingForage = { INDEXEDDB: 'INDEXEDDB', createInstance: () => ({ ready: async () => {}, getItem: () => new Promise(() => {}), setItem: () => new Promise(() => {}), removeItem: async () => {}, keys: async () => [] }) };
   const hangingCache = createIndexedDbCoreRecordCache({ localForage: hangingForage, indexedDBProvider: () => idb.indexedDB,
@@ -561,6 +840,36 @@ test('1000楼 production store 含完整摘要/CSE与五类core，缓存重载�
   assert.equal(h.backend.calls.slice(bStartAt).filter(([method, collection, key]) => method === 'get' && collection === `chat-${targetId}`
     && (key.startsWith('v3-floor-memory-') || key.startsWith('v3-state-delta-'))).length, 0,
   '迁移runtime热路径不逐楼回源读取已验证的1000份summary/CSE');
+});
+
+test('千事迁移补齐计划只包含当前聊天的待处理楼', async () => {
+  const task = options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+    ? { jsonData: { summary: '已整理的中性摘要。' } } : { jsonData: { noMaterialChange: true } };
+  const source = harness({ initialChat: [user('旧开场'), assistant('归档历史事实。'), user('确认归档楼')], utility: task });
+  await source.runtime.start();
+  for (const floor of source.runtime.getState().floors) await source.runtime.extractFloor(floor.floorId);
+  const sourceReachable = await source.store.readReachable({ mode: 'runtime' });
+  assert.equal(sourceReachable.status, 'ready');
+
+  const targetId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const targetChat = [assistant('当前聊天待整理的事实。'), user('确认当前楼')];
+  const target = harness({ initialChat: targetChat, sharedBackend: source.backend, utility: task });
+  target.context.chatId = 'target-host-chat'; target.context.chatMetadata.qianqianjie.chatId = targetId;
+  const sourceIdentity = { hostChatId: 'host-chat', chatId: CHAT, characterLocator: 'character.png', personaLocator: 'persona.png' };
+  const targetIdentity = { ...sourceIdentity, hostChatId: target.context.chatId, chatId: targetId };
+  const migrated = await initializeMigrationGraph({ store: target.store, sourceIdentity, targetIdentity, sourceReachable,
+    targetChat, now: () => new Date(NOW), newUuid: uuidFactory() });
+  await target.runtime.start();
+  const frozenIds = new Set(migrated.reachable.migrationDescriptor.frozenFloorIds);
+  const live = target.runtime.getState().floors.filter(floor => !frozenIds.has(floor.floorId));
+  assert.equal(live.length, 1, '迁移后只有一个当前聊天活动楼');
+  await target.runtime.extractFloor(live[0].floorId);
+  const snapshot = target.runtime.getQianshiSnapshot();
+  assert.equal(snapshot.coverage.eligibleFloors, 2, '公开总计仍包括冻结历史与当前楼');
+  assert.equal(snapshot.coverage.processable.pendingFloors, 1);
+  const plan = await target.runtime.prepareQianshiHistory();
+  assert.equal(plan.totalFloors, 1, '真实 memory runtime 只计划当前聊天的待处理楼');
+  assert.deepEqual(plan.batches.flatMap(batch => batch.assistantSeqs), [live[0].assistantSeq]);
 });
 
 test('CSE提交后root版本再次推进时重新读取实际图', async () => {
@@ -724,7 +1033,7 @@ test('SillyTavern 与 Luker 的正文事件投影新发现连续 AI 后提醒且
 test('正常逐楼摘要准备复用增量千事索引，连续新增楼只做一次完整投影', async () => {
   let projections = 0;
   const h = harness({ modernAnchors: true,
-    initialChat: Array.from({ length: 4 }, (_, index) => [assistant(`普通楼 ${index + 1}`), user(`确认 ${index + 1}`)]).flat(),
+    initialChat: Array.from({ length: 5 }, (_, index) => [assistant(index ? `普通楼 ${index}` : '建立人物身份基线'), user(`确认 ${index}`)]).flat(),
     automation: { enabled: false, batchSize: 1 },
     qianshiCandidateIndexFactory: () => createQianshiCandidateIndex({ projector: (...args) => { projections += 1; return projectQianshiGraph(...args); } }),
     utility: options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics'
@@ -732,6 +1041,9 @@ test('正常逐楼摘要准备复用增量千事索引，连续新增楼只做�
       : { jsonData: { noMaterialChange: true } },
   });
   await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId);
+  assert.ok(h.runtime.getState().memoryEntities.some(entity => entity.specialRole === 'user'), '先固定人物身份，避免把首次创建全局用户当作同一索引范围');
+  h.calls.splice(0); projections = 0;
   await h.runtime.startHistoricalRebuild();
   await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().memoryWorkBusy);
   assert.equal(h.calls.filter(call => JSON.parse(call.taskMessages[0].content).task === 'extractFloorSemantics').length, 4);
@@ -760,8 +1072,251 @@ async function primeEarlyGenerationTail(h) {
   h.calls.splice(0);
 }
 
+test('实际聚合记忆状态进入自动隐藏时按来源楼覆盖并在批次内部保留最近正文', async () => {
+  const h = harness({ modernAnchors: true, readOnlyLifecycle: true,
+    initialChat: Array.from({ length: 12 }, (_, index) => [assistant(`剧情段落 ${index + 1}`), user(`确认 ${index + 1}`)]).flat(),
+    utility: options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics'
+      ? { jsonData: { summary: '已记录的剧情摘要。' } } : { jsonData: { noMaterialChange: true } },
+  });
+  h.context.chatMetadata.integrity = 'offline-full-chat';
+  assert.equal((await h.foundationRuntime.reconcile('autoHideSeed')).status, 'ready');
+  await h.runtime.start();
+  await h.runtime.startHistoricalRebuild({ aggregate: true });
+  await waitFor(() => !h.runtime.getState().memoryWorkBusy && !h.runtime.getState().activeAutoMemory);
+  const state = h.runtime.getState();
+  assert.equal(state.memorySnapshotStatus, 'ready');
+  assert.equal(state.rememberedCount, 12);
+  assert.deepEqual(state.floors.map(floor => floor.assistantSeq), [10, 12]);
+  assert.deepEqual(state.floors.map(floor => floor.sourceAssistantSeqs), [Array.from({ length: 10 }, (_, index) => index + 1), [11, 12]]);
+  assert.ok(state.floors.every(floor => floor.status === 'ready' && floor.cse.status === 'noChange'));
+  const plan = planAutoHide({ chat: h.context.chat, memoryState: state, keepAiCount: 3 });
+  assert.equal(plan.keepFrom, 15, '保留3条历史AI与当前回复槽，并保留之前相邻用户输入');
+  assert.deepEqual(plan.hideRanges, [{ start: 0, end: 14 }], '首批1–10内只隐藏1–8，不要求等整批跨过保留边界');
+});
+
+test('等待诊断切聊后B未新提取时不继承A完成或取消的最后请求', async t => {
+  for (const outcome of ['completed', 'cancelled']) await t.test(outcome, async () => {
+    let started;
+    const ready = new Promise(resolve => { started = resolve; });
+    const client = createCompactApiClient({ timeoutMs: () => 10000, fetchImpl: async () => ({ ok: true,
+      json: () => outcome === 'cancelled' ? new Promise(() => { started(); })
+        : Promise.resolve({ choices: [{ message: { content: JSON.stringify({ summary: 'A已保存摘要' }) }, finish_reason: 'stop' }] }) }) });
+    const h = harness({ initialChat: [assistant('A原文'), user('稳定A')], utility: options => client.generateTask({ ...options,
+      config: { url: 'https://offline.test', key: 'PRIVATE', model: 'PRIVATE', timeoutSec: 5 } }) });
+    await h.runtime.start();
+    if (outcome === 'completed') await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+    else { const pending = h.runtime.startHistoricalRebuild(); await ready; h.runtime.pauseHistoricalRebuild(); await pending; }
+    assert.equal(h.runtime.getState().extractorRequest.outcome, outcome);
+    const calls = h.calls.length, otherId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    h.context.chatId = 'host-B'; h.context.chatMetadata = { qianqianjie: { schemaVersion: 1, chatId: otherId } };
+    h.context.chat = [assistant('B原文'), user('稳定B')]; h.emit('CHAT_CHANGED');
+    await h.foundationRuntime.reconcile('diagnostic-chat-B'); await h.runtime.refreshStatus({ preferCached: false });
+    const state = h.runtime.getState();
+    assert.equal(state.chatId, otherId); assert.equal(state.memorySnapshotStatus, 'ready');
+    assert.equal(state.extractorRequest, null, 'B尚未提取，不能把A最后请求作为B的诊断');
+    assert.equal(h.calls.length, calls, '切聊诊断清理不派发模型');
+  });
+});
+
+test('等待诊断边界普通单楼摘要已提交后只等CSE，摘要完成时间不继续累计', async () => {
+  let started, release;
+  const ready = new Promise(resolve => { started = resolve; });
+  const client = createCompactApiClient({ fetchImpl: async (_url, options) => {
+    const request = JSON.parse(JSON.parse(options.body).messages.at(-1).content);
+    const reply = value => ({ choices: [{ message: { content: JSON.stringify(value) }, finish_reason: 'stop' }] });
+    return { ok: true, json: () => request.task === 'extractFloorSemantics' ? Promise.resolve(reply({ summary: '已保存摘要' }))
+      : new Promise(resolve => { release = () => resolve(reply({ noMaterialChange: true })); started(); }) };
+  } });
+  const h = harness({ initialChat: [assistant('普通单楼'), user('稳定')], utility: options => client.generateTask({ ...options,
+    config: { url: 'https://offline.test', key: 'PRIVATE', model: 'PRIVATE', timeoutSec: 5 } }) });
+  await h.runtime.start();const pending=h.runtime.extractFloor(h.runtime.getState().floors[0].floorId);let summary;
+  try {await ready;summary=h.runtime.getState().extractorRequest;
+    assert.equal(summary.outcome,'completed');assert.ok(Number.isSafeInteger(summary.endedAt));
+    assert.equal(h.runtime.getState().cseRequest.outcome,'running');
+  } finally {release();await pending;}
+  assert.equal(h.runtime.getState().extractorRequest.endedAt,summary.endedAt);
+});
+
+test('等待诊断真实摘要CSE并发各有owner，暂停留阶段且新轮不复用旧在途', async () => {
+  let summaryStarted, cseStarted, releaseSummary, holdCse = true;
+  let summaryReady = new Promise(resolve => { summaryStarted = resolve; });
+  const cseReady = new Promise(resolve => { cseStarted = resolve; });
+  const response = value => ({ ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => ({ choices: [{ message: { content: JSON.stringify(value) }, finish_reason: 'stop' }] }) });
+  const client = createCompactApiClient({ timeoutMs: () => 10000, fetchImpl: async (_url, options) => {
+    const request = JSON.parse(JSON.parse(options.body).messages.at(-1).content), content = request.payload.canonicalContent;
+    if (request.task === 'extractFloorSemantics' && content === '等待楼3') return { ...response({}), json: () => new Promise(resolve => {
+      releaseSummary = () => resolve({ choices: [{ message: { content: JSON.stringify({ summary: '等待楼3摘要' }) }, finish_reason: 'stop' }] }); summaryStarted();
+    }) };
+    if (request.task !== 'extractFloorSemantics' && content === '等待楼2' && holdCse) return { ok: true, status: 200,
+      headers: { get: () => 'text/event-stream' }, body: { getReader: () => ({ read: () => { cseStarted(); return new Promise(() => {}); }, cancel() {}, releaseLock() {} }) } };
+    return response(request.task === 'extractFloorSemantics' ? { summary: `${content}摘要` } : { noMaterialChange: true });
+  } });
+  const route = { kind: 'independent', source: 'test', config: { url: 'https://offline.test', key: 'PRIVATE_WAIT', model: 'PRIVATE_WAIT', timeoutSec: 5, stream: true } };
+  const router = createTaskRouter({ resolver: { resolve: () => route, resolveUtility: () => route }, compactClient: client });
+  const h = harness({ initialChat: [assistant('等待楼1'), user('稳定1'), assistant('等待楼2'), user('稳定2'), assistant('等待楼3'), user('稳定3')],
+    utility: options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics' ? router.generateUtilityTask(options) : router.generateAnalysisTask(options) });
+  await h.runtime.start();
+  const running = h.runtime.startHistoricalRebuild();
+  try {
+    await Promise.all([summaryReady, cseReady]);
+    const during = h.runtime.getState();
+    assert.equal(during.extractorRequest.phase, 'responseBody'); assert.equal(during.cseRequest.phase, 'sseBody');
+    assert.deepEqual([during.extractorRequest.fromAssistantSeq, during.extractorRequest.toAssistantSeq], [3, 3]);
+    assert.deepEqual([during.cseRequest.fromAssistantSeq, during.cseRequest.toAssistantSeq], [2, 2]);
+  } finally { h.runtime.pauseHistoricalRebuild(); await running; }
+  const stopped = h.runtime.getState();
+  assert.equal(stopped.extractorRequest.outcome, 'cancelled'); assert.equal(stopped.extractorRequest.phase, 'responseBody');
+  assert.equal(stopped.cseRequest.outcome, 'cancelled'); assert.equal(stopped.cseRequest.phase, 'sseBody');
+  assert.equal(stopped.extractorRequest.attempts, 1); assert.equal(stopped.cseRequest.attempts, 1);
+  holdCse = false; summaryReady = new Promise(resolve => { summaryStarted = resolve; });
+  const next = h.runtime.startHistoricalRebuild(); await summaryReady;
+  const fresh = h.runtime.getState().extractorRequest;
+  assert.equal(fresh.outcome, 'running'); assert.equal(fresh.attempts, 1); assert.equal(fresh.lastAttemptError, null);
+  releaseSummary(); await next;
+  assert.equal(h.runtime.getState().extractorRequest.outcome, 'completed');
+});
+
+test('等待诊断outer超时重试共享budget，第二次取消不覆盖先前timeout', async () => {
+  let calls = 0, started, logicalStartedAt;
+  const ready = new Promise(resolve => { started = resolve; });
+  const client = createCompactApiClient({ timeoutMs: () => calls < 1 ? 5 : 10000, fetchImpl: async () => {
+    calls += 1;
+    if (calls === 1) return new Promise(() => {});
+    return { ok: true, json: () => { started(); return new Promise(() => {}); } };
+  } });
+  const h = harness({ initialChat: [assistant('一楼等待'), user('稳定')], utility: options => client.generateTask({ ...options,
+    config: { url: 'https://offline.test', key: 'PRIVATE_WAIT', model: 'PRIVATE_WAIT', timeoutSec: 5 } }) });
+  await h.runtime.start(); const pending = h.runtime.startHistoricalRebuild();
+  try { await ready; const value = h.runtime.getState().extractorRequest;
+    assert.equal(value.attempts, 2); assert.equal(value.lastAttemptError.code, 'QQJ_TIMEOUT');
+    assert.equal(value.outcome, 'running'); assert.ok(value.elapsedMs >= value.attemptElapsedMs);
+    logicalStartedAt = value.startedAt;
+    assert.ok(value.lastAttemptError.at >= value.startedAt); assert.equal(value.endedAt, null);
+  } finally { h.runtime.pauseHistoricalRebuild(); await pending; }
+  const last = h.runtime.getState().extractorRequest;
+  assert.equal(last.outcome, 'cancelled'); assert.equal(last.phase, 'responseBody'); assert.equal(last.attempts, 2);
+  assert.equal(last.lastAttemptError.code, 'QQJ_TIMEOUT'); assert.equal(calls, 2);
+  assert.equal(last.startedAt, logicalStartedAt); assert.ok(last.endedAt >= last.lastAttemptError.at);
+});
+
+test('等待诊断真实client经engine最终401与耗尽503仍保HTTP状态且总运输不超三次', async t => {
+  for (const status of [401, 503]) await t.test(String(status), async () => {
+    let calls = 0, copied;
+    const client = createCompactApiClient({ retryWait: async () => {}, fetchImpl: async () => {
+      calls += 1; return { ok: false, status, json: async () => ({ error: { message: 'PRIVATE_HTTP', code: 'provider_error' } }) };
+    } });
+    const h = harness({ initialChat: [assistant('一楼HTTP失败'), user('稳定')], utility: options => client.generateTask({ ...options,
+      config: { url: 'https://offline.test', key: 'PRIVATE_HTTP', model: 'PRIVATE_HTTP', timeoutSec: 5 } }) });
+    await h.runtime.start(); await h.runtime.startHistoricalRebuild();
+    const value = h.runtime.getState().extractorRequest;
+    assert.equal(value.error.httpStatus, status); assert.equal(value.lastAttemptError.httpStatus, status);
+    assert.equal(value.attempts, status === 401 ? 1 : 3); assert.equal(calls, value.attempts);
+    const ui = viewHarness(h.runtime, { page: 'management', navigatorRef: { clipboard: { writeText: async text => { copied = text; } } } });
+    ui.flatten(ui.container).find(node => node.textContent === '复制状态诊断').click(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(JSON.parse(copied).memory.request.error.httpStatus, status);
+    assert.doesNotMatch(copied, /PRIVATE_HTTP/u); ui.view.deactivate();
+  });
+});
+
+test('四十楼历史流水在30楼等待后正常与Abort及旧paused恢复失效的自然终态', async t => {
+  for (const outcome of ['normal', 'abort', 'resumeInvalidated']) await t.test(outcome, async () => {
+    let summaries = 0, cses = 0, summaryPending = null, csePending = null;
+    const active = { summary: 0, cse: 0 }, max = { summary: 0, cse: 0 }, batchSizes = [];
+    const controlled = (options, kind) => {
+      let resolve, reject;
+      const control = { signal: options.signal, settled: false,
+        resolve: value => resolve(value), reject: error => reject(error) };
+      const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      const abort = () => reject(new DOMException('offline operation cancelled', 'AbortError'));
+      options.signal.addEventListener('abort', abort, { once: true });
+      if (options.signal.aborted) abort();
+      if (kind === 'summary') summaryPending = control; else csePending = control;
+      return promise.finally(() => { control.settled = true; options.signal.removeEventListener('abort', abort); });
+    };
+    const h = harness({ modernAnchors: true,
+      initialChat: Array.from({ length: 40 }, (_, index) => [assistant(`离线流水正文 ${index + 1}`),
+        { ...user(`确认 ${index + 1}`), send_date: `probe-forty-${index + 1}` }]).flat(),
+      utility: async options => {
+        const request = JSON.parse(options.taskMessages[0].content), kind = request.task === 'extractFloorSemantics' ? 'summary' : 'cse';
+        active[kind] += 1; max[kind] = Math.max(max[kind], active[kind]);
+        try {
+          if (kind === 'summary') {
+            summaries += 1; batchSizes.push(request.payload.sourceFloors.length);
+            if (summaries === 4 || summaries === 5) return await controlled(options, kind);
+            return { jsonData: { summary: `已保存批次 ${summaries}` } };
+          }
+          cses += 1;
+          if (cses === 3) return await controlled(options, kind);
+          return { jsonData: { noMaterialChange: true } };
+        } finally { active[kind] -= 1; }
+      } });
+    await h.runtime.start();
+    const ui = viewHarness(h.runtime, { page: 'management' });
+    await ui.view.activate();
+    const activity = createPluginActivity([h.foundationRuntime, h.runtime]);
+    const releaseActivity = activity.subscribe(value => ui.view.setActivity(value));
+    ui.view.setActivity(activity.getState());
+    const notifications = [];
+    const narrow = state => ({ remembered: state.rememberedCount, stable: state.stableCount, rebuild: state.rebuildStatus,
+      busy: state.memoryWorkBusy, phase: state.activeMemoryWork?.phase ?? null, extraction: Boolean(state.activeExtraction),
+      cse: Boolean(state.activeCse), error: state.lastExtractorError?.code ?? null, errorPhase: state.lastExtractorError?.phase ?? null,
+      lastAuto: state.lastAutoMemory?.status ?? null });
+    const releaseState = h.runtime.subscribe(state => notifications.push(narrow(state)));
+    let running = h.runtime.startHistoricalRebuild({ aggregate: true });
+    await waitFor(() => summaries === 4 && summaryPending && csePending, '前三批后摘要4与CSE3没有同时等待');
+    const waiting = narrow(h.runtime.getState());
+    assert.equal(waiting.remembered, 30); assert.equal(waiting.rebuild, 'rebuilding');
+    assert.deepEqual(active, { summary: 1, cse: 1 });
+    assert.ok(ui.flatten(ui.container).some(node => node.textContent === '暂停补齐'));
+    h.runtime.setIdentityProjection({});
+    h.runtime.setIdentityProjection({});
+    assert.equal(summaryPending.signal.aborted, false, '等价身份投影本身不取消正在进行的摘要');
+    csePending.resolve({ jsonData: { noMaterialChange: true } });
+    await waitFor(() => active.cse === 0 && !h.runtime.getState().activeCse, '真实CSE3没有自然收尾');
+    assert.equal(summaryPending.signal.aborted, false, '并行CSE正常提交不取消摘要4');
+    let pausedSeed = null;
+    if (outcome === 'resumeInvalidated') {
+      h.runtime.pauseHistoricalRebuild();
+      await running;
+      pausedSeed = narrow(h.runtime.getState());
+      assert.equal(pausedSeed.rebuild, 'paused');
+      running = h.runtime.startHistoricalRebuild({ aggregate: true });
+      await waitFor(() => summaries === 5 && summaryPending && !summaryPending.settled, '旧paused任务没有恢复到最后一批');
+      assert.equal(h.runtime.getState().rebuildStatus, 'rebuilding');
+      h.context.chat[60].mes = '真实变化的第31楼正文';
+      h.context.chat[60].swipes = ['真实变化的第31楼正文'];
+      h.emit('MESSAGE_EDITED', 60);
+      await waitFor(() => summaryPending.signal.aborted, '恢复任务真实来源变化后没有取消旧请求');
+    } else if (outcome === 'abort') summaryPending.reject(new DOMException('offline transport aborted', 'AbortError'));
+    else summaryPending.resolve({ jsonData: { summary: '已保存批次 4' } });
+    const returned = await running;
+    await waitFor(() => !h.runtime.getActivityState().busy, '流水收尾后runtime活动没有自然归闲');
+    const final = narrow(h.runtime.getState()), graph = await h.store.readReachable({ mode: 'runtime' });
+    assert.deepEqual(active, { summary: 0, cse: 0 });
+    assert.deepEqual(max, { summary: 1, cse: 1 });
+    assert.equal(final.busy, false); assert.equal(final.extraction, false); assert.equal(final.cse, false);
+    assert.equal(activity.getState().busy, false);
+    assert.deepEqual(notifications.at(-1), final, '最后一次真实runtime通知必须包含已清理的owner终态');
+    assert.equal(ui.flatten(ui.container).some(node => node.textContent === '暂停补齐'), false,
+      '真实runtime自然结束后管理view订阅不保留运行中的暂停按钮');
+    if (outcome === 'normal') {
+      assert.equal(final.remembered, 40); assert.equal(final.rebuild, 'caughtUp'); assert.equal(final.error, null);
+      assert.equal(graph.floorMemories.length, 4); assert.equal(graph.stateDeltas.length, 4);
+    } else {
+      assert.equal(final.remembered, 30); assert.equal(final.error, 'V3_MEMORY_STALE');
+      assert.equal(final.rebuild, outcome === 'abort' ? 'partial' : 'paused');
+      assert.equal(graph.floorMemories.length, 3);
+    }
+    console.log(JSON.stringify({ fortyFloorProbe: { outcome, waiting, pausedSeed, returned: narrow(returned), final,
+      summaries, cses, batchSizes, memorySourceCounts: graph.floorMemories.map(memory => memory.sourceFloorIds.length),
+      deltaCount: graph.stateDeltas.length, pluginBusy: activity.getState().busy,
+      newPauseCallsAfterResume: 0, explicitPausedSeed: outcome === 'resumeInvalidated', realModelRequests: 0 } }));
+    releaseState(); releaseActivity(); activity.dispose(); ui.view.deactivate();
+  });
+});
+
 test('高楼压缩把 23 个连续 AI 楼按 10/10/3 写成三份记忆并各分析一次 CSE', async () => {
-  const sourceBatchSizes = [];
+  const sourceBatchSizes = [], aggregatePrompts = [];
   const h = harness({
     modernAnchors: true,
     initialChat: Array.from({ length: 23 }, (_, index) => [assistant(`高楼正文 ${index + 1}：共同原句`), { ...user(`确认 ${index + 1}`), send_date: `high-floor-${index + 1}` }]).flat(),
@@ -770,6 +1325,7 @@ test('高楼压缩把 23 个连续 AI 楼按 10/10/3 写成三份记忆并各分
       const request = JSON.parse(options.taskMessages[0].content);
       if (request.task === 'extractFloorSemantics') {
         sourceBatchSizes.push(request.payload.sourceFloors?.length ?? 1);
+        aggregatePrompts.push(options.systemPrompt);
         assert.equal(options.systemPrompt, buildHighFloorExtractorSystemPrompt('', ''));
         return { jsonData: { summary: `压缩 ${sourceBatchSizes.length}`, ...(sourceBatchSizes.length === 1 ? { exactQuotes: [
           { text: '共同原句', sourceFloorKey: 'floor-1', why: '跨楼同句一' },
@@ -783,6 +1339,7 @@ test('高楼压缩把 23 个连续 AI 楼按 10/10/3 写成三份记忆并各分
   await h.runtime.startHistoricalRebuild({ aggregate: true });
   await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().activeAutoMemory,
     () => JSON.stringify(h.runtime.getState()));
+  aggregatePrompts.forEach(assertQianshiLifecycleGuidance);
   const graph = await h.store.readReachable({ mode: 'runtime' });
   assert.deepEqual(sourceBatchSizes, [10, 10, 3]);
   assert.deepEqual(graph.floorMemories.map(memory => memory.sourceFloorIds.length), [10, 10, 3]);
@@ -916,8 +1473,7 @@ test('同版本但挂标同步未恢复时拒绝快路，完整同步成功后�
     },
   });
   await h.runtime.start();
-  const first = h.runtime.getState().floors[0];
-  await h.runtime.extractFloor(first.floorId, { analyzeState: false });
+  await h.runtime.extractNext();
   assert.equal(h.runtime.getState().lastExtractorError?.phase, 'anchor');
   await h.runtime.startHistoricalRebuild();
   await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().memoryWorkBusy);
@@ -1001,7 +1557,7 @@ test('旧单楼 CSE 悬挂时高楼摘要仍连续保存，较早 CSE 不读取�
   assert.ok(graph.floorMemories.some(memory => memory.summary?.aiText === '并行第二批摘要'));
 });
 
-test('普通历史 CSE 在途失败时合并新摘要唤醒额度，仍从原楼单路按序接续', async () => {
+test('普通历史 CSE 在途失败后本批保旧，用户继续从原楼单路接续', async () => {
   let releaseDebt;
   let debtStartedResolve;
   let holdDebt = true;
@@ -1040,13 +1596,16 @@ test('普通历史 CSE 在途失败时合并新摘要唤醒额度，仍从原楼
   assert.equal(cseInFlight, 1);
   releaseDebt();
   await rebuilding;
+  await waitFor(() => h.runtime.getState().lastAutoMemory?.status === 'partial' && !h.runtime.getState().memoryWorkBusy);
+  assert.deepEqual(cseContents, ['基线楼', '欠账楼', '新摘要甲', '新摘要乙'], '本批失败楼不重复，其他健康楼继续');
+  await h.runtime.startHistoricalRebuild();
   await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().memoryWorkBusy);
-  assert.deepEqual(cseContents, ['基线楼', '欠账楼', '欠账楼', '新摘要甲', '新摘要乙'],
-    '失败后必须先重试原欠账楼，成功后才能处理后楼');
+  assert.deepEqual(cseContents, ['基线楼', '欠账楼', '新摘要甲', '新摘要乙', '欠账楼'],
+    '用户继续只补原失败楼，不重复健康后楼');
   assert.equal(maxCseInFlight, 1, '摘要提交期间也只能有一条 CSE 请求在途');
 });
 
-test('CSE 前置读取在途报错不吞掉同期新摘要额度，并从同一欠账楼恢复', async () => {
+test('CSE 前置读取在途报错保已存摘要，本批停止并由用户继续原欠账楼', async () => {
   let enableArm = false;
   let refreshCalls = 0;
   let holdRootRead = false;
@@ -1090,7 +1649,15 @@ test('CSE 前置读取在途报错不吞掉同期新摘要额度，并从同一�
   await waitFor(() => h.runtime.getState().rememberedCount === 4);
   releaseRead();
   await rebuilding;
+  await waitFor(() => !h.runtime.getState().memoryWorkBusy);
+  assert.equal(h.runtime.getState().rememberedCount, 4);
+  assert.equal(h.runtime.getState().lastAutoMemory.status, 'partial');
+  assert.equal(registeredGraphCaughtUp(h.runtime.getState()), false);
+  assert.deepEqual(cseContents, ['同步基线'], '本批核心读取失败后停止人物派发');
+  const summaryCalls = h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length;
+  await h.runtime.startHistoricalRebuild();
   await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().memoryWorkBusy);
+  assert.equal(h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, summaryCalls, '新批继续只补人物欠账');
   assert.equal(readFailures, 1);
   assert.deepEqual(cseContents, ['同步基线', '同步欠账', '同步新甲', '同步新乙'],
     '前置读取失败本身不发模型请求，恢复后仍从原欠账楼开始且不重复成功楼');
@@ -1154,7 +1721,7 @@ test('删除压缩批成员会保留其后的普通单楼摘要，但清掉破�
   assert.equal(after.stateDeltas.length, 0, '从破损聚合起的全部 CSE 都必须清除，包括后续普通单楼 CSE');
 });
 
-test('高楼压缩首批 CSE 失败后由下一份摘要唤醒同楼并自动按序追平', async () => {
+test('高楼压缩首批 CSE 失败保摘要，用户继续再按序补齐', async () => {
   let failCse = true;
   let extractorCalls = 0, cseCalls = 0;
   const h = harness({
@@ -1171,9 +1738,12 @@ test('高楼压缩首批 CSE 失败后由下一份摘要唤醒同楼并自动按
   });
   await h.runtime.start();
   await h.runtime.startHistoricalRebuild({ aggregate: true });
+  await waitFor(() => h.runtime.getState().lastAutoMemory?.status === 'partial' && !h.runtime.getState().memoryWorkBusy);
+  assert.deepEqual([h.runtime.getState().rememberedCount, extractorCalls, cseCalls], [20, 2, 2]);
+  await h.runtime.startHistoricalRebuild({ aggregate: true });
   await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()));
   assert.deepEqual([h.runtime.getState().rememberedCount, extractorCalls, cseCalls], [20, 2, 3],
-    '每份压缩摘要只提供一次机会，第二批提交应先重试第一批再处理第二批');
+    '用户继续不重提两份摘要，只补失败的CSE');
   assert.equal((await h.store.readReachable({ mode: 'runtime' })).stateDeltas.length, 2);
   await h.runtime.refreshStatus();
   await new Promise(resolve => setTimeout(resolve, 20));
@@ -1326,11 +1896,248 @@ async function seedMiddleSummaryGap() {
   return seed;
 }
 
-async function direct(response, { content = '裴晚生提醒你带伞。', entities = [], userIdentity = { displayName: '林岚', aliases: ['林岚', '你', '{{user}}'] }, batchId = '33333333-3333-4333-8333-333333333333', preservedSummary = null, sourceUserInputSnapshot = null, storyClock = null, previousFloorContext = null, finishReason } = {}) {
+async function direct(response, { content = '裴晚生提醒你带伞。', entities = [], userIdentity = { displayName: '林岚', aliases: ['林岚', '你', '{{user}}'] }, batchId = '33333333-3333-4333-8333-333333333333', preservedSummary = null, sourceUserInputSnapshot = null, storyClock = null, previousFloorContext = null, placeWorldbookSources = [], finishReason } = {}) {
   const floor = { id: '11111111-1111-4111-8111-111111111111', chatId: CHAT, narrativeGeneration: GENERATION, assistantSeq: 1, content: { canonicalContent: content } };
-  const envelope = await createExtractorEnvelope({ batchId, chatId: CHAT, narrativeGeneration: GENERATION, checkpointId: null, floor, entities, userIdentity, sourceUserInputSnapshot, storyClock, previousFloorContext });
+  const envelope = await createExtractorEnvelope({ batchId, chatId: CHAT, narrativeGeneration: GENERATION, checkpointId: null, floor, entities, userIdentity, sourceUserInputSnapshot, storyClock, previousFloorContext, placeWorldbookSources });
   return normalizeExtractorResponse({ response, finishReason, envelope, floor, existingEntities: entities, now: NOW, preservedSummary, expectedScope: envelope.scope });
 }
+
+test('普通空间ownershipChanged贯穿Core改回祖先与撤销，旧边ID绑定且非显式空父隔离', async () => {
+  const entities=[precisionPlace(701,'主楼'),precisionPlace(702,'三楼'),precisionPlace(703,'客房')];
+  const content='先前三楼归属记错了，客房直接属于主楼。',floor={id:'11111111-1111-4111-8111-111111111111',chatId:CHAT,narrativeGeneration:GENERATION,assistantSeq:2,content:{canonicalContent:content}};
+  const originalEnvelope=await createExtractorEnvelope({batchId:'33333333-3333-4333-8333-333333333333',chatId:CHAT,narrativeGeneration:GENERATION,checkpointId:null,floor,entities,userIdentity:null});
+  const key=id=>originalEnvelope.scope.placeCatalogBindings.find(x=>x.entityId===id).entityKey;
+  const prior={itemId:'70000000-0000-4000-8000-000000000001',placeEntityId:entities[2].id,parentEntityId:entities[1].id};
+  const env={...originalEnvelope,scope:{...originalEnvelope.scope,parentEntityIdsByPlaceId:new Map([[entities[2].id,new Set([entities[1].id])],[entities[1].id,new Set([entities[0].id])]]),placeParentFactBindings:[prior]}};
+  const ev={source:'canonicalContent',sourceFloorKey:env.request.payload.sourceFloorKey,exactQuote:content};
+  for(const parentPlaceKey of ['place-mention-2',null]){
+    const response={summary:content,spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'existing',sameAsPlaceKey:key(entities[2].id),identityChange:'ownershipChanged',...ev},{key:'place-mention-2',name:'主楼',identity:'existing',sameAsPlaceKey:key(entities[0].id),...ev}],containments:[{placeKey:'place-mention-1',parentPlaceKey,...ev}],positions:[]}};
+    const compiled=await normalizeExtractorResponse({response,envelope:env,floor,existingEntities:entities,now:NOW,expectedScope:env.scope});
+    assert.deepEqual(compiled.isolated,[]);const fact=compiled.memory.spatialFacts.containments[0];assert.ok(fact);
+    assert.equal(fact.parentEntityId,parentPlaceKey?entities[0].id:null);assert.equal(fact.identityChange,'ownershipChanged');assert.deepEqual(fact.replacesItemIds,[prior.itemId]);
+    assert.doesNotThrow(()=>validateFloorMemory(compiled.memory,{expectedChatId:CHAT}));
+    if(parentPlaceKey===null){delete response.spatialFacts.places[0].identityChange;const bad=await normalizeExtractorResponse({response,envelope:env,floor,existingEntities:entities,now:NOW,expectedScope:env.scope});assert.ok(bad.isolated.length);assert.equal(bad.memory.spatialFacts?.containments?.length??0,0);}
+  }
+});
+
+test('空间证据复用已有floorKey别名与唯一引文定位，不因重复前门隔离合法父边',async()=>{
+ const content='林岚进入甲楼三楼的客房，客房内有书桌。';
+ for(const hint of [{floorKey:'floor-1'},{}]){
+  const ev={source:'canonicalContent',exactQuote:content,...hint};
+  const result=await direct({summary:'林岚进入客房。',people:[{name:'林岚',entityKind:'individual'}],spatialFacts:{
+   places:['甲楼','三楼','客房'].map((name,i)=>({key:`place-mention-${i+1}`,name,identity:'new',...ev})),
+   containments:[{placeKey:'place-mention-3',parentPlaceKey:'place-mention-2',...ev},{placeKey:'place-mention-2',parentPlaceKey:'place-mention-1',...ev}],
+   positions:[{subject:'林岚',placeKey:'place-mention-3',status:'confirmed',...ev}],
+   features:[{key:'feature-1',placeKey:'place-mention-3',kind:'stable',text:'客房内有书桌。',replacesKeys:[],...ev}],
+  }},{content});
+  assert.equal(result.memory.spatialFacts.containments.length,2);assert.equal(result.memory.spatialFacts.positions.length,1,JSON.stringify(result.isolated));
+  assert.equal(result.memory.spatialFacts.features.length,1);assert.equal(result.isolated.length,0);
+ }
+});
+
+test('空间隔离保留准确子原因，跨USER与AI或聚合重复引文不默认来源',async()=>{
+ const content='甲楼内有客房。',ev={source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content};
+ const places=[{key:'place-mention-1',name:'甲楼',identity:'new',...ev},{key:'place-mention-2',name:'客房',identity:'new',...ev}];
+ const result=await direct({summary:'查看甲楼与客房。',spatialFacts:{places,positions:[],containments:[
+  {placeKey:'place-mention-2',...ev},
+  {placeKey:'place-mention-2',parentPlaceKey:'place-mention-99',...ev},
+  {placeKey:'place-mention-2',parentPlaceKey:'place-mention-1',source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:'原文没有这句话。'},
+ ]}},{content});
+ assert.deepEqual(result.isolated.filter(x=>x.field==='spatialFacts.containments').map(x=>x.reason),['parentPlaceKeyMissing','unknownParentPlaceKey','sourceQuoteUnlocated']);
+ const ambiguous=await direct({summary:content,spatialFacts:{places:[{key:'place-mention-1',name:'甲楼',identity:'new',exactQuote:content}],containments:[],positions:[]}},
+  {content,sourceUserInputSnapshot:{messages:[{content,messageIndex:0}]}});
+ assert.ok(ambiguous.isolated.some(x=>x.reason==='ambiguousSourceQuote'));
+ const sources=[1,2].map(n=>({floor:{id:`0000000${n}-1111-4111-8111-111111111111`,chatId:CHAT,narrativeGeneration:GENERATION,assistantSeq:n,content:{canonicalContent:content,rawFingerprint:'sha256:'+createHash('sha256').update('spatial-source-'+n).digest('hex')}}}));
+ const floor=sources[1].floor,envelope=await createExtractorEnvelope({batchId:'33333333-3333-4333-8333-333333333333',chatId:CHAT,narrativeGeneration:GENERATION,floor,sourceFloors:sources});
+ const grouped=await normalizeExtractorResponse({response:{summary:content,spatialFacts:{places:[{key:'place-mention-1',name:'甲楼',identity:'new',source:'canonicalContent',exactQuote:content}],containments:[],positions:[]}},envelope,floor,expectedScope:envelope.scope,now:NOW});
+ assert.ok(grouped.isolated.some(x=>x.reason==='ambiguousSourceQuote'));
+});
+
+test('正常结束别名：聚合semantic保十个来源楼与完整台词且仅请求一次', async () => {
+  const sources = Array.from({ length: 10 }, (_, index) => ({
+    id: (index + 1).toString(16).padStart(8, '0') + '-1111-4111-8111-111111111111', chatId: CHAT, narrativeGeneration: GENERATION,
+    assistantSeq: index + 31, hostLocator: { messageIndex: 60 + 2 * index },
+    content: { canonicalContent: '合成人物休息后继续前行。', rawFingerprint: 'sha256:' + createHash('sha256').update('source-' + index).digest('hex') },
+  }));
+  const floor = sources.at(-1), envelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333333', chatId: CHAT,
+    narrativeGeneration: GENERATION, floor, sourceFloors: sources.map(floor => ({ floor })) });
+  for (const summary of ['他自我安慰"忍一忍"，随后继续前行。', '他自我安慰"忍一忍"', '他自我安慰"忍一忍",随后继续前行。', '这根棒长6"。']) {
+    const response = '```json\n{"summary":"' + summary + '"}\n```';
+    const compiled = await normalizeExtractorResponse({ response, finishReason: 'end_turn', envelope, floor, expectedScope: envelope.scope, now: NOW });
+    assert.equal(compiled.memory.summary.aiText, summary);
+    let calls = 0;
+    const result = await runExtractorRequest({ generateUtilityTask: async options => {
+      calls++; assert.equal(options.parseMode, 'semantic');
+      assert.equal(JSON.parse(options.taskMessages[0].content).payload.sourceFloors.length, sources.length);
+      assert.deepEqual(JSON.parse(options.taskMessages[0].content).payload.sourceFloors.map(value => value.messageIndex), sources.map(value => value.hostLocator.messageIndex));
+      return { textData: response, taskMetadata: { finishReason: 'end_turn' } };
+    }, aggregate: true, envelope, floor, expectedScope: envelope.scope, now: NOW });
+    assert.equal(result.memory.summary.aiText, summary);
+    assert.deepEqual(result.memory.sourceFloorIds, sources.map(floor => floor.id));
+    assert.deepEqual(result.memory.sourceFloorSnapshots.map(value => value.floorId), sources.map(floor => floor.id));
+    assert.equal(validateFloorMemory(result.memory).summary.aiText, summary);
+    assert.equal(calls, 1); assert.equal(result.attempts, 1);
+  }
+});
+
+test('用户权威：明确user的普通人物sameAs键不能改投用户归属', async () => {
+  const seeded = await direct({ summary: '林岚与同行者在场。', people: [
+    { name: '你', role: 'user', entityKind: 'individual', presence: 'present' },
+    { name: '同行者', entityKind: 'individual', presence: 'present' },
+  ] });
+  const originalUser = seeded.newEntities.find(entity => entity.specialRole === 'user');
+  const npc = seeded.newEntities.find(entity => entity.specialRole === 'none');
+  for (const hasExistingUser of [true, false]) {
+    const entities = hasExistingUser ? [originalUser, npc] : [npc];
+    const result = await direct({ summary: '林岚停下脚步。', people: [{ name: '你', role: 'user', entityKind: 'individual', presence: 'present',
+      sameAsEntityKey: hasExistingUser ? 'catalog-2' : 'catalog-1' }] }, { entities, batchId: '45454545-1111-4111-8111-454545454545' });
+    const participantId = result.memory.participants[0].entityId;
+    assert.notEqual(participantId, npc.id, '明确user不能被普通人物key改投');
+    if (hasExistingUser) assert.equal(participantId, originalUser.id);
+    else assert.ok(result.newEntities.some(entity => entity.id === participantId && entity.specialRole === 'user'));
+    assert.ok(result.isolated.some(item => item.code === 'V3_EXTRACTOR_USER_ROLE_CONFLICT'));
+  }
+});
+
+test('用户权威：摘要元信息保存使用当前canonical人物并保留人工映射', async () => {
+  const h = harness({ utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+    ? { jsonData: { summary: '合成用户与同行者在场。', people: [{ name: '你', role: 'user', presence: 'present' }, { name: '同行者', presence: 'mentioned' }] } }
+    : { jsonData: { noMaterialChange: true } } });
+  await h.runtime.start(); await h.runtime.extractNext();
+  const state = h.runtime.getState(), floor = state.floors[0];
+  const user = state.memoryEntities.find(entity => entity.specialRole === 'user');
+  const target = state.memoryEntities.find(entity => entity.displayName === '同行者');
+  h.runtime.setIdentityProjection({ identityRedirectsByEntityId: { [user.entityId]: target.entityId } });
+  const calls = h.calls.length;
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  await h.runtime.editMemory(floor.floorId, { summary: floor.summary, participantNames: ['同行者'], locations: [],
+    timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false });
+  const unchanged = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(unchanged.root.headCheckpointId, before.root.headCheckpointId, '无改保存不能因raw/canonical ID不同写新revision');
+  assert.equal(unchanged.floorMemories[0].id, before.floorMemories[0].id);
+  assert.deepEqual(unchanged.floorMemories[0].participants, before.floorMemories[0].participants);
+  await h.runtime.editMemory(floor.floorId, { summary: '修订后的合成摘要', timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false });
+  const summaryOnly = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(summaryOnly.floorMemories[0].participants, before.floorMemories[0].participants, '只改摘要不改旧raw人物引用');
+  await h.runtime.editMemory(floor.floorId, { summary: '修订后的合成摘要', participantNames: ['同行者', '新路人'], locations: [],
+    timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false, revisionNote: '人工核对' });
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.status, 'ready');
+  assert.equal(saved.floorMemories[0].participants[0].entityId, target.entityId);
+  assert.equal(saved.floorMemories[0].participants.length, 2);
+  assert.equal(saved.floorMemories[0].participants[0].presence, 'present', 'canonical参与者沿现有投影保留首条presence');
+  assert.equal(h.runtime.getState().memoryEntities.find(entity => entity.specialRole === 'user').entityId, target.entityId);
+  assert.equal(saved.entities.find(entity => entity.id === user.entityId).specialRole, 'user');
+  assert.equal(saved.entities.find(entity => entity.id === target.entityId).specialRole, 'none');
+  assert.equal(h.calls.length, calls);
+});
+
+test('NPC身份简介随正式people结果按变化写入本地实体，复用已有目录作对照且不新增请求', async () => {
+  const briefEvidence = quote => [{ quoteSegments: [quote], supports: '人物稳定身份专属依据', evidenceMode: 'explicit', sourceMentionKey: null }];
+  const entityId = '99999999-9999-4999-8999-999999999801';
+  const floorId = '11111111-1111-4111-8111-111111111111';
+  const canonical = validateEntityRecord({ schemaVersion: 3, recordType: 'entity', id: entityId, chatId: CHAT, narrativeGeneration: GENERATION,
+    entityType: 'person', displayName: '裴晚生', aliases: [], specialRole: 'none', firstSeenFloorId: floorId, lastSeenFloorId: floorId,
+    status: 'established', mergedIntoEntityId: null, mergeEvidenceRefs: [], baselineClaimIds: [], identityBrief: '药铺学徒，今早为邻居送来蔬菜。',
+    createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z', recordStatus: 'active', supersedes: null }, { expectedChatId: CHAT });
+  const floor = { id: '22222222-2222-4222-8222-222222222222', chatId: CHAT, narrativeGeneration: GENERATION, assistantSeq: 2,
+    content: { canonicalContent: '裴晚生回到裴家药铺，介绍自己是这里的学徒。' } };
+  const envelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333333', chatId: CHAT,
+    narrativeGeneration: GENERATION, floor, entities: [canonical] });
+  assert.deepEqual(envelope.request.payload.knownPeople, [{ entityKey: 'catalog-1', displayName: '裴晚生', aliases: [], entityKind: 'individual', specialRole: 'none', identityBrief: '药铺学徒，今早为邻居送来蔬菜。' }],
+    '普通摘要请求应拿到现有合并目录中的简介作为身份对照');
+
+  const first = await normalizeExtractorResponse({ response: { summary: '裴晚生回到裴家药铺，介绍自己是这里的学徒。', people: [{ name: '裴晚生', sameAsEntityKey: 'catalog-1', identityBrief: '裴家药铺的学徒。', identityBriefEvidence: briefEvidence(floor.content.canonicalContent) }] },
+    envelope, floor, existingEntities: [canonical], now: '2026-09-02T00:00:00.000Z', expectedScope: envelope.scope });
+  assert.equal(first.newEntities.length, 1);
+  assert.equal(first.newEntities[0].identityBrief, '裴家药铺的学徒。');
+  assert.equal(first.newEntities[0].mergedIntoEntityId, entityId);
+
+  let extractorCall;
+  const promptedUpdate = await runExtractorRequest({ generateUtilityTask: async options => {
+    extractorCall = options;
+    return { jsonData: { summary: '裴晚生回到裴家药铺，介绍自己是这里的学徒。', people: [{ name: '裴晚生', sameAsEntityKey: 'catalog-1', identityBrief: '裴家药铺的学徒。', identityBriefEvidence: briefEvidence(floor.content.canonicalContent) }] } };
+  }, envelope, floor, existingEntities: [canonical], now: '2026-09-02T00:00:00.000Z', expectedScope: envelope.scope });
+  const extractorPayload = JSON.parse(extractorCall.taskMessages[0].content).payload;
+  assert.equal(extractorPayload.knownPeople[0].identityBrief, '药铺学徒，今早为邻居送来蔬菜。', '正式摘要请求仍把旧简介作为身份对照传入');
+  assert.match(extractorCall.systemPrompt, /people\[\]\.identityFacts 是可选的完整当前稳定身份列表/u, '正式摘要请求使用逐条身份与依据合同');
+  assert.equal(promptedUpdate.newEntities[0].identityBrief, '裴家药铺的学徒。', '正式请求的正常解析仍保存正文明确支持的完整稳定身份');
+
+  const aliasFloor = { ...floor, id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeee01' };
+  const aliasEnvelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333339', chatId: CHAT,
+    narrativeGeneration: GENERATION, floor: aliasFloor, entities: [canonical] });
+  const aliasOnly = await normalizeExtractorResponse({ response: { summary: '裴晚生回到裴家药铺，介绍自己是这里的学徒。', people: [{ name: '裴晚生', aliases: ['阿裴'], sameAsEntityKey: 'catalog-1' }] },
+    envelope: aliasEnvelope, floor: aliasFloor, existingEntities: [canonical], now: '2026-09-02T00:00:00.000Z', expectedScope: aliasEnvelope.scope });
+  assert.equal(aliasOnly.newEntities[0].id, await deterministicUuid(['v3-entity-merged-alias', entityId, aliasFloor.id, aliasEnvelope.scope.batchId, ['阿裴']]));
+  assert.equal(Object.hasOwn(aliasOnly.newEntities[0], 'identityBrief'), false, '没有稳定身份更新时不生成清理旧简介的修订');
+
+  const withFirst = [canonical, ...first.newEntities];
+  const secondFloor = { ...floor, id: '33333333-3333-4333-8333-333333333333', assistantSeq: 3, content: { canonicalContent: '裴晚生接手裴家药铺。' } };
+  const secondEnvelope = await createExtractorEnvelope({ batchId: '44444444-4444-4444-8444-444444444444', chatId: CHAT,
+    narrativeGeneration: GENERATION, floor: secondFloor, entities: withFirst });
+  assert.equal(secondEnvelope.request.payload.knownPeople[0].identityFacts[0].text, '裴家药铺的学徒。', '对照值应取当前目录中较新的不可变修订而非canonical旧值');
+  const aggregateEnvelope = await createExtractorEnvelope({ batchId: '44444444-4444-4444-8444-444444444445', chatId: CHAT,
+    narrativeGeneration: GENERATION,
+    floor: { ...secondFloor, id: '44444444-4444-4444-8444-444444444447', assistantSeq: 4 }, entities: withFirst,
+    sourceFloors: [
+      { floor: { ...secondFloor, id: '44444444-4444-4444-8444-444444444446', assistantSeq: 3 } },
+      { floor: { ...secondFloor, id: '44444444-4444-4444-8444-444444444447', assistantSeq: 4 } },
+    ] });
+  assert.equal(aggregateEnvelope.request.payload.knownPeople[0].identityFacts[0].text, '裴家药铺的学徒。', '聚合摘要复用同一已合并目录简介');
+  assert.equal(aggregateEnvelope.request.payload.knownPeople.length, secondEnvelope.request.payload.knownPeople.length, '聚合入口不扩人物目录');
+  const second = await normalizeExtractorResponse({ response: { summary: '裴晚生接手药铺。', people: [{ name: '裴晚生', sameAsEntityKey: 'catalog-1', identityBrief: '现已负责药铺经营。', identityBriefEvidence: briefEvidence(secondFloor.content.canonicalContent) }] },
+    envelope: secondEnvelope, floor: secondFloor, existingEntities: withFirst, now: '2026-09-03T00:00:00.000Z', expectedScope: secondEnvelope.scope });
+  assert.equal(second.newEntities.length, 1, '简介发生变化时写入一条身份修订');
+  const currentEntities = [...withFirst, ...second.newEntities];
+  const reordered = [...currentEntities].reverse();
+  assert.equal(buildEntityIdentityDirectory({ entities: currentEntities }).find(entry => entry.entityId === entityId).identityBrief, '现已负责药铺经营。');
+  assert.equal(buildEntityIdentityDirectory({ entities: reordered }).find(entry => entry.entityId === entityId).identityBrief, '现已负责药铺经营。', '实体目录重排不改变最新简介');
+
+  const repeatFloor = { ...secondFloor, id: '55555555-5555-4555-8555-555555555555', assistantSeq: 4 };
+  const repeatEnvelope = await createExtractorEnvelope({ batchId: '66666666-6666-4666-8666-666666666666', chatId: CHAT,
+    narrativeGeneration: GENERATION, floor: repeatFloor, entities: reordered });
+  const repeat = await normalizeExtractorResponse({ response: { summary: '裴晚生继续经营药铺。', people: [{ name: '裴晚生', sameAsEntityKey: 'catalog-1', identityFacts: [{ existingKey: repeatEnvelope.request.payload.knownPeople[0].identityFacts[0].existingKey }] }] },
+    envelope: repeatEnvelope, floor: repeatFloor, existingEntities: reordered, now: '2026-09-04T00:00:00.000Z', expectedScope: repeatEnvelope.scope });
+  assert.equal(repeat.newEntities.length, 0, '重复简介不新增身份修订');
+
+  const returnToFirstFloor = { ...secondFloor, assistantSeq: 3, content: { canonicalContent: '裴晚生回到裴家药铺的学徒岗位。' } };
+  const returnToFirstEnvelope = await createExtractorEnvelope({ batchId: '77777777-7777-4777-8777-777777777777', chatId: CHAT,
+    narrativeGeneration: GENERATION, floor: returnToFirstFloor, entities: reordered });
+  const returnToFirst = await normalizeExtractorResponse({ response: { summary: '裴晚生回到药铺学徒岗位。', people: [{ name: '裴晚生', sameAsEntityKey: 'catalog-1', identityBrief: '裴家药铺的学徒。', identityBriefEvidence: briefEvidence(returnToFirstFloor.content.canonicalContent) }] },
+    envelope: returnToFirstEnvelope, floor: returnToFirstFloor, existingEntities: reordered, now: '2026-09-05T00:00:00.000Z', expectedScope: returnToFirstEnvelope.scope });
+  assert.equal(returnToFirst.newEntities.length, 1, '回到旧简介值仍是一次新的业务修订');
+  assert.equal(returnToFirst.newEntities[0].identityBrief, first.newEntities[0].identityBrief);
+  assert.notEqual(returnToFirst.newEntities[0].id, first.newEntities[0].id, '旧简介值的新修订不得复用不可变ID');
+
+  const backend = backendHarness();
+  const runtimeHarness = harness({ sharedBackend: backend, initialChat: [assistant('裴晚生在药铺学徒。'), user('确认楼层'), assistant('下一楼提到裴晚生。'), user('确认第二楼'), assistant('尾楼。')],
+    utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+      ? { jsonData: { summary: '裴晚生在药铺学徒。', people: [{ name: '裴晚生', identityBrief: '药铺学徒。', identityBriefEvidence: briefEvidence('裴晚生在药铺学徒。') }] } }
+      : { jsonData: { noMaterialChange: true } } });
+  await runtimeHarness.runtime.start();
+  await runtimeHarness.runtime.extractNext();
+  assert.equal(runtimeHarness.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, 1, '简介随既有单次提取结果保存，不增加模型请求');
+  const cold = harness({ sharedBackend: backend, sharedContext: runtimeHarness.context, utility: () => { throw new Error('冷读不调用模型'); } });
+  await cold.runtime.start();
+  const coldReachable = await cold.store.readReachable({ mode: 'runtime' });
+  const savedPerson = coldReachable.entities.find(entity => entity.displayName === '裴晚生');
+  assert.equal(savedPerson.identityBrief, '药铺学徒。', '真实FloorMemory提交后由新runtime冷读简介');
+  assert.equal(Object.hasOwn(cold.runtime.getState().memoryEntities.find(entity => entity.entityId === savedPerson.id), 'identityBrief'), false,
+    '常规人物投影不公开NPC简介');
+  const identity = { hostChatId: cold.context.chatId, chatId: CHAT, characterLocator: 'character.png', personaLocator: 'persona.png' };
+  const peopleStore = createPeopleWorkspaceStore({ client: cold.backend.client });
+  const people = createPeopleWorkspaceRuntime({ store: peopleStore, session: { identity: () => identity }, foundationRuntime: cold.foundationRuntime,
+    memoryRuntime: cold.runtime, generateUtilityTask: async () => { throw new Error('不应生成完整人物资料'); },
+    sourcePermissions: { filterCandidates: ({ candidates }) => candidates, filterWorldInfoSources: sources => sources },
+    contextProvider: () => cold.context, now: () => new Date(NOW), logger: { warn() {} } });
+  await people.refresh({ refreshMemory: false });
+  const publicPerson = people.getState().people.find(person => person.entityId === savedPerson.id);
+  assert.equal(publicPerson.profiled, false, 'NPC简介不使既有完整人物资料标记为已建立');
+  assert.equal(publicPerson.profile, null);
+  assert.equal(publicPerson.identityBrief, '药铺学徒。');
+  assert.equal(publicPerson.identityBriefSource.facts[0].evidence[0].quotedText, '裴晚生在药铺学徒。');
+  people.destroy();
+});
 
 test('新 user 实体在同批次保持确定，不同提取批次使用不同 ID', async () => {
   const response = { summary: '用户接过雨伞。', people: [{ name: '你', role: 'user' }] };
@@ -1343,6 +2150,60 @@ test('新 user 实体在同批次保持确定，不同提取批次使用不同 I
   assert.ok(firstUser && sameBatchUser && retryUser);
   assert.equal(firstUser.id, sameBatchUser.id);
   assert.notEqual(firstUser.id, retryUser.id);
+});
+
+test('同楼独立新增的同名房间保留各自ID与父级并可冷读', async t => {
+  for (const host of ['official', 'luker']) await t.test(host, async () => {
+    const text = '东区公寓内有卧室。西区公寓内也有卧室。';
+    const h = harness({ host, modernAnchors: true, initialChat: [user('确认住处'), assistant(text), user('继续')], utility: options => {
+      if (options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
+      const { sourceFloorKey } = JSON.parse(options.taskMessages[0].content).payload;
+      return { jsonData: { summary: text, spatialFacts: {
+        places: [
+          { key: 'place-mention-1', name: '东区公寓', identity: 'new', exactQuote: '东区公寓内有卧室', source: 'canonicalContent', sourceFloorKey },
+          { key: 'place-mention-2', name: '卧室', identity: 'new', exactQuote: '东区公寓内有卧室', source: 'canonicalContent', sourceFloorKey },
+          { key: 'place-mention-3', name: '西区公寓', identity: 'new', exactQuote: '西区公寓内也有卧室', source: 'canonicalContent', sourceFloorKey },
+          { key: 'place-mention-4', name: '卧室', identity: 'new', exactQuote: '西区公寓内也有卧室', source: 'canonicalContent', sourceFloorKey },
+        ],
+        containments: [
+          { placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', exactQuote: '东区公寓内有卧室', source: 'canonicalContent', sourceFloorKey },
+          { placeKey: 'place-mention-4', parentPlaceKey: 'place-mention-3', exactQuote: '西区公寓内也有卧室', source: 'canonicalContent', sourceFloorKey },
+        ],
+        positions: [],
+      } } };
+    } });
+
+    await h.runtime.start();
+    const floor = h.runtime.getState().floors[0];
+    assert.ok(floor, `${host}: 有真实稳定楼可供提取`);
+    await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    const saved = await h.store.readReachable({ mode: 'runtime' });
+    assert.equal(saved.status, 'ready');
+    const savedMemory = saved.floorMemories.find(memory => memory.floorId === floor.floorId);
+    const edges = savedMemory?.spatialFacts?.containments ?? [];
+    assert.equal(edges.length, 2, '正式编译与runtime保存保留两条独立父边');
+    const entityNames = new Map(saved.entities.map(entity => [entity.id, entity.displayName]));
+    const rooms = saved.entities.filter(entity => entity.entityType === 'place' && entity.displayName === '卧室');
+    assert.equal(rooms.length, 2, '同名new mention分别保存为两个地点实体');
+    assert.equal(new Set(rooms.map(entity => entity.id)).size, 2, '独立mention获得独立地点ID');
+    assert.deepEqual(edges.map(edge => [entityNames.get(edge.parentEntityId), entityNames.get(edge.placeEntityId)]).sort(), [
+      ['东区公寓', '卧室'], ['西区公寓', '卧室'],
+    ], '两条父边分别指向同名房间各自的住处');
+
+    const coldStore = createFoundationStore({ client: h.backend.client, contextProvider: () => ({ hostChatId: h.context.chatId,
+      chatId: CHAT, characterLocator: 'character.png', personaLocator: 'persona.png' }) });
+    const cold = await coldStore.readReachable({ mode: 'full' });
+    assert.equal(cold.status, 'ready');
+    const coldMemory = cold.floorMemories.find(memory => memory.id === savedMemory.id);
+    const coldNames = new Map(cold.entities.map(entity => [entity.id, entity.displayName]));
+    const coldRooms = cold.entities.filter(entity => entity.entityType === 'place' && entity.displayName === '卧室');
+    assert.equal(coldRooms.length, 2, '冷读保留两个独立同名地点记录');
+    assert.equal(new Set(coldRooms.map(entity => entity.id)).size, 2, '冷读保留两个不同地点 ID');
+    assert.equal(new Set(coldMemory.spatialFacts.containments.map(edge => edge.placeEntityId)).size, 2, '冷读后两条父边仍各自指向一个房间');
+    assert.deepEqual(coldMemory.spatialFacts.containments.map(edge => [coldNames.get(edge.parentEntityId), coldNames.get(edge.placeEntityId)]).sort(), [
+      ['东区公寓', '卧室'], ['西区公寓', '卧室'],
+    ], '冷读保持两个地点身份与各自父级关系');
+  });
 });
 
 test('摘要人物键优先标准 people，空值回退 person 且坏人物不影响有效人物', async () => {
@@ -1433,10 +2294,11 @@ test('地点目录不以房间、厨房等泛称别名绑定旧地点，前楼�
   const envelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333333', chatId: CHAT, narrativeGeneration: GENERATION,
     checkpointId: null, floor, entities, previousFloorContext: prior });
   const generic = await normalizeExtractorResponse({ response: genericResponse, envelope, floor, existingEntities: entities, now: NOW, expectedScope: envelope.scope });
-  assert.equal(envelope.request.payload.knownPlaces.length, 1, '前楼完整地点名提供有限身份参照，旧房间不因厨房泛称进入候选');
+  assert.equal(envelope.request.payload.knownPlaces.length, 2, '直接命中的公寓优先，其他有效旧地点也作为有限身份参照');
   assert.equal(envelope.request.payload.knownPlaces[0].displayName, '西区新公寓');
   assert.equal(envelope.request.payload.knownPlaces[0].entityKey, 'place-1');
   assert.deepEqual(envelope.request.payload.knownPlaces[0].aliases, [], '泛称alias不进入本次地点身份目录');
+  assert.equal(envelope.request.payload.knownPlaces[1].displayName, '林岚的房间');
   assert.equal(generic.memory.summary.aiText, '她在厨房里整理物品。', '无法定位的空间条目不影响合法摘要');
   assert.equal(generic.memory.spatialFacts, undefined, '只有“厨房”不足以把正文绑定到旧房间或新公寓');
   assert.ok(generic.isolated.some(item => item.path === 'spatialFacts.places[0].name'));
@@ -1453,13 +2315,120 @@ test('地点目录不以房间、厨房等泛称别名绑定旧地点，前楼�
   } }, { content: '她搬进北区新公寓，未说它是旧房间。', entities, previousFloorContext: prior });
   assert.notEqual(newIdentity.newEntities.find(entity => entity.entityType === 'place')?.id, oldPlaceId, '明确的新地点不因旧地点的泛称别名沿用旧实体');
   assert.notEqual(newIdentity.newEntities.find(entity => entity.entityType === 'place')?.id, apartmentId, '身份标为new的新地点不复用现有公寓实体');
+
+  const manyPlaces = Array.from({ length: 45 }, (_, index) => entity(
+    `99999999-9999-4999-8999-${String(index + 830).padStart(12, '0')}`, `已知地点 ${index + 1} 号`));
+  const bounded = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333335', chatId: CHAT, narrativeGeneration: GENERATION,
+    checkpointId: null, floor: { ...floor, content: { canonicalContent: '林岚回到已知地点 45 号。' } }, entities: manyPlaces });
+  assert.equal(bounded.request.payload.knownPlaces.length, 40, '目录继续受40条上限约束');
+  assert.equal(bounded.request.payload.knownPlaces[0].displayName, '已知地点 45 号', '当前正文直接命中的地点优先于其余目录项');
+  assert.equal(bounded.request.payload.knownPlaces.some(item => item.displayName === '已知地点 1 号'), true, '小型其余目录仍按有效身份目录顺序补充');
+  const taggedPlace = entity('99999999-9999-4999-8999-999999999816', '东区公寓·卧室');
+  const taggedSources = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333338', chatId: CHAT, narrativeGeneration: GENERATION,
+    checkpointId: null, floor: { ...floor, content: { canonicalContent: '林岚仍在卧室。' } }, entities: [...manyPlaces, taggedPlace],
+    locationReference: ['东区公寓·卧室'] });
+  assert.equal(taggedSources.request.payload.knownPlaces.length, 40, '顶层单楼来源标签不打破40项地点目录上限');
+  assert.ok(taggedSources.request.payload.knownPlaces.some(item => item.displayName === '东区公寓·卧室'), '单楼来源标签可优先带入对应的已有地点身份');
+  const memberFloor = { ...floor, id: '11111111-1111-4111-8111-111111111817', assistantSeq: 1, hostLocator: { messageIndex: 1 }, content: { canonicalContent: '先前仍在卧室。' } };
+  const aggregateTagged = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333339', chatId: CHAT, narrativeGeneration: GENERATION,
+    checkpointId: null, floor: { ...floor, assistantSeq: 2, content: { canonicalContent: '后来仍在卧室。' } }, entities: [...manyPlaces, taggedPlace],
+    sourceFloors: [{ floor: memberFloor, locationReference: ['东区公寓·卧室'] }, { floor: { ...floor, assistantSeq: 2, hostLocator: { messageIndex: 2 }, content: { canonicalContent: '后来仍在卧室。' } } }] });
+  assert.equal(aggregateTagged.request.payload.knownPlaces.length, 40, '聚合成员来源标签也遵守目录上限');
+  assert.ok(aggregateTagged.request.payload.knownPlaces.some(item => item.displayName === '东区公寓·卧室'), '聚合成员来源标签不会被其他45个目录项挤掉');
+  const pinnedRoomId = '99999999-9999-4999-8999-999999999814';
+  const pinnedParentId = '99999999-9999-4999-8999-999999999815';
+  const sameNameElsewhere = manyPlaces.map(item => entity(item.id, '卧室'));
+  const pinnedEntities = [...sameNameElsewhere, entity(pinnedRoomId, '卧室'), entity(pinnedParentId, '东区公寓')];
+  const pinned = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333337', chatId: CHAT, narrativeGeneration: GENERATION,
+    checkpointId: null, floor: { ...floor, content: { canonicalContent: '林岚回到已知地点 45 号。' } }, entities: pinnedEntities,
+    previousFloorContext: { placeNames: ['已绑定旧卧室'], placeBindings: [{ placeEntityId: pinnedRoomId, name: '已绑定旧卧室' }],
+      priorityPlaceEntityIds: [pinnedRoomId, pinnedParentId], parentEntityIdsByPlaceId: new Map([[pinnedRoomId, new Set([pinnedParentId])]]) } });
+  const pinnedCatalog = pinned.request.payload.knownPlaces;
+  assert.equal(pinnedCatalog.length, 40, '保留有依据的前楼地点和必要父级时仍遵守目录上限');
+  assert.deepEqual(pinnedCatalog.slice(0, 2).map(item => item.displayName), ['卧室', '东区公寓'], '同名候选不能挤掉真实前楼绑定及必要父级');
+  assert.deepEqual(pinnedCatalog[0].parentPlaceKeys, [pinnedCatalog[1].entityKey], '父级使用本次有效的目录键');
+  assert.deepEqual(pinned.request.payload.previousFloorContext.placeBindings, [{ placeKey: pinnedCatalog[0].entityKey, name: '已绑定旧卧室' }]);
+  assert.equal(JSON.stringify(pinned.request.payload).includes(pinnedRoomId), false, '不向模型暴露存档实体ID');
+});
+
+test('生产提取可用已知地点承接简称并将地点身份与来源保存至召回冷读', async () => {
+  const scenes = [
+    { content: '林岚在废弃二层小楼暂住。废弃二层小楼内有独立卧室。', name: '废弃二层小楼', identity: 'new' },
+    { content: '林岚改在山口营地过夜。', name: '山口营地', identity: 'new' },
+    { content: '林岚重新回到废弃小楼。', name: '废弃小楼', identity: 'existing' },
+  ];
+  const initialChat = scenes.flatMap((scene, index) => [user(`第${index + 1}段`), assistant(scene.content)])
+    .concat([user('继续'), assistant('之后的日常。')]);
+  const extractorRequests = [];
+  const h = harness({ modernAnchors: true, readOnlyLifecycle: true, initialChat, utility: options => {
+    if (options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
+    const request = JSON.parse(options.taskMessages[0].content);
+    const payload = request.payload;
+    extractorRequests.push(request);
+    const scene = scenes.find(item => item.content === payload.canonicalContent);
+    if (!scene) return { jsonData: { summary: payload.canonicalContent } };
+    const placeKey = scene.identity === 'existing'
+      ? payload.knownPlaces.find(item => item.displayName === '废弃二层小楼')?.entityKey
+      : undefined;
+    return { jsonData: { summary: scene.content, people: [{ name: '林岚', role: 'user', presence: 'present' }],
+      locations: [{ name: scene.name, change: 'present', people: ['林岚'] }],
+      spatialFacts: {
+        places: [{ key: 'place-mention-1', name: scene.name, identity: scene.identity,
+          ...(placeKey ? { sameAsPlaceKey: placeKey } : {}),
+          ...(scene.identity === 'existing' ? { aliases: ['废弃小楼'] } : {}),
+          exactQuote: scene.content, source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey },
+        ...(scene === scenes[0] ? [{ key: 'place-mention-2', name: '独立卧室', identity: 'new',
+          exactQuote: '废弃二层小楼内有独立卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }] : [])],
+        containments: scene === scenes[0] ? [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1',
+          exactQuote: '废弃二层小楼内有独立卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }] : [],
+        positions: [{ subject: '林岚', placeKey: 'place-mention-1', status: 'confirmed', exactQuote: scene.content,
+          source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
+      },
+    } };
+  } });
+  assert.equal((await h.foundationRuntime.reconcile('placeCatalogProductionSeed')).status, 'ready',
+    '使用生产foundation入口建立被真实memory/runtime读取的稳定楼');
+  await h.runtime.start();
+  const floors = h.runtime.getState().floors;
+  assert.equal(floors.length, 3);
+  for (const floor of floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  assert.equal(extractorRequests.length, 3, JSON.stringify({ calls: h.calls.length, floorStates: h.runtime.getState().floors.map(item => ({ status: item.status, floorId: item.floorId })), warnings: h.warnings }));
+  const returnRequest = extractorRequests.find(request => request.payload.canonicalContent === scenes[2].content);
+  assert.ok(returnRequest);
+  const candidate = returnRequest.payload.knownPlaces.find(item => item.displayName === '废弃二层小楼');
+  assert.ok(candidate, '场景变化后，目录仍让模型看见可供语义承接的原地点键');
+
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  const oldPlace = saved.entities.find(item => item.entityType === 'place' && item.displayName === '废弃二层小楼');
+  assert.ok(oldPlace);
+  const firstMemory = saved.floorMemories.find(item => item.floorId === floors[0].floorId);
+  assert.equal(firstMemory.spatialFacts.containments.length, 1, '普通单楼流程保存有完整地点、父地点和关系引文的包含事实');
+  const coldRecallSource = await readRecallSource({ store: h.store, now: () => new Date(NOW) });
+  const coldFirstMemory = coldRecallSource.floorMemories.find(item => item.floorId === floors[0].floorId);
+  assert.equal(coldFirstMemory.spatialFacts.containments[0].sourceRefs[0].quotedText, '废弃二层小楼内有独立卧室');
+  const returnFloor = saved.floorMemories.find(item => item.floorId === floors[2].floorId);
+  assert.equal(returnFloor.spatialFacts.positions[0].placeEntityId, oldPlace.id,
+    '受控返回只证明显式同地键可沿生产编译与保存路径复用身份');
+  const recallSource = await readRecallSource({ store: h.store, now: () => new Date(NOW) });
+  const recalled = recallSource.floorMemories.find(item => item.floorId === floors[2].floorId);
+  assert.equal(recalled.spatialFacts.positions[0].placeEntityId, oldPlace.id, '冷读召回保留旧地点身份');
+  assert.equal(recalled.spatialFacts.positions[0].sourceRefs[0].floorId, floors[2].floorId, '召回证据仍归属简称出现的本楼');
+  const learnedAlias = saved.entities.find(item => item.mergedIntoEntityId === oldPlace.id && (item.displayName === '废弃小楼' || item.aliases.some(alias => alias.name === '废弃小楼')));
+  assert.ok(learnedAlias, '明确承接的简称通过既有实体合并合同保存');
+  const coldEnvelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333336', chatId: CHAT,
+    narrativeGeneration: GENERATION, checkpointId: null,
+    floor: { ...floors[2], content: { canonicalContent: '林岚再次回到废弃小楼。' } }, entities: saved.entities });
+  const coldOldPlace = coldEnvelope.request.payload.knownPlaces.find(item => item.displayName === '废弃二层小楼');
+  assert.ok(coldOldPlace);
+  assert.ok(coldOldPlace.aliases.includes('废弃小楼'), '冷读后的地点身份目录仍以原ID提供学名和已学简称');
 });
 
 test('实际顺序提取从前楼 locations 提供地点名参照，但不把泛称房间绑定给旧地点', async () => {
   const extractorRequests = [];
   const oldLocation = '林岚在自己的房间里整理物品。';
+  const oldRawLocation = `${oldLocation}<location>东区公寓·卧室</location>`;
   const currentContent = '林岚在厨房里整理物品。';
-  const h = harness({ initialChat: [user('先安排住处'), assistant(oldLocation), user('继续整理'), assistant(currentContent), user('确认完成'), assistant('会话继续。')],
+  const h = harness({ initialChat: [user('先安排住处'), assistant(oldRawLocation), user('继续整理'), assistant(currentContent), user('确认完成'), assistant('会话继续。')],
     utility: options => {
       if (options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
       const request = JSON.parse(options.taskMessages[0].content);
@@ -1482,24 +2451,303 @@ test('实际顺序提取从前楼 locations 提供地点名参照，但不把泛
   await h.runtime.extractFloor(first.floorId, { analyzeState: false });
   await h.runtime.extractFloor(second.floorId, { analyzeState: false });
   assert.equal(extractorRequests.length, 2);
+  assert.deepEqual(extractorRequests[0].payload.locationReference, ['东区公寓·卧室'],
+    '正式提取请求应从目标楼的原消息冻结地点标签，但canonical正文仍不含标签');
   assert.equal(extractorRequests[1].payload.previousFloorContext.placeNames.includes('西区新公寓'), true,
     '前楼明确登记的地点即使不在摘要末段也作为有限参照');
   assert.equal(extractorRequests[1].payload.previousFloorContext.summaryTail.includes('西区新公寓'), false,
     '前楼摘要尾段未包含地点名，地点参照来自已保存location');
-  assert.equal(extractorRequests[1].payload.knownPlaces.length, 0,
-    '第二楼只有厨房泛称，旧“林岚的房间”不会因厨房alias进入候选');
+  assert.equal(extractorRequests[1].payload.knownPlaces.length, 1,
+    '有效旧地点可作有限参照，但厨房泛称仍不是地点身份依据');
+  assert.equal(extractorRequests[1].payload.knownPlaces[0].displayName, '林岚的房间');
+  assert.equal(extractorRequests[1].payload.previousFloorContext.placeBindings, undefined,
+    '旧location没有实体ID时不以同名房间猜测绑定');
+  assert.deepEqual(extractorRequests[1].payload.previousFloorContext.locationReference, ['东区公寓·卧室'],
+    '后楼沿前楼保存的地点参考衔接，不把它升级成已知地点实体');
   const current = h.runtime.getState().floors.find(item => item.floorId === second.floorId);
   assert.equal(current.memory.summary.aiText, '林岚在厨房里整理物品。');
   assert.equal(current.memory.spatialFacts, undefined, '泛称漏key时保留summary，不把第二楼绑定到旧实体');
   const saved = await h.store.readReachable({ mode: 'runtime' });
   const firstMemory = saved.floorMemories.find(item => item.floorId === first.floorId);
+  assert.deepEqual(firstMemory.sourceLocationReference, ['东区公寓·卧室']);
+  assert.equal(Object.hasOwn(saved.floorMemories.find(item => item.floorId === second.floorId), 'sourceLocationReference'), false,
+    '无原消息地点标签时不把缺省伪存成人工清除');
   assert.equal(firstMemory.locations[0].name, '西区新公寓');
   assert.equal(firstMemory.locations[0].entityId, null, '前楼旧location保留无entityId格式供后楼作名称参照');
   assert.ok(saved.entities.some(item => item.displayName === '林岚的房间'), '实际生产保存图保留独立旧地点实体');
   assert.equal(saved.floorMemories.find(item => item.floorId === second.floorId).spatialFacts, undefined);
 });
 
-test('空间位置经运行时提交、冷读来源、选择回执与摘要详情保留地点身份和来源楼', async () => {
+test('重提保留人工摘要时不从原消息恢复已清除的地点参照', async () => {
+  const content = '林岚仍记得前往钟楼。';
+  const rawContent = `${content}<location>东区公寓·卧室</location>`;
+  const requests = [];
+  const h = harness({ initialChat: [user('记录这段经过'), assistant(rawContent), user('继续')], utility: options => {
+    if (options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
+    const request = JSON.parse(options.taskMessages[0].content);
+    requests.push(request);
+    return { jsonData: { summary: '林岚仍记得前往钟楼。' } };
+  } });
+  await h.runtime.start();
+  const floor = h.runtime.getState().floors[0];
+  await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  assert.deepEqual(h.runtime.getState().floors[0].memory.sourceLocationReference, ['东区公寓·卧室']);
+  await h.runtime.editSummary(floor.floorId, '人工确认的摘要。');
+  assert.equal(h.runtime.getState().floors[0].memory.sourceLocationReference, null);
+  await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].payload.locationReference, undefined, '人工清除后重提不把原标签作为请求参考');
+  const saved = h.runtime.getState().floors[0].memory;
+  assert.equal(saved.summary.userText, '人工确认的摘要。', '重提继续保留同一人工摘要');
+  assert.equal(saved.sourceLocationReference, null, '重提结果保持显式人工清除');
+  const cold = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(cold.floorMemories.find(value => value.floorId === floor.floorId).sourceLocationReference, null,
+    '人工清除经重提和Store冷读仍生效');
+});
+
+test('实际提取请求用上一楼绑定地点键区分不同住处的同名房间并携带已存父级', async t => {
+  const run = async (host, selectedRoomIndex) => {
+    const scenes = [
+      { content: '林岚在东区公寓的卧室。东区公寓内有独立卧室。', apartment: '东区公寓' },
+      { content: '林岚在西区公寓的卧室。西区公寓内有独立卧室。', apartment: '西区公寓' },
+      { content: '林岚仍在卧室。', apartment: null },
+      { content: '林岚仍在卧室。', apartment: null },
+    ];
+    const extractorRequests = [];
+    const h = harness({ host, modernAnchors: true, readOnlyLifecycle: true,
+      initialChat: scenes.flatMap((scene, index) => [user(`确认第${index + 1}段`), assistant(scene.content)]).concat([user('继续')]),
+      utility: options => {
+        if (options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
+        const request = JSON.parse(options.taskMessages[0].content);
+        extractorRequests.push(request);
+        const payload = request.payload;
+        const sceneIndex = scenes.findIndex(item => item.content === payload.canonicalContent);
+        if (sceneIndex === 0 || sceneIndex === 1) {
+          const apartmentName = scenes[sceneIndex].apartment;
+          return { jsonData: {
+            summary: payload.canonicalContent,
+            people: [{ name: '林岚', role: 'user', presence: 'present' }],
+            locations: [{ name: '卧室', change: 'present', people: ['林岚'] }],
+            spatialFacts: {
+              places: [
+                { key: 'place-mention-1', name: apartmentName, identity: 'new', exactQuote: `${apartmentName}内有独立卧室`, source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey },
+                { key: 'place-mention-2', name: '卧室', identity: 'new', exactQuote: `${apartmentName}内有独立卧室`, source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey },
+              ],
+              containments: [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', exactQuote: `${apartmentName}内有独立卧室`, source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
+              positions: [{ subject: '林岚', placeKey: 'place-mention-2', status: 'confirmed', exactQuote: '林岚在', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
+            },
+          } };
+        }
+        if (sceneIndex === 2) {
+          const rooms = payload.knownPlaces.filter(item => item.displayName === '卧室');
+          return { jsonData: { summary: '前楼仍记录在卧室。',
+            people: [{ name: '林岚', role: 'user', presence: 'present' }],
+            locations: [{ name: '卧室', change: 'present', people: ['林岚'] }],
+            spatialFacts: { places: [{ key: 'place-mention-1', name: '卧室', identity: 'existing', sameAsPlaceKey: rooms[selectedRoomIndex]?.entityKey,
+              exactQuote: '林岚仍在卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }], containments: [],
+              positions: [{ subject: '林岚', placeKey: 'place-mention-1', status: 'confirmed', exactQuote: '林岚仍在卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }] },
+          } };
+        }
+        return { jsonData: { summary: '本楼摘要。' } };
+      } });
+    assert.equal((await h.foundationRuntime.reconcile('sameNamePlaceIdentity')).status, 'ready');
+    await h.runtime.start();
+    const floors = h.runtime.getState().floors;
+    assert.equal(floors.length, 4);
+    for (const floor of floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    const request = extractorRequests.filter(item => item.payload.canonicalContent === scenes[3].content).at(-1);
+    assert.ok(request, JSON.stringify({ calls: h.calls.length, warnings: h.warnings }));
+    const saved = await h.store.readReachable({ mode: 'runtime' });
+    for (const floor of floors.slice(0, 2)) {
+      const memory = saved.floorMemories.find(item => item.floorId === floor.floorId);
+      assert.equal(memory.spatialFacts.containments.length, 1, '前楼包含关系经真实compiler/runtime保存');
+      assert.equal(memory.spatialFacts.positions[0].placeEntityId, memory.spatialFacts.containments[0].placeEntityId,
+        '位置与房间实体绑定一致');
+    }
+    const boundMemory = saved.floorMemories.find(item => item.floorId === floors[2].floorId);
+    const boundPlaceId = boundMemory.spatialFacts.positions[0].placeEntityId;
+    assert.ok(boundPlaceId, '第3楼真实保存所选同名房间的绑定');
+    const savedParentId = saved.floorMemories.flatMap(memory => memory.spatialFacts?.containments ?? [])
+      .find(edge => edge.placeEntityId === boundPlaceId)?.parentEntityId;
+    const savedParentName = saved.entities.find(item => item.id === savedParentId)?.displayName;
+    assert.ok(savedParentName, '实际已保存的父关系能解析到一个具体住处');
+    return { request, savedParentName };
+  };
+
+  for (const host of ['official', 'luker']) await t.test(host, async () => {
+    const east = await run(host, 0);
+    const west = await run(host, 1);
+    assert.equal(east.request.payload.canonicalContent, west.request.payload.canonicalContent);
+    assert.equal(east.request.payload.previousFloorContext.summaryTail, west.request.payload.previousFloorContext.summaryTail,
+      '两个测试请求拥有同一前楼摘要');
+    const resolvedRequests = [east, west].map(({ request, savedParentName }) => {
+      const previous = request.payload.previousFloorContext;
+      assert.ok(Array.isArray(previous?.placeBindings) && previous.placeBindings.length > 0,
+        '请求应带前楼已绑定的本次地点键');
+      const roomBinding = previous.placeBindings.find(item => item.name === '卧室');
+      assert.ok(roomBinding?.placeKey);
+      const room = request.payload.knownPlaces.find(item => item.entityKey === roomBinding.placeKey);
+      assert.ok(room, '前楼绑定地点必须保留在本次40项目录中');
+      assert.ok(room.parentPlaceKeys?.length, '目录地点应指出已有父级的本次目录键');
+      const parentNames = room.parentPlaceKeys.map(key => request.payload.knownPlaces.find(item => item.entityKey === key)?.displayName).filter(Boolean);
+      assert.deepEqual(parentNames, [savedParentName], '请求父关系与上楼实际保存的房间关系一致');
+      return { request, parentNames };
+    });
+    assert.notEqual(east.savedParentName, west.savedParentName, '两次上楼的真实绑定分别指向不同住处');
+    assert.notDeepEqual(resolvedRequests[0], resolvedRequests[1], '虽本次局部键可以重排，完整目录仍区分两处绑定关系');
+  });
+});
+
+test('原消息地点参考只取正式标签内容，去重并跳过思维区与代码范例', () => {
+  const raw = [
+    '林岚回到卧室。',
+    '<location>东区公寓·卧室</location>',
+    '<location>东区公寓·卧室</location>',
+    '<think><location>推理里的地址</location></think>',
+    '<reasoning_content><location>隐藏分析里的地址</location></reasoning_content>',
+    '<code><location>代码范例里的地址</location></code>',
+    '```xml\n<location>围栏范例里的地址</location>\n```',
+    '<location>未闭合地址',
+  ].join('\n');
+  assert.deepEqual(readLocationReference(raw), ['东区公寓·卧室']);
+  assert.equal(readLocationReference('正文没有地点标签'), null);
+  assert.equal(readLocationReference('<think><location>仅有思维标签</location></think>'), null);
+  assert.equal(readLocationReference('<location> \n </location>'), null);
+});
+
+test('真实高楼聚合提取只携带首个来源楼之前的地点绑定和父级', async () => {
+  const eastContent = '林岚在东区公寓的卧室。东区公寓内有独立卧室。';
+  const eastText = `${eastContent}<location>前置来源·卧室</location>`;
+  const laterBatchText = '高楼正文 11。<location>批内后楼旧标签</location>';
+  const aggregateRequests = [];
+  const h = harness({ modernAnchors: true,
+    initialChat: Array.from({ length: 11 }, (_, index) => [assistant(index === 0 ? eastText : index === 10 ? laterBatchText : `高楼正文 ${index + 1}。`), user(`确认 ${index + 1}`)]).flat(),
+    automation: { enabled: false, batchSize: 1 },
+    utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
+      if (request.payload.sourceFloors?.length > 1) {
+        aggregateRequests.push(request);
+        return { jsonData: { summary: '聚合楼摘要。' } };
+      }
+      if (request.payload.canonicalContent === eastContent) return { jsonData: { summary: eastContent, people: [{ name: '林岚', role: 'user', presence: 'present' }],
+        locations: [{ name: '卧室', change: 'present', people: ['林岚'] }],
+        spatialFacts: { places: [
+          { key: 'place-mention-1', name: '东区公寓', identity: 'new', exactQuote: '东区公寓内有独立卧室', source: 'canonicalContent', sourceFloorKey: request.payload.sourceFloorKey },
+          { key: 'place-mention-2', name: '卧室', identity: 'new', exactQuote: '东区公寓内有独立卧室', source: 'canonicalContent', sourceFloorKey: request.payload.sourceFloorKey },
+        ], containments: [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', exactQuote: '东区公寓内有独立卧室', source: 'canonicalContent', sourceFloorKey: request.payload.sourceFloorKey }],
+        positions: [{ subject: '林岚', placeKey: 'place-mention-2', status: 'confirmed', exactQuote: '林岚在东区公寓的卧室', source: 'canonicalContent', sourceFloorKey: request.payload.sourceFloorKey }] } } };
+      return { jsonData: { summary: request.payload.canonicalContent } };
+    } });
+  assert.equal((await h.foundationRuntime.reconcile('aggregatePlacePrefix')).status, 'ready');
+  await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  await h.runtime.startHistoricalRebuild({ aggregate: true });
+  await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().activeAutoMemory,
+    () => JSON.stringify(h.runtime.getState()));
+  const request = aggregateRequests[0]?.payload;
+  assert.equal(request?.sourceFloors?.length, 10, '通过现有历史重建的真实高楼聚合入口');
+  assert.equal(request?.locationReference, undefined, '聚合地点只按各来源楼传递，不把锚点标签提升为全批参考');
+  assert.deepEqual(request?.previousFloorContext?.locationReference, ['前置来源·卧室'], '聚合前情地点只来自首个来源楼之前的真实已保存楼');
+  assert.deepEqual(request?.sourceFloors?.at(-1)?.locationReference, ['批内后楼旧标签'], '后楼地点标签仍归属自身来源快照');
+  assert.doesNotMatch(JSON.stringify(request?.previousFloorContext), /批内后楼旧标签/u, '批内较晚旧标签不得倒灌到整个聚合批次的前楼上下文');
+  const previousBinding = request.previousFloorContext.placeBindings.find(item => item.name === '卧室');
+  const eastRoom = request.knownPlaces.find(item => item.entityKey === previousBinding.placeKey);
+  assert.ok(eastRoom, '聚合前一楼的真实绑定必须保留');
+  assert.deepEqual(eastRoom.parentPlaceKeys.map(key => request.knownPlaces.find(item => item.entityKey === key)?.displayName), ['东区公寓']);
+
+  const stored = await h.store.readReachable({ mode: 'runtime' });
+  const aggregateMemory = stored.floorMemories.find(value => value.sourceFloorSnapshots?.length === 10);
+  assert.ok(aggregateMemory, '真实聚合摘要及其十份成员来源已存储');
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, modernAnchors: true, automation: { enabled: false, batchSize: 1 }, utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (request.task === 'extractFloorSemantics') return { jsonData: { summary: request.payload.canonicalContent } };
+    return { jsonData: { noMaterialChange: true } };
+  } });
+  await cold.runtime.start();
+  const coldGraph = await cold.store.readReachable({ mode: 'runtime' });
+  const coldAggregate = coldGraph.floorMemories.find(value => value.id === aggregateMemory.id);
+  assert.equal(coldAggregate.sourceFloorSnapshots.length, 10, '新 Store 实例逐来源冷读全部十名成员');
+  for (const member of request.sourceFloors) {
+    const floorId = stored.floors.find(value => value.hostLocator?.messageIndex === member.messageIndex)?.id;
+    const snapshot = coldAggregate.sourceFloorSnapshots.find(value => value.floorId === floorId);
+    assert.ok(snapshot, `冷读缺少来源楼 ${member.assistantSeq}`);
+    assert.equal(Object.hasOwn(snapshot, 'locationReference'), Object.hasOwn(member, 'locationReference'), `冷读保留来源楼 ${member.assistantSeq} 的缺省/null形状`);
+    if (Object.hasOwn(member, 'locationReference')) assert.deepEqual(snapshot.locationReference, member.locationReference);
+  }
+  const aggregateView = cold.runtime.getState().floors.find(value => value.floorId === coldAggregate.floorId);
+  await cold.runtime.editSummary(aggregateView.floorId, '人工确认的聚合摘要。');
+  const nullCold = harness({ sharedBackend: h.backend, sharedContext: h.context, modernAnchors: true, automation: { enabled: false, batchSize: 1 }, utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (request.task === 'extractFloorSemantics') return { jsonData: { summary: request.payload.canonicalContent } };
+    return { jsonData: { noMaterialChange: true } };
+  } });
+  await nullCold.runtime.start();
+  const nullGraph = await nullCold.store.readReachable({ mode: 'runtime' });
+  const nullAggregate = nullGraph.floorMemories.find(value => value.floorId === coldAggregate.floorId && value.recordStatus === 'active');
+  assert.ok(nullAggregate, '修改摘要后应有新的活动聚合记录');
+  assert.ok(nullAggregate.supersedes.includes(coldAggregate.id), '人工修订沿活动替换关系生成新的摘要版本');
+  assert.equal(nullAggregate.sourceFloorSnapshots.length, 10);
+  assert.ok(nullAggregate.sourceFloorSnapshots.every(value => Object.hasOwn(value, 'locationReference') && value.locationReference === null),
+    '人工清除后十份成员参考都以显式null冷读，不会由原消息标签复活');
+});
+
+test('地点父关系按证据楼截止，后楼更新不覆盖早楼参照', async () => {
+  const firstText = '林岚住在旧馆卧室。旧馆内有卧室。';
+  const correctionText = '林岚确认卧室现在归新馆。新馆内有卧室。';
+  const targetText = '林岚仍在卧室。';
+  const targetRequests = [];
+  const h = harness({ modernAnchors: true,
+    initialChat: [user('确认旧馆'), assistant(firstText), user('继续一'), assistant(targetText),
+      user('确认调整'), assistant(correctionText), user('继续二'), assistant(targetText), user('稳定'), assistant('后续稳定楼。')],
+    utility: options => {
+      if (options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
+      const request = JSON.parse(options.taskMessages[0].content), payload = request.payload;
+      if (payload.canonicalContent === targetText) targetRequests.push(request);
+      if (payload.canonicalContent === firstText) return { jsonData: { summary: firstText, people: [{ name: '林岚', role: 'user', presence: 'present' }],
+        locations: [{ name: '卧室', change: 'present', people: ['林岚'] }], spatialFacts: {
+          places: [
+            { key: 'place-mention-1', name: '旧馆', identity: 'new', exactQuote: '旧馆内有卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey },
+            { key: 'place-mention-2', name: '卧室', identity: 'new', exactQuote: '旧馆内有卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey },
+          ], containments: [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', exactQuote: '旧馆内有卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
+          positions: [{ subject: '林岚', placeKey: 'place-mention-2', status: 'confirmed', exactQuote: '林岚住在旧馆卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
+        } } };
+      if (payload.canonicalContent === correctionText) {
+        const room = payload.knownPlaces.find(item => item.displayName === '卧室');
+        return { jsonData: { summary: correctionText, people: [{ name: '林岚', role: 'user', presence: 'present' }],
+          locations: [{ name: '卧室', change: 'present', people: ['林岚'] }], spatialFacts: {
+            places: [
+              { key: 'place-mention-1', name: '卧室', identity: 'existing', sameAsPlaceKey: room.entityKey, identityChange: 'ownershipChanged', exactQuote: '卧室现在归新馆', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey },
+              { key: 'place-mention-2', name: '新馆', identity: 'new', exactQuote: '新馆内有卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey },
+            ], containments: [{ placeKey: 'place-mention-1', parentPlaceKey: 'place-mention-2', exactQuote: '新馆内有卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
+            positions: [{ subject: '林岚', placeKey: 'place-mention-1', status: 'confirmed', exactQuote: '林岚确认卧室现在归新馆', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
+          } } };
+      }
+      const room = payload.knownPlaces.find(item => item.displayName === '卧室');
+      return { jsonData: { summary: targetText, people: [{ name: '林岚', role: 'user', presence: 'present' }],
+        locations: [{ name: '卧室', change: 'present', people: ['林岚'] }], spatialFacts: {
+          places: [{ key: 'place-mention-1', name: '卧室', identity: 'existing', sameAsPlaceKey: room.entityKey, exactQuote: '林岚仍在卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }], containments: [],
+          positions: [{ subject: '林岚', placeKey: 'place-mention-1', status: 'confirmed', exactQuote: '林岚仍在卧室', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
+        } } };
+    } });
+  assert.equal((await h.foundationRuntime.reconcile('locationEvidencePrefix')).status, 'ready');
+  await h.runtime.start();
+  const [firstFloor, earlierTarget, laterCorrection, laterTarget] = h.runtime.getState().floors;
+  await h.runtime.extractFloor(firstFloor.floorId, { analyzeState: false });
+  await h.runtime.extractFloor(laterCorrection.floorId, { analyzeState: false });
+  await h.runtime.extractFloor(earlierTarget.floorId, { analyzeState: false });
+  await h.runtime.extractFloor(laterTarget.floorId, { analyzeState: false });
+  assert.equal(targetRequests.length, 2);
+  const parentName = request => {
+    const previousBinding = request.payload.previousFloorContext.placeBindings.find(item => item.name === '卧室');
+    const room = request.payload.knownPlaces.find(item => item.entityKey === previousBinding.placeKey);
+    return room.parentPlaceKeys.map(key => request.payload.knownPlaces.find(item => item.entityKey === key)?.displayName);
+  };
+  assert.deepEqual(parentName(targetRequests[0]), ['旧馆'], '较早楼排除来源顺序更晚、但已提前写入的关系');
+  assert.deepEqual(parentName(targetRequests[1]), ['新馆'], '后续楼采用最新已保存来源楼明确更新的父级');
+});
+
+test('空间事实与召回来源保留内部地点身份和来源楼，用户界面隐藏空间块', async () => {
   const content = '林岚走进钟楼。随后林岚离开钟楼，去向未知。';
   const initialChat = [user('继续一'), assistant(content), user('继续二'), assistant('第二楼继续赶路。'),
     user('继续三'), assistant('第三楼抵达街口。'), user('继续四'), assistant('第四楼停下来。'),
@@ -1508,7 +2756,7 @@ test('空间位置经运行时提交、冷读来源、选择回执与摘要详�
     if (options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
     const payload = JSON.parse(options.taskMessages[0].content).payload;
     if (payload.canonicalContent !== content) return { jsonData: { summary: payload.canonicalContent } };
-    return { jsonData: { summary: '林岚先进入钟楼，之后离开且去向未知。', people: [{ name: '林岚', role: 'user' }], spatialFacts: {
+    return { jsonData: { summary: '林岚先进入钟楼，之后离开且去向未知。', people: [{ name: '林岚', role: 'user' }], locations: [{ name: '钟楼', change: 'left', people: ['林岚'] }], spatialFacts: {
       places: [{ key: 'place-mention-1', name: '钟楼', identity: 'new', exactQuote: '林岚走进钟楼', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
       containments: [], positions: [{ subject: '林岚', placeKey: 'place-mention-1', status: 'leftUnknown', exactQuote: '林岚离开钟楼，去向未知', source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey }],
     } } };
@@ -1549,13 +2797,17 @@ test('空间位置经运行时提交、冷读来源、选择回执与摘要详�
   h.context.setExtensionPrompt = () => {};
   const intercepted = await recall.intercept(structuredClone(h.context.chat), 12000, () => {}, 'normal');
   assert.equal(intercepted.lastRecall.status, 'ready');
-  assert.match(intercepted.lastRecall.injectionText, /来源楼当时\(AI #1\)记录林岚已离开原地点钟楼/u);
+  assert.match(intercepted.lastRecall.injectionText, /来源楼当时\(AI #1\)离开记录:林岚已离开原地点钟楼;去向:未知/u);
+  assert.deepEqual(floor.memory.locations.map(item => item.name), ['钟楼'], '既有地点 meta 字段保留');
   const ui = viewHarness(h.runtime);
   await ui.view.activate();
-  const spatial = ui.flatten(ui.container).find(node => node.className === 'qqj-memory-spatial');
-  assert.ok(spatial);
-  const spatialText = ui.flatten(spatial).filter(node => node.className === 'qqj-memory-spatial-item').map(node => node.textContent).join('\n');
-  assert.match(spatialText, /林岚已离开原地点钟楼，去向未知；钟楼不是当前位置/u);
+  const sourceCard = ui.flatten(ui.container).find(node => node.attributes['data-qqj-floor-id'] === floor.floorId);
+  sourceCard.open = true; sourceCard.fire('toggle');
+  assert.equal(ui.flatten(ui.container).some(node => node.className === 'qqj-memory-spatial'), false, '整块空间记录不向用户呈现');
+  const metas = ui.flatten(ui.container).filter(node => node.className === 'qqj-memory-meta');
+  assert.ok(metas.some(meta => ui.flatten(meta).some(node => node.textContent === '地点')
+    && ui.flatten(meta).some(node => node.textContent === '钟楼')), '原地点 meta 保留');
+  assert.equal(ui.flatten(ui.container).some(node => node.className === 'qqj-memory-main' && node.textContent.includes('空间记录')), false);
 
   const groupId = '99999999-9999-4999-8999-999999999819';
   const baseState = h.runtime.getState();
@@ -1564,8 +2816,8 @@ test('空间位置经运行时提交、冷读来源、选择回执与摘要详�
       { ...item.memory.spatialFacts.positions[0], itemId: '99999999-9999-4999-8999-999999999818', subjectEntityId: groupId }] } },
   }) };
   const groupUi = viewHarness({ ...h.runtime, getState: () => detailState }); await groupUi.view.activate();
-  assert.ok(groupUi.flatten(groupUi.container).some(node => node.className === 'qqj-memory-spatial-item' && node.textContent.includes('守夜组')),
-    '空间详情能通过 group 名称投影显示群体主体');
+  assert.equal(groupUi.flatten(groupUi.container).some(node => node.className === 'qqj-memory-spatial-item'), false,
+    '群体空间细节同样不在用户界面呈现');
 });
 
 test('楼末位置按实际离开者保存，送别对象保留最后所见状态', async () => {
@@ -1614,7 +2866,7 @@ test('楼末位置按实际离开者保存，送别对象保留最后所见状�
   assert.equal(statuses.size, 2);
 });
 
-test('聚合空间引文保留成员楼序号并在详情标注来源成员', async () => {
+test('聚合空间引文保留成员楼序号且用户界面隐藏空间细节', async () => {
   const sourceText = '独立卧室属于新公寓，新公寓位于西区。';
   const initialChat = Array.from({ length: 10 }, (_, index) => [
     assistant(index === 1 ? sourceText : `连续楼 ${index + 1}。`), user(`确认 ${index + 1}`),
@@ -1648,20 +2900,22 @@ test('聚合空间引文保留成员楼序号并在详情标注来源成员', as
   const memory = source.floorMemories.find(item => item.floorId === floor.floorId);
   assert.ok(memory.spatialFacts.containments.every(item => item.sourceRefs[0].assistantSeq === 2));
   const ui = viewHarness(h.runtime); await ui.view.activate();
-  const line = ui.flatten(ui.container).find(node => node.className === 'qqj-memory-spatial-item');
-  assert.match(line.textContent, /AI #2.*独立卧室 属于 新公寓/u);
+  assert.equal(ui.flatten(ui.container).some(node => node.className === 'qqj-memory-spatial'), false,
+    '聚合空间事实仍保存并保留来源楼，用户界面隐藏空间块');
 });
 
 test('人工编辑仅在摘要、地点或人物实质变化时降级本楼空间证据', async t => {
   for (const change of ['note-time', 'summary', 'location', 'participant']) await t.test(change, async () => {
     const content = '林岚走进钟楼。';
-    const h = harness({ text: content, utility: async options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+    const h = harness({ text: `${content}<location>东区公寓·卧室</location>`, utility: async options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
       ? { jsonData: { summary: '林岚走进钟楼。', people: [{ name: '林岚', role: 'user', presence: 'present' }], locations: [{ name: '钟楼', change: 'entered', people: ['林岚'] }], spatialFacts: {
         places: [{ key: 'place-mention-1', name: '钟楼', identity: 'new', exactQuote: content, source: 'canonicalContent', sourceFloorKey: JSON.parse(options.taskMessages[0].content).payload.sourceFloorKey }],
         containments: [], positions: [{ subject: '林岚', placeKey: 'place-mention-1', status: 'confirmed', exactQuote: content, source: 'canonicalContent', sourceFloorKey: JSON.parse(options.taskMessages[0].content).payload.sourceFloorKey }],
       } } } : { jsonData: { noMaterialChange: true } } });
     await h.runtime.start();
     const floor = h.runtime.getState().floors[0]; await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    assert.doesNotMatch(h.runtime.copySafeDiagnostic(floor.floorId), /东区公寓·卧室/u, '普通诊断不泄露原消息地点标签');
+    assert.match(h.runtime.copyFullDiagnostic(floor.floorId), /东区公寓·卧室/u, '完整诊断沿现有明确导出保留来源字段');
     const before = h.runtime.getState().floors[0], names = new Map(h.runtime.getState().memoryEntities.map(entity => [entity.entityId, entity.displayName]));
     const placeId = h.runtime.getState().memoryPlaceEntities.find(entity => entity.displayName === '钟楼').entityId;
     const locations = before.memory.locations.map(item => ({ itemId: item.itemId, name: item.name }));
@@ -1674,6 +2928,11 @@ test('人工编辑仅在摘要、地点或人物实质变化时降级本楼空�
     if (change === 'note-time') assert.equal(after.spatialFacts.positions.length, 1);
     else assert.equal(after.spatialFacts, undefined);
     assert.equal(after.locations[0].entityId, change === 'location' ? null : placeId);
+    assert.deepEqual(after.sourceLocationReference, ['summary', 'location'].includes(change) ? null : ['东区公寓·卧室'],
+      '实质改摘要或地点时显式清除原标签；只改时间/人物时保留未修改的来源参照');
+    const cold = await h.store.readReachable({ mode: 'runtime' });
+    assert.deepEqual(cold.floorMemories.find(item => item.floorId === floor.floorId).sourceLocationReference, after.sourceLocationReference,
+      '人工清除或保留合同经正式Store冷读保持');
   });
 });
 
@@ -1743,7 +3002,7 @@ test('pinned 人工修订允许点击前未同步到存档的普通正文编辑'
   } finally { targetStore.release(); }
 });
 
-test('pinned 人工修订拒绝保存开始后真实变化的目标正文', async () => {
+test('pinned 人工修订在正文变化后仍保存原明确目标', async () => {
   let h = null;
   h = harness({ captureBusinessIdentity: () => h ? ({
     hostChatId: h.context.chatId, chatId: h.context.chatMetadata.qianqianjie.chatId,
@@ -1765,11 +3024,11 @@ test('pinned 人工修订拒绝保存开始后真实变化的目标正文', asyn
   const source = h.context.chat.find(message => !message.is_user && message.mes.includes('裴晚生提醒你带伞'));
   source.mes = '保存开始后正文发生真实变化。'; source.swipes[0] = source.mes;
   releaseRead();
-  await assert.rejects(edit, error => error.code === 'V3_MEMORY_PREFIX_CHANGED');
+  await edit;
   const targetStore = h.store.forIdentity(initial);
   try {
     const saved = await targetStore.readReachable({ mode: 'runtime' });
-    assert.equal(saved.floorMemories.find(item => item.floorId === floor.floorId).summary.userText, null);
+    assert.equal(saved.floorMemories.find(item => item.floorId === floor.floorId).summary.userText, '不能覆盖保存开始后的来源编辑。');
   } finally { targetStore.release(); }
 });
 
@@ -1805,19 +3064,22 @@ test('身份合并、删除、同源多父与环只隔离冲突空间引用', ()
   const ids = ['99999999-9999-4999-8999-999999999821', '99999999-9999-4999-8999-999999999822', '99999999-9999-4999-8999-999999999823', '99999999-9999-4999-8999-999999999824', '99999999-9999-4999-8999-999999999825', '99999999-9999-4999-8999-999999999826'];
   const [childA, childB, parentA, parentB, childC, parentC] = ids;
   const ref = floorId => ({ floorId, quotedText: '明确包含', occurrence: 1, evidenceMode: 'explicit', supports: '明确空间关系', sourceEntityId: null });
-  const memory = { spatialFacts: { schemaVersion: 1, containments: [
+  const memory = { exactAnchors: [{ anchorId: '99999999-9999-4999-8999-999999999830', manual: true, knownEntityIds: [childA, parentB] }], spatialFacts: { schemaVersion: 1, containments: [
     { itemId: '99999999-9999-4999-8999-999999999831', placeEntityId: childA, parentEntityId: parentA, evidenceRefs: [ref('floor-1'), ref('floor-2')] },
     { itemId: '99999999-9999-4999-8999-999999999832', placeEntityId: childB, parentEntityId: parentB, evidenceRefs: [ref('floor-1')] },
     { itemId: '99999999-9999-4999-8999-999999999833', placeEntityId: parentA, parentEntityId: childA, evidenceRefs: [ref('floor-2')] },
     { itemId: '99999999-9999-4999-8999-999999999834', placeEntityId: childC, parentEntityId: parentC, evidenceRefs: [ref('floor-3')] },
   ], positions: [] } };
   const projected = projectFloorMemoryIdentityReferences(memory, { identityRedirectsByEntityId: { [childA]: childB }, deletedEntityIds: [] });
+  assert.deepEqual(projected.exactAnchors[0].knownEntityIds, [childB, parentB], '知情人物引用随现有实体合并映射并保持其他实体身份');
   assert.deepEqual(projected.spatialFacts.containments.map(item => [item.placeEntityId, item.parentEntityId, item.evidenceRefs.map(entry => entry.floorId)]), [
     [childC, parentC, ['floor-3']],
   ], '合并后的同源多父与环仅去除对应来源楼的冲突边');
   const deleted = projectFloorMemoryIdentityReferences({ spatialFacts: { schemaVersion: 1, containments: memory.spatialFacts.containments, positions: [] } },
     { identityRedirectsByEntityId: {}, deletedEntityIds: [parentB] });
   assert.equal(deleted.spatialFacts.containments.some(item => item.parentEntityId === parentB), false);
+  const deletedKnowledge = projectFloorMemoryIdentityReferences({ exactAnchors: memory.exactAnchors }, { identityRedirectsByEntityId: {}, deletedEntityIds: [parentB] });
+  assert.deepEqual(deletedKnowledge.exactAnchors[0].knownEntityIds, [childA], '真实删除的知情身份移除后仍是收窄范围，不公开原文');
 });
 
 test('HostAdapter 优先 official 并为 official/Luker 提供同一宿主 user identity', () => {
@@ -1862,34 +3124,78 @@ test('Extractor 输入只含浅层语义提示，不暴露作用域、UUID 或�
   const extractorCalls = h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT);
   assert.equal(extractorCalls.length, 1);
   const call = extractorCalls[0];
+  assertQianshiLifecycleGuidance(call.systemPrompt);
   assert.equal(call.parseMode, 'semantic');
   assert.equal(Object.hasOwn(call, 'jsonSchema'), false);
-  assert.match(EXTRACTOR_SYSTEM_PROMPT, /people、time、locations 也要分别检查并提取/);
-  assert.equal(EXTRACTOR_PROMPT_VERSION, 'qqj-v3-extractor-prompt-30');
-  assert.equal(EXTRACTOR_VERSION, 'qqj-v3-extractor-prompt-30/schema-3/semantic-compiler-14');
+  assert.match(EXTRACTOR_SYSTEM_PROMPT, /本轮关键经过、事实与状态/);
+  assert.match(call.systemPrompt, /普通单楼 summary 通常以 200–300 字、3–5 句为目标/u);
+  assert.match(buildExtractorSystemPrompt('自定义偏好'), /普通单楼 summary 通常以 200–300 字、3–5 句为目标/u);
+  assertQianshiLifecycleGuidance(buildExtractorSystemPrompt('用户自定义偏好'));
+  assert.doesNotMatch(buildHighFloorExtractorSystemPrompt(), /普通单楼 summary 通常以 200–300 字、3–5 句为目标/u);
+  assert.match(call.systemPrompt, /summary、承诺与千事description保留原有知情范围/u);
+  assert.equal(EXTRACTOR_PROMPT_VERSION, 'qqj-v3-extractor-prompt-68');
+  assert.equal(EXTRACTOR_VERSION, 'qqj-v3-extractor-prompt-68/schema-3/semantic-compiler-37');
+  assert.equal(EXTRACTOR_RESPONSE_SCHEMA.properties.people.items.properties.aliases.maxItems, 20);
+  assert.equal(EXTRACTOR_RESPONSE_SCHEMA.properties.people.items.properties.identityBrief.maxLength, 400);
+  assert.match(EXTRACTOR_RESPONSE_SCHEMA.properties.people.items.properties.identityBrief.description, /identityBriefEvidence.*identityFacts/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /people\[\]\.identityBrief/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /knownPeople\.identityBrief 仅是身份对照，不是本楼新证据/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /people\[\]\.identityFacts 是可选的完整当前稳定身份列表/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /旧简介只作对照，不是证据/u);
+  assert.match(EXTRACTOR_RESPONSE_SCHEMA.properties.summary.description, /篇末实际状态.*条件预期/u);
+  assert.match(EXTRACTOR_RESPONSE_SCHEMA.properties.events.items.properties.description.description, /连续微动作可合并/u);
+  assert.match(EXTRACTOR_RESPONSE_SCHEMA.properties.actions.items.properties.action.description, /正在/u);
+  assert.match(EXTRACTOR_RESPONSE_SCHEMA.properties.actions.items.properties.completion.description, /按实际执行证据.*不等于受令任务已完成/u);
+  assert.match(EXTRACTOR_RESPONSE_SCHEMA.properties.actions.items.properties.result.description, /未知为 null/u);
+  assert.match(EXTRACTOR_RESPONSE_SCHEMA.properties.exactQuotes.items.anyOf[0].description, /措辞本身有后续核对或复用价值/u);
+  assert.match(EXTRACTOR_RESPONSE_SCHEMA.properties.exactQuotes.items.anyOf[1].properties.whyPreserve.description, /具体的核对或复用价值/u);
+  assert.match(EXTRACTOR_RESPONSE_SCHEMA.properties.openLoops.description, /影响后续且仍未解决/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /每楼必须检查并返回 qianshi；确无事件增量时返回 events:\[\]/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /qianshi 独立于 summary、普通 events、eventFragments/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /一次性新事实.*matter=false；计划、持续推进或需要跟踪的事项按 matter=true/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /也不要求每楼至少有一条/u);
   assert.deepEqual(EXTRACTOR_RESPONSE_SCHEMA.required, ['summary', 'qianshi']);
   assert.deepEqual(EXTRACTOR_RESPONSE_SCHEMA.properties.qianshi.required, ['events', 'order']);
+  assert.equal(EXTRACTOR_RESPONSE_SCHEMA.properties.qianshi.properties.events.maxItems, 160);
+  assert.equal(EXTRACTOR_RESPONSE_SCHEMA.properties.qianshi.properties.order.maxItems, 320);
+  assert.equal(EXTRACTOR_RESPONSE_SCHEMA.properties.qianshi.properties.events.items.properties.people.maxItems, 40);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /160 条事件、320 条不同有效关系.*40 位人物/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /本楼没有明确时间锚时.*previousFloorContext.*推定/);
   assert.match(call.systemPrompt, /object 只填写对后续叙事有用的具体物品，多个物品用“、”分隔/u);
   assert.match(call.systemPrompt, /人物写入 people，地点或建筑及事件主题应在相应正文事件信息中表达/u);
   assert.match(call.systemPrompt, /不要混入 object，也不要凭空补物品；没有合适物品时 object 写 null/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /时间是唯一允许合理推定的例外/);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /time\/chronology 只记录本篇主线实际发生的时间或范围，按剧情顺序输出，最后一条表示篇末时间/);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /回忆、未来约定等时间仍写入对应摘要或事项字段，不混作本篇当前时间/);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /插话、暂时停手或后文未提及均不证明原活动结束/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /正文已给出的条件、可能或预计若影响后续，须保留原口径，不能写成确定事实/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /相关条件也要写进对应动作表述/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /发出命令或请求只证明指令已发，受令任务须有执行依据才记完成/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /普通寒暄、催复、拌嘴和群聊不因是原话就保留/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /exactQuotes 仅按第8条的选择标准填写/u);
+  assert.doesNotMatch(EXTRACTOR_FIXED_CONTRACT, /不预测下一轮/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /每次依次检查地点身份、明确包含关系、每个人物楼末位置/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /locations 与 spatialFacts 中需单独追踪的地点默认按房间或有独立意义的区域为粒度/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /向某人告别不表示被告别者离开/u);
-  assert.match(EXTRACTOR_FIXED_CONTRACT, /“房间”“卧室”“厨房”等泛称本身不能证明/u);
+  assert.match(EXTRACTOR_FIXED_CONTRACT, /名称相似、房间\/厨房等泛称或不同地址的同名地点都不能单独证明同一身份/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /前楼地点名仅作身份参照，不是本楼引文或当前位置/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /source（canonicalContent 或 precedingUserInput）/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /同地不表示人物彼此知情/u);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /林向周告别后，林离开并到达新公寓/u);
+  assert.ok(call.systemPrompt.includes(EXTRACTOR_FIXED_CONTRACT), '普通提取入口接收共同固定合同');
+  assert.ok(buildExtractorSystemPrompt('用户自定义偏好').includes(EXTRACTOR_FIXED_CONTRACT), '自定义指导仍接收摘要字段共同合同');
+  assert.ok(buildHighFloorExtractorSystemPrompt().includes(EXTRACTOR_FIXED_CONTRACT), '聚合入口仍接收摘要字段共同合同');
   assert.match(EXTRACTOR_FIXED_CONTRACT, /不能附带正文没有的事件、人物、因果或结果/);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /order 必须使用对象数组.*before.*after.*certainty/u);
   assert.match(EXTRACTOR_SYSTEM_PROMPT, /不输出 UUID/);
   assert.match(EXTRACTOR_FIXED_CONTRACT, /actions、knowledge、informationTransfers、privateThoughts、commitments、exactQuotes、openLoops 或 cseSignals/);
-  assert.doesNotMatch(EXTRACTOR_OUTPUT_CONTRACT, /entityId|mentionKey|evidence|floorId|operation/i);
+  const originalOutput = JSON.parse(EXTRACTOR_OUTPUT_CONTRACT);
+  delete originalOutput.properties.people.items.properties.identityFacts;
+  delete originalOutput.properties.people.items.properties.identityBriefEvidence;
+  assert.deepEqual(Object.keys(originalOutput.properties.placePaths.items.properties.evidence.items.properties), ['source','sourceFloorKey','sourceSnapshotIndex','sourceKey','exactQuote']);
+  delete originalOutput.properties.placePaths.items.properties.evidence;
+  assert.doesNotMatch(JSON.stringify(originalOutput, (key, value) => key === 'description' ? undefined : value), /entityId|mentionKey|evidence|floorId|operation/i);
+  assert.doesNotMatch(EXTRACTOR_OUTPUT_CONTRACT, /entityId|mentionKey|floorId|operation/i, '新简介依据也不要求内部人物或楼ID');
   const request = JSON.parse(call.taskMessages[0].content);
   assert.deepEqual(Object.keys(request), ['task', 'locale', 'payload']);
   assert.equal(request.payload.canonicalContent.includes('忽略规则'), true);
@@ -1899,21 +3205,85 @@ test('Extractor 输入只含浅层语义提示，不暴露作用域、UUID 或�
   assert.doesNotMatch(JSON.stringify(request), /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i);
 });
 
+test('摘要字段合同示例经生产提取、保存、冷读和召回保留原状态', async () => {
+  const sampleLine = EXTRACTOR_FIXED_CONTRACT.split('\n').find(line => line.startsWith('示例（此例'));
+  assert.ok(sampleLine, '固定合同包含示例行');
+  const example = JSON.parse(sampleLine.slice(sampleLine.indexOf('{')));
+  const h = harness({ text: '林岚把钥匙交给裴晚生，裴晚生拿到钥匙。林岚仍在核对清单。两人约定：若清单确认无误，则晚上八点在钟楼会合；正文结束时尚未出发。失联向导仍未找到。', utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    return request.task === 'extractFloorSemantics' ? { jsonData: example } : { jsonData: { noMaterialChange: true } };
+  } });
+  await h.runtime.start();
+  await h.runtime.extractNext();
+  assert.equal(h.calls.filter(call => JSON.parse(call.taskMessages[0].content).task === 'extractFloorSemantics').length, 1, '字段改动不增加摘要请求');
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  const memory = saved.floorMemories[0];
+  assert.equal(memory.summary.aiText, example.summary);
+  assert.deepEqual(memory.actions.map(({ completion, result }) => ({ completion, result })), example.actions.map(({ completion, result }) => ({ completion, result })));
+  assert.equal(memory.actions[1].action, '正在核对清单');
+  assert.equal(memory.actions[1].completion, 'attempted', '现有枚举记录进行中的动作阶段，不臆造新状态');
+  assert.equal(memory.participants.length, 2);
+  assert.ok(memory.participants.every(person => person.presence === 'present'));
+  assert.equal(memory.actions[0].targetEntityIds.length, 1);
+  assert.equal(memory.actions[1].targetEntityIds.length, 0);
+  assert.equal(memory.actions[2].targetEntityIds.length, 1);
+  assert.match(memory.actions[2].action, /若清单确认无误/u, '会合动作保留条件，避免单项召回时丢失条件');
+  assert.deepEqual(memory.openLoops.map(item => item.description), ['失联向导仍未找到']);
+  assert.equal(memory.commitments[0].content, '若清单确认无误，则晚上八点在钟楼会合');
+  assert.equal(memory.qianshiDelta.events.length, 3, '示例中的 event-N 与 sourceFloorKey 可由生产编译器接受');
+  assert.equal(memory.qianshiDelta.events[0].status, 'completed');
+  assert.equal(memory.qianshiDelta.events[1].status, 'inProgress');
+  assert.equal(memory.qianshiDelta.events[1].actionStatus, 'inProgress');
+  assert.equal(memory.qianshiDelta.events[2].status, 'planned');
+  assert.equal(memory.qianshiDelta.events[2].description, '已约定:若清单确认无误,则晚上八点会合;篇末尚未出发');
+  assert.equal(memory.qianshiDelta.events[2].scheduledTime, '晚上八点');
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => { throw new Error('冷读不得调用模型'); } });
+  const coldStored = await cold.store.readReachable({ mode: 'runtime' });
+  assert.equal(coldStored.floorMemories[0].qianshiDelta.events[1].actionStatus, 'inProgress');
+  assert.equal(coldStored.floorMemories[0].qianshiDelta.events[2].scheduledTime, '晚上八点');
+  const source = await readRecallSource({ store: cold.store, now: () => new Date(NOW) });
+  const recalled = source.floorMemories[0];
+  assert.equal(recalled.summary, example.summary);
+  assert.equal(recalled.actions[0].completion, 'completed');
+  assert.equal(recalled.actions[1].action, '正在核对清单');
+  assert.equal(recalled.actions[1].completion, 'attempted');
+  assert.equal(recalled.actions[1].result, null);
+  assert.equal(recalled.actions[2].completion, 'intended');
+  assert.equal(recalled.actions[2].result, null);
+  const entityNames = new Map(source.entities.map(entity => [entity.entityId, entity.displayName]));
+  assert.equal(entityNames.get(recalled.actions[0].targetEntityIds[0]), '裴晚生');
+  assert.equal(entityNames.get(recalled.actions[2].targetEntityIds[0]), '裴晚生');
+  const selected = selectRecall({ source, queryContext: { text: '钟楼会合钥匙', latestUserText: '钟楼会合钥匙', messageCount: 1 }, contextSize: 12000 });
+  assert.match(selected.injectionText, /把钥匙交给裴晚生/);
+  assert.match(selected.injectionText, /失联向导仍未找到/);
+  const emptyLoops = await direct({ summary: '本楼没有具体未决事项。', openLoops: [] });
+  assert.deepEqual(emptyLoops.memory.openLoops, []);
+});
+
+test('摘要目标不成为新的硬长度门槛，合法较长摘要仍经生产保存', async () => {
+  const summary = '约定的后续条件和本楼已完成的变化均有实际意义。'.repeat(25);
+  assert.ok(summary.length > 300 && summary.length < 4000);
+  const h = harness({ text: '正文中有足够证据支撑这段摘要。', utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    return request.task === 'extractFloorSemantics' ? { jsonData: { summary } } : { jsonData: { noMaterialChange: true } };
+  } });
+  await h.runtime.start();
+  await h.runtime.extractNext();
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.floorMemories[0].summary.aiText, summary);
+});
+
 test('破限、摘要与 CSE 指导按任务取最新快照，设置变化不追溯旧结果且固定合同不串用', async () => {
   const guidance = { summary: '摘要自定义第一版', cse: 'CSE 自定义第一版' };
   let processing = '  破限自定义第一版\n';
   const getterReads = { summary: 0, cse: 0, processing: 0 };
+  const transport=processingTransport({processingPrompt:()=>processing,respond:options=>{const request=JSON.parse(options.taskMessages[0].content);return request.task==='extractFloorSemantics'?{jsonData:{summary:`摘要-${request.payload.canonicalContent}`}}:{jsonData:{noMaterialChange:true}};}});
   const h = harness({
     initialChat: [user('开始'), assistant('第一楼'), assistant('第二楼'), assistant('第三楼'), assistant('用于确认第三楼稳定。')],
     extractorPromptGuidance: () => { getterReads.summary += 1; return guidance.summary; },
     csePromptGuidance: () => { getterReads.cse += 1; return guidance.cse; },
     processingPrompt: () => { getterReads.processing += 1; return processing; },
-    utility: options => {
-      const request = JSON.parse(options.taskMessages[0].content);
-      return request.task === 'extractFloorSemantics'
-        ? { jsonData: { summary: `摘要-${request.payload.canonicalContent}` } }
-        : { jsonData: { noMaterialChange: true } };
-    },
+    utility: options=>transport.generate(options),
   });
   await h.runtime.start();
   await h.runtime.extractNext();
@@ -1935,19 +3305,21 @@ test('破限、摘要与 CSE 指导按任务取最新快照，设置变化不追
   const cseCalls = h.calls.filter(call => call.taskMessages[0].content.includes('understandCharacterStateAfterFloor'));
   assert.deepEqual(summaryCalls.map(call => call.systemPrompt), [buildExtractorSystemPrompt('摘要自定义第一版', '  破限自定义第一版\n'), buildExtractorSystemPrompt('摘要自定义第二版', ' \n\t '), buildExtractorSystemPrompt('', '破限自定义第三版')]);
   assert.deepEqual(cseCalls.map(call => call.systemPrompt), [buildCseSystemPrompt('CSE 自定义第一版', '  破限自定义第一版\n'), buildCseSystemPrompt('CSE 自定义第二版', ' \n\t '), buildCseSystemPrompt('', '破限自定义第三版')]);
-  assert.equal(getterReads.summary, 3); assert.equal(getterReads.cse, 3); assert.equal(getterReads.processing, 6);
+  assert.equal(getterReads.summary, 3); assert.equal(getterReads.cse, 3); assert.equal(getterReads.processing, 9);assert.equal(transport.prefixReads(),6);
   assert.doesNotMatch(summaryCalls[0].systemPrompt, new RegExp(DEFAULT_EXTRACTOR_GUIDANCE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.doesNotMatch(cseCalls[0].systemPrompt, new RegExp(DEFAULT_CSE_GUIDANCE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(summaryCalls[0].systemPrompt, /固定事实边界/); assert.ok(summaryCalls[0].systemPrompt.includes(EXTRACTOR_FIXED_CONTRACT));
   assert.match(cseCalls[0].systemPrompt, /固定事实与隐私边界/); assert.ok(cseCalls[0].systemPrompt.includes(CSE_FIXED_CONTRACT));
   assert.doesNotMatch(summaryCalls[0].systemPrompt, /CSE 自定义/); assert.doesNotMatch(cseCalls[0].systemPrompt, /摘要自定义/);
-  for (const call of [summaryCalls[0], cseCalls[0]]) {
+  const sent=transport.bodies.map(body=>({systemPrompt:body.messages[0].content,task:JSON.parse(body.messages[1].content).task}));
+  const summarySent=sent.filter(call=>call.task==='extractFloorSemantics'),cseSent=sent.filter(call=>call.task==='understandCharacterStateAfterFloor');
+  for (const call of [summarySent[0], cseSent[0]]) {
     assert.ok(call.systemPrompt.startsWith('  破限自定义第一版\n\n\n'), '自定义破限文本必须保留首尾空白并逐字置于系统提示开头');
     assert.equal(call.systemPrompt.split('破限自定义第一版').length - 1, 1);
     assert.equal(call.systemPrompt.includes(BASE_PROCESSING_PROMPT), false, '自定义破限文本必须替换内置默认');
   }
-  for (const call of [summaryCalls[1], cseCalls[1]]) assert.equal(call.systemPrompt.split(BASE_PROCESSING_PROMPT).length - 1, 1, '纯空白应回退到内置默认且只出现一次');
-  for (const call of [summaryCalls[2], cseCalls[2]]) {
+  for (const call of [summarySent[1], cseSent[1]]) assert.equal(call.systemPrompt.split(BASE_PROCESSING_PROMPT).length - 1, 1, '纯空白应回退到内置默认且只出现一次');
+  for (const call of [summarySent[2], cseSent[2]]) {
     assert.ok(call.systemPrompt.startsWith('破限自定义第三版\n\n'));
     assert.equal(call.systemPrompt.split('破限自定义第三版').length - 1, 1);
     assert.equal(call.systemPrompt.includes(BASE_PROCESSING_PROMPT), false);
@@ -2040,6 +3412,10 @@ test('extractor 固定合同要求语义使用 displayName，并明确保护逐�
   assert.match(customPrompt, /exactQuotes\.exactText、承诺原话及证据引文必须逐字照抄相应来源/);
   assert.match(customPrompt, /此例的 payload\.userIdentity\.displayName 为“林岚”/);
   for (const prompt of [customPrompt, highFloorPrompt]) {
+    assert.match(prompt, /插话、暂时停手或后文未提及均不证明原活动结束/u);
+    assert.match(prompt, /正文已给出的条件、可能或预计若影响后续，须保留原口径/u);
+    assert.match(prompt, /发出命令或请求只证明指令已发/u);
+    assert.match(prompt, /普通寒暄、催复、拌嘴和群聊不因是原话就保留/u);
     assert.match(prompt, /summary、time，以及 qianshi 的 storyTime 与 scheduledTime.*必须保留该年份或纪年/u);
     assert.match(prompt, /回忆、约定日期和年份未知的时间不得无依据套用当前故事年或现实年份/u);
     assert.match(prompt, /同一 sourceFloorKey（来源楼）的同一场景/);
@@ -2052,18 +3428,14 @@ test('extractor 固定合同要求语义使用 displayName，并明确保护逐�
   assert.doesNotMatch(EXTRACTOR_OUTPUT_CONTRACT, /important/u);
 });
 
-test('摘要语义保留完整故事年份与纪年，旧月日仍原样兼容', async () => {
+test('摘要时间记录本楼主线时间，qianshi 的既往与约定年份原样兼容', async () => {
   const result = await direct({
     summary: '公历2026年10月4日抵达，约定大陆历1687年1月2日再会。',
-    time: [
-      { sourceText: '2026年10月4日', description: '抵达', kind: 'explicit', precision: 'exact' },
-      { sourceText: '大陆历1686年10月4日', description: '旧事', kind: 'explicit', precision: 'exact' },
-      { sourceText: '10月5日', description: '年份未知的记录', kind: 'explicit', precision: 'exact' },
-    ],
+    time: [{ sourceText: '2026年10月4日', description: '本楼抵达', kind: 'explicit', precision: 'exact' }],
     qianshi: { events: [{ key: 'event-1', title: '约定再会', description: '约定次年再会', status: 'planned', matter: true,
       storyTime: '大陆历1686年10月4日', scheduledTime: '大陆历1687年1月2日' }], order: [] },
   });
-  assert.deepEqual(result.memory.chronology.map(item => item.time.sourceText), ['2026年10月4日', '大陆历1686年10月4日', '10月5日']);
+  assert.deepEqual(result.memory.chronology.map(item => item.time.sourceText), ['2026年10月4日']);
   assert.equal(result.memory.qianshiDelta.events[0].storyTime, '大陆历1686年10月4日');
   assert.equal(result.memory.qianshiDelta.events[0].scheduledTime, '大陆历1687年1月2日');
 });
@@ -2205,7 +3577,25 @@ test('人工身份映射贯穿真实 memory→extractor→保存链，模型误�
   let reachable = await h.store.readReachable({ mode: 'runtime' });
   const source = reachable.entities.find(entity => entity.displayName === '旧称甲' && entity.status !== 'merged');
   const target = reachable.entities.find(entity => entity.displayName === '目标乙' && entity.status !== 'merged');
+  let floor = h.runtime.getState().floors[0];
+  const participantNames = floor.memory.participants.map(item => reachable.entities.find(entity => entity.id === item.entityId)?.displayName).filter(Boolean);
+  await h.runtime.editMemory(floor.floorId, { summary: floor.summary, timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false,
+    locations: [], participantNames, exactAnchors: [{ anchorId: null, carrier: '旧称甲的折页', exactText: '只告诉旧称甲的内容。', knownEntityIds: [source.id] }] });
   projection = { identityRedirectsByEntityId: { [source.id]: target.id }, deletedEntityIds: [] };
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, identityProjectionProvider: async () => projection,
+    utility: () => { throw new Error('身份合并后的编辑冷读不应调用模型'); } });
+  await cold.runtime.start();
+  cold.runtime.setIdentityProjection(projection); // 模拟宿主既有 people workspace refresh → adopt → syncIdentityProjection 接线
+  const coldState = cold.runtime.getState(), mergedPerson = coldState.memoryEntities.find(entity => entity.entityId === target.id);
+  assert.deepEqual(mergedPerson.memberEntityIds, [source.id, target.id].sort(), `冷读的人物选项投影提供现有合并成员ID ${JSON.stringify({ source: source.id, target: target.id, memoryEntities: coldState.memoryEntities.map(({ entityId, memberEntityIds }) => ({ entityId, memberEntityIds })) })}`);
+  const coldFloor = coldState.floors.find(item => item.floorId === floor.floorId), rawAnchor = coldFloor.memory.exactAnchors.find(item => item.manual);
+  assert.deepEqual(rawAnchor.knownEntityIds, [source.id], '冷读楼仍保留权威原始知情ID供编辑器映射');
+  const namesByMemberId = new Map(coldState.memoryEntities.flatMap(entity => (entity.memberEntityIds ?? [entity.entityId]).map(id => [id, entity.displayName])));
+  await cold.runtime.editMemory(coldFloor.floorId, { summary: `${coldFloor.summary} 人工核对。`, timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false,
+    locations: [], participantNames: coldFloor.memory.participants.map(item => namesByMemberId.get(item.entityId)).filter(Boolean),
+    exactAnchors: [{ anchorId: rawAnchor.anchorId, carrier: rawAnchor.carrier, exactText: rawAnchor.exactText, knownEntityIds: [target.id] }] });
+  const savedAnchor = cold.runtime.getState().floors.find(item => item.floorId === floor.floorId).memory.exactAnchors.find(item => item.manual);
+  assert.deepEqual(savedAnchor.knownEntityIds, [source.id], '合并后以canonical选项重开编辑并保存成功；等价旧引用继续沿用权威存储值');
   state = h.runtime.getState(); await h.runtime.extractFloor(state.floors[2].floorId, { analyzeState: false });
   reachable = await h.store.readReachable({ mode: 'runtime' });
   const third = reachable.floorMemories.find(memory => memory.floorId === state.floors[2].floorId && memory.recordStatus === 'active');
@@ -2340,12 +3730,42 @@ test('sameAs 只接受局部同类型精确绑定，错误键、用户冒绑与�
   assert.equal(result.memory.participants.filter(item => item.entityId === entities[0].id).length, 1, '同一 canonical 的重复 mentions 应去重');
   assert.equal(result.memory.actions[0].actorEntityId, entities[0].id, 'char 的合法局部 sameAs 必须可用');
   const aliasRecords = result.newEntities.filter(entity => entity.status === 'merged');
-  assert.equal(aliasRecords.length, 1);
-  assert.equal(aliasRecords[0].mergedIntoEntityId, entities[0].id);
-  assert.deepEqual([aliasRecords[0].displayName, ...aliasRecords[0].aliases.map(alias => alias.name)].sort(), ['晚生', '裴先生'].sort());
+  assert.equal(aliasRecords.length, 0, 'sameAs绑定本轮称呼，不自动把surface登记为永久别名');
   assert.ok(result.newEntities.some(entity => entity.status !== 'merged' && entity.displayName === '阿'), '包含匹配不得把“阿”误并入“阿砚”');
   for (const code of ['V3_EXTRACTOR_ENTITY_TYPE_CONFLICT', 'V3_EXTRACTOR_USER_ROLE_CONFLICT', 'V3_EXTRACTOR_ENTITY_AMBIGUOUS', 'V3_EXTRACTOR_ENTITY_KEY_INVALID']) assert.ok(result.isolated.some(item => item.code === code), code);
   assert.equal(result.newEntities.some(entity => ['守卫组', '冒名者', '共同称呼', '错误键'].includes(entity.displayName)), false, '显式错误或歧义不能回退新建');
+});
+
+test('超限别名仅限制保存列表，仍以完整称谓绑定动作和引文说话人', async () => {
+  const aliases = Array.from({ length: 24 }, (_, index) => `裴晚生别称${index + 1}`);
+  const response = {
+    summary: '裴晚生正在清点物品，并留下关键口令。',
+    people: [{ name: '裴晚生', aliases }],
+    actions: [{ actor: aliases.at(-1), action: '正在清点物品', completion: 'attempted' }],
+    exactQuotes: [{ exactText: '秋水为凭', kind: 'codePhrase', speaker: aliases.at(-1), whyPreserve: '用于后续核对的口令' }],
+  };
+  const result = await direct(response, { content: '裴晚生正在清点物品，并说：“秋水为凭”。' });
+  const person = result.newEntities.find(entity => entity.displayName === '裴晚生');
+  assert.ok(person);
+  assert.equal(result.memory.participants.some(item => item.entityId === person.id), true);
+  assert.equal(result.memory.actions[0].actorEntityId, person.id, '第24个别名仍可绑定动作主体');
+  assert.equal(result.memory.exactAnchors[0].speakerEntityId, person.id, '第24个别名仍可绑定引文说话人');
+  assert.ok(person.aliases.length <= 20, '实体字段遵守持久别名上限');
+
+  const known = { id: '10000000-0000-4000-8000-000000000099', chatId: CHAT, narrativeGeneration: GENERATION,
+    entityType: 'person', displayName: '赤狐', aliases: [], specialRole: 'none', firstSeenFloorId: null,
+    lastSeenFloorId: null, status: 'established', recordStatus: 'active' };
+  const repeated = Array.from({ length: 5 }, (_, index) => {
+    const label = `赤狐别称组${index + 1}`;
+    return { name: label, sameAsEntityKey: 'catalog-1', aliases: Array.from({ length: 19 }, (_, aliasIndex) => `${label}-${aliasIndex + 1}`) };
+  });
+  const finalAlias = repeated.at(-1).aliases.at(-1);
+  const existing = await direct({ summary: '赤狐仍在现场。', people: repeated,
+    actions: [{ actor: finalAlias, action: '继续观察', completion: 'attempted' }] },
+  { entities: [known], content: `赤狐正在现场，${finalAlias}仍在继续观察。` });
+  assert.equal(existing.memory.actions[0].actorEntityId, known.id, '重复同一已知身份时，截断后的最后别名仍用于本次引用');
+  const learned = existing.newEntities.find(entity => entity.status === 'merged');
+  assert.ok(learned && learned.aliases.length <= 80, '重复别名合并后仍服从既有实体别名上限');
 });
 
 test('同名个人与群体、带标点的不同新名称均保持独立，同类重复和旧目录仍精确去重', async () => {
@@ -2400,7 +3820,7 @@ test('code fence、前后说明、数组包裹、尾逗号、常见键别名与�
   assert.equal(explainedJson.memory.eventFragments.length, 1);
   const narrativeWithBraces = await direct('他看到墙上写着 {"summary":"旧记录"}，随后继续前行。');
   assert.equal(narrativeWithBraces.memory.summary.aiText, '他看到墙上写着 {"summary":"旧记录"}，随后继续前行。');
-  await assert.rejects(direct('说明：{"summary":"候选甲。"} 完毕。\n{"summary":"候选乙。"}'), error => error.code === 'V3_EXTRACTOR_SUMMARY_INVALID');
+  await assert.rejects(direct('说明：{"summary":"候选甲。"} 完毕。\n{"summary":"候选乙。"}'), error => error.code === 'V3_EXTRACTOR_MULTIPLE_RESULTS');
   for (const invalid of [
     '说明：{"people":[{"name":"裴晚生"}]} 完毕。',
     '说明：{"summary":broken} 完毕。',
@@ -2412,17 +3832,51 @@ test('code fence、前后说明、数组包裹、尾逗号、常见键别名与�
   assert.equal(floorWrapped.memory.summary.aiText, '楼层包裹摘要。');
 });
 
+test('多围栏忽略无关JSON注释、接受完整等价重复并拒绝不同正式结果', async () => {
+  const formal = '{"summary":"裴晚生提醒用户带伞。","people":[{"name":"裴晚生"}]}';
+  const noteFirst = await direct(`\`\`\`json\n{"note":"仅供说明"}\n\`\`\`\n\`\`\`json\n${formal}\n\`\`\``);
+  assert.equal(noteFirst.memory.summary.aiText, '裴晚生提醒用户带伞。');
+  const duplicate = await direct(`\`\`\`json\n${formal}\n\`\`\`\n\`\`\`json\n${formal}\n\`\`\``);
+  assert.equal(duplicate.memory.summary.aiText, '裴晚生提醒用户带伞。');
+  await assert.rejects(direct(`\`\`\`json\n${formal}\n\`\`\`\n\`\`\`json\n{"summary":"裴晚生提醒用户带伞。","people":[{"name":"林岚"}]}\n\`\`\``), error => error.code === 'V3_EXTRACTOR_MULTIPLE_RESULTS');
+  await assert.rejects(direct(`\`\`\`json\n{"summary":"有效摘要。"}\n\`\`\`\n\`\`\`json\n{"summary":broken}\n\`\`\``), error => error.code === 'V3_EXTRACTOR_SUMMARY_INVALID');
+});
+
+test('完整 JSON 优先解析，字符串中的反引号不作为候选分段', async () => {
+  const summary = '原文引用 ```json {"summary":"示例"} ```，这只是摘要中的文字。';
+  const exactText = '原句包含 ```json {"note":"引用"} ```，须逐字保留。';
+  const packet = { summary, people: [{ name: '裴晚生' }], exactQuotes: [{ exactText, kind: 'wording', speaker: '裴晚生', whyPreserve: '用于逐字核对' }] };
+  const raw = await direct(JSON.stringify(packet), { content: `${summary}\n${exactText}` });
+  assert.equal(raw.memory.summary.aiText, summary);
+  assert.equal(raw.memory.exactAnchors[0].exactText, exactText);
+  assert.equal(raw.memory.exactAnchors[0].speakerEntityId, raw.newEntities[0].id);
+
+  const outer = await direct(`\`\`\`json\n${JSON.stringify(packet)}\n\`\`\``, { content: `${summary}\n${exactText}` });
+  assert.equal(outer.memory.summary.aiText, summary);
+  assert.equal(outer.memory.exactAnchors[0].exactText, exactText);
+  assert.equal(outer.memory.exactAnchors[0].speakerEntityId, outer.newEntities[0].id);
+});
+
+test('聚合payload来源键按anchor楼ID定位，不依赖成员数组的首尾顺序', async () => {
+  const floor = (id, seq, content) => ({ id, chatId: CHAT, narrativeGeneration: GENERATION, assistantSeq: seq, content: { canonicalContent: content } });
+  const members = [floor('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 1, '首楼'), floor('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 2, 'anchor楼'), floor('cccccccc-cccc-4ccc-8ccc-cccccccccccc', 3, '末楼')];
+  const envelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333333', chatId: CHAT, narrativeGeneration: GENERATION,
+    floor: members[1], sourceFloors: members.map(item => ({ floor: item })) });
+  assert.equal(envelope.request.payload.sourceFloorKey, 'floor-2');
+  assert.equal(envelope.request.payload.sourceFloors[1].canonicalContent, 'anchor楼');
+});
+
 test('人物裁剪引用覆盖千事候选与 CSE 的全部有效关系位置', () => {
   const ids = Array.from({ length: 10 }, (_, index) => `${String(index + 1).padStart(8, '0')}-0000-4000-8000-000000000000`);
   const memory = {
-    summaryEvidenceRefs: [], locations: [], participants: [], actions: [], observations: [], informationTransfers: [], privateCognition: [], commitments: [], exactAnchors: [], openLoops: [], cseSignals: [], chronology: [], eventFragments: [], ambiguities: [],
+    summaryEvidenceRefs: [], locations: [], participants: [], actions: [], observations: [], informationTransfers: [], privateCognition: [], commitments: [], exactAnchors: [{ anchorId: ids[8], kind: 'other', exactText: '纸条全文', occurrence: 1, speakerEntityId: ids[1], whyPreserve: '手填', manual: true, carrier: '纸条', knownEntityIds: [ids[4]] }], openLoops: [], cseSignals: [], chronology: [], eventFragments: [], ambiguities: [],
     qianshiDelta: {
       events: [{ people: [{ entityId: ids[0] }] }],
       historyReview: { candidates: [{ event: { people: [{ entityId: ids[1] }] } }] },
     },
   };
-  assert.deepEqual([...collectFloorMemoryEntityIds(memory)].sort(), ids.slice(0, 2).sort());
-  assert.deepEqual([...collectFloorMemoryEntityIds(memory, { includeReviewCandidates: false })], [ids[0]], '旧图校验仍只要求正式事件引用实体');
+  assert.deepEqual([...collectFloorMemoryEntityIds(memory)].sort(), [ids[0], ids[1], ids[4]].sort(), '知情人物也是原文的实体引用');
+  assert.deepEqual([...collectFloorMemoryEntityIds(memory, { includeReviewCandidates: false })].sort(), [ids[0], ids[1], ids[4]].sort(), '正式原文引用仍进入图校验，候选审阅引用仍可排除');
   const delta = {
     subjectSnapshots: [{ subjectEntityId: ids[2], core: [{ towardEntityId: ids[3] }], adaptive: [{ towardEntityId: ids[4] }], situational: [{ towardEntityId: ids[5] }] }],
     fixedChanges: [{ subjectEntityId: ids[6], items: [{ before: { towardEntityId: ids[7] }, after: { towardEntityId: ids[8] } }] }],
@@ -2678,7 +4132,7 @@ test('extractor 通过真实 compact 路由共享三次 HTTP 预算，格式失�
   catch (error) { failure = error; }
   assert.equal(failedFetches, 3);
   assert.equal(failure.code, 'V3_EXTRACTOR_SUMMARY_INVALID');
-  assert.match(failure.message, /^已尝试 3 次仍失败：/);
+  assert.equal(failure.message, '模型没有返回可用摘要，请重新提取本楼。');
   assert.equal(failure.extractorDiagnostics.attempts, 3);
   assert.equal(failure.extractorDiagnostics.transportAttempts, 3);
   assert.equal(failure.extractorDiagnostics.validationErrors.length, 3);
@@ -2695,12 +4149,12 @@ test('extractor 超时与空回复可在剩余预算内恢复，Abort 和认证�
     return compactResponse('{"summary":"超时后成功。"}');
   });
   const timed = await runExtractorRequest({ generateUtilityTask: timeoutRouter.generateUtilityTask, envelope, floor, expectedScope: envelope.scope, now: NOW });
-  assert.equal(timeoutFetches, 2); assert.equal(timed.attempts, 2); assert.equal(timed.transportAttempts, 2);
+  assert.equal(timeoutFetches, 2); assert.equal(timed.attempts, 1); assert.equal(timed.transportAttempts, 2);
 
   let emptyFetches = 0;
   const emptyRouter = taskRouter(async () => compactResponse(++emptyFetches === 1 ? '' : '{"summary":"空回复后成功。"}'));
   const emptied = await runExtractorRequest({ generateUtilityTask: emptyRouter.generateUtilityTask, envelope, floor, expectedScope: envelope.scope, now: NOW });
-  assert.equal(emptyFetches, 2); assert.equal(emptied.attempts, 2); assert.equal(emptied.transportAttempts, 2);
+  assert.equal(emptyFetches, 2); assert.equal(emptied.attempts, 1); assert.equal(emptied.transportAttempts, 2);
 
   const controller = new AbortController();
   let abortFetches = 0;
@@ -2769,6 +4223,10 @@ test('extractor 在坏 schema 回显后只接受唯一合法业务 JSON，歧义
 
   await assert.rejects(
     normalizeExtractorResponse({ response: '{"summary":"候选甲。"}\n{"summary":"候选乙。"}', finishReason: 'stop', envelope, floor, expectedScope: envelope.scope, now: NOW }),
+    error => error.code === 'V3_EXTRACTOR_MULTIPLE_RESULTS',
+  );
+  await assert.rejects(
+    normalizeExtractorResponse({ response: `${business}\n{"type":"object","properties":{},"summary":broken}`, finishReason: 'stop', envelope, floor, expectedScope: envelope.scope, now: NOW }),
     error => error.code === 'V3_EXTRACTOR_SUMMARY_INVALID',
   );
   await assert.rejects(
@@ -3076,6 +4534,7 @@ test('foundation reload 单飞会消费运行中到达的尾部 ready，旧 epoc
   for (let attempt = 0; attempt < 100 && runtime.getState().stableCount !== 3; attempt += 1) await new Promise(resolve => setTimeout(resolve, 2));
   const state = runtime.getState();
   assert.equal(state.stableCount, 3);
+  assert.equal(state.narrativeGeneration, GENERATION, '记忆快照直接投影其已加载root代际');
   assert.equal(state.headCheckpointId, 'head-3');
   assert.equal(state.floors.at(-1).checkpointId, 'head-3');
   assert.equal(state.floors.at(-1).assistantSeq, 3);
@@ -3093,7 +4552,7 @@ test('召回选材中root推进，精确ready快照绕过另一次挂起刷新�
   await memory.start(); await waitFor(() => memory.getState().memorySyncStatus === 'idle');
   seed.context.chat.push(user('带伞')); seed.context.constants = { promptTypes: { IN_CHAT: 1 }, promptRoles: { SYSTEM: 0 } }; seed.context.setExtensionPrompt = () => {};
   let refresh, selects = 0, beforeCommitInspects = 0, beforeCommitReads = 0; const prepareOptions = [];
-  const recall = createV3RecallRuntime({ store: seed.store, hostAdapter: seed.hostAdapter, prepareMemory: options => { prepareOptions.push(options); return memory.prepareCurrent(options); },
+  const recall = createV3RecallRuntime({ recentBodyFloorLimit: () => 1, store: seed.store, hostAdapter: seed.hostAdapter, prepareMemory: options => { prepareOptions.push(options); return memory.prepareCurrent(options); },
     selector: async options => {
       selects += 1; await seed.runtime.extractFloor(floors[1].floorId, { analyzeState: false }); await memory.refreshStatus({ preferCached: false });
       await waitFor(() => memory.getState().memorySyncStatus === 'idle'); held = true; refresh = memory.refreshStatus({ preferCached: false }); await heldStarted;
@@ -3118,6 +4577,7 @@ test('recall fresh重试等待同目标已在途prepare，超时后不重复启�
   const floor = seed.runtime.getState().floors[0];
   await seed.runtime.extractFloor(floor.floorId, { analyzeState: false });
   seed.context.chat.push(user('账本放在哪里？'));
+  seed.context.constants = { promptTypes: { IN_CHAT: 1 }, promptRoles: { SYSTEM: 0 } }; seed.context.setExtensionPrompt = () => {};
 
   let releaseGraph, markGraphStarted, markFreshPrepare;
   const graphStarted = new Promise(resolve => { markGraphStarted = resolve; });
@@ -3143,7 +4603,7 @@ test('recall fresh重试等待同目标已在途prepare，超时后不重复启�
     return memory.prepareCurrent(options);
   };
   let sourceReads = 0;
-  const recall = createV3RecallRuntime({ store: seed.store, hostAdapter: seed.hostAdapter, prepareMemory,
+  const recall = createV3RecallRuntime({ recentBodyFloorLimit: () => 1, store: seed.store, hostAdapter: seed.hostAdapter, prepareMemory,
     sourceReader: options => { sourceReads += 1; return readRecallSource(options); },
     selector: options => selectRecall(options), preparationTimeoutMs: 35,
     pluginVersion: 'test-reuse-inflight-prepare', now: () => new Date(NOW), logger: { warn() {} } });
@@ -3202,7 +4662,7 @@ test('CHAT_CHANGED 与 start 并发发布同版本 foundation 快照时共用后
   const graph = {
     status: 'ready', rootRevision: 1,
     root: { chatId: CHAT, narrativeGeneration: GENERATION, headCheckpointId: '33333333-3333-4333-8333-333333333333', stableBoundary: { assistantSeq: 0 } },
-    floors: [], floorMemories: [], entities: [], indexes: [], stateDeltas: [],
+    floors: [], floorMemories: [], entities: [], indexes: [], stateDeltas: [], followingReviewEventIds: [],
   };
   let foundationState = { status: 'idle' };
   let foundationListener = null;
@@ -3263,7 +4723,7 @@ test('生产式冷启动等待真实身份认领后只读一次完整图并恢�
     await new Promise(resolve => { releaseBinding = resolve; });
   });
   const context = {
-    ...seeded.context,
+    ...seeded.context, name2: '测试角色',
     chat: structuredClone(seeded.context.chat),
     chatMetadata: structuredClone(seeded.context.chatMetadata),
   };
@@ -3646,7 +5106,7 @@ test('后台 load 失败后成功刷新清旧读取错误并保留摘要，具�
     async readReachable() {
       if (failNextLoad) {
         failNextLoad = false;
-        throw Object.assign(new Error('当前聊天身份尚未完成后端认领'), { code: 'CHAT_SESSION_NOT_READY' });
+        throw Object.assign(new Error('当前聊天身份尚未准备完成，请等待准备完成后再操作。'), { code: 'CHAT_SESSION_NOT_READY' });
       }
       return graph;
     },
@@ -3965,9 +5425,12 @@ test('保存重试按父版本冻结候选与模型准备信息，root推进后�
 });
 
 test('root 保存失败的待保存结果可跨过另一楼成功提交后继续复用', async () => {
-  const h = harness({ initialChat: [assistant('第一楼'), assistant('第二楼'), assistant('用于确认第二楼稳定。')] });
+  const h = harness({ initialChat: [assistant('建立人物身份基线'), assistant('第一楼'), assistant('第二楼'), assistant('用于确认第二楼稳定。')] });
   await h.runtime.start();
-  const [firstFloor, secondFloor] = h.runtime.getState().floors;
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  assert.ok(h.runtime.getState().memoryEntities.some(entity => entity.specialRole === 'user'), '预先建立共享用户身份，另一楼提交才不改变待保存结果的身份依赖');
+  h.calls.splice(0);
+  const [, firstFloor, secondFloor] = h.runtime.getState().floors;
   let failRootOnce = true;
   h.backend.setBeforePut(({ key }) => {
     if (!failRootOnce || key !== 'v3-root') return;
@@ -3976,14 +5439,35 @@ test('root 保存失败的待保存结果可跨过另一楼成功提交后继续
   });
 
   let state = await h.runtime.extractFloor(firstFloor.floorId, { analyzeState: false });
-  assert.equal(state.rememberedCount, 0);
+  assert.equal(state.rememberedCount, 1);
   h.backend.setBeforePut(null);
   state = await h.runtime.extractFloor(secondFloor.floorId, { analyzeState: false });
-  assert.equal(state.rememberedCount, 1, JSON.stringify(state.lastExtractorError));
-  state = await h.runtime.extractFloor(firstFloor.floorId, { analyzeState: false });
   assert.equal(state.rememberedCount, 2, JSON.stringify(state.lastExtractorError));
+  state = await h.runtime.extractFloor(firstFloor.floorId, { analyzeState: false });
+  assert.equal(state.rememberedCount, 3, JSON.stringify(state.lastExtractorError));
   assert.equal(h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, 2,
     '两楼各生成一次；第一楼保存重试不得产生第三次模型请求');
+});
+
+test('待保存期间兼容新增共享用户身份沿当前绑定承接，不重调旧摘要', async () => {
+  const h = harness({ initialChat: [assistant('第一楼'), assistant('第二楼'), assistant('用于确认第二楼稳定。')] });
+  await h.runtime.start();
+  const [firstFloor, secondFloor] = h.runtime.getState().floors;
+  assert.equal(h.runtime.getState().memoryEntities.some(entity => entity.specialRole === 'user'), false);
+  let failRootOnce = true;
+  h.backend.setBeforePut(({ key }) => {
+    if (!failRootOnce || key !== 'v3-root') return;
+    failRootOnce = false;
+    throw Object.assign(new Error('root timeout'), { status: 504, code: 'BACKEND_TIMEOUT' });
+  });
+  await h.runtime.extractFloor(firstFloor.floorId, { analyzeState: false });
+  h.backend.setBeforePut(null);
+  await h.runtime.extractFloor(secondFloor.floorId, { analyzeState: false });
+  assert.ok(h.runtime.getState().memoryEntities.some(entity => entity.specialRole === 'user'));
+  const state = await h.runtime.extractFloor(firstFloor.floorId, { analyzeState: false });
+  assert.equal(state.rememberedCount, 2, JSON.stringify(state.lastExtractorError));
+  assert.equal(h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, 2,
+    '兼容增加共享用户不改变已付费正文依赖，当前身份绑定在保存时承接');
 });
 
 test('待保存期间处理提示变化会重新生成，并按新提示记录来源指纹', async () => {
@@ -4169,11 +5653,9 @@ test('摘要 prepared 记录最多四路并发，run/checkpoint 等独立写完�
 
 test('历史按钮单楼失败后继续保存独立后楼并撤销授权；刷新零调用，再次点击只补失败楼', async () => {
   let failSecond = true;
-  const automaticSummaryReceipts = [];
   const h = harness({
     initialChat: [user('开始'), assistant('历史一'), assistant('历史二'), assistant('历史三'), assistant('待确认尾楼')],
     automation: { enabled: true, batchSize: 2 },
-    onAutomaticSummaryCommitted: receipt => { automaticSummaryReceipts.push(receipt); },
     utility: options => {
       if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) {
         const content = JSON.parse(options.taskMessages[0].content).payload.canonicalContent;
@@ -4188,11 +5670,7 @@ test('历史按钮单楼失败后继续保存独立后楼并撤销授权；刷�
   assert.equal(h.runtime.getState().rebuildStatus, 'partial');
   assert.equal(h.runtime.shouldBlockMainGeneration(), false, '历史重建失败后必须立即释放主生成门禁');
   assert.equal(h.runtime.getState().rememberedCount, 2, '失败楼后的独立摘要仍应在同批保存');
-  assert.equal(automaticSummaryReceipts.length, 2, '仅两楼正式成功提交发出通知，失败楼不通知');
-  assert.ok(automaticSummaryReceipts.every(receipt => receipt.chatId === CHAT
-    && h.runtime.getState().floors.some(floor => floor.floorId === receipt.floorId && floor.memoryId === receipt.memoryId && floor.status === 'ready')),
-  '自动通知必须携带当前 ready 摘要的 chatId/floorId/memoryId');
-  assert.equal(h.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 1, '人物状态只处理摘要缺口之前，失败后的独立摘要保留待后续补齐');
+  assert.equal(h.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 2, '缺摘要楼隔离，前后已存摘要分别分析一次');
   const callsAtFailure = h.calls.length;
   await h.runtime.refreshAutomation();
   await h.runtime.refreshStatus();
@@ -4201,7 +5679,6 @@ test('历史按钮单楼失败后继续保存独立后楼并撤销授权；刷�
   await h.runtime.startHistoricalRebuild();
   await waitFor(() => ['caughtUp', 'waitingRealtime'].includes(h.runtime.getState().rebuildStatus));
   assert.equal(h.runtime.getState().rememberedCount, 3);
-  assert.equal(automaticSummaryReceipts.length, 3, '失败楼后续成功时才补发一次通知');
   assert.equal(h.runtime.getState().cseReady, true);
 });
 
@@ -4342,6 +5819,24 @@ test('未知星期时间戳沿提取保存保留准确区间，模型时间不�
   delete legacyShape.pairs;
   const normalized = await direct({ summary: '摘要。' }, { storyClock: legacyShape });
   assert.equal(normalized.memory.chronology[0].time.precision, 'exact', '没有 pairs 的完整旧结构也接受显式未知星期');
+});
+
+test('单一合法 end 作为篇末时间点保存，不造起点且压过模型时间', async () => {
+  const end = '<!-- QQJ-end | date=2026年5月10日 | weekday=周日 | time=18:20 -->';
+  const h = harness({ initialChat: [user('继续'), assistant(`${end}本楼正文。`), assistant('确认稳定。')],
+    utility: () => ({ jsonData: { summary: '本楼摘要。', time: [{ sourceText: '不可靠的回忆时间', description: '不得覆盖' }] } }) });
+  await h.runtime.start();
+  const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  const payload = JSON.parse(h.calls.find(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).taskMessages[0].content).payload;
+  assert.equal(payload.storyClock.complete, false);
+  assert.equal(payload.storyClock.singleEnd, true);
+  assert.equal(payload.storyClock.start, null);
+  assert.equal(payload.storyClock.end.time, '18:20');
+  const chronology = h.runtime.getState().floors[0].memory.chronology;
+  assert.equal(chronology.length, 1);
+  assert.equal(chronology[0].time.sourceText, '2026年5月10日 周日 18:20');
+  assert.equal(chronology[0].time.precision, 'exact');
 });
 
 test('CSE 分析期间 pending-only 刷新不推进正式 root，假模型结果仍按原守卫提交', async () => {
@@ -4732,7 +6227,7 @@ test('历史楼顺序提取只把最近已保存前楼的末段时间与摘要�
   const h = harness({
     initialChat: [
       user('开始'),
-      assistant('十月四日晚九点，宴席结束。'),
+      assistant('宾客散去，十月四日晚九点，宴席结束。'),
       assistant('众人稍作休息后继续交谈。'),
       assistant('未来楼写着十二月二十日。'),
       assistant('用于确认未来楼稳定。'),
@@ -4753,8 +6248,9 @@ test('历史楼顺序提取只把最近已保存前楼的末段时间与摘要�
 
   assert.equal(extractorRequests.length, 2, '两楼顺序提取仍只各发一次原有模型请求');
   assert.equal(extractorRequests[0].payload.previousFloorContext, null, '第一楼没有已保存前楼上下文');
+  assert.equal(extractorRequests[0].payload.storyClock, null, '本例测试无独立正文时钟时的摘要时间衔接');
   assert.deepEqual(extractorRequests[1].payload.previousFloorContext, {
-    time: '十月四日晚九点',
+    time: '10月4日 21:00',
     summaryTail: firstSummary.trim().slice(-300),
   });
   assert.equal(extractorRequests[1].payload.previousFloorContext.summaryTail.length, 300);
@@ -4770,7 +6266,7 @@ test('历史楼顺序提取只把最近已保存前楼的末段时间与摘要�
   assert.equal(graph.run.diagnostics.floorProvenance[secondFloor.floorId].semanticInputFingerprint, expectedFingerprint, '辅助上下文必须进入本次语义输入指纹');
 });
 
-test('残缺同楼时间戳进入同次提取并作非 exact 兜底，前序参照只取目标楼之前且不读取未来楼', async () => {
+test('残缺同楼时间戳进入同次提取但不合成主线时间，前序参照只取目标楼之前且不读取未来楼', async () => {
   const full = (date, start, end) => `<!-- myknots-start | date=${date} | weekday=周二 | time=${start} -->正文<!-- myknots-end | date=${date} | weekday=周二 | time=${end} -->`;
   const partial = '<!-- myknots-start | date=10月5日 | time=10:15 -->目标楼正文。';
   const h = harness({
@@ -4802,8 +6298,70 @@ test('残缺同楼时间戳进入同次提取并作非 exact 兜底，前序参�
   assert.equal(JSON.stringify(payload.previousStoryClock).includes('12月20日'), false, '不得把目标楼之后的时间戳作为前序参照');
 
   const memory = h.runtime.getState().floors[1].memory;
-  assert.match(memory.chronology[0].time.sourceText, /10月5日.*10:15/);
-  assert.notEqual(memory.chronology[0].time.precision, 'exact');
+  assert.deepEqual(memory.chronology, [], '仅起点不被当成本篇当前时间，模型未给主线时间时保留空值');
+});
+
+test('长内部时间签名经真实提取保存及冷读完整保留，旧档与类型合同不变', async t => {
+  const cases = [
+    { name: '长时间参考', tags: 'clock', raw: `<clock>天历三百一十二年六月十五日。${'时间参考信息。'.repeat(80)}</clock>本楼正文。` },
+    { name: '多个合法时间戳', tags: '', raw: Array.from({ length: 6 }, (_, index) => `<!-- QQJ-start | date=10月30日 | weekday=周五 | time=${10 + index}:00 -->本楼正文。<!-- QQJ-end | date=10月30日 | weekday=周五 | time=${10 + index}:30 -->`).join('') },
+  ];
+  for (const { name, tags, raw } of cases) await t.test(name, async () => {
+    const signature = resolveStoryClock(raw, tags).signature;
+    assert.ok(signature.length > 500, '生产时间签名确实超过旧门槛');
+    const h = harness({ text: raw, storyClockReferenceTags: tags, utility: () => ({ jsonData: { summary: '正常本楼摘要。' } }) });
+    await h.runtime.start();
+    const floorId = h.runtime.getState().floors[0].floorId;
+    await h.runtime.extractFloor(floorId, { analyzeState: false });
+    const memory = h.runtime.getState().floors[0].memory;
+    assert.ok(memory, JSON.stringify(h.runtime.getState().floors[0]));
+    assert.equal(memory.summary.aiText, '正常本楼摘要。');
+    assert.equal(memory.sourceStoryClockSignature, signature);
+    const coldStore = createFoundationStore({ client: h.backend.client, contextProvider: () => ({ hostChatId: h.context.chatId, chatId: CHAT,
+      characterLocator: 'character.png', personaLocator: 'persona.png' }) });
+    const saved = await coldStore.readReachable({ mode: 'full' });
+    assert.equal(saved.status, 'ready');
+    assert.equal(saved.floorMemories.find(item => item.floorId === floorId).sourceStoryClockSignature, signature, '存储冷读不截断或改写签名');
+    assert.equal(h.calls.length, 1, '正常摘要仅调用既有一次合成提取响应');
+    const legacy = structuredClone(memory);
+    delete legacy.sourceStoryClockSignature;
+    assert.doesNotThrow(() => validateFloorMemory(legacy));
+    assert.doesNotThrow(() => validateFloorMemory({ ...legacy, sourceStoryClockSignature: '' }));
+    for (const invalid of [null, 1, {}, []]) assert.throws(() => validateFloorMemory({ ...legacy, sourceStoryClockSignature: invalid }),
+      error => error.code === 'V3_FLOORMEMORY_INVALID' && error.message.includes('sourceStoryClockSignature'));
+  });
+});
+
+test('长内部时间签名经真实高楼聚合保存为各来源快照且不截断', async () => {
+  const raw = index => `<clock>第${index}楼时间参考。${'时间参考信息。'.repeat(80)}</clock>第${index}楼正文。`;
+  const h = harness({ modernAnchors: true, storyClockReferenceTags: 'clock',
+    initialChat: Array.from({ length: 11 }, (_, index) => [assistant(raw(index)), user(`确认${index}`)]).flat(),
+    automation: { enabled: false, batchSize: 1 },
+    utility: options => ({ jsonData: JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics'
+      ? { summary: '正常摘要。' } : { noMaterialChange: true } }),
+  });
+  await h.foundationRuntime.reconcile('longStoryClockSignature');
+  await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  await h.runtime.startHistoricalRebuild({ aggregate: true });
+  await waitFor(() => !h.runtime.getState().activeAutoMemory, () => JSON.stringify(h.runtime.getState()));
+  const coldStore = createFoundationStore({ client: h.backend.client, contextProvider: () => ({ hostChatId: h.context.chatId, chatId: CHAT,
+    characterLocator: 'character.png', personaLocator: 'persona.png' }) });
+  const saved = await coldStore.readReachable({ mode: 'full' });
+  const aggregate = saved.floorMemories.find(item => item.sourceFloorIds?.length === 10);
+  assert.ok(aggregate, '真实历史重建生成十楼聚合记忆');
+  assert.equal(aggregate.sourceFloorSnapshots.length, 10);
+  for (const [index, snapshot] of aggregate.sourceFloorSnapshots.entries()) {
+    const signature = resolveStoryClock(raw(index + 1), 'clock').signature;
+    assert.ok(signature.length > 500);
+    assert.equal(snapshot.storyClockSignature, signature, '每个来源楼快照保留自身完整签名');
+  }
+  assert.equal(aggregate.sourceStoryClockSignature, resolveStoryClock(raw(10), 'clock').signature);
+  const withSnapshotSignature = value => ({ ...structuredClone(aggregate), sourceFloorSnapshots: aggregate.sourceFloorSnapshots.map((snapshot, index) => index ? snapshot : { ...snapshot, storyClockSignature: value }) });
+  assert.doesNotThrow(() => validateFloorMemory(withSnapshotSignature('')));
+  for (const invalid of [null, 1, {}, []]) assert.throws(() => validateFloorMemory(withSnapshotSignature(invalid)),
+    error => error.code === 'V3_FLOORMEMORY_INVALID' && error.message.includes('sourceFloorSnapshots[0].storyClockSignature'));
+  assert.equal(h.calls.filter(call => JSON.parse(call.taskMessages[0].content).task === 'extractFloorSemantics').length, 2, '首楼与十楼聚合各一次合成响应');
 });
 
 test('原文时间参考标签进入本楼与前楼语义输入，漏写时间时整段 unresolved 兜底且不读取未来楼', async () => {
@@ -4924,6 +6482,142 @@ test('时间、地点、人物与摘要一次保存，保留原有 ID/证据及�
   assert.deepEqual(restored.locations.map(item => item.name), ['旧钟楼', '河港']);
 });
 
+test('人工载体保存并由新runtime冷读兼容official与Luker宿主', async () => {
+  for (const host of ['official', 'luker']) {
+    const backend = backendHarness();
+    const h = harness({ host, sharedBackend: backend, utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+      ? { jsonData: { summary: '裴晚生把一张便笺交给你。', people: [{ name: '裴晚生' }] } }
+      : { jsonData: { noMaterialChange: true } } });
+    await h.runtime.start(); await h.runtime.extractNext();
+    const floor = h.runtime.getState().floors[0];
+    const speakerId = floor.memory.participants[0].entityId;
+    const userId = h.runtime.getState().memoryEntities.find(entity => entity.specialRole === 'user')?.entityId;
+    assert.ok(userId, `${host}: user为可选的知情人物`);
+    await h.runtime.editMemory(floor.floorId, { summary: floor.summary, timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false,
+      locations: [], participantNames: floor.memory.participants.map(item => h.runtime.getState().memoryEntities.find(entity => entity.entityId === item.entityId)?.displayName).filter(Boolean),
+      exactAnchors: [{ anchorId: null, carrier: '裴晚生的便笺', exactText: '明早九点在西门见。', knownEntityIds: [userId] }] });
+    const cold = harness({ host, sharedBackend: backend, sharedContext: h.context, utility: () => { throw new Error('冷读不应调用模型'); } });
+    await cold.runtime.start();
+    const anchor = cold.runtime.getState().floors[0].memory.exactAnchors.find(item => item.manual);
+    assert.equal(anchor.carrier, '裴晚生的便笺', `${host}: carrier冷读`);
+    assert.equal(anchor.exactText, '明早九点在西门见。', `${host}: 字面内容冷读`);
+    assert.deepEqual(anchor.knownEntityIds, [userId], `${host}: 选中的user知情范围冷读`);
+    assert.ok(!anchor.knownEntityIds.includes(speakerId), `${host}: 原说话人不自动成为知情人`);
+    await cold.runtime.extractFloor(floor.floorId);
+    const afterReextract = cold.runtime.getState().floors[0].memory.exactAnchors.find(item => item.manual);
+    assert.deepEqual(afterReextract.knownEntityIds, [userId], `${host}: 正式重新提取保留人工知情范围`);
+    const currentFloor = cold.runtime.getState().floors[0];
+    const currentManual = currentFloor.memory.exactAnchors.find(item => item.manual);
+    await cold.runtime.editMemory(floor.floorId, { summary: currentFloor.summary, timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false,
+      locations: [], participantNames: currentFloor.memory.participants.map(item => cold.runtime.getState().memoryEntities.find(entity => entity.entityId === item.entityId)?.displayName).filter(Boolean),
+      exactAnchors: [{ anchorId: currentManual.anchorId, carrier: currentManual.carrier, exactText: currentManual.exactText, knownEntityIds: [] }] });
+    const cleared = harness({ host, sharedBackend: backend, sharedContext: h.context, utility: () => { throw new Error('知情范围冷读不应调用模型'); } });
+    await cleared.runtime.start();
+    assert.deepEqual(cleared.runtime.getState().floors[0].memory.exactAnchors.find(item => item.manual).knownEntityIds, [], `${host}: 只清空知情人会保存且冷读为空集合`);
+  }
+});
+
+test('人工关键原文覆盖关联事实旧文并在再提取后召回最新版', async () => {
+  const backend = backendHarness();
+  const originalQuote = '八点在东门';
+  let reextract = false;
+  const h = harness({ sharedBackend: backend, initialChat: [assistant('裴晚生留下一张字条，写着“八点在东门”。'), user('确认楼层'), assistant('确认尾楼。')],
+    utility: options => {
+      if (options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
+      return { jsonData: { summary: reextract ? '裴晚生的字条仍在桌上。' : '裴晚生留下一张字条。',
+        people: [{ name: '裴晚生' }],
+        commitments: [{ issuer: '裴晚生', content: '答应替林岚保守秘密', exactQuote: originalQuote },
+          { issuer: '裴晚生', content: originalQuote, exactQuote: originalQuote }],
+        privateCognition: [{ owner: '裴晚生', content: originalQuote, visibility: 'private' }],
+        exactQuotes: [{ exactText: originalQuote, speaker: '裴晚生', whyPreserve: '约定原句' }],
+      } };
+    } });
+  await h.runtime.start(); await h.runtime.extractNext();
+  let floor = h.runtime.getState().floors[0];
+  assert.equal(floor.memory.commitments[1].content, originalQuote);
+  assert.equal(floor.memory.commitments[0].exactAnchorId, floor.memory.exactAnchors[0].anchorId, '语义承诺也引用原句，但自身内容不是原句');
+  const literal = '九点在西门\n<content>保留标签字面值</content>!?';
+  const editFields = exactAnchors => ({ summary: floor.summary, timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false,
+    locations: [], participantNames: [], exactAnchors });
+  await assert.rejects(h.runtime.editMemory(floor.floorId, editFields([{ anchorId: null, carrier: '字条', exactText: '  ' }])),
+    error => error.code === 'V3_MEMORY_EXACT_ANCHOR_INVALID');
+  await assert.rejects(h.runtime.editMemory(floor.floorId, editFields([{ anchorId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', carrier: '字条', exactText: '有效原文' }])),
+    error => error.code === 'V3_MEMORY_EXACT_ANCHOR_STALE');
+  await assert.rejects(h.runtime.editMemory(floor.floorId, editFields([{ anchorId: null, carrier: '字条', exactText: '原文'.repeat(1001) }])),
+    error => error.code === 'V3_MEMORY_EXACT_ANCHOR_TEXT_LIMIT');
+  await assert.rejects(h.runtime.editMemory(floor.floorId, editFields([{ anchorId: null, carrier: '载体'.repeat(251), exactText: '有效原文' }])),
+    error => error.code === 'V3_MEMORY_EXACT_ANCHOR_CARRIER_LIMIT');
+  await h.runtime.editMemory(floor.floorId, { summary: floor.summary, timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false,
+    locations: [], participantNames: [], exactAnchors: [{ anchorId: floor.memory.exactAnchors[0].anchorId, carrier: '给我的字条', exactText: literal }] });
+  const edited = h.runtime.getState().floors[0].memory;
+  assert.equal(edited.exactAnchors[0].manual, true);
+  assert.equal(edited.exactAnchors[0].carrier, '给我的字条');
+  assert.equal(edited.exactAnchors[0].exactText, literal);
+  assert.equal(edited.commitments[1].content, literal, '明确关联原句的承诺保留，但同步采用当前人工版本');
+  assert.equal(edited.commitments[0].content, '答应替林岚保守秘密', 'anchor关联不允许覆盖不同于原句的承诺语义');
+  assert.equal(edited.privateCognition[0].content, literal, '私有认知仅在内容逐字等于被修订原句且归属一致时同步');
+  assert.equal(edited.commitments[0].exactAnchorId, edited.exactAnchors[0].anchorId);
+  reextract = true;
+  await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  floor = h.runtime.getState().floors[0];
+  assert.deepEqual(floor.memory.exactAnchors.filter(anchor => anchor.manual !== true).map(anchor => anchor.exactText), [], '旧自动原句在再提取时不复活');
+  assert.equal(floor.memory.exactAnchors.find(anchor => anchor.manual).exactText, literal);
+  assert.equal(floor.memory.commitments[1].content, literal, '再提取中的同anchor承诺继续采用人工最新版');
+  assert.equal(floor.memory.commitments[0].content, '答应替林岚保守秘密', '再提取保留引用原句的语义承诺概述');
+  assert.equal(floor.memory.privateCognition[0].content, literal, '再提取继续同步同归属的私有认知原句');
+  const source = await readRecallSource({ store: h.store, now: () => new Date(NOW) });
+  const queryContext = { text: '给我的字条上写了什么', latestUserText: '给我的字条上写了什么', messageCount: 1 };
+  const selected = await selectRecallWithLlm({ source, queryContext, contextSize: 12000, generateUtilityTask: async ({ taskMessages }) => {
+    const payload = JSON.parse(taskMessages[0].content);
+    const artifact = payload.candidates.find(candidate => candidate.fact.includes('载体：给我的字条'));
+    assert.ok(artifact, '近期真实手填原件进入同次模型选材候选');
+    return { jsonData: { history_exclude_keys: payload.candidates.filter(candidate => candidate.key !== artifact.key).map(candidate => candidate.key),
+      artifact_select_keys: [artifact.key], state_exclude_keys: payload.cseContextGroups.flatMap(group => group.items.map(item => item.key)), priority_keys: [] } };
+  } });
+  assert.match(selected.injectionText, /给我的字条/u);
+  assert.match(selected.injectionText, /九点在西门/u);
+  assert.doesNotMatch(selected.injectionText, /八点在东门/u, '召回不同时输出关联承诺的旧引文');
+  assert.match(selected.injectionText, /原文载体「给我的字条」（知情：无；不知情：全部人物）/u);
+  const reloaded = harness({ sharedBackend: backend, sharedContext: h.context, utility: () => { throw new Error('冷读不应调用 AI'); } });
+  await reloaded.runtime.start();
+  assert.equal(reloaded.runtime.getState().floors[0].memory.exactAnchors.find(anchor => anchor.manual).exactText, literal);
+  const reloadedFloor = reloaded.runtime.getState().floors[0];
+  await reloaded.runtime.editMemory(reloadedFloor.floorId, { summary: reloadedFloor.summary, timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false,
+    locations: [], participantNames: [], exactAnchors: [] });
+  reextract = true;
+  await reloaded.runtime.extractFloor(reloadedFloor.floorId, { analyzeState: false });
+  assert.deepEqual(reloaded.runtime.getState().floors[0].memory.exactAnchors, [], '删除人工版本后被抑制的旧自动原句不再出现');
+});
+
+test('人工二次修订同步同一承诺但不改同文的其他说话人事实', async () => {
+  const originalQuote = '明天见';
+  const content = '裴晚生说“明天见”。林岚也说“明天见”。';
+  const h = harness({ text: content, utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT ? { jsonData: {
+    summary: '裴晚生和林岚分别说了相同的告别话。', people: [{ name: '裴晚生' }, { name: '林岚', role: 'user' }],
+    commitments: [{ issuer: '裴晚生', content: originalQuote, exactQuote: originalQuote }, { issuer: '林岚', content: originalQuote, exactQuote: originalQuote }],
+    exactQuotes: [{ exactText: originalQuote, speaker: '裴晚生' }, { exactText: originalQuote, speaker: '林岚' }],
+  } } : { jsonData: { noMaterialChange: true } } });
+  await h.runtime.start(); await h.runtime.extractNext();
+  const floor = h.runtime.getState().floors[0];
+  const peopleById = new Map(h.runtime.getState().memoryEntities.map(person => [person.entityId, person.displayName]));
+  const quoteFor = speaker => floor.memory.exactAnchors.find(item => peopleById.get(item.speakerEntityId) === speaker);
+  const edit = async (quote, text) => h.runtime.editMemory(floor.floorId, { summary: floor.summary, timeText: '时间未明确', originalTimeText: '时间未明确', timeChanged: false,
+    locations: [], participantNames: floor.memory.participants.map(item => peopleById.get(item.entityId)).filter(Boolean),
+    exactAnchors: floor.memory.exactAnchors.map(item => item.anchorId === quote.anchorId
+      ? { anchorId: item.anchorId, carrier: '各自收到的便笺', exactText: text }
+      : { anchorId: item.anchorId, carrier: item.carrier ?? '', exactText: item.exactText }) });
+  await edit(quoteFor('裴晚生'), '后天见');
+  let memory = h.runtime.getState().floors[0].memory;
+  assert.equal(memory.commitments.find(item => peopleById.get(item.speakerEntityId) === '裴晚生').content, '后天见');
+  assert.equal(memory.commitments.find(item => peopleById.get(item.speakerEntityId) === '林岚').content, originalQuote,
+    '逐字同文也需对应原说话人，不把甲的原件改到乙的事实');
+  const currentQuote = memory.exactAnchors.find(item => peopleById.get(item.speakerEntityId) === '裴晚生');
+  await edit(currentQuote, '周末见');
+  memory = h.runtime.getState().floors[0].memory;
+  assert.equal(memory.commitments.find(item => peopleById.get(item.speakerEntityId) === '裴晚生').content, '周末见', '同一人工条目再次修订继续覆盖关联事实');
+  assert.equal(memory.commitments.find(item => peopleById.get(item.speakerEntityId) === '林岚').content, originalQuote);
+});
+
 test('摘要保存后正文普通编辑仍可人工修订摘要、时间、地点与人物', async () => {
   const h = harness({ modernAnchors: true, initialChat: [assistant('裴晚生提醒你带伞。'), user('确认这一楼'), assistant('待确认尾楼。')] });
   await h.runtime.start();
@@ -4994,38 +6688,38 @@ test('真实 runtime 保存中关闭并重开，提交完成后立即退出编�
   await h.runtime.start(); await h.runtime.extractNext();
   const ui = viewHarness(h.runtime);
   const registeredCard = () => ui.flatten(ui.container).find(node => String(node.className).includes('qqj-memory-card')
-    && ui.flatten(node).some(child => child.textContent === '编辑' || child.placeholder === '输入用户修订摘要'));
+    && node.attributes['data-qqj-floor-id'] === h.runtime.getState().floors.find(floor => floor.memoryId).floorId);
   let card = registeredCard(); card.open = true; card.fire('toggle');
   ui.flatten(ui.container).find(node => node.textContent === '编辑').click();
-  const summary = ui.flatten(ui.container).find(node => node.placeholder === '输入用户修订摘要'); summary.value = '真实保存后的摘要'; summary.fire('input');
+  const summary = ui.flatten(ui.editorContent()).find(node => node.placeholder === '输入用户修订摘要'); summary.value = '真实保存后的摘要'; summary.fire('input');
   const gate = h.backend.holdNextRootPut();
-  ui.flatten(ui.container).find(node => node.textContent === '保存').click();
+  const pendingSave = ui.submitEditor();
   await gate.started;
-  const saving = ui.flatten(ui.container).find(node => node.textContent === '保存中…'); assert.ok(saving); assert.equal(saving.disabled, true);
+  assert.equal(h.runtime.getState().memoryWorkBusy, true); assert.equal(summary.disabled, true, '保存中真实编辑字段禁用');
   ui.view.deactivate();
   await ui.view.activate();
-  assert.ok(ui.flatten(ui.container).some(node => node.placeholder === '输入用户修订摘要'), '提交未完成时重开应继续显示本次草稿');
-  gate.release();
-  await waitFor(() => !h.runtime.getState().memoryWorkBusy && !ui.flatten(ui.container).some(node => node.placeholder === '输入用户修订摘要'), '真实保存完成后界面未退出编辑');
+  assert.ok(Boolean(ui.editorContent()), '提交未完成时重开应继续显示本次草稿');
+  gate.release(); await pendingSave;
+  await waitFor(() => !h.runtime.getState().memoryWorkBusy && !Boolean(ui.editorContent()), '真实保存完成后界面未退出编辑');
   card = registeredCard();
   assert.equal(card.open, true); assert.match(ui.flatten(card).map(node => node.textContent).join('|'), /真实保存后的摘要/);
-  assert.equal(ui.flatten(ui.container).some(node => node.textContent === '保存中…'), false);
+  assert.equal(h.runtime.getState().memoryWorkBusy, false);
   ui.view.deactivate(); await ui.view.activate();
   assert.equal(registeredCard().open, true, '保存完成后再关闭重开仍应保持展开');
-  assert.equal(ui.flatten(ui.container).some(node => node.placeholder === '输入用户修订摘要'), false);
+  assert.equal(Boolean(ui.editorContent()), false);
 
   card = registeredCard(); card.open = true; card.fire('toggle');
   ui.flatten(ui.container).find(node => node.textContent === '编辑').click();
-  const secondSummary = ui.flatten(ui.container).find(node => node.placeholder === '输入用户修订摘要'); secondSummary.value = '面板关闭期间完成的摘要'; secondSummary.fire('input');
+  const secondSummary = ui.flatten(ui.editorContent()).find(node => node.placeholder === '输入用户修订摘要'); secondSummary.value = '面板关闭期间完成的摘要'; secondSummary.fire('input');
   const inactiveGate = h.backend.holdNextRootPut();
-  ui.flatten(ui.container).find(node => node.textContent === '保存').click();
+  const inactiveSave = ui.submitEditor();
   await inactiveGate.started;
-  ui.view.deactivate(); inactiveGate.release();
+  ui.view.deactivate(); inactiveGate.release(); await inactiveSave;
   await waitFor(() => !h.runtime.getState().memoryWorkBusy, '面板关闭期间后台保存未完成');
   await ui.view.activate();
   card = registeredCard();
   assert.equal(card.open, true, '面板关闭期间保存完成后首次重开就应保持展开');
-  assert.equal(ui.flatten(ui.container).some(node => node.placeholder === '输入用户修订摘要'), false);
+  assert.equal(Boolean(ui.editorContent()), false);
   assert.match(ui.flatten(card).map(node => node.textContent).join('|'), /面板关闭期间完成的摘要/);
 });
 
@@ -5041,18 +6735,19 @@ test('聊天切换到仅含B楼的状态后仍完成A楼保存回调', async () 
     editMemory: (floorId, payload) => { assert.equal(floorId, floorA.floorId); return new Promise(resolve => { completeSave = resolve; }); },
   };
   const ui = viewHarness(runtime); await ui.view.activate();
-  ui.flatten(ui.container).find(node => node.textContent === '编辑').click();
-  const summary = ui.flatten(ui.container).find(node => node.placeholder === '输入用户修订摘要');
+  const card = ui.flatten(ui.container).find(node => node.attributes['data-qqj-floor-id'] === floorA.floorId); card.open = true; card.fire('toggle');
+  ui.flatten(card).find(node => node.textContent === '编辑').click();
+  const summary = ui.flatten(ui.editorContent()).find(node => node.placeholder === '输入用户修订摘要');
   summary.value = 'A楼保存完成'; summary.fire('input');
-  ui.flatten(ui.container).find(node => node.textContent === '保存').click();
+  const pendingSave = ui.submitEditor();
   assert.ok(completeSave, 'A 楼保存请求已发出');
   const floorB = { ...floorA, floorId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', messageIndex: floorA.messageIndex + 1 };
   state = { ...stateA, chatId: 'chat-b', floors: [floorB] };
   for (const listener of listeners) listener(state);
   assert.deepEqual(ui.flatten(ui.container).map(node => node.attributes['data-qqj-floor-id']).filter(Boolean), [floorB.floorId]);
-  completeSave(state);
-  await waitFor(() => !ui.flatten(ui.container).some(node => node.placeholder === '输入用户修订摘要'), '切到只含B楼后A保存完成回调没有结束草稿');
-  assert.equal(ui.flatten(ui.container).some(node => node.textContent === '保存中…'), false);
+  completeSave(state); await pendingSave;
+  await waitFor(() => !ui.editorContent(), '切到只含B楼后A保存完成回调没有结束草稿');
+  assert.equal(ui.editorContent(), null);
 });
 
 test('真实 runtime 保存 CAS 失败时保留草稿、显示错误并恢复按钮', async () => {
@@ -5060,18 +6755,49 @@ test('真实 runtime 保存 CAS 失败时保留草稿、显示错误并恢复按
   await h.runtime.start(); await h.runtime.extractNext();
   const before = await h.store.readReachable({ mode: 'runtime' });
   const ui = viewHarness(h.runtime);
-  const card = ui.flatten(ui.container).find(node => String(node.className).includes('qqj-memory-card')); card.open = true; card.fire('toggle');
+  const card = ui.flatten(ui.container).find(node => node.attributes['data-qqj-floor-id'] === before.floorMemories[0].floorId); card.open = true; card.fire('toggle');
   ui.flatten(ui.container).find(node => node.textContent === '编辑').click();
-  const summary = ui.flatten(ui.container).find(node => node.placeholder === '输入用户修订摘要'); summary.value = '失败时保留的草稿'; summary.fire('input');
+  const summary = ui.flatten(ui.editorContent()).find(node => node.placeholder === '输入用户修订摘要'); summary.value = '失败时保留的草稿'; summary.fire('input');
   h.backend.setConflictRoot(true);
-  ui.flatten(ui.container).find(node => node.textContent === '保存').click();
-  await waitFor(() => !h.runtime.getState().memoryWorkBusy && ui.flatten(ui.container).some(node => String(node.textContent).includes('保存失败')), '保存失败后界面未恢复');
+  assert.equal(await ui.submitEditor(), false);
+  assert.ok(ui.editorError(), '真实保存错误返回弹窗，保留可重试草稿');
+  assert.equal(h.runtime.getState().memoryWorkBusy, false);
   const after = await h.store.readReachable({ mode: 'runtime' });
-  const restoredInput = ui.flatten(ui.container).find(node => node.placeholder === '输入用户修订摘要');
+  const restoredInput = ui.flatten(ui.editorContent()).find(node => node.placeholder === '输入用户修订摘要');
   assert.equal(restoredInput.value, '失败时保留的草稿');
-  const save = ui.flatten(ui.container).find(node => node.textContent === '保存'); assert.ok(save); assert.equal(save.disabled, false);
-  assert.equal(ui.flatten(ui.container).find(node => String(node.className).includes('qqj-memory-card')).open, true);
+  assert.equal(ui.editorOptions().confirmText, '保存'); assert.equal(restoredInput.disabled, false);
+  assert.equal(ui.flatten(ui.container).find(node => node.attributes['data-qqj-floor-id'] === before.floorMemories[0].floorId).open, true);
   assert.equal(after.rootRevision, before.rootRevision); assert.equal(after.root.headCheckpointId, before.root.headCheckpointId);
+});
+
+test('人工摘要与修订说明超长时界面说明限制并保留草稿，边界长度可保存', async () => {
+  const h = harness(); await h.runtime.start(); await h.runtime.extractNext();
+  const floor = h.runtime.getState().floors[0], writesBefore = h.backend.calls.filter(call => call[0] === 'put').length;
+  const ui = viewHarness(h.runtime), card = ui.flatten(ui.container).find(node => node.attributes['data-qqj-floor-id'] === floor.floorId);
+  card.open = true; card.fire('toggle'); ui.flatten(ui.container).find(node => node.textContent === '编辑').click();
+  const find = placeholder => ui.editorContent() ? ui.flatten(ui.editorContent()).find(node => node.placeholder === placeholder) : undefined;
+  const save = () => ui.submitEditor();
+  let summary = find('输入用户修订摘要'); summary.value = '甲'.repeat(4001); summary.fire('input'); await save();
+  await waitFor(() => !h.runtime.getState().memoryWorkBusy && ui.editorError()?.message.includes('摘要超过 4000 字'),
+    '超长摘要未显示对应限制');
+  assert.equal(find('输入用户修订摘要').value.length, 4001, '摘要超限草稿保留完整');
+  assert.equal(h.backend.calls.filter(call => call[0] === 'put').length, writesBefore, '拒绝超长摘要时未写入');
+
+  summary = find('输入用户修订摘要'); summary.value = '可保存的修订摘要'; summary.fire('input');
+  const note = find('修订说明（可选）'); note.value = '乙'.repeat(1001); note.fire('input'); await save();
+  await waitFor(() => !h.runtime.getState().memoryWorkBusy && ui.editorError()?.message.includes('修订说明超过 1000 字'),
+    '超长修订说明未显示对应限制');
+  assert.equal(find('输入用户修订摘要').value, '可保存的修订摘要');
+  assert.equal(find('修订说明（可选）').value.length, 1001, '修订说明超限草稿保留完整');
+  assert.equal(h.backend.calls.filter(call => call[0] === 'put').length, writesBefore, '拒绝超长修订说明时未写入');
+
+  summary = find('输入用户修订摘要'); summary.value = '丙'.repeat(4000); summary.fire('input');
+  const validNote = find('修订说明（可选）'); validNote.value = '丁'.repeat(1000); validNote.fire('input'); await save();
+  await waitFor(() => !h.runtime.getState().memoryWorkBusy && !find('输入用户修订摘要'), '合法边界长度未保存并退出编辑');
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  const memory = saved.floorMemories.find(item => item.floorId === floor.floorId);
+  assert.equal(memory.summary.userText.length, 4000);
+  assert.equal(memory.summary.revisionNote.length, 1000);
 });
 
 test('人物手填复用已有 alias，且同名歧义优先本楼原 participant', async () => {
@@ -5116,6 +6842,236 @@ test('自动记忆关闭时 runtime 启动不调用历史提取或 CSE', async (
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(h.calls.length, 0);
   assert.equal(h.runtime.getState().rebuildStatus, 'pendingRebuild');
+});
+
+test('排除连续 AI 楼后正常摘要与 CSE 继续；恢复只补本楼并保留后续记录', async () => {
+  const captureBusinessIdentity = () => ({ chatId: CHAT, hostChatId: 'host-chat', characterLocator: 'character.png', personaLocator: 'persona.png' });
+  const utilityTasks = [];
+  const utility = async options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    utilityTasks.push(request.task);
+    if (request.task === 'extractFloorSemantics') return { jsonData: { summary: `合成摘要：${request.payload.canonicalContent}` } };
+    return { jsonData: { noMaterialChange: true } };
+  };
+  const h = harness({ initialChat: [assistant('已有前缀楼。'), user('确认前缀楼稳定。')], modernAnchors: true,
+    captureBusinessIdentity, readOnlyLifecycle: true, automation: { enabled: true, batchSize: 1 }, utility });
+  h.context.saveChat = async () => true;
+  await h.runtime.start({ explicitEnable: true });
+  assert.equal(h.runtime.allowsRealtimeTailFromEmpty(), true);
+  assert.equal(h.calls.length, 0, '显式建档只授权后续正常实时维护');
+
+  const excludedIndex = h.context.chat.length;
+  h.context.chat.push(assistant('本楼将被排除。'));
+  h.emit('MESSAGE_RECEIVED', excludedIndex);
+  await waitFor(() => h.runtime.getState().rememberedCount === 1 && h.runtime.getState().cseReady && !h.runtime.getState().memoryWorkBusy,
+    () => `先沿正常实时入口保存已有前缀楼 ${JSON.stringify({ state: h.runtime.getState(), foundation: h.foundationRuntime.getState(), calls: h.calls.length })}`);
+  const prefixGraph = await h.store.readReachable({ mode: 'runtime' });
+  const prefixFloor = h.runtime.getState().floors.find(floor => floor.messageIndex === excludedIndex - 2);
+  assert.ok(prefixFloor?.floorId);
+  const beforeMarkCalls = h.calls.length;
+  assert.equal((await h.runtime.setMemoryExcluded(excludedIndex, true)).status, 'persisted');
+  assert.equal(h.context.chat[excludedIndex].extra.qianqianjie_memory_excluded, true);
+  assert.equal(h.calls.length, beforeMarkCalls, '标记动作本身不增加模型请求');
+
+  const nextIndex = h.context.chat.length;
+  assert.equal(nextIndex, excludedIndex + 1, '目标是相邻 AI 楼，不插入 user 消息');
+  h.context.chat.push(assistant('排除楼之后的正常回复。'));
+  h.emit('MESSAGE_RECEIVED', nextIndex);
+  h.context.chat.push(user('确认连续 AI 楼结束。'));
+  h.emit('MESSAGE_SENT', h.context.chat.length - 1);
+  await waitFor(() => h.runtime.getState().rememberedCount === 2 && h.runtime.getState().cseReady && !h.runtime.getState().memoryWorkBusy,
+    () => `后续正常楼应沿原实时路径完成摘要与 CSE ${JSON.stringify({ state: h.runtime.getState(), foundation: h.foundationRuntime.getState(), calls: h.calls.length })}`);
+  assert.ok(utilityTasks.includes('understandCharacterStateAfterFloor'), '正式 CSE 任务通过 utility 入口运行');
+
+  const afterLater = await h.store.readReachable({ mode: 'runtime' });
+  const excludedFloor = h.runtime.getState().floors.find(floor => floor.messageIndex === excludedIndex);
+  const laterFloor = h.runtime.getState().floors.find(floor => floor.messageIndex === nextIndex);
+  assert.equal(excludedFloor?.memoryExcluded, true);
+  assert.ok(laterFloor?.floorId);
+  assert.ok(afterLater.checkpoint.inputFingerprints.some(item => item.floorId === excludedFloor.floorId && item.memoryExcluded === true),
+    '后续摘要/CSE checkpoint 保留排除见证');
+  const laterMemoryBefore = afterLater.floorMemories.find(memory => memory.floorId === laterFloor.floorId);
+  const laterDeltaBefore = afterLater.stateDeltas.find(delta => delta.floorId === laterFloor.floorId);
+  assert.ok(laterMemoryBefore && laterDeltaBefore, '后续楼有正式摘要和 CSE delta');
+  const callsBeforeReject = h.calls.length;
+  assert.equal((await h.runtime.setMemoryExcluded(nextIndex, true)).status, 'rejected', '已有摘要的后续楼不能被当成未记录楼排除');
+  assert.equal(h.calls.length, callsBeforeReject, '拒绝标记已有记忆楼不调用模型');
+
+  const reloaded = harness({ sharedBackend: h.backend, sharedContext: h.context, captureBusinessIdentity,
+    modernAnchors: true, automation: { enabled: false, batchSize: 1 }, utility });
+  await reloaded.runtime.start();
+  assert.equal(reloaded.runtime.getState().floors.find(floor => floor.messageIndex === excludedIndex)?.memoryExcluded, true,
+    '新 runtime 从 checkpoint 与宿主标记重载排除状态');
+  const callsBeforeExplicitExcluded = reloaded.calls.length;
+  await assert.rejects(reloaded.runtime.extractFloor(excludedFloor.floorId, { analyzeState: false }), { code: 'V3_MEMORY_FLOOR_UNAVAILABLE' });
+  assert.equal(reloaded.calls.length, callsBeforeExplicitExcluded, '显式指定被排除楼仍不得调用模型');
+  assert.equal((await reloaded.runtime.setMemoryExcluded(excludedIndex, false)).status, 'persisted');
+  assert.equal(reloaded.context.chat[excludedIndex].extra.qianqianjie_memory_excluded, undefined);
+  const callsBeforeRestore = reloaded.calls.length;
+  await reloaded.runtime.extractNext();
+  const restoredSummaryTargets = reloaded.calls.map(call => JSON.parse(call.taskMessages[0].content))
+    .filter(request => request.task === 'extractFloorSemantics').map(request => request.payload.canonicalContent);
+  assert.deepEqual(restoredSummaryTargets, ['本楼将被排除。'], '恢复补记的模型输入只包含恢复楼，不重算已保存后楼');
+  const afterRestore = await reloaded.store.readReachable({ mode: 'runtime' });
+  assert.ok(afterRestore.floorMemories.some(memory => memory.floorId === excludedFloor.floorId), '恢复后通过现有待补入口写入本楼摘要');
+  assert.equal(afterRestore.floorMemories.find(memory => memory.floorId === laterFloor.floorId)?.id, laterMemoryBefore.id,
+    '后续已保存摘要不重算');
+  assert.equal(afterRestore.stateDeltas.find(delta => delta.floorId === laterFloor.floorId)?.id, laterDeltaBefore.id,
+    '后续已保存 CSE delta 不重算');
+  assert.ok(reloaded.calls.length > callsBeforeRestore, '恢复后的正常待补处理实际调用既有 utility');
+  assert.equal(prefixGraph.floorMemories.some(memory => memory.floorId === excludedFloor.floorId), false);
+});
+
+test('自动记忆关闭时排除点击只保存标记、不调用模型', async () => {
+  const h = harness({ initialChat: [user('开始'), assistant('未记录的 AI 楼'), user('确认稳定')], modernAnchors: true,
+    captureBusinessIdentity: () => ({ chatId: CHAT, hostChatId: 'host-chat', characterLocator: 'character.png', personaLocator: 'persona.png' }),
+    automation: { enabled: false, batchSize: 1 } });
+  h.context.saveChat = async () => true;
+  await h.runtime.start();
+  const result = await h.runtime.setMemoryExcluded(1, true);
+  assert.equal(result.status, 'persisted');
+  assert.equal(h.context.chat[1].extra.qianqianjie_memory_excluded, true);
+  assert.equal(h.calls.length, 0);
+});
+
+test('排除后恢复的最新 AI 楼继续等待正常稳定确认', async () => {
+  const extractorTargets = [];
+  const h = harness({
+    initialChat: [user('开始'), assistant('已确认前楼。'), user('确认前楼。')],
+    modernAnchors: true,
+    automation: { enabled: false, batchSize: 1 },
+    utility: async options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (request.task === 'extractFloorSemantics') {
+        extractorTargets.push(request.payload.canonicalContent);
+        return { jsonData: { summary: `摘要：${request.payload.canonicalContent}` } };
+      }
+      return { jsonData: { noMaterialChange: true } };
+    },
+  });
+  h.context.saveChat = async () => true;
+  await h.runtime.start();
+  const prefix = h.runtime.getState().floors[0];
+  await h.runtime.extractFloor(prefix.floorId, { analyzeState: false });
+  assert.deepEqual(extractorTargets, ['已确认前楼。']);
+
+  const latestIndex = h.context.chat.length;
+  h.context.chat.push(assistant('最新待确认楼。'));
+  h.setAutomation({ enabled: true, batchSize: 1 });
+  assert.equal((await h.runtime.setMemoryExcluded(latestIndex, true)).status, 'persisted');
+  await waitFor(() => !h.runtime.getState().memoryWorkBusy, '排除后的自动维护未完成');
+  const excludedFloor = h.foundationRuntime.getReachable().floors.find(floor => floor.hostLocator.messageIndex === latestIndex);
+  assert.ok(excludedFloor?.id, '排除楼仍有结构floor供后续楼序与checkpoint使用');
+  assert.equal((await h.runtime.setMemoryExcluded(latestIndex, false)).status, 'persisted');
+  await waitFor(() => !h.runtime.getState().memoryWorkBusy, '恢复后的自动维护未完成');
+
+  const inlineState = projectInlineMemoryFloor(h.runtime.getState(), latestIndex);
+  const restoredFloor = h.foundationRuntime.getReachable().floors.find(floor => floor.id === excludedFloor.id);
+  const restoredFloorId = restoredFloor?.id ?? excludedFloor.id;
+  let extractionError = null;
+  if (!extractorTargets.includes('最新待确认楼。')) {
+    try {
+      await h.runtime.extractFloor(restoredFloorId, { analyzeState: false });
+    } catch (error) {
+      extractionError = error;
+    }
+  }
+  const latestTargetsBeforeConfirmation = extractorTargets.filter(target => target === '最新待确认楼。');
+  h.context.chat.push(user('确认最新楼。'));
+  h.emit('MESSAGE_SENT', h.context.chat.length - 1);
+  await waitFor(() => extractorTargets.includes('最新待确认楼。') && !h.runtime.getState().memoryWorkBusy,
+    () => `用户确认最新楼后应沿原实时流程处理 ${JSON.stringify({ extractorTargets, state: h.runtime.getState() })}`);
+
+  const actual = {
+    inlineStatus: inlineState.status,
+    inlineStatusText: inlineState.statusText,
+    inlineCanExtract: inlineState.canExtract,
+    latestTargetsBeforeConfirmation,
+    extractionError: extractionError?.code ?? null,
+    latestTargetsAfterConfirmation: extractorTargets.filter(target => target === '最新待确认楼。'),
+  };
+  console.log(`LATEST_RESTORE_METRIC ${JSON.stringify(actual)}`);
+  assert.deepEqual(actual, {
+    inlineStatus: 'pending',
+    inlineStatusText: '等待下一条用户消息',
+    inlineCanExtract: false,
+    extractionError: 'V3_MEMORY_FLOOR_UNAVAILABLE',
+    latestTargetsBeforeConfirmation: [],
+    latestTargetsAfterConfirmation: ['最新待确认楼。'],
+  }, '恢复只撤销排除资格；最新楼须等用户确认后才能自动或显式提取');
+});
+
+test('首个唯一 AI 楼排除后恢复仍等待用户确认', async () => {
+  const targets = [];
+  const context = { name1: '林岚', personaId: 'persona-linlan', characterId: 0, groupId: null, chatId: 'new-host-chat',
+    characters: [{ avatar: 'character.png' }], userAvatar: 'persona.png', chatMetadata: { qianqianjie: { schemaVersion: 1 } },
+    chat: [user('开始新故事。'), assistant('首个最新 AI 楼。')], saveChat: async () => true, saveMetadata: async () => true };
+  const session = createChatSession({ contextProvider: () => context });
+  const h = harness({
+    sharedContext: context,
+    initialChat: context.chat,
+    modernAnchors: true,
+    readOnlyLifecycle: true,
+    storeIdentityProvider: () => session.identity(),
+    captureBusinessIdentity: () => session.identity(),
+    prepareSession: () => session.prepare(),
+    automation: { enabled: false, batchSize: 1 },
+    utility: async options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (request.task === 'extractFloorSemantics') {
+        targets.push(request.payload.canonicalContent);
+        return { jsonData: { summary: `摘要：${request.payload.canonicalContent}` } };
+      }
+      return { jsonData: { noMaterialChange: true } };
+    },
+  });
+  await session.prepare();
+  await h.runtime.start({ explicitEnable: true });
+  assert.equal(h.runtime.getState().stableCount, 0);
+  assert.equal((await h.runtime.setMemoryExcluded(1, true)).status, 'persisted');
+  assert.equal((await h.runtime.setMemoryExcluded(1, false)).status, 'persisted');
+  const state = h.runtime.getState();
+  const inline = projectInlineMemoryFloor(state, 1);
+  assert.equal(state.stableCount, 0);
+  assert.equal(inline.status, 'pending');
+  assert.equal(inline.statusText, '等待下一条用户消息');
+  await h.runtime.extractNext();
+  assert.deepEqual(targets, [], '无前缀且没有后续用户确认时，提取入口不调用模型');
+});
+
+test('排除楼保留结构行但不计入记忆待处理总数', async () => {
+  const excludedMessage = assistant('排除正文');
+  excludedMessage.extra = { qianqianjie_memory_excluded: true };
+  const h = harness({
+    initialChat: [user('开始'), excludedMessage, assistant('正常待记正文'), user('确认')],
+    automation: { enabled: false, batchSize: 2 },
+  });
+  await h.runtime.start();
+  const state = h.runtime.getState();
+  assert.equal(state.floors.length, 2, '原始assistantSeq所需的排除行仍保留结构位置');
+  assert.equal(state.floors[0].memoryExcluded, true);
+  assert.equal(state.stableCount, 1, '排除行不进入记忆覆盖分母');
+  assert.equal(state.summaryCompletedCount, 0);
+  assert.equal(state.unprocessedCount, 1);
+  assert.equal(h.calls.length, 0);
+});
+
+test('已准备聊天身份但尚无记忆图时首个稳定 AI 楼可正常排除', async () => {
+  const context = { name1: '林岚', personaId: 'persona-linlan', characterId: 0, groupId: null, chatId: 'new-host-chat',
+    characters: [{ avatar: 'character.png' }], userAvatar: 'persona.png', chatMetadata: { qianqianjie: { schemaVersion: 1 } },
+    chat: [user('开始新故事。'), assistant('首个 AI 楼。'), user('确认首楼稳定。')], saveChat: async () => true, saveMetadata: async () => true };
+  const session = createChatSession({ contextProvider: () => context });
+  const h = harness({ sharedContext: context, initialChat: context.chat, modernAnchors: true, readOnlyLifecycle: true,
+    storeIdentityProvider: () => session.identity(), captureBusinessIdentity: () => session.identity(), prepareSession: () => session.prepare(),
+    automation: { enabled: false, batchSize: 1 }, utility: async () => assert.fail('标记首楼不得调用模型') });
+  await session.prepare();
+  await h.runtime.start();
+  assert.equal(session.getState().status, 'ready', '复用宿主既有 session prepare 为新聊天准备身份');
+  assert.equal(h.runtime.getState().rememberedCount, 0, '尚无记忆图时仍是待记录状态');
+  const result = await h.runtime.setMemoryExcluded(1, true);
+  assert.equal(result.status, 'persisted');
+  assert.equal(h.context.chat[1].extra.qianqianjie_memory_excluded, true);
+  assert.equal(h.calls.length, 0);
 });
 
 test('没有来源证明的旧 completed0 保持历史授权边界且零 API', async () => {
@@ -5326,9 +7282,9 @@ test('CSE 失败不再拖停后续摘要，同一稳定快照只有限尝试且�
   await waitFor(() => h.runtime.getState().lastAutoMemory?.status === 'partial' && h.runtime.getState().rememberedCount === 3 && !h.runtime.getState().memoryWorkBusy);
   state = h.runtime.getState();
   assert.equal(state.summaryCompletedCount, 3, '没有 realtimeOrigin 的正常已建前缀仍应继续补新摘要');
-  assert.equal(state.rebuildCompletedCount, 1, '旧 CSE 缺口失败时不得越过它写后楼 delta');
+  assert.equal(state.rebuildCompletedCount, 1, '两楼都实际失败时仍保持已保存前缀');
   assert.equal(h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, 2);
-  assert.equal(h.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 2, '新稳定输入只重试最早 CSE 一次');
+  assert.equal(h.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 3, '新稳定输入中失败旧楼与新楼各分析一次');
 
   const callsAtSettledSnapshot = h.calls.length;
   h.emit('MESSAGE_RECEIVED');
@@ -5339,7 +7295,7 @@ test('CSE 失败不再拖停后续摘要，同一稳定快照只有限尝试且�
   await h.runtime.startHistoricalRebuild();
   await waitFor(() => h.runtime.getState().lastAutoMemory?.status === 'failed' && !h.runtime.getState().memoryWorkBusy);
   assert.equal(notifications.filter(item => item.kind === 'warning').length, warningsBeforeManualRetry + 1, '同一快照下用户手动发起的新逻辑任务失败仍须提示一次');
-  assert.equal(h.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 3, '一次逻辑任务即使内部记录 3 次 transport，也只形成一次最终失败提示');
+  assert.equal(h.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 5, '本轮两处缺口各分析一次，各自保原transport预算');
 
   failCse = false;
   const extractorCallsBeforeContinue = h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length;
@@ -5348,10 +7304,10 @@ test('CSE 失败不再拖停后续摘要，同一稳定快照只有限尝试且�
   state = h.runtime.getState();
   assert.equal(state.rebuildCompletedCount, 3);
   assert.equal(h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, extractorCallsBeforeContinue, '手动继续不得重提已保存摘要');
-  assert.equal(h.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 5, '手动继续只按顺序补两处人物状态');
+  assert.equal(h.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 7, '手动继续只按顺序补两处人物状态');
 });
 
-test('历史 CSE 连续失败时每份新摘要只唤醒一次，无新摘要不自旋且继续只补人物状态', async () => {
+test('历史 CSE 连续失败每楼本批各派一次，用户继续只补人物状态', async () => {
   let failCse = true;
   const notifications = [];
   const h = harness({
@@ -5373,14 +7329,14 @@ test('历史 CSE 连续失败时每份新摘要只唤醒一次，无新摘要不
   let state = h.runtime.getState();
   assert.equal(h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, 3);
   assert.equal(h.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 3,
-    '首份摘要失败后，后两份成功摘要应各提供一次同楼重试机会');
+    '三份独立来源各分析一次，不重复失败楼');
   assert.equal(state.rememberedCount, 3, JSON.stringify({ floors: state.floors.map(floor => ({ status: floor.status, summary: floor.summary })), warnings: h.warnings }));
   assert.equal(state.summaryCompletedCount, 3);
-  assert.deepEqual(state.floors.map(floor => floor.cse.status), ['failed', 'pending', 'pending']);
+  assert.deepEqual(state.floors.map(floor => floor.cse.status), ['failed', 'failed', 'failed']);
   assert.equal(state.lastAutoMemory.summarySaved, 3);
   assert.equal(state.lastAutoMemory.cseProcessed, 0);
   assert.equal(notifications.filter(item => item.kind === 'warning').length, 1, '同一次逻辑任务只提示一次最终失败');
-  assert.match(notifications.find(item => item.kind === 'warning').text, /新摘要保存时会从本楼再试.*点击继续/);
+  assert.match(notifications.find(item => item.kind === 'warning').text, /本批继续处理其他健康楼.*不重复本楼分析.*点击继续/);
   const memoryIds = state.floors.map(floor => floor.memoryId);
   const callsAtFailure = h.calls.length;
   await h.runtime.refreshStatus();
@@ -5399,7 +7355,7 @@ test('历史 CSE 连续失败时每份新摘要只唤醒一次，无新摘要不
   assert.deepEqual(state.floors.map(floor => floor.cse.status), ['noChange', 'noChange', 'noChange']);
 });
 
-test('CSE 前置读取或成功落盘后的同步失败只停本次 drain，新摘要提交后接续且不重算已保存楼', async t => {
+test('CSE 核心读取失败本批保partial且用户继续补齐，已落盘结果直接复用', async t => {
   for (const failurePoint of ['beforeCse', 'afterCseCommit']) await t.test(failurePoint, async () => {
     let historicalSummaryStarted = false;
     let failNextRootRead = false;
@@ -5438,10 +7394,17 @@ test('CSE 前置读取或成功落盘后的同步失败只停本次 drain，新�
     });
     await h.runtime.start();
     await h.runtime.startHistoricalRebuild();
-    await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().memoryWorkBusy,
-      () => `${failurePoint} 未恢复 ${JSON.stringify({ state: h.runtime.getState().lastAutoMemory,
-        floors: h.runtime.getState().floors.map(floor => ({ status: floor.status, cse: floor.cse.status })),
-        readFailures, cseContents, warnings: h.warnings })}`);
+    await waitFor(() => !h.runtime.getState().memoryWorkBusy);
+    assert.equal(h.runtime.getState().rememberedCount, 4, '健康摘要全部保留');
+    if (failurePoint === 'beforeCse') {
+      assert.equal(h.runtime.getState().lastAutoMemory.status, 'partial');
+      assert.equal(registeredGraphCaughtUp(h.runtime.getState()), false);
+      assert.equal(new Set(cseContents).size, cseContents.length, '本批不重派已保存人物楼');
+      const summaryCalls = h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length;
+      await h.runtime.startHistoricalRebuild();
+      assert.equal(h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, summaryCalls, '用户继续复用全部已存摘要');
+    }
+    await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().memoryWorkBusy);
     assert.equal(readFailures, failurePoint === 'beforeCse' ? 1 : 0,
       'CSE 已提交的验证图应直接复用，不再安排一次提交后整图读取');
     assert.deepEqual(cseContents, ['初始化前缀', '批楼甲', '批楼乙', '批楼丙'], '读取异常不能重发已保存楼的模型请求');
@@ -5533,8 +7496,8 @@ test('首个 CSE 失败前已捕获摘要全部保存；提取失败跳过本楼
   assert.equal(cseFailed.runtime.getState().summaryCompletedCount, 5);
   assert.equal(cseFailed.calls.filter(call => JSON.parse(call.taskMessages[0].content).task === 'extractFloorSemantics').length, 4,
     '首个 CSE 失败时摘要仍应按楼继续推进');
-  assert.equal(cseFailed.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 1);
-  assert.match(cseNotifications.at(-1).text, /第 2 楼人物状态未完成，未完成摘要 0 楼.*后续有新稳定回复时会有限重试/);
+  assert.equal(cseFailed.calls.filter(call => call.systemPrompt === CSE_SYSTEM_PROMPT).length, 4, '四份独立欠账各分析一次');
+  assert.match(cseNotifications.at(-1).text, /人物状态未完成，未完成摘要 0 楼.*后续有新稳定回复时会有限重试/);
 
   const extractorSeed = await seedContinuousSummaryTail(3);
   let extractorCalls = 0;
@@ -5599,20 +7562,20 @@ test('同楼提取失败按聊天持久累计，后楼成功不清且本楼成�
   await first.runtime.extractFloor(floorB.floorId, { analyzeState: false });
   let state = first.runtime.getState();
   assert.equal(state.floors[1].status, 'failed');
-  assert.match(state.floors[1].error, /连续失败 1 次；最近：B 最近失败原因 1/);
+  assert.match(state.floors[1].error, /B 最近失败原因 1/);
   await first.runtime.extractFloor(floorC.floorId, { analyzeState: false });
   state = first.runtime.getState();
   assert.equal(state.floors[2].status, 'ready');
-  assert.match(state.floors[1].error, /连续失败 1 次/, '后楼成功不能清掉中间失败楼');
+  assert.match(state.floors[1].error, /B 最近失败原因 1/ , '后楼成功不能清掉中间失败楼');
   await first.runtime.extractFloor(floorB.floorId, { analyzeState: false });
-  assert.match(first.runtime.getState().floors[1].error, /连续失败 2 次；最近：B 最近失败原因 2/);
+  assert.match(first.runtime.getState().floors[1].error, /B 最近失败原因 2/);
 
   const serialized = storage.values.get(key);
   const saved = JSON.parse(serialized);
   assert.deepEqual(Object.keys(saved).sort(), ['failures', 'narrativeGeneration']);
   assert.deepEqual(Object.keys(saved.failures), [floorB.floorId]);
   assert.equal(saved.failures[floorB.floorId].count, 2);
-  assert.equal(saved.failures[floorB.floorId].code, 'TEST_B_FAILED');
+  assert.equal(saved.failures[floorB.floorId].code, 'TEST_B_FAILED'); assert.equal(saved.failures[floorB.floorId].lastFailedAt, NOW); assert.doesNotMatch(state.floors[1].error, /连续失败|2026-/u);
   assert.doesNotMatch(serialized, /待处理楼 A|失败楼 B|成功楼 C|待确认尾楼|taskMessages|jsonData/u);
   const backendCallsBeforeProjection = first.backend.calls.length;
   first.runtime.getState(); first.runtime.getState();
@@ -5626,7 +7589,7 @@ test('同楼提取失败按聊天持久累计，后楼成功不清且本楼成�
   await resumed.runtime.start();
   state = resumed.runtime.getState();
   assert.equal(storage.calls.filter(call => call[0] === 'getItem').length, 2);
-  assert.match(state.floors.find(floor => floor.floorId === floorB.floorId).error, /连续失败 2 次；最近：B 最近失败原因 2/, '刷新后必须恢复同楼次数与最近原因');
+  assert.match(state.floors.find(floor => floor.floorId === floorB.floorId).error, /B 最近失败原因 2/, '刷新后必须恢复同楼次数与最近原因');
   assert.equal(state.floors.find(floor => floor.floorId === floorC.floorId).status, 'ready');
 
   failureByContent.set('待处理楼 A', true);
@@ -5635,7 +7598,7 @@ test('同楼提取失败按聊天持久累计，后楼成功不清且本楼成�
   await resumed.runtime.extractFloor(floorB.floorId, { analyzeState: false });
   state = resumed.runtime.getState();
   assert.equal(state.floors.find(floor => floor.floorId === floorB.floorId).error, null);
-  assert.match(state.floors.find(floor => floor.floorId === floorA.floorId).error, /连续失败 1 次/, '本楼成功只能清本楼，其他失败楼保留');
+  assert.match(state.floors.find(floor => floor.floorId === floorA.floorId).error, /失败/ , '本楼成功只能清本楼，其他失败楼保留');
 
   const oldCSummary = state.floors.find(floor => floor.floorId === floorC.floorId).summary;
   failureByContent.set('成功楼 C', true);
@@ -5644,7 +7607,7 @@ test('同楼提取失败按聊天持久累计，后楼成功不清且本楼成�
   const failedReextract = state.floors.find(floor => floor.floorId === floorC.floorId);
   assert.equal(failedReextract.status, 'ready');
   assert.equal(failedReextract.summary, oldCSummary, '已有摘要重提失败不能清空旧摘要');
-  assert.match(failedReextract.error, /连续失败 1 次/);
+  assert.match(failedReextract.error, /失败/);
   await resumed.runtime.editSummary(floorC.floorId, '人工修订后的 C 摘要');
   assert.equal(resumed.runtime.getState().floors.find(floor => floor.floorId === floorC.floorId).error, null, '人工修订成功应清本楼失败提示');
 
@@ -5669,7 +7632,7 @@ test('失败提示存储损坏或不可写不阻断摘要流程，内存提示�
   await h.runtime.start();
   const floorId = h.runtime.getState().floors[0].floorId;
   await h.runtime.extractFloor(floorId, { analyzeState: false });
-  assert.match(h.runtime.getState().floors[0].error, /连续失败 1 次.*可选存储不可写时的提取失败/);
+  assert.match(h.runtime.getState().floors[0].error, /可选存储不可写时的提取失败/);
   assert.deepEqual(calls, ['get', 'set']);
   fail = false;
   await h.runtime.extractFloor(floorId, { analyzeState: false });
@@ -5802,6 +7765,7 @@ test('切换单槽浏览器失败范围后原目标CSE成功清理与失败记�
 test('CSE 楼级失败跨刷新累计并按楼清除，旧有效 delta 重析失败仍保持可用', async () => {
   const storage = browserStorage();
   let failA = true;
+  let cseAFailures = 0;
   let failSummaryC = false;
   const utility = options => {
     const content = JSON.parse(options.taskMessages[0].content).payload.canonicalContent;
@@ -5809,7 +7773,7 @@ test('CSE 楼级失败跨刷新累计并按楼清除，旧有效 delta 重析失
       if (failSummaryC && content === '历史三') throw Object.assign(new Error('受控摘要 C 失败'), { code: 'TEST_SUMMARY_C_FAILED' });
       return { jsonData: { summary: `摘要-${content}` } };
     }
-    if (failA && content === '历史一') throw Object.assign(new Error('受控 CSE A 失败'), { code: 'TEST_CSE_A_FAILED' });
+    if (failA && content === '历史一') { cseAFailures += 1; throw Object.assign(new Error('受控 CSE A 失败'), { code: 'TEST_CSE_A_FAILED' }); }
     return { jsonData: { noMaterialChange: true } };
   };
   const first = harness({
@@ -5825,12 +7789,13 @@ test('CSE 楼级失败跨刷新累计并按楼清除，旧有效 delta 重析失
   state = first.runtime.getState();
   assert.equal(state.floors[0].cse.status, 'failed');
   assert.equal(state.floors[1].cse.status, 'noChange');
-  assert.match(state.floors[0].cse.error, /连续失败 4 次/);
+  assert.match(state.floors[0].cse.error, /受控 CSE A 失败/);
   failSummaryC = true;
   await first.runtime.extractFloor(floorC.floorId, { analyzeState: false });
   const key = [...storage.values.keys()][0];
   let saved = JSON.parse(storage.values.get(key));
-  assert.equal(saved.cseFailures[floorA.floorId].count, 4);
+  assert.equal(cseAFailures, 2, '历史本批一次，加用户显式重试一次');
+  assert.equal(saved.cseFailures[floorA.floorId].count, cseAFailures);
   assert.equal(saved.failures[floorC.floorId].count, 1);
   assert.doesNotMatch(storage.values.get(key), /历史一|历史二|历史三|taskMessages|jsonData|api/u);
 
@@ -5839,9 +7804,9 @@ test('CSE 楼级失败跨刷新累计并按楼清除，旧有效 delta 重析失
   await resumed.runtime.start();
   state = resumed.runtime.getState();
   assert.equal(state.floors[0].cse.status, 'failed');
-  assert.match(state.floors[0].cse.error, /连续失败 4 次.*受控 CSE A 失败/);
+  assert.match(state.floors[0].cse.error, /受控 CSE A 失败/);
   assert.equal(state.floors[1].cse.status, 'noChange');
-  assert.match(state.floors[2].error, /连续失败 1 次.*受控摘要 C 失败/);
+  assert.match(state.floors[2].error, /受控摘要 C 失败/);
   assert.equal(state.lastCseError.floorId, floorA.floorId);
 
   failA = false;
@@ -5849,7 +7814,7 @@ test('CSE 楼级失败跨刷新累计并按楼清除，旧有效 delta 重析失
   state = resumed.runtime.getState();
   assert.equal(state.floors[0].cse.status, 'noChange');
   assert.equal(state.floors[0].cse.error, null);
-  assert.match(state.floors[2].error, /连续失败 1 次/, 'CSE 本楼成功不得清摘要失败提示');
+  assert.match(state.floors[2].error, /受控摘要 C 失败/ , 'CSE 本楼成功不得清摘要失败提示');
   saved = JSON.parse(storage.values.get(key));
   assert.equal(saved.cseFailures, undefined);
   assert.equal(saved.failures[floorC.floorId].count, 1);
@@ -5900,7 +7865,7 @@ test('自动任务外层错误跨刷新保留，暂停不清且仅在后续批�
   armedOuter = true;
   await h.runtime.startHistoricalRebuild();
   let state = h.runtime.getState();
-  assert.match(state.lastAutomationError?.message ?? '', /连续失败 1 次.*自动任务外层受控失败/);
+  assert.match(state.lastAutomationError?.message ?? '', /自动任务外层受控失败/);
   const key = [...storage.values.keys()][0];
   let saved = JSON.parse(storage.values.get(key));
   assert.equal(saved.automationFailure.phase, 'reconciling');
@@ -5933,11 +7898,12 @@ test('自动任务外层错误跨刷新保留，暂停不清且仅在后续批�
 });
 
 test('合法跨楼重复千事关系只投影一次并让自动高楼继续到模拟提取与保存', async () => {
-  let extractorCalls = 0;
+  let extractorCalls = 0; const aggregateRequests = [];
   const utility = options => {
     const request = JSON.parse(options.taskMessages[0].content);
     if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
     extractorCalls += 1;
+    if (request.payload.sourceFloors?.length > 1) aggregateRequests.push(request.payload);
     const title = ['事项甲', '事项乙', '旁支丙', '旁支丁'][extractorCalls - 1] ?? `后续 ${extractorCalls}`;
     const qianshi = { events: [{ key: `event-${extractorCalls}`, title, description: `${title}的固定测试描述`, status: 'planned', matter: true }], order: [] };
     if (extractorCalls >= 3 && extractorCalls <= 4) {
@@ -5975,6 +7941,13 @@ test('合法跨楼重复千事关系只投影一次并让自动高楼继续到�
   assert.equal(state.lastExtractorError, null);
   assert.equal(state.lastAutomationError, null);
   assert.equal(state.rememberedCount, 14);
+  assert.equal(aggregateRequests.length, 1, '高楼真实runtime只发出一份聚合请求');
+  const aggregate = aggregateRequests[0];
+  const maxAssistantSeq = Math.max(...aggregate.sourceFloors.map(item => item.assistantSeq));
+  const anchorSource = aggregate.sourceFloors.find(item => item.assistantSeq === maxAssistantSeq);
+  assert.ok(anchorSource, '聚合高楼夹具必须包含实际末端anchor成员');
+  assert.equal(aggregate.sourceFloorKey, anchorSource.floorKey, '顶层来源键必须引用正文anchor成员，而非聚合首楼');
+  assert.notEqual(aggregate.sourceFloorKey, aggregate.sourceFloors[0].floorKey, '该生产夹具的首楼不是高楼anchor');
   const projected = prepareQianshiCandidates(await h.store.readReachable({ mode: 'runtime' }));
   assert.ok(projected.stats.count >= 2, '重复关系不能丢失其关联事项');
 });
@@ -5982,8 +7955,8 @@ test('合法跨楼重复千事关系只投影一次并让自动高楼继续到�
 test('准备期受控重复边异常贯通持久、重载、累计与两种复制方式，成功后清除', async () => {
   const storage = browserStorage();
   let failPreparation = false;
-  const qianshiCandidatePreparer = (...args) => {
-    if (!failPreparation) return prepareQianshiCandidates(...args);
+  const extractorPromptGuidance = () => {
+    if (!failPreparation) return '';
     const error = new Error('Graph.addDirectedEdgeWithKey: PRIVATE_BODY entity=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa https://api.example.test/v1?key=SECRET edge already exists in the graph.');
     error.name = 'UsageGraphError';
     throw error;
@@ -5991,7 +7964,7 @@ test('准备期受控重复边异常贯通持久、重载、累计与两种复�
   const utility = options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics'
     ? { jsonData: { summary: '安全摘要' } }
     : { jsonData: { noMaterialChange: true } };
-  const h = harness({ modernAnchors: true, initialChat: [assistant('种子楼'), user('确认种子'), assistant('种子尾楼')], automation: { enabled: false, batchSize: 1 }, utility, qianshiCandidatePreparer, failureStorage: storage });
+  const h = harness({ modernAnchors: true, initialChat: [assistant('种子楼'), user('确认种子'), assistant('种子尾楼')], automation: { enabled: false, batchSize: 1 }, utility, extractorPromptGuidance, failureStorage: storage });
   await h.runtime.start(); await h.runtime.startHistoricalRebuild();
   await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().memoryWorkBusy);
   h.context.chat.pop();
@@ -6004,7 +7977,7 @@ test('准备期受控重复边异常贯通持久、重载、累计与两种复�
   assert.equal(h.calls.length, callsBefore); assert.equal(h.backend.calls.filter(call => call[0] === 'put').length, 0);
   assert.equal(state.lastExtractorError, null);
   assert.deepEqual({ phase: state.lastAutomationError.phase, prepareStep: state.lastAutomationError.prepareStep, name: state.lastAutomationError.name, code: state.lastAutomationError.code, detail: state.lastAutomationError.detail, count: state.lastAutomationError.count }, {
-    phase: 'extracting', prepareStep: 'qianshiCandidates', name: 'UsageGraphError', code: 'V3_AUTO_MEMORY_FAILED', detail: 'Graphology 检测到重复图边。', count: 1,
+    phase: 'extracting', prepareStep: 'extractorEnvelope', name: 'UsageGraphError', code: 'V3_AUTO_MEMORY_FAILED', detail: 'Graphology 检测到重复图边。', count: 1,
   });
   assert.match(state.lastAutomationError.location, /^src\/v3\/memory-runtime\.js:\d+:\d+$/u);
   const key = [...storage.values.keys()][0], serializedFailure = storage.values.get(key);
@@ -6013,12 +7986,12 @@ test('准备期受控重复边异常贯通持久、重载、累计与两种复�
   const saved = JSON.parse(serializedFailure).automationFailure;
   const savedEnvelope = JSON.parse(serializedFailure);
   assert.deepEqual({ phase: saved.phase, prepareStep: saved.prepareStep, name: saved.name, code: saved.code, detail: saved.detail, location: saved.location, count: saved.count }, {
-    phase: 'extracting', prepareStep: 'qianshiCandidates', name: 'UsageGraphError', code: 'V3_AUTO_MEMORY_FAILED',
+    phase: 'extracting', prepareStep: 'extractorEnvelope', name: 'UsageGraphError', code: 'V3_AUTO_MEMORY_FAILED',
     detail: 'Graphology 检测到重复图边。', location: state.lastAutomationError.location, count: 1,
   });
 
   h.runtime.invalidate();
-  const resumed = harness({ sharedBackend: h.backend, sharedContext: h.context, automation: { enabled: false, batchSize: 1 }, utility, qianshiCandidatePreparer, failureStorage: storage });
+  const resumed = harness({ sharedBackend: h.backend, sharedContext: h.context, automation: { enabled: false, batchSize: 1 }, utility, extractorPromptGuidance, failureStorage: storage });
   await resumed.runtime.start();
   assert.deepEqual(resumed.runtime.getState().lastAutomationError, state.lastAutomationError, '重载必须恢复同一份受控诊断');
   await resumed.runtime.startHistoricalRebuild({ aggregate: true });
@@ -6032,7 +8005,7 @@ test('准备期受控重复边异常贯通持久、重载、累计与两种复�
   assert.equal(clipboardDiagnostic.formatVersion, 2); assert.equal(clipboardDiagnostic.pluginVersion, '0.4.2');
   assert.deepEqual(clipboardDiagnostic.memory.lastAutomationError, {
     present: true, name: 'UsageGraphError', code: 'V3_AUTO_MEMORY_FAILED', phase: 'extracting', count: 2,
-    prepareStep: 'qianshiCandidates', detail: 'Graphology 检测到重复图边。', location: state.lastAutomationError.location,
+    prepareStep: 'extractorEnvelope', detail: 'Graphology 检测到重复图边。', location: state.lastAutomationError.location,
     lastFailedAt: state.lastAutomationError.lastFailedAt,
   });
   const fallbackUi = viewHarness(resumed.runtime, { page: 'management', pluginVersion: '0.4.2', navigatorRef: { clipboard: { writeText: async () => { throw new Error('clipboard denied'); } } } });
@@ -6053,12 +8026,104 @@ test('准备期受控重复边异常贯通持久、重载、累计与两种复�
     count: 3, lastReason: '旧版通用错误', code: 'UsageGraphError', phase: 'extracting', lastFailedAt: NOW,
   } }));
   resumed.runtime.invalidate();
-  const legacy = harness({ sharedBackend: h.backend, sharedContext: h.context, automation: { enabled: false, batchSize: 1 }, utility, qianshiCandidatePreparer, failureStorage: storage });
+  const legacy = harness({ sharedBackend: h.backend, sharedContext: h.context, automation: { enabled: false, batchSize: 1 }, utility, extractorPromptGuidance, failureStorage: storage });
   await legacy.runtime.start();
   assert.deepEqual(legacy.runtime.getState().lastAutomationError, {
-    code: null, name: 'UsageGraphError', message: `连续失败 3 次；最近：旧版通用错误（${NOW}）`, phase: 'extracting', prepareStep: null,
+    code: null, name: 'UsageGraphError', message: '旧版通用错误', phase: 'extracting', prepareStep: null,
     detail: null, location: null, count: 3, lastFailedAt: NOW,
   }, '旧0.4.0/0.4.1失败提示可恢复已有类型，新字段如实null');
+});
+
+test('固定摘要来源在前台身份未准备好时读取自身映射并更新本runtime投影', async () => {
+  const chat = [user('开始'), assistant('裴晚生提醒你带伞。'), user('稳定')];
+  const seed = harness({ initialChat: chat });
+  await seed.runtime.start();
+  await seed.runtime.extractNext({ analyzeState: false });
+  const source = await seed.store.readReachable({ mode: 'runtime' });
+  const person = source.entities.find(entity => entity.displayName === '裴晚生');
+  const userEntity = source.entities.find(entity => entity.specialRole === 'user');
+  assert.ok(person && userEntity);
+  const projection = { currentNamesByEntityId: { [person.id]: '人工正式名', [userEntity.id]: '{{user}}本人' },
+    manualAliasesByEntityId: { [person.id]: [] } };
+  const providerTargets = [], payloads = [];
+  const h = harness({ sharedBackend: seed.backend, sharedContext: seed.context,
+    identityProjectionProvider: async targetIdentity => {
+      providerTargets.push(targetIdentity);
+      if (!targetIdentity) throw Object.assign(new Error('前台身份暂未准备好'), { code: 'CHAT_SESSION_NOT_READY' });
+      assert.equal(targetIdentity.chatId, CHAT);
+      return projection;
+    }, utility: options => {
+      payloads.push(JSON.parse(options.taskMessages[0].content).payload);
+      return { jsonData: { summary: '原目标摘要正常保存。', people: [{ name: '人工正式名' }, { name: '你', role: 'user' }] } };
+    } });
+  await h.runtime.start();
+  const result = await h.runtime.extractFloor(source.floors[0].id, { analyzeState: false });
+  assert.equal(result.lastExtractorError, null);
+  assert.equal(h.calls.length, 1, '固定来源准备与提交只使用原有一次假模型调用');
+  assert.ok(providerTargets.length > 0);
+  assert.ok(providerTargets.every(target => target?.chatId === CHAT), '所有准备及提交映射读取都带原来源身份');
+  assert.equal(payloads[0].knownPeople.find(value => value.displayName === '人工正式名')?.aliases.length, 0);
+  assert.ok(payloads[0].knownPeople.some(value => value.displayName === '林岚本人'), '用户宏按原来源baseline投影');
+  assert.equal(h.runtime.getState().memoryEntities.find(value => value.entityId === person.id).displayName, '人工正式名',
+    '普通runtime读取仍更新自身投影，不能因provider补target而退化为只derive');
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.entities.filter(value => value.specialRole === 'user').length, 1);
+  assert.equal(saved.floorMemories.find(value => value.floorId === source.floors[0].id).summary.aiText, '原目标摘要正常保存。');
+});
+
+test('千事显式目标映射使用目标图及宏且不污染前台runtime投影', async t => {
+  for (const mode of ['history', 'rejudge']) await t.test(mode, async () => {
+    const event = { key: 'old-book', title: '归还旧书', description: '林岚答应归还旧书。', status: 'planned', matter: true };
+    const seed = harness({ initialChat: [user('开始'), assistant('林岚答应归还旧书。'), user('稳定')],
+      utility: () => ({ jsonData: { summary: '原A摘要', people: [{ name: '你', role: 'user' }],
+        ...(mode === 'rejudge' ? { qianshi: { events: [event], order: [] } } : {}) } }) });
+    await seed.runtime.start();
+    await seed.runtime.extractNext({ analyzeState: false });
+    const source = await seed.store.readReachable({ mode: 'runtime' }), userId = source.baseline.userPersona.entityId;
+    const targetIdentity = { chatId: CHAT, hostChatId: 'host-chat', characterLocator: 'character.png', personaLocator: 'persona.png' };
+    const otherId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    let runningTarget = false, current;
+    const projections = [], providerTargets = [];
+    current = harness({ sharedBackend: seed.backend, sharedContext: { ...seed.context, chatId: 'other-host', name1: '乙页用户',
+      chatMetadata: { qianqianjie: { schemaVersion: 1, chatId: otherId } }, chat: [user('乙页开始'), assistant('乙页用户在阅读。'), user('乙页稳定')] },
+      captureBusinessIdentity: () => ({ ...targetIdentity, chatId: otherId, hostChatId: 'other-host' }),
+      identityProjectionProvider: async identity => {
+        providerTargets.push(identity);
+        return identity?.chatId === CHAT ? { currentNamesByEntityId: { [userId]: '{{user}}档案' } } : {};
+      }, qianshiGraphProjector: (value, options) => {
+        if (runningTarget && value.root.chatId === CHAT && options?.identityProjection) projections.push(options.identityProjection);
+        return projectQianshiGraph(value, options);
+      }, utility: options => {
+        if (!runningTarget) return { jsonData: { summary: '乙页摘要', people: [{ name: '你', role: 'user' }] } };
+        const request = JSON.parse(options.taskMessages[0].content);
+        return mode === 'history' ? { jsonData: { floors: request.floors.map(floor => ({ floorKey: floor.floorKey, qianshi: { events: [event], order: [] } })) } }
+          : { jsonData: { qianshi: { events: [{ key: 'record-1', status: 'planned', matter: true }], order: [] } } };
+      } });
+    await current.runtime.start();
+    await current.runtime.extractNext({ analyzeState: false });
+    const visibleBefore = current.runtime.getState().memoryEntities;
+    const plan = mode === 'history' ? await current.runtime.prepareQianshiHistory({ targetIdentity })
+      : await current.runtime.prepareQianshiRejudge({ targetIdentity });
+    runningTarget = true; providerTargets.length = 0;
+    const callsBefore = current.calls.length;
+    const result = mode === 'history' ? await current.runtime.startQianshiHistory(plan.planId)
+      : await current.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.status, 'completed', JSON.stringify(result));
+    assert.equal(current.calls.length - callsBefore, plan.apiCalls);
+    if (mode === 'rejudge') {
+      assert.equal(plan.historyApiCalls, 1); assert.equal(result.followup.calls, 1);
+      assert.equal(plan.apiCalls, 2);
+      const requests = current.calls.slice(callsBefore).map(call => JSON.parse(call.taskMessages[0].content));
+      assert.deepEqual(requests.map(request => request.task), ['rejudgeStoredQianshiV1', 'reviewQianshiFollowingV1']);
+    } else assert.equal(plan.apiCalls, 1);
+    assert.ok(providerTargets.length > 0 && providerTargets.every(identity => identity === targetIdentity), '显式原目标完整坐标优先');
+    assert.ok(projections.length > 0);
+    assert.ok(projections.every(projection => projection.userEntityId === userId
+      && projection.currentNamesByEntityId[userId] === '林岚档案'), 'A workspace映射只能搭A图和A宏，不能混入前台B图');
+    assert.deepEqual(current.runtime.getState().memoryEntities, visibleBefore, '显式别档derive不更新前台runtime投影');
+    const saved = await seed.store.readReachable({ mode: 'runtime' });
+    assert.equal(saved.floorMemories[0].summary.aiText, '原A摘要');
+  });
 });
 
 test('准备期身份目录异常标记真实步骤，不会全部退化成交接阶段', async () => {
@@ -6494,6 +8559,88 @@ test('冷读把跨代实体视图投影到当前首见楼，不改后端实体�
   assert.equal(persisted.firstSeenFloorId, deletedFirstFloorId);
 });
 
+test('完整实时生成状态为空闲时解除normal/quiet旧标记并保留已存摘要', async () => {
+  for (const type of ['normal', 'quiet']) {
+    let nativeBusy = false;
+    const notices = [];
+    const h = harness({ initialChat: [assistant('历史摘要'), user('稳定'), assistant('尾楼')],
+      automation: { enabled: true, batchSize: 1 }, isMainGenerationActive: () => nativeBusy,
+      readMainGenerationState: () => false, notifyUser: value => notices.push(value),
+      utility: options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics'
+        ? { jsonData: { summary: '已保存摘要' } } : { jsonData: { noMaterialChange: true } } });
+    await h.runtime.start();
+    h.emit('GENERATION_STARTED', type, {}, false); nativeBusy = true;
+    await h.runtime.startHistoricalRebuild();
+    assert.equal(h.runtime.getState().rememberedCount, 1, '宿主完整空闲覆盖旧START和旧sendpress，不再误拦补齐');
+    assert.equal(h.runtime.getState().mainGenerationActive, false, '导出状态与有效门禁一致');
+    assert.equal(notices.some(value => value.text === '主模型正在生成，请等待完成后再开始重建。'), false);
+  }
+});
+
+test('完整实时生成状态覆盖早START与STOP清理期，跨刷新时仍阻止历史授权', async () => {
+  let live = false, gate = null, markStarted;
+  const refreshStarted = new Promise(resolve => { markStarted = resolve; });
+  const h = harness({ initialChat: [assistant('历史摘要'), user('稳定'), assistant('尾楼')],
+    automation: { enabled: true, batchSize: 1 }, isMainGenerationActive: () => false,
+    readMainGenerationState: () => live,
+    foundationRefresh: async base => { if (gate) { const wait = gate; gate = null; markStarted(); await wait; } return base.refreshStatus(); },
+    utility: options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics'
+      ? { jsonData: { summary: '已保存摘要' } } : { jsonData: { noMaterialChange: true } } });
+  await h.runtime.start();
+  live = true;
+  await h.runtime.startHistoricalRebuild();
+  assert.equal(h.calls.length, 0, '真实Generate在START之前也已属于busy');
+  assert.equal(h.runtime.getState().mainGenerationActive, true);
+  live = false;
+  let release; gate = new Promise(resolve => { release = resolve; });
+  const pending = h.runtime.startHistoricalRebuild(); await refreshStarted;
+  live = true; h.emit('GENERATION_STARTED', 'normal', {}, false); release(); await pending;
+  assert.equal(h.calls.length, 0, '异步刷新期间真实START不得获得历史授权');
+  h.emit('GENERATION_STOPPED'); h.emit('GENERATION_ENDED');
+  await h.runtime.startHistoricalRebuild();
+  assert.equal(h.calls.length, 0, 'STOP先解UI、Generate尚未finally时继续保真实busy');
+  live = false;
+  await h.runtime.startHistoricalRebuild();
+  assert.equal(h.runtime.getState().rememberedCount, 1);
+});
+
+test('完整实时生成接口unknown保旧门禁，不把缺失抛错或非bool当空闲', async () => {
+  for (const provider of [undefined, () => null, () => { throw new Error('synthetic unavailable'); }, () => 'false']) {
+    let refreshes = 0;
+    const h = harness({ isMainGenerationActive: () => false, readMainGenerationState: provider,
+      foundationRefresh: async () => { refreshes += 1; return { status: 'uninitialized' }; } });
+    h.emit('GENERATION_STARTED', 'normal', {}, false);
+    await h.runtime.startHistoricalRebuild();
+    assert.equal(refreshes, 0); assert.equal(h.calls.length, 0);
+    assert.equal(h.runtime.getState().mainGenerationActive, true, 'legacy事件标记与诊断一致');
+    h.emit('GENERATION_STOPPED'); h.emit('GENERATION_ENDED');
+    assert.equal(h.runtime.getState().mainGenerationActive, false);
+    await h.runtime.startHistoricalRebuild(); assert.equal(refreshes, 1);
+  }
+});
+
+test('完整实时空闲清除旧formal位后，下次真实START仍捕获并授权新生命周期', async () => {
+  let live = false;
+  const h = harness({ initialChat: [assistant('已建楼'), assistant('上一楼正文')], automation: { enabled: true, batchSize: 1 },
+    isMainGenerationActive: () => false, readMainGenerationState: () => live,
+    utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+      ? { jsonData: { summary: '上一楼摘要' } } : { jsonData: { noMaterialChange: true } } });
+  await primeEarlyGenerationTail(h);
+  h.emit('GENERATION_STARTED', 'quiet', {}, false);
+  await h.runtime.startHistoricalRebuild();
+  assert.equal(h.runtime.getState().mainGenerationActive, false);
+  live = null;
+  assert.equal(h.runtime.getState().mainGenerationActive, false, '完整空闲已清旧位，接口随后unknown也不会复活旧门禁');
+  h.context.chat.push(user('继续'));
+  h.emit('GENERATION_STARTED', 'normal', {}, false);
+  assert.equal(h.runtime.getState().mainGenerationActive, true, '恢复unknown后新的真实START仍可置位');
+  h.context.chat.push(assistant('新的正式回复'));
+  h.emit('GENERATION_ENDED');
+  await waitFor(() => h.runtime.getState().rememberedCount === 2 && !h.runtime.getState().memoryWorkBusy,
+    '旧formal若仅被忽略而未清除，新START会早退、无法捕获这次完成事件');
+  assert.deepEqual(h.calls.map(call => call.systemPrompt), [EXTRACTOR_SYSTEM_PROMPT, CSE_SYSTEM_PROMPT]);
+});
+
 test('GENERATION_STARTED 抢在 isGenerating 变真前仍拒绝历史授权，STOPPED/ENDED 后可幂等恢复', async () => {
   let blockHistoricalRefresh = false;
   let releaseRefresh;
@@ -6924,7 +9071,8 @@ test('历史重建中关闭会使旧响应失效，重新开启后从 reachable 
 
   h.setEnabled(true);
   await h.runtime.setEnabled(true);
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitFor(() => h.runtime.getState().memorySnapshotStatus === 'ready'
+    && h.runtime.getState().memorySyncStatus === 'idle', '重新启用后的记忆读取未完成');
   assert.equal(h.calls.length, 1, '重新开启不得恢复已经失效的运行时授权');
   assert.equal(h.runtime.getState().rebuildStatus, 'pendingRebuild');
   await h.runtime.startHistoricalRebuild();
@@ -6990,12 +9138,10 @@ test('自动 reconciling、extracting、CSE 全程共用一个门闩，手动入
   const foundationStarted = new Promise(resolve => { foundationStartedResolve = resolve; });
   const extractorStarted = new Promise(resolve => { extractorStartedResolve = resolve; });
   const cseStarted = new Promise(resolve => { cseStartedResolve = resolve; });
-  const automaticSummaryReceipts = [];
   const h = harness({
     modernAnchors: true,
     initialChat: [user('开始'), assistant('已建楼'), user('确认已建楼'), assistant('待确认尾楼')],
     automation: { enabled: false, batchSize: 2 },
-    onAutomaticSummaryCommitted: receipt => { automaticSummaryReceipts.push(receipt); },
     foundationRefresh: async base => {
       if (holdFoundation) {
         holdFoundation = false;
@@ -7036,9 +9182,6 @@ test('自动 reconciling、extracting、CSE 全程共用一个门闩，手动入
   releaseExtractor();
 
   await cseStarted;
-  assert.equal(automaticSummaryReceipts.length, 2, '自动摘要正式提交后按两楼各通知一次人物资料维护');
-  assert.ok(automaticSummaryReceipts.every(receipt => receipt.chatId === CHAT
-    && h.runtime.getState().floors.some(floor => floor.floorId === receipt.floorId && floor.memoryId === receipt.memoryId && floor.status === 'ready')));
   assert.equal(h.runtime.getState().activeAutoMemory.phase, 'analyzingCse');
   assert.equal(h.runtime.shouldBlockMainGeneration(), false, '日常自动 CSE 不得阻断主生成');
   const callsDuringCse = h.calls.length;
@@ -7050,9 +9193,7 @@ test('自动 reconciling、extracting、CSE 全程共用一个门闩，手动入
   const callsAfterBatch = h.calls.length;
   await h.runtime.extractFloor(firstFloorId);
   assert.equal(h.calls.length, callsAfterBatch + 1, '批次完成后摘要入口恢复，但不自动重算已存 CSE');
-  assert.equal(automaticSummaryReceipts.length, 2, '手动单楼提取不得冒充自动摘要通知');
   await h.runtime.editSummary(firstFloorId, '人工修订后的摘要');
-  assert.equal(automaticSummaryReceipts.length, 2, '人工摘要修订不得触发人物资料维护');
 });
 
 test('历史欠账期间开启自动维护只改设置，不在手动作业结束后偷跑历史', async () => {
@@ -7420,6 +9561,8 @@ test('同目标人工摘要阻止旧模型覆盖；CAS 期间新后缀触发一�
   let graph = await primary.store.readReachable({ mode: 'runtime' });
   assert.equal(graph.floorMemories.find(memory => memory.floorId === targetId)?.summary.userText, '并发人工摘要。');
   assert.equal(primary.runtime.getState().lastExtractorError?.code, 'V3_MEMORY_PREFIX_CHANGED');
+  assert.deepEqual(primary.runtime.getState().lastExtractorError?.prefixDifference, { categories: ['summaryContent'], assistantSeqs: [1], relatedFloorCount: 1, truncated: false });
+  assert.doesNotMatch(JSON.stringify(primary.runtime.getState().lastExtractorError?.prefixDifference), /并发人工摘要|不应覆盖|floorId|memoryId|chatId/u);
 
   let releaseThird, thirdStartedResolve;
   const thirdStarted = new Promise(resolve => { thirdStartedResolve = resolve; });
@@ -7818,6 +9961,146 @@ test('正式十楼聚合摘要阻止末登记楼重登', async () => {
   assert.equal(hostWrites, 0);
 });
 
+async function manualReextractHarness({ utility = null } = {}) {
+  let h, saveFails = false;
+  h = harness({ modernAnchors: true,
+    initialChat: [assistant('A独有旧正文。'), user('稳定A'), assistant('B独有旧正文。'), user('稳定B')],
+    persistAnchors: options => persistMessageFloorAnchors({ ...options, fetchImpl: async () => ({ ok: true,
+      json: async () => [{ chat_metadata: h.context.chatMetadata }, ...structuredClone(h.context.chat)] }) }),
+    utility: options => utility?.(options) ?? (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+      ? { jsonData: { summary: `摘要：${JSON.parse(options.taskMessages[0].content).payload.canonicalContent}` } }
+      : { jsonData: { noMaterialChange: true } }),
+  });
+  h.context.saveChat = async () => !saveFails;
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  h.calls.splice(0);
+  return { ...h, failSave(value) { saveFails = value; } };
+}
+
+test('主动重提当前AI先补标：缺标改文恢复原楼，人工稿保留且不增加模型轮次', async () => {
+  const h = await manualReextractHarness();
+  const old = h.runtime.getState().floors[0];
+  await h.runtime.editSummary(old.floorId, '人工稿权威');
+  const before = h.runtime.getState().floors[0];
+  h.context.chat[0].mes = 'A人工改后正文。'; h.context.chat[0].swipes = ['A人工改后正文。'];
+  delete h.context.chat[0].extra.qianqianjie_floor;
+  await h.runtime.refreshStatus();
+  assert.ok(['needsReview', 'error'].includes(h.foundationRuntime.getState().status));
+  const target = h.runtime.captureExtractionTarget(old.floorId, { messageIndex: 0 });
+  await h.runtime.extractFloor(old.floorId, { extractionTarget: target, analyzeState: false });
+  const after = h.runtime.getState().floors.find(floor => floor.floorId === old.floorId);
+  assert.equal(h.context.chat[0].extra.qianqianjie_floor.floorId, old.floorId);
+  assert.equal(h.foundationRuntime.getState().status, 'ready');
+  assert.equal(after.summary, '人工稿权威');
+  assert.notEqual(after.memoryId, before.memoryId);
+  assert.equal(h.calls.length, 1);
+  assert.equal(JSON.parse(h.calls[0].taskMessages[0].content).payload.canonicalContent, 'A人工改后正文。');
+});
+
+test('主动重提缺标当前新swipe按所选正文更新本楼', async () => {
+  const h = await manualReextractHarness(); const old = h.runtime.getState().floors[0];
+  h.context.chat[0].swipes.push('当前选中的第二回复'); h.context.chat[0].swipe_id = 1;
+  h.context.chat[0].mes = h.context.chat[0].swipes[1]; delete h.context.chat[0].extra.qianqianjie_floor;
+  await h.runtime.extractFloor(old.floorId, { analyzeState: false });
+  assert.equal(h.context.chat[0].extra.qianqianjie_floor.floorId, old.floorId);
+  assert.equal(h.calls.length, 1);
+  assert.equal(JSON.parse(h.calls[0].taskMessages[0].content).payload.canonicalContent, '当前选中的第二回复');
+  assert.notEqual(h.runtime.getState().floors[0].memoryId, old.memoryId);
+});
+
+test('主动重提目标见证在正文/swipe/删重插/切chat后拒绝，零模型与补标', async t => {
+  for (const mutation of ['body', 'swipe', 'replace', 'chat']) await t.test(mutation, async () => {
+    const h = await manualReextractHarness();
+    const floor = h.runtime.getState().floors[0];
+    const target = h.runtime.captureExtractionTarget(floor.floorId, { messageIndex: 0 });
+    if (mutation === 'body') h.context.chat[0].swipes[0] = '变更正文';
+    if (mutation === 'swipe') { h.context.chat[0].swipes.push('另一回复'); h.context.chat[0].swipe_id = 1; }
+    if (mutation === 'replace') h.context.chat[0] = structuredClone(h.context.chat[0]);
+    if (mutation === 'chat') h.context.chatId = 'changed-chat';
+    await assert.rejects(h.runtime.extractFloor(floor.floorId, { extractionTarget: target, analyzeState: false }),
+      error => error.code === 'V3_MEMORY_EXTRACTION_TARGET_CHANGED');
+    assert.equal(h.calls.length, 0);
+  });
+});
+
+test('重提当前B不借A旧位置覆盖：缺标B上移仍按唯一正文提B', async () => {
+  const h = await manualReextractHarness();
+  const [a, b] = h.runtime.getState().floors;
+  h.context.chat.splice(0, 2); delete h.context.chat[0].extra.qianqianjie_floor;
+  const target = h.runtime.captureExtractionTarget(a.floorId, { messageIndex: 0 });
+  await h.runtime.extractFloor(a.floorId, { extractionTarget: target, analyzeState: false });
+  assert.equal(h.context.chat[0].extra.qianqianjie_floor.floorId, b.floorId);
+  assert.equal(h.calls.length, 1);
+  assert.equal(JSON.parse(h.calls[0].taskMessages[0].content).payload.canonicalContent, 'B独有旧正文。');
+  assert.notEqual(h.runtime.getState().floors.find(f => f.floorId === b.floorId)?.memoryId, b.memoryId);
+});
+
+test('主动重提先补标失败无模型，原按钮重试一次提取；无关失配楼保留原稿', async () => {
+  const h = await manualReextractHarness();
+  const [a, b] = h.runtime.getState().floors;
+  for (const index of [0, 2]) { h.context.chat[index].mes += '改文'; h.context.chat[index].swipes = [h.context.chat[index].mes]; delete h.context.chat[index].extra.qianqianjie_floor; }
+  const target = h.runtime.captureExtractionTarget(b.floorId, { messageIndex: 2 });
+  h.failSave(true);
+  await assert.rejects(h.runtime.extractFloor(b.floorId, { extractionTarget: target, analyzeState: false }),
+    error => error.code === 'V3_MESSAGE_ANCHOR_SAVE_FAILED');
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.runtime.getState().floors.find(f => f.floorId === b.floorId).memoryId, b.memoryId);
+  h.failSave(false);
+  await h.runtime.extractFloor(b.floorId, { extractionTarget: target, analyzeState: false });
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.runtime.getState().floors.find(f => f.floorId === a.floorId).memoryId, a.memoryId);
+  assert.notEqual(h.runtime.getState().floors.find(f => f.floorId === b.floorId).memoryId, b.memoryId);
+});
+
+test('主动重提纠正当前消息foreign/错楼/重复标记，不覆盖别楼稿', async t => {
+  for (const kind of ['foreign', 'wrongFloor', 'duplicate']) await t.test(kind, async () => {
+    const h = await manualReextractHarness();
+    const [a, b] = h.runtime.getState().floors;
+    h.context.chat[2].extra.qianqianjie_floor = { schemaVersion: 1,
+      chatId: kind === 'foreign' ? 'ffffffff-ffff-4fff-8fff-ffffffffffff' : CHAT,
+      floorId: kind === 'duplicate' || kind === 'wrongFloor' ? a.floorId : b.floorId };
+    const target = h.runtime.captureExtractionTarget(b.floorId, { messageIndex: 2 });
+    await h.runtime.extractFloor(b.floorId, { extractionTarget: target, analyzeState: false });
+    assert.equal(h.context.chat[2].extra.qianqianjie_floor.floorId, b.floorId);
+    assert.equal(h.context.chat[2].extra.qianqianjie_floor.chatId, CHAT);
+    assert.equal(h.runtime.getState().floors.find(f => f.floorId === a.floorId).memoryId, a.memoryId);
+    assert.notEqual(h.runtime.getState().floors.find(f => f.floorId === b.floorId).memoryId, b.memoryId);
+    assert.equal(h.calls.length, 1);
+  });
+});
+
+test('补标成功而提取失败保旧摘要，原按钮重试沿原一次提取', async () => {
+  let failRequest = false;
+  const h = await manualReextractHarness({ utility: () => {
+    if (failRequest) throw Object.assign(new Error('模拟请求被拒绝'), { status: 400, code: 'HTTP_400' });
+    return null;
+  } });
+  const old = h.runtime.getState().floors[0];
+  h.context.chat[0].mes = '改后当前正文'; h.context.chat[0].swipes = ['改后当前正文'];
+  delete h.context.chat[0].extra.qianqianjie_floor;
+  failRequest = true;
+  await h.runtime.extractFloor(old.floorId, { analyzeState: false });
+  assert.equal(h.context.chat[0].extra.qianqianjie_floor.floorId, old.floorId);
+  assert.equal(h.runtime.getState().floors[0].memoryId, old.memoryId);
+  assert.match(h.runtime.getState().lastExtractorError.message, /标记已保存.*摘要未更新/);
+  assert.equal(h.calls.length, 1);
+  failRequest = false; h.calls.splice(0);
+  await h.runtime.extractFloor(old.floorId, { analyzeState: false });
+  assert.equal(h.calls.length, 1);
+  assert.notEqual(h.runtime.getState().floors[0].memoryId, old.memoryId);
+});
+
+test('主动重提root响应丢失沿既有冷读确认，不重复已保存摘要请求', async () => {
+  const h = await manualReextractHarness(); const old = h.runtime.getState().floors[0];
+  h.backend.abortAfterNextPut(key => key === 'v3-root');
+  const result = await h.runtime.extractFloor(old.floorId, { analyzeState: false });
+  assert.equal(result.extractionFloorId, old.floorId);
+  assert.notEqual(h.runtime.getState().floors[0].memoryId, old.memoryId);
+  assert.equal(h.runtime.getState().lastExtractorError, null);
+  assert.equal(h.calls.length, 1);
+});
+
 test('正文编辑后的明确摘要重提不碰 CSE，显式 CSE 重分析只换本楼', async () => {
   let context;
   const persistAnchors = async ({ chatId, bindings }) => {
@@ -8181,21 +10464,19 @@ test('摘要在途 USER 编辑、删除和后置确认删除都提交捕获快�
 });
 
 
-test('时间接线：历史多楼摘要与CSE完成后只通知一批，不逐楼请求', async () => {
-  const batches = [];
+test('历史多楼摘要及CSE各自保存，原工作门禁完成后释放', async () => {
   const h = harness({ initialChat: [
     { is_user: false, mes: '裴晚生第一天手腕受伤。' }, { is_user: true, mes: '继续' },
     { is_user: false, mes: '裴晚生第二天手腕仍痛。' }, { is_user: true, mes: '继续' },
     { is_user: false, mes: '裴晚生第三天创口已干。' }, { is_user: true, mes: '继续' },
   ], utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
     ? { jsonData: { summary: '裴晚生的手腕伤势随时间变化。', people: [{ name: '裴晚生' }, { name: '林岚', role: 'user' }] } }
-    : { jsonData: { noMaterialChange: true } }, onMemoryBatchCommitted: receipt => { batches.push(receipt); } });
+    : { jsonData: { noMaterialChange: true } } });
   await h.runtime.start();
-  assert.equal(batches.length, 0);
   await h.runtime.startHistoricalRebuild();
   assert.equal(h.runtime.getState().rememberedCount, 3);
-  assert.equal(batches.length, 1);
-  assert.equal(batches[0].historical, true);
+  assert.equal(h.runtime.getState().memoryWorkBusy, false);
+  assert.equal(h.runtime.getState().cseReady, true);
 });
 
 test('历史流水真实请求重叠，摘要先/CSE先提交都保全图且各链最多一请求', async t => {
@@ -8205,10 +10486,8 @@ test('历史流水真实请求重叠，摘要先/CSE先提交都保全图且各�
     const cseGate = new Promise(resolve => { releaseCse = resolve; });
     const summaryStart = new Promise(resolve => { summaryStarted = resolve; });
     const cseStart = new Promise(resolve => { cseStarted = resolve; });
-    const active = { summary: 0, cse: 0 }, max = { summary: 0, cse: 0 }, order = [], summaries = [], batches = [];
+    const active = { summary: 0, cse: 0 }, max = { summary: 0, cse: 0 }, order = [];
     const h = harness({ initialChat: [user('开始'), ...['流水一', '流水二', '流水三', '流水四', '流水五'].map(assistant), user('确认')],
-      onAutomaticSummaryCommitted: receipt => summaries.push(receipt),
-      onMemoryBatchCommitted: receipt => { assert.deepEqual(active, { summary: 0, cse: 0 }); batches.push(receipt); },
       utility: async options => {
         const request = JSON.parse(options.taskMessages[0].content);
         const kind = request.task === 'extractFloorSemantics' ? 'summary' : 'cse';
@@ -8227,7 +10506,6 @@ test('历史流水真实请求重叠，摘要先/CSE先提交都保全图且各�
     const running = h.runtime.startHistoricalRebuild();
     await Promise.all([summaryStart, cseStart]);
     assert.deepEqual(active, { summary: 1, cse: 1 }, 'S(n+1)与CSE(n)真实同时在途');
-    assert.equal(batches.length, 0);
     assert.ok(order.indexOf('cse:流水二') < order.indexOf('summary:流水三'), '首楼基线初始化后，下一楼摘要与前一楼 CSE 流水并行');
     if (winner === 'summary') {
       releaseSummary();
@@ -8235,7 +10513,6 @@ test('历史流水真实请求重叠，摘要先/CSE先提交都保全图且各�
       assert.equal(h.runtime.getState().activeMemoryWork.phase, 'analyzingCse');
       assert.equal(h.runtime.getState().activeAutoMemory.phase, 'analyzingCse');
       assert.equal(h.runtime.getState().memoryWorkBusy, true, 'summary is saved, but the CSE worker still owns the batch lock');
-      assert.equal(batches.length, 0, '摘要结束时CSE仍在途，不提前通知时间任务');
       releaseCse();
     } else {
       releaseCse();
@@ -8245,8 +10522,6 @@ test('历史流水真实请求重叠，摘要先/CSE先提交都保全图且各�
     }
     await running;
     assert.deepEqual(max, { summary: 1, cse: 1 });
-    assert.equal(summaries.length, 5);
-    assert.equal(batches.length, 1);
     assert.deepEqual(order.filter(value => value.startsWith('cse:')), ['cse:流水一', 'cse:流水二', 'cse:流水三', 'cse:流水四', 'cse:流水五']);
     const graph = await h.store.readReachable({ mode: 'runtime' });
     assert.equal(graph.status, 'ready'); assert.equal(graph.floorMemories.length, 5); assert.equal(graph.stateDeltas.length, 5);
@@ -8261,9 +10536,7 @@ test('历史流水双在途暂停或切聊，两路迟到结果均不提交', as
     const cseGate = new Promise(resolve => { releaseCse = resolve; });
     const summaryStart = new Promise(resolve => { summaryStarted = resolve; });
     const cseStart = new Promise(resolve => { cseStarted = resolve; });
-    const batches = [];
     const h = harness({ initialChat: [user('开始'), ...['取消一', '取消二', '取消三', '取消四', '取消五'].map(assistant), user('确认')],
-      onMemoryBatchCommitted: receipt => batches.push(receipt),
       utility: async options => {
         const request = JSON.parse(options.taskMessages[0].content);
         const summary = request.task === 'extractFloorSemantics';
@@ -8296,47 +10569,38 @@ test('历史流水双在途暂停或切聊，两路迟到结果均不提交', as
     releaseSummary(); releaseCse(); rootGate?.release();
     await running;
     assert.deepEqual(h.backend.records.get(rootEntry[0]), durableRoot, '暂停或切聊后，持锁及等待提交的两路结果均不改旧root');
-    assert.equal(batches.length, 0, '取消批次不触发时间任务');
     assert.equal(h.calls.length, 5, '停止后不启动额外请求');
   });
 });
 
-test('刷新中断后手动补最后CSE才通知时间并落盘，非最后、失败和已ready重析不通知', async () => {
+test('刷新中断后手动补人物缺口，已有摘要和健康CSE继续保留', async () => {
   const seed = harness({ initialChat: [user('开始'), ...['林岚伤后观察', '林岚时间推进', '林岚当前观察'].map((text, index) => assistant(`<!-- QQJ-start | date=2026-09-15 | weekday=周二 | time=${8 + index}:00 -->${text}<!-- QQJ-end | date=2026-09-15 | weekday=周二 | time=${9 + index}:00 -->`)), user('确认')],
     utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT ? { jsonData: { summary: '林岚手腕擦伤仍可见', people: [{ name: '林岚', role: 'user' }], observations: [{ subject: '林岚', kind: 'injury', description: '手腕擦伤' }] } } : { jsonData: { noMaterialChange: true } } });
   await seed.runtime.start();
   for (const floor of seed.runtime.getState().floors) await seed.runtime.extractFloor(floor.floorId, { analyzeState: false });
   await seed.runtime.analyzeNextState();
-  let fail = true, timeCalls = 0, timePromise;
-  const receipts = [];
-  const timeStore = createTimeStore({ client: seed.backend.client });
-  let resumed;
-  const time = createTimeRuntime({ store: timeStore, foundationStore: seed.store, hostAdapter: seed.hostAdapter, session: { identity: () => ({ chatId: CHAT }) }, isEnabled: () => true, logger: { warn() {} },
-    getReachable: () => resumed.foundationRuntime.getReachable(), getMemoryState: () => resumed.runtime.getState(),
-    generateTimeTask: async options => { timeCalls += 1; const request = JSON.parse(options.taskMessages[0].content), source = request.observations[0]; assert.ok(source, '真实摘要身体观察进入时间任务'); return { changes: [{ itemId: null, sourceKeys: [source.sourceKey], subjectEntityId: request.people[0].entityId, type: 'body', label: '手腕擦伤', observation: '擦伤仍可见', occurrenceTime: '', dueTime: '', status: 'active', stateRefs: [] }] }; } });
-  resumed = harness({ sharedBackend: seed.backend, sharedContext: seed.context,
-    utility: () => { if (fail) throw new Error('受控CSE失败'); return { jsonData: { noMaterialChange: true } }; },
-    onMemoryBatchCommitted: receipt => { assert.equal(resumed.runtime.getState().memoryWorkBusy, false); receipts.push(receipt); timePromise = time.runBatch(receipt); } });
+  let fail = true;
+  const resumed = harness({ sharedBackend: seed.backend, sharedContext: seed.context,
+    utility: () => { if (fail) throw new Error('受控CSE失败'); return { jsonData: { noMaterialChange: true } }; } });
   await resumed.runtime.start();
   await resumed.runtime.analyzeNextState();
-  assert.equal(receipts.length, 0, '失败不通知');
+  assert.equal(resumed.runtime.getState().cseReady, false);
   fail = false;
   await resumed.runtime.analyzeNextState();
-  assert.equal(receipts.length, 0, '仍有最后缺口不通知');
+  assert.equal(resumed.runtime.getState().cseReady, false);
   const last = resumed.runtime.getState().floors.at(-1);
   await resumed.runtime.retryStateAnalysis(last.floorId);
-  await timePromise;
-  assert.equal(receipts.length, 1); assert.equal(timeCalls, 1);
-  const stored = await timeStore.read(CHAT);
-  assert.ok(stored.head); assert.equal(stored.batches.length, 1);
+  assert.equal(resumed.runtime.getState().cseReady, true);
+  assert.equal(resumed.runtime.getState().rememberedCount, 3);
   await resumed.runtime.retryStateAnalysis(last.floorId);
   await resumed.runtime.refreshStatus();
-  assert.equal(receipts.length, 1, '已ready重析或刷新不自动时间任务');
+  assert.equal(resumed.runtime.getState().cseReady, true);
+  assert.ok(resumed.calls.every(call => call.systemPrompt === CSE_SYSTEM_PROMPT), '手动补人物仅调用人物分析');
 });
 
-test('手动最后CSE取消不通知，时间开关关闭仍不调用时间模型', async () => {
+test('手动人物补齐取消释放工作门禁，时间开关关闭仍零调用', async () => {
   let release;
-  const h = harness({ utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT ? { jsonData: { summary: '摘要' } } : new Promise(resolve => { release = () => resolve({ jsonData: { noMaterialChange: true } }); }), onMemoryBatchCommitted: () => assert.fail('取消不得通知时间') });
+  const h = harness({ utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT ? { jsonData: { summary: '摘要' } } : new Promise(resolve => { release = () => resolve({ jsonData: { noMaterialChange: true } }); }) });
   await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
   const running = h.runtime.analyzeNextState();
   await waitFor(() => release); h.runtime.invalidate(); release(); await running;
@@ -8373,6 +10637,7 @@ test('千事历史计划只读，显式开始后每批一次请求并逐楼替�
   mode = 'history';
   const result = await h.runtime.startQianshiHistory(plan.planId);
   assert.equal(h.calls.length, beforePlanCalls + 1, '同一批只调用一次模型');
+  assertQianshiLifecycleGuidance(h.calls.at(-1).systemPrompt);
   assert.match(h.calls.at(-1).systemPrompt, /同一场景同一事项的连续动作合成一件完整事件/u);
   assert.match(h.calls.at(-1).systemPrompt, /同一人物、同一天或相似主题不足以认定接续/u);
   assert.match(h.calls.at(-1).systemPrompt, /每楼必须检查并返回 qianshi.*qianshi 独立于 summary/u);
@@ -8395,28 +10660,107 @@ test('千事历史计划只读，显式开始后每批一次请求并逐楼替�
   assert.deepEqual(afterHistory.stateDeltas, preservedCse, '历史补齐不改写已落盘 CSE');
 });
 
+test('千事历史补齐保存 partial 原因并保持逐楼完整与部分计数', async () => {
+  let mode = 'summary', graphProjectionCalls = 0;
+  const graphProjectionInputs = [];
+  const h = harness({ initialChat: [user('开始'), assistant('第一楼有两条记录。'), user('继续'), assistant('第二楼一条记录。'), user('稳定')],
+    qianshiGraphProjector: (...args) => { graphProjectionCalls += 1; graphProjectionInputs.push({ head: args[0].root.headCheckpointId, floors: args[0].floors.length, memories: args[0].floorMemories.length }); return projectQianshiGraph(...args); },
+    utility: options => {
+      if (mode === 'summary') return options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+        ? { jsonData: { summary: '保留原摘要。' } } : { jsonData: { noMaterialChange: true } };
+      const request = JSON.parse(options.taskMessages[0].content);
+      return { jsonData: { floors: request.floors.map(value => ({ floorKey: value.floorKey, qianshi: { events:
+        value.floorKey === 'floor-1' ? [
+          { key: 'valid', title: '有效记录', description: '有效内容应保留', status: 'occurred', matter: false },
+          { key: 'invalid', title: '状态不明记录', description: '无效状态应报告', lineStatus: 'not-a-status', actionStatus: 'occurred', matter: false },
+        ] : [{ key: 'complete', title: '完整记录', description: '完整楼结果', status: 'occurred', matter: false }], order: [] } })) } };
+    } });
+  await h.runtime.start();
+  for (const value of h.runtime.getState().floors) await h.runtime.extractFloor(value.floorId);
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  const summaries = before.floorMemories.map(value => [value.floorId, value.summary]);
+  const cse = structuredClone(before.stateDeltas);
+  const historyPlan = await h.runtime.prepareQianshiHistory();
+  graphProjectionCalls = 0; graphProjectionInputs.length = 0;
+  mode = 'history'; const result = await h.runtime.startQianshiHistory(historyPlan.planId);
+  assert.equal(graphProjectionCalls, 3, '批次全图投影一次，两个不同历史前缀各投影一次');
+  assert.deepEqual(graphProjectionInputs.map(value => [value.floors, value.memories]), [[2, 2], [0, 0], [1, 1]]);
+  assert.ok(graphProjectionInputs.every(value => value.head === before.root.headCheckpointId), '同批不为每楼重复重载整图');
+  assert.equal(result.status, 'partial');
+  assert.equal(result.savedCompleteFloors, 1);
+  assert.equal(result.savedPartialFloors, 1);
+  assert.deepEqual(result.outcomes.map(value => value.status), ['saved-partial', 'saved-complete']);
+  assert.equal(result.outcomes[0].reasonCode, 'QIANSHI_HISTORY_EVENT_PARTIAL');
+  assert.match(result.outcomes[0].message, /状态无法识别/u);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  const partialDelta = after.floorMemories.find(value => value.floorId === result.outcomes[0].floorId).qianshiDelta;
+  assert.equal(partialDelta.events.length, 1, '有效事件正常保存');
+  assert.equal(partialDelta.events[0].title, '有效记录');
+  assert.match(partialDelta.reason, /状态无法识别/u, '中文编译原因写入原千事状态');
+  assert.deepEqual(after.floorMemories.map(value => [value.floorId, value.summary]), summaries, '摘要不变');
+  assert.deepEqual(after.stateDeltas, cse, 'CSE 不变');
+});
+
+test('千事历史写入回执丢失后按回读结果保留 saved-partial 与原因', async () => {
+  let mode = 'summary';
+  const h = harness({ initialChat: [user('开始'), assistant('待补千事事实。'), user('确认楼')], utility: options => {
+    if (mode === 'summary') return options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+      ? { jsonData: { summary: '已保存摘要。' } } : { jsonData: { noMaterialChange: true } };
+    assert.match(options.systemPrompt, /160 条事件、320 条不同有效关系.*40 位人物/u);
+    return { jsonData: { floors: [{ floorKey: 'floor-1', qianshi: { events: [
+      { key: 'valid', title: '保留事件', description: '有效事件内容。', status: 'occurred', matter: false },
+      { key: 'invalid', title: '无效状态', description: '原因需要保留。', lineStatus: 'bad-status', actionStatus: 'occurred', matter: false },
+    ], order: [] } }] } };
+  } });
+  await h.runtime.start();
+  const [floor] = h.runtime.getState().floors; await h.runtime.extractFloor(floor.floorId);
+  const plan = await h.runtime.prepareQianshiHistory(); mode = 'history';
+  let durableRootWrite = false;
+  h.backend.setAfterPut(async ({ key }) => {
+    if (key !== 'v3-root') return;
+    durableRootWrite = true; throw new Error('模拟写入响应丢失');
+  });
+  const result = await h.runtime.startQianshiHistory(plan.planId);
+  assert.equal(durableRootWrite, true);
+  assert.equal(result.status, 'partial');
+  assert.equal(result.savedPartialFloors, 1);
+  assert.equal(result.outcomes[0].status, 'saved-partial');
+  assert.equal(result.outcomes[0].reasonCode, 'QIANSHI_HISTORY_EVENT_PARTIAL');
+  assert.match(result.outcomes[0].message, /整件事或本次动作状态无法识别/u);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(after.floorMemories.find(value => value.floorId === floor.floorId).qianshiDelta.events[0].title, '保留事件');
+});
+
 test('已存千事重判按record-N保文字和ID、读取前楼暂存候选并仅一次提交整组', async () => {
-  let mode = 'summary', externalReferences = [];
+  let mode = 'summary', externalReferences = [], graphProjectionCalls = 0, rejudgePrompts = [];
   const h = harness({ initialChat: [user('归还旧书计划'), assistant('双方建立归还旧书计划，暂定明日交接。'),
-    assistant('双方继续归还旧书计划，并约定在钟楼交接。'), user('稳定楼')], utility: options => {
+    assistant('双方继续归还旧书计划，并约定在钟楼交接。'), user('稳定楼')],
+    qianshiGraphProjector: (...args) => { graphProjectionCalls += 1; return projectQianshiGraph(...args); }, utility: options => {
     if (mode === 'summary') return options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
       ? { jsonData: { summary: '本楼保留摘要。' } } : { jsonData: { noMaterialChange: true } };
     const request = JSON.parse(options.taskMessages[0].content);
-    if (mode === 'history') return { jsonData: { floors: request.floors.map((item, index) => ({ floorKey: item.floorKey, qianshi: { events: [
+    if (mode === 'history') {
+      assert.match(options.systemPrompt, /160 条事件、320 条不同有效关系.*40 位人物/u);
+      return { jsonData: { floors: request.floors.map((item, index) => ({ floorKey: item.floorKey, qianshi: { events: [
       { key: `event-${index + 1}`, title: index ? '第二楼原题' : '第一楼原题', description: index ? '第二楼原经过' : '第一楼原经过',
         status: 'planned', matter: true, object: index ? '第二楼原物' : '第一楼原物', people: ['原人物'], storyTime: `2026-08-0${index + 1} 10:00`, scheduledTime: '明日' },
     ], order: [] } })) } };
+    }
     assert.match(options.systemPrompt, /已存千事重判器/u);
+    rejudgePrompts.push(options.systemPrompt);
+    assert.match(options.systemPrompt, /160 条事件、320 条不同有效关系.*40 位人物/u);
     assert.match(options.systemPrompt, /一次性新事实或互动变化可记为 matter=false，计划与持续事项仍按 matter\/progress 合同记录/u);
     assert.match(options.systemPrompt, /planned.*inProgress.*completed.*cancelled.*occurred.*unknown/u);
-    assert.equal(request.records[0].key, 'record-1');
-    if (request.floor === 'floor-2') assert.ok(request.qianshiCandidates.some(item => item.title === '第一楼原题'), '后楼候选来自已暂存的前楼新图');
-    const event = request.floor === 'floor-1'
-      ? { key: 'record-1', lineStatus: 'ongoing', actionStatus: 'done', matter: true }
-      : { key: 'record-1', lineStatus: 'completed', actionStatus: 'completed',
-        // 与真实重判返回相同：type/target别名且省略matter，仍须串线并一次保存。
-        links: [{ target: 'candidate-1', type: 'progress' }, { target: 'candidate-background', type: 'context' }] };
-    return { jsonData: { qianshi: { events: [event], order: [] } } };
+    assert.equal(request.floors[0].records[0].key, 'record-1');
+    return rejudgeBatchResponse(request, request => {
+      if (request.floor === 'floor-2') assert.ok(request.qianshiCandidateKeys.includes('floor-1:record-1'), '后楼通过明确来源键读取前楼本次新判');
+      const event = request.floor === 'floor-1'
+        ? { key: 'record-1', lineStatus: 'ongoing', actionStatus: 'done', matter: true }
+        : { key: 'record-1', lineStatus: 'completed', actionStatus: 'completed',
+          // 与真实重判返回相同：type/target别名且省略matter，仍须串线并一次保存。
+          links: [{ target: 'floor-1:record-1', type: 'progress' }, { target: 'floor-1:record-1', type: 'context' }] };
+      return { events: [event], order: [] };
+    });
   }, qianshiExternalReferenceProvider: () => externalReferences });
   await h.runtime.start();
   for (const value of h.runtime.getState().floors) await h.runtime.extractFloor(value.floorId);
@@ -8434,20 +10778,26 @@ test('已存千事重判按record-N保文字和ID、读取前楼暂存候选并�
   const blank = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: '0', toMessageIndex: '  ' });
   assert.equal(blank.totalFloors, 2, '空字符串终点不能被当成第0楼');
   const plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: 0, toMessageIndex: null });
-  assert.equal(plan.status, 'ready'); assert.equal(plan.totalFloors, 2); assert.equal(plan.apiCalls, 2);
+  assert.equal(plan.status, 'ready'); assert.equal(plan.totalFloors, 2); assert.equal(plan.historyApiCalls, 1); assert.equal(plan.followup.apiCalls, 1);
   const oldMemoryKeys = new Set(before.floorMemories.map(memory => h.store.recordKey(memory)));
   const memoryReads = () => h.backend.calls.filter(call => call[0] === 'get' && oldMemoryKeys.has(call[2])).length;
   const memoryReadsBefore = memoryReads();
   mode = 'rejudge';
+  graphProjectionCalls = 0;
   const rootGate = h.backend.holdNextRootPut();
   const pending = h.runtime.startQianshiRejudge(plan.planId);
   await rootGate.started;
   assert.equal(h.runtime.getQianshiSnapshot().history.committing, true, '单次root CAS前显示不可取消的提交阶段');
+  assert.equal(h.runtime.getQianshiStatus().history.request.phase, 'saving', '重判整组提交等待期间保留saving诊断');
+  assert.equal(h.runtime.getQianshiStatus().history.request.outcome, 'running');
   await h.runtime.stopQianshiHistory();
   assert.equal(h.runtime.getQianshiSnapshot().history.status, 'running', 'root CAS期间停止请求不会谎称整组零写');
   rootGate.release();
   const result = await pending;
-  assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.calls, 2);
+  rejudgePrompts.forEach(assertQianshiLifecycleGuidance);
+  assert.equal(graphProjectionCalls, 5, '两楼重判图按原缓存复用，末阶段一次全局投影');
+  assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.calls, 1);
+  assert.equal(h.runtime.getQianshiStatus().history.request.outcome, 'completed');
   assert.ok(memoryReads() - memoryReadsBefore <= before.floorMemories.length,
     '请求前后只核对root版本，旧楼档案最多完整读取一次，不能按楼反复拉取整档');
   const after = await h.store.readReachable({ mode: 'runtime' });
@@ -8464,7 +10814,78 @@ test('已存千事重判按record-N保文字和ID、读取前楼暂存候选并�
     '所有楼只通过一个root CAS发布');
 });
 
-test('已存千事重判逐楼保留partial原因，整组partial且只计完整楼', async () => {
+test('同版存档2/4楼重判按楼线性完整核raw正文与memory并保留结果', async () => {
+  for (const floorCount of [2, 4]) {
+    let mode = 'summary', graphProjectionCalls = 0, rejudgeCalls = 0;
+    const initialChat = [user('开始')];
+    for (let index = 0; index < floorCount; index += 1) initialChat.push(assistant(`第${index + 1}楼稳定事实。`));
+    initialChat.push(user('确认'));
+    const h = harness({ initialChat, captureBusinessIdentity: () => ({ chatId: CHAT, hostChatId: 'host-chat',
+      characterLocator: 'character.png', personaLocator: 'persona.png' }), qianshiGraphProjector: (...args) => {
+      graphProjectionCalls += 1; return projectQianshiGraph(...args);
+    }, utility: options => {
+      if (mode === 'summary') return options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+        ? { jsonData: { summary: '逐楼摘要保留。' } } : { jsonData: { noMaterialChange: true } };
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (mode === 'history') return { jsonData: { floors: request.floors.map(value => ({ floorKey: value.floorKey, qianshi: { events: [
+        { key: `history-${value.floorKey}`, title: `${value.floorKey}原事项`, description: `${value.floorKey}原经过。`, status: 'occurred', matter: false },
+      ], order: [] } })) } };
+      rejudgeCalls += 1;
+      return rejudgeBatchResponse(request, () => ({ events: [{ key: 'record-1', title: '模型新标题会被忽略', description: '模型新经过会被忽略',
+        lineStatus: 'completed', actionStatus: 'occurred', matter: false }], order: [] }));
+    } });
+    await h.runtime.start();
+    for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId);
+    mode = 'history';
+    const historyPlan = await h.runtime.prepareQianshiHistory();
+    assert.equal((await h.runtime.startQianshiHistory(historyPlan.planId)).status, 'completed');
+    const plan = await h.runtime.prepareQianshiRejudge();
+    assert.equal(plan.totalFloors, floorCount);
+    const source = await h.store.readReachable({ mode: 'runtime' });
+    const floorIds = new Set(plan.floors.map(item => source.floors.find(floor => floor.assistantSeq === item.assistantSeq)?.id).filter(Boolean));
+    const rawContents = new Set(source.floors.filter(floor => floorIds.has(floor.id))
+      .map(floor => h.context.chat[floor.hostLocator.messageIndex].mes));
+    const memoryIds = new Set(source.floorMemories.filter(memory => floorIds.has(memory.floorId)).map(memory => memory.id));
+    const subtle = globalThis.crypto.subtle, digestDescriptor = Object.getOwnPropertyDescriptor(subtle, 'digest');
+    const originalDigest = subtle.digest, stringifyDescriptor = Object.getOwnPropertyDescriptor(JSON, 'stringify');
+    const originalStringify = JSON.stringify;
+    const rawHashCalls = { rejudgeSnapshot: 0, floorValidation: 0, coverageScan: 0, other: 0 };
+    let fullMemorySerializations = 0;
+    Object.defineProperty(subtle, 'digest', { configurable: true, writable: true, value(algorithm, data) {
+      if (rawContents.has(new TextDecoder().decode(data))) {
+        const stack = new Error().stack;
+        if (stack.includes('assertQianshiRejudgeSnapshot')) rawHashCalls.rejudgeSnapshot += 1;
+        else if (stack.includes('validateFoundationFloorContent')) rawHashCalls.floorValidation += 1;
+        else if (stack.includes('scanAssistantCandidates')) rawHashCalls.coverageScan += 1;
+        else rawHashCalls.other += 1;
+      }
+      return originalDigest.call(subtle, algorithm, data);
+    } });
+    Object.defineProperty(JSON, 'stringify', { configurable: true, writable: true, value(value, ...args) {
+      if (value && typeof value === 'object' && memoryIds.has(value.id) && value.qianshiDelta) fullMemorySerializations += 1;
+      return originalStringify.call(JSON, value, ...args);
+    } });
+    graphProjectionCalls = 0; mode = 'rejudge';
+    let result;
+    try { result = await h.runtime.startQianshiRejudge(plan.planId); }
+    finally {
+      if (digestDescriptor) Object.defineProperty(subtle, 'digest', digestDescriptor); else delete subtle.digest;
+      if (stringifyDescriptor) Object.defineProperty(JSON, 'stringify', stringifyDescriptor); else delete JSON.stringify;
+    }
+    assert.equal(result.status, 'completed', JSON.stringify({ result, warnings: h.warnings }));
+    assert.equal(result.calls, plan.historyApiCalls + result.followup.calls, '历史批次外只发实际需要的全局收尾');
+    assert.equal(rejudgeCalls, plan.historyApiCalls);
+    assert.deepEqual(rawHashCalls, { rejudgeSnapshot: floorCount * 2, floorValidation: floorCount * 2,
+      coverageScan: floorCount * 2, other: 0 }, '重判自身只在初次和最终完整核hash正文；floor schema及提交覆盖扫描各自仍按真实保存合同线性hash');
+    assert.equal(fullMemorySerializations, 0, '重判只签实际千事输入，不序列化整份旧memory');
+    assert.equal(graphProjectionCalls, floorCount + 3, '原历史图按原合同复用，末阶段仅增加一次全局投影');
+    const saved = await h.store.readReachable({ mode: 'runtime' });
+    assert.equal(saved.floorMemories.filter(memory => memory.qianshiDelta?.events?.length).length, floorCount,
+      '完整核复用不影响各楼结果保存');
+  }
+});
+
+test('已存千事重判保留partial质量原因，本轮完成且完整楼独立计数', async () => {
   let mode = 'summary';
   const h = harness({ initialChat: [user('旧计划'), assistant('第一楼记录一和二。'), user('继续'), assistant('第二楼另一件事。'), user('稳定楼')], utility: options => {
     if (mode === 'summary') return options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
@@ -8475,13 +10896,15 @@ test('已存千事重判逐楼保留partial原因，整组partial且只计完整
         { key: 'old-one', title: '原事实一', description: '原经过一', status: 'occurred', matter: false },
         { key: 'old-two', title: '原事实二', description: '原经过二', status: 'occurred', matter: false },
       ] : [{ key: 'old-three', title: '原事实三', description: '原经过三', status: 'occurred', matter: false }], order: [] } })) } };
-    if (request.floor === 'floor-1') return { jsonData: { qianshi: { events: [
-      { key: 'record-1', lineStatus: 'not-a-status', actionStatus: 'occurred', matter: false },
-      { key: 'record-2', lineStatus: 'completed', actionStatus: 'completed', matter: false },
-    ], order: [] } } };
-    return { jsonData: { qianshi: { events: [
-      { key: 'record-1', lineStatus: 'completed', actionStatus: 'completed', matter: false },
-    ], order: [] } } };
+    return rejudgeBatchResponse(request, request => {
+      if (request.floor === 'floor-1') return { events: [
+        { key: 'record-1', lineStatus: 'not-a-status', actionStatus: 'occurred', matter: false },
+        { key: 'record-2', lineStatus: 'completed', actionStatus: 'completed', matter: false },
+      ], order: [] };
+      return { events: [
+        { key: 'record-1', lineStatus: 'completed', actionStatus: 'completed', matter: false },
+      ], order: [] };
+    });
   } });
   await h.runtime.start();
   for (const value of h.runtime.getState().floors) await h.runtime.extractFloor(value.floorId);
@@ -8493,13 +10916,14 @@ test('已存千事重判逐楼保留partial原因，整组partial且只计完整
   mode = 'rejudge';
   const plan = await h.runtime.prepareQianshiRejudge();
   const result = await h.runtime.startQianshiRejudge(plan.planId);
-  assert.equal(result.status, 'partial');
+  assert.equal(result.status, 'completed');
   assert.equal(result.savedCompleteFloors, 1, '只计第二楼完整保存');
   assert.deepEqual(result.outcomes.map(item => item.status), ['saved-partial', 'saved-complete']);
   assert.equal(result.outcomes[0].reasonCode, 'QIANSHI_REJUDGE_EVENT_PARTIAL');
-  assert.match(result.outcomes[0].message, /整线或动作状态无法识别/u, '逐楼结果展示编译器给出的无效状态原因');
-  assert.match(result.outcomes[0].message, /record-1/u, '逐楼结果指出未通过判断的精确旧记录键');
-  assert.match(result.message, /1 楼只有部分记录/u);
+  assert.match(result.outcomes[0].message, /整件事或本次动作状态无法识别/u, '逐楼结果展示编译器给出的无效状态原因');
+  assert.match(result.outcomes[0].message, /1 条旧记录没有得到有效重判，已按原值保留/u, '逐楼结果说明未完成旧记录数量及保留行为');
+  assert.doesNotMatch(result.outcomes[0].message, /record-1/u, '用户提示不暴露内部绑定键');
+  assert.match(result.message, /1 楼部分旧记录沿用原值/u);
   const after = await h.store.readReachable({ mode: 'runtime' });
   assert.deepEqual(after.floorMemories.flatMap(memory => memory.qianshiDelta.events.map(event => event.id)).sort(), oldIds,
     '无效状态记录按原值保留，其他明确结果照常提交');
@@ -8566,18 +10990,20 @@ test('重判第二楼读root超时明确计失败楼，原档保留且不重试'
   for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId);
   mode = 'history';
   const history = await h.runtime.prepareQianshiHistory(); await h.runtime.startQianshiHistory(history.planId);
-  const plan = await h.runtime.prepareQianshiRejudge();
+  const plan = await h.runtime.prepareQianshiRejudge({ maxOutputTokens: 1200 });
   const rootPuts = h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length;
   mode = 'rejudge';
   const result = await h.runtime.startQianshiRejudge(plan.planId);
   assert.equal(result.status, 'failed'); assert.equal(result.processedFloors, 1); assert.equal(result.failedFloors, 1);
   assert.equal(result.calls, 2); assert.equal(rejudgeCalls, 2, '后台读取失败不重复调用模型');
   assert.equal(result.outcomes.at(-1).assistantSeq, 2); assert.equal(result.outcomes.at(-1).reasonCode, 'BACKEND_TIMEOUT');
+  assert.equal(result.request.phase, 'validating'); assert.equal(result.request.outcome, 'failed');
+  assert.equal(result.request.error.code, 'BACKEND_TIMEOUT'); assert.equal(result.request.lastAttemptError, null);
   assert.match(result.message, /整组未提交/u);
   assert.equal(h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length, rootPuts);
 });
 
-test('重判复用存档时仍拒绝请求期间改正文或改root版本', async () => {
+test('重判拒绝真实正文变化，独立root元数据版本推进仍承接', async () => {
   for (const mutation of ['source', 'root']) {
     let mode = 'summary', h;
     h = harness({ initialChat: [user('起点'), assistant('原始正文。'), user('稳定')], captureBusinessIdentity: () => ({
@@ -8598,11 +11024,18 @@ test('重判复用存档时仍拒绝请求期间改正文或改root版本', asyn
     } });
     await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId);
     mode = 'history'; const history = await h.runtime.prepareQianshiHistory(); await h.runtime.startQianshiHistory(history.planId);
-    const plan = await h.runtime.prepareQianshiRejudge(), rootPuts = h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length;
+    const original = await h.store.readReachable({ mode: 'runtime' });
+    const plan = await h.runtime.prepareQianshiRejudge();
     mode = 'rejudge'; const result = await h.runtime.startQianshiRejudge(plan.planId);
-    assert.equal(result.status, 'failed', mutation); assert.equal(result.calls, 1);
-    assert.equal(result.outcomes.at(-1).reasonCode, mutation === 'source' ? 'QIANSHI_REJUDGE_SOURCE_CHANGED' : 'QIANSHI_REJUDGE_PLAN_STALE');
-    assert.equal(h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length, rootPuts);
+    assert.equal(result.calls, 1);
+    if (mutation === 'source') {
+      assert.equal(result.status, 'failed'); assert.equal(result.savedFloors, 0);
+      assert.ok(['QIANSHI_REJUDGE_SOURCE_CHANGED', 'QIANSHI_REJUDGE_PLAN_STALE'].includes(result.failure.code));
+      assert.deepEqual((await h.store.readReachable({ mode: 'runtime' })).floorMemories, original.floorMemories);
+    } else {
+      assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.commitStatus, 'saved');
+      assert.equal(result.savedFloors, 1);
+    }
   }
 });
 
@@ -8819,7 +11252,12 @@ test('千事历史启动先发布读档与候选阶段，再进入模型任务�
   let heldRead = false;
   const h = harness({ initialChat: [user('开始'), assistant('顾舟答应归还旧书。'), user('稳定')], utility: async options => {
     if (mode === 'summary') return { jsonData: { summary: '顾舟答应归还旧书。' } };
-    markModel(); await modelWait;
+    markModel();
+    options.transportBudget.used = 1;
+    options.transportBudget.remaining = 2;
+    options.transportBudget.diagnostic.phase = 'responseBody';
+    options.transportBudget.diagnostic.phaseStartedAt = Date.now();
+    await modelWait;
     const request = JSON.parse(options.taskMessages[0].content);
     return { jsonData: { floors: request.floors.map(value => ({ floorKey: value.floorKey, qianshi: { events: [
       { key: 'event-1', title: '归还旧书', description: '顾舟答应归还旧书。', status: 'occurred', matter: false },
@@ -8844,10 +11282,156 @@ test('千事历史启动先发布读档与候选阶段，再进入模型任务�
   const requesting = h.runtime.getQianshiSnapshot().history;
   assert.equal(requesting.calls, 1, '模型任务尝试数只在准备完本批后递增');
   assert.match(requesting.message, /正在调用第 1\/1 批模型任务/u);
+  assert.equal(requesting.request.phase, 'responseBody');
+  assert.equal(h.runtime.getQianshiStatus().history.request.phase, 'responseBody');
+  const versionBeforeElapsed = h.runtime.getQianshiSnapshotVersion();
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(h.runtime.getQianshiSnapshotVersion(), versionBeforeElapsed, '纯耗时变化不使千事快照版本抖动');
   assert.equal(h.calls.length, callsBeforeHistory + 1, '已进入 fake 模型任务');
   releaseModel();
   const result = await running;
   assert.equal(result.status, 'completed');
+});
+
+test('千事历史请求暴露独立传输诊断并沿用三次预算', async () => {
+  let mode = 'summary', initialBudget = null;
+  const h = harness({ initialChat: [user('开始'), assistant('顾舟答应归还旧书。'), user('稳定')], utility: async options => {
+    if (mode === 'summary') return { jsonData: { summary: '顾舟答应归还旧书。' } };
+    initialBudget = { remaining: options.transportBudget.remaining, used: options.transportBudget.used };
+    options.transportBudget.used = 1;
+    options.transportBudget.remaining = 2;
+    const request = JSON.parse(options.taskMessages[0].content);
+    return { jsonData: { floors: request.floors.map(value => ({ floorKey: value.floorKey, qianshi: { events: [
+      { key: 'event-1', title: '归还旧书', description: '顾舟归还旧书。', status: 'occurred', matter: false },
+    ], order: [] } })) } };
+  } });
+  await h.runtime.start();
+  const floor = h.runtime.getState().floors[0]; await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const plan = await h.runtime.prepareQianshiHistory(); mode = 'history';
+  const result = await h.runtime.startQianshiHistory(plan.planId);
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(initialBudget, { remaining: 3, used: 0 });
+  const request = h.runtime.getQianshiSnapshot().history.request;
+  assert.equal(request.outcome, 'completed');
+  assert.equal(request.phase, 'saving');
+  assert.equal(request.attempts, 1);
+  assert.equal(request.error, null);
+});
+
+test('千事历史真实 compact/router 加诊断前后尝试数相同，成功与429/5xx及超时均有回执', async () => {
+  const scenarios = [
+    { name: 'success', statuses: [], expectedAttempts: 1, expectedOutcome: 'completed' },
+    { name: '429-recover', statuses: [429], expectedAttempts: 2, expectedOutcome: 'completed', keepLastAttempt: true },
+    { name: '429-exhausted', statuses: [429, 429, 429], expectedAttempts: 3, expectedOutcome: 'failed' },
+    { name: '5xx-exhausted', statuses: [503, 503, 503], expectedAttempts: 3, expectedOutcome: 'failed' },
+    { name: 'timeout', timeout: true, expectedAttempts: 3, expectedOutcome: 'failed' },
+  ];
+  for (const scenario of scenarios) for (const withBudget of [false, true]) {
+    let historyAttempts = 0, statuses = [...(scenario.statuses ?? [])];
+    const client = createCompactApiClient({ retryWait: async () => {}, timeoutMs: () => scenario.timeout ? 5 : 5000, fetchImpl: async (_path, options) => {
+      const input = JSON.parse(options.body), task = JSON.parse(input.messages.at(-1).content);
+      const content = task.task === 'extractFloorSemantics' ? { summary: '顾舟答应归还旧书。' } : {
+        floors: task.floors.map(value => ({ floorKey: value.floorKey, qianshi: { events: [{ key: 'event-1', title: '归还旧书', description: '顾舟归还旧书。', status: 'occurred', matter: false }], order: [] } })),
+      };
+      if (task.task === 'extractFloorSemantics') return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } });
+      historyAttempts += 1;
+      if (scenario.timeout) return await new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(Object.assign(new Error('timeout'), { name: 'AbortError' })), { once: true }));
+      const status = statuses.shift();
+      if (status) return new Response(JSON.stringify({ error: { message: `fixture ${status}` } }), { status, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } });
+    }});
+    const router = createTaskRouter({ resolver: { resolveUtility: () => ({ kind: 'independent', source: 'fixture', config: { url: 'https://fixture.invalid', key: 'fixture', model: 'fixture' } }), resolve: () => ({ kind: 'independent' }) }, compactClient: client });
+    const h = harness({ initialChat: [user('开始'), assistant('顾舟答应归还旧书。'), user('稳定')], utility: options => {
+      const { transportBudget, ...request } = options;
+      return router.generateUtilityTask(withBudget ? options : request);
+    } });
+    await h.runtime.start();
+    const floor = h.runtime.getState().floors[0]; await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    const beforeHistory = historyAttempts; const plan = await h.runtime.prepareQianshiHistory();
+    const result = await h.runtime.startQianshiHistory(plan.planId);
+    const request = h.runtime.getQianshiStatus().history.request;
+    assert.equal(historyAttempts - beforeHistory, scenario.expectedAttempts, `${scenario.name} transport attempts`);
+    if (withBudget) assert.equal(request.attempts, scenario.expectedAttempts, `${scenario.name} diagnostic attempts`);
+    assert.equal(request.outcome, scenario.expectedOutcome, `${scenario.name} outcome`);
+    if (withBudget && scenario.keepLastAttempt) assert.equal(request.lastAttemptError.httpStatus, 429, `${scenario.name} keeps prior 429`);
+    if (scenario.expectedOutcome === 'completed') assert.equal(result.status, 'completed', scenario.name);
+  }
+});
+
+test('重判下一楼请求前读档失败保留上一楼完成回执，未发生新模型调用和提交', async () => {
+  let rejudging = false, rejudgeCalls = 0;
+  const h = harness({ initialChat: [user('开始'), assistant('约好归还旧书。'), user('继续'), assistant('约好送还雨伞。'), user('稳定')], utility: options => {
+    if (!rejudging) return { jsonData: { summary: '已有约定。', qianshi: { events: [
+      { key: 'event-1', title: '归还物品', description: '双方约好归还物品。', status: 'planned', matter: true },
+    ], order: [] } } };
+    rejudgeCalls += 1;
+    options.transportBudget.used = 1;
+    const input = JSON.parse(options.taskMessages[0].content);
+    return { jsonData: { qianshi: { events: input.floors[0].records.map(record => ({ key: record.key,
+      lineStatus: 'inProgress', actionStatus: 'occurred', matter: true })), order: [] } } };
+  } });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const plan = await h.runtime.prepareQianshiRejudge({ maxOutputTokens: 1200 });
+  const rootPuts = h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length;
+  rejudging = true;
+  h.backend.setBeforeGet(({ key }) => {
+    if (key === 'v3-root' && h.runtime.getQianshiStatus().history.request?.outcome === 'completed') {
+      throw Object.assign(new Error('下一楼准备读档超时'), { code: 'BACKEND_TIMEOUT' });
+    }
+  });
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'failed'); assert.equal(result.outcomes.at(-1).reasonCode, 'BACKEND_TIMEOUT');
+  assert.equal(result.request.outcome, 'completed'); assert.equal(result.request.phase, 'compile');
+  assert.equal(result.request.fromAssistantSeq, 1); assert.equal(result.request.error, null);
+  assert.equal(rejudgeCalls, 1); assert.equal(result.calls, 1);
+  assert.equal(h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length, rootPuts);
+});
+
+test('千事历史 abort 不伪报 completed，新 job 不沿用旧取消回执', async () => {
+  let hold = false, historyStarted;
+  const client = createCompactApiClient({ fetchImpl: async (_path, options) => {
+    const input = JSON.parse(options.body), task = JSON.parse(input.messages.at(-1).content);
+    if (task.task === 'extractFloorSemantics') return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: '旧摘要。' }) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } });
+    historyStarted?.();
+    if (hold) return await new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true }));
+    return new Response(JSON.stringify({ choices: [{ message: { content: '{"floors":[]}' }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } });
+  }});
+  const router = createTaskRouter({ resolver: { resolveUtility: () => ({ kind: 'independent', source: 'fixture', config: { url: 'https://fixture.invalid', key: 'fixture', model: 'fixture' } }), resolve: () => ({ kind: 'independent' }) }, compactClient: client });
+  const h = harness({ initialChat: [user('开始'), assistant('旧摘要事实。'), user('稳定')], utility: options => router.generateUtilityTask(options) });
+  await h.runtime.start(); const floor = h.runtime.getState().floors[0]; await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const plan = await h.runtime.prepareQianshiHistory(); hold = true;
+  const started = new Promise(resolve => { historyStarted = resolve; }); const running = h.runtime.startQianshiHistory(plan.planId); await started;
+  await h.runtime.stopQianshiHistory(); const stopped = await running;
+  assert.equal(stopped.status, 'stopped'); assert.equal(h.runtime.getQianshiStatus().history.request.outcome, 'cancelled');
+  assert.equal(h.runtime.getQianshiStatus().history.request.attempts, 1, '取消沿一次实际HTTP请求结束');
+  assert.notEqual(h.runtime.getQianshiStatus().history.request.phase, 'completed');
+  hold = false; const nextPlan = await h.runtime.prepareQianshiHistory();
+  const nextRunning = h.runtime.startQianshiHistory(nextPlan.planId);
+  await nextRunning;
+  assert.notEqual(h.runtime.getQianshiStatus().history.request?.outcome, 'cancelled', 'new job does not retain the old cancellation');
+});
+
+test('千事历史保存门闩期间 request 保持 saving，完成后耗时快照稳定', async () => {
+  let mode = 'summary', releaseSave, saveStarted;
+  const saveWait = new Promise(resolve => { releaseSave = resolve; }), saveSeen = new Promise(resolve => { saveStarted = resolve; });
+  const h = harness({ initialChat: [user('开始'), assistant('顾舟答应归还旧书。'), user('稳定')], utility: async options => {
+    if (mode === 'summary') return { jsonData: { summary: '顾舟答应归还旧书。' } };
+    const request = JSON.parse(options.taskMessages[0].content);
+    options.transportBudget.used = 1;
+    return { jsonData: { floors: request.floors.map(value => ({ floorKey: value.floorKey, qianshi: { events: [{ key: 'event-1', title: '归还旧书', description: '顾舟归还旧书。', status: 'occurred', matter: false }], order: [] } })) } };
+  } });
+  await h.runtime.start(); const floor = h.runtime.getState().floors[0]; await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const plan = await h.runtime.prepareQianshiHistory(); mode = 'history';
+  h.backend.setBeforePut(async ({ key }) => { if (key === 'v3-root') { saveStarted(); await saveWait; } });
+  const running = h.runtime.startQianshiHistory(plan.planId); await saveSeen;
+  const during = h.runtime.getQianshiStatus().history.request;
+  assert.equal(during.phase, 'saving'); assert.equal(during.outcome, 'running');
+  releaseSave(); const result = await running; assert.equal(result.status, 'completed');
+  const after = h.runtime.getQianshiStatus().history.request;
+  assert.equal(after.phase, 'saving'); assert.equal(after.outcome, 'completed'); assert.equal(after.attemptElapsedMs, 0);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(h.runtime.getQianshiStatus().history.request, after, '结束后的耗时冻结，不再增长或变为NaN');
 });
 
 test('千事历史补齐用项目 JSON 解析器处理未落盘的七楼结果并保留旧响应字段', async () => {
@@ -8958,6 +11542,10 @@ test('千事历史校验顶层响应、逐楼重复漏回和单楼完整输入�
       : scenario === 'duplicate' ? ['QIANSHI_HISTORY_FLOOR_DUPLICATE', 'QIANSHI_HISTORY_FLOOR_MISSING']
         : ['QIANSHI_HISTORY_FLOOR_MISSING', 'QIANSHI_HISTORY_FLOOR_MISSING'];
     assert.deepEqual(result.outcomes.map(outcome => outcome.reasonCode), Array.isArray(expected) ? expected : [expected, expected]);
+    const requestDiagnostic = h.runtime.getQianshiStatus().history.request;
+    assert.equal(requestDiagnostic.outcome, 'failed');
+    assert.equal(requestDiagnostic.error.code, Array.isArray(expected) ? expected[0] : expected);
+    assert.equal(requestDiagnostic.lastAttemptError, null, '业务校验失败不冒充传输失败');
     const after = await h.store.readReachable({ mode: 'runtime' });
     assert.ok(after.floorMemories.every(memory => !memory.qianshiDelta || memory.qianshiDelta.status === 'pending'), '坏批响应不覆盖旧字段');
   });
@@ -9327,10 +11915,9 @@ test('历史候选 CAS 重试复核事项起点与最新事件语义，未变化
     const history = harness({ sharedBackend: seed.backend, sharedContext: seed.context, utility: options => {
       const request = JSON.parse(options.taskMessages[0].content), candidate = request.qianshiCandidates.find(value => value.candidateType === 'matter');
       assert.ok(candidate, '请求包含持续事项候选');
-      return { jsonData: { floors: request.floors.map(value => ({ floorKey: value.floorKey, qianshi: { events: [{
+      return { jsonData: { floors: request.floors.map(value => ({ floorKey: value.floorKey, events: [{
         key: 'late-progress', title: '归还旧书', description: '顾舟完成旧书归还计划', status: 'completed', matter: true,
-        links: [{ candidateKey: candidate.key, kind: 'progress' }],
-      }], order: [] } })) } };
+      }], order: [{ before: candidate.key, after: 'late-progress' }] })) } };
     } });
     const concurrent = harness({ sharedBackend: seed.backend, sharedContext: seed.context });
     await history.runtime.start(); await concurrent.runtime.start();
@@ -9363,6 +11950,7 @@ test('历史候选 CAS 重试复核事项起点与最新事件语义，未变化
       assert.equal(outcome.reasonCode, null);
       assert.equal(result.status, 'completed');
       assert.equal(savedTarget.qianshiDelta.status, 'ready', '候选语义未变时 CAS 重试正常保存历史结果');
+      assert.equal(savedTarget.qianshiDelta.relations.length, 1, '平铺返回的 order 候选端点被编译并提交');
     } else {
       assert.equal(outcome.reasonCode, 'QIANSHI_HISTORY_CANDIDATE_STALE', '必须由候选完整语义守卫拒绝，不能由目标楼 prefix 检查代替');
       assert.equal(result.status, 'partial');
@@ -9600,7 +12188,9 @@ test('千事事件物品编辑只改 object，保留文字、楼档其他字段�
   const originalRelations = structuredClone(beforeMemory.qianshiDelta.relations);
   const baseline = structuredClone(beforeMemory);
   assert.equal(event.object, '旧信封', '既有 object 字符串按原样读取');
-  assert.deepEqual(h.runtime.getQianshiRecall({ queryContext: { latestUserText: '旧信封' } }).eventIds, [event.id], '既有 object 字符串继续参与相关性召回');
+  const firstRecall = h.runtime.getQianshiRecall({ queryContext: { latestUserText: '旧信封' } });
+  assert.deepEqual(firstRecall.eventIds, [event.id], '既有 object 字符串继续参与相关性召回');
+  assert.match(firstRecall.text, /本轮千事资料来源截至：AI #1。/u, 'memory-runtime 普通候选入口保留所选来源楼范围');
   assert.equal(prepareQianshiCandidates(beforeGraph, { canonicalContent: '旧信封', includeEventContextCandidates: true }).request.some(value => value.object === '旧信封'), true,
     '既有 object 字符串继续进入后续事项候选');
   assert.equal(h.runtime.canEditQianshiEventText(event.id), true);
@@ -9657,7 +12247,7 @@ test('千事事件物品编辑只改 object，保留文字、楼档其他字段�
   assert.equal(h.calls.filter(options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics').length, 1, '编辑不调用模型');
 });
 
-test('千事文字编辑在目标档案发生并发 revision 后拒绝旧草稿', async () => {
+test('千事文字编辑合并无关摘要修订且保留人工字段', async () => {
   const utility = options => {
     const request = JSON.parse(options.taskMessages[0].content);
     if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
@@ -9678,14 +12268,14 @@ test('千事文字编辑在目标档案发生并发 revision 后拒绝旧草稿'
   await gate.started;
   await competitor.runtime.editSummary(floor.floorId, '并发摘要修订。');
   gate.release();
-  await assert.rejects(pendingEdit, { code: 'QIANSHI_TEXT_EDIT_TARGET_CHANGED' });
+  await pendingEdit;
   const after = await h.store.readReachable({ mode: 'runtime' });
   const saved = after.floorMemories.find(value => value.floorId === floor.floorId);
-  assert.equal(saved.qianshiDelta.events[0].title, '旧事实');
+  assert.equal(saved.qianshiDelta.events[0].title, '迟到草稿');
   assert.equal(saved.summary.userText, '并发摘要修订。');
 });
 
-test('聚合楼千事编辑保留成员来源，成员原文离开当前分支后拒绝保存', async () => {
+test('聚合楼千事编辑保留成员归属，原文变化不否决人工字段', async () => {
   const utility = options => {
     const request = JSON.parse(options.taskMessages[0].content);
     if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
@@ -9733,16 +12323,16 @@ test('聚合楼千事编辑保留成员来源，成员原文离开当前分支�
     cold.backend.setBeforePut(null);
   });
   const revisionBeforeReject = saved.rootRevision;
-  await assert.rejects(cold.runtime.editQianshiEventText({ eventId: savedEvent.id,
-    expected: { memoryId: savedMemory.id, title: savedEvent.title, description: savedEvent.description, object: savedEvent.object }, title: '不应覆盖', description: '来源失效。', object: '不应覆盖' }),
-  { code: 'QIANSHI_TEXT_EDIT_SOURCE_CHANGED' });
+  await cold.runtime.editQianshiEventText({ eventId: savedEvent.id,
+    expected: { memoryId: savedMemory.id, title: savedEvent.title, description: savedEvent.description, object: savedEvent.object }, title: '不应覆盖', description: '来源失效。', object: '不应覆盖' });
+
   const afterRejected = await cold.store.readReachable({ mode: 'runtime' });
-  assert.equal(afterRejected.rootRevision, revisionBeforeReject);
-  assert.equal(afterRejected.floorMemories.find(value => value.floorId === targetFloor.floorId).qianshiDelta.events[0].title, '调整文字');
+  assert.ok(afterRejected.rootRevision > revisionBeforeReject);
+  assert.equal(afterRejected.floorMemories.find(value => value.floorId === targetFloor.floorId).qianshiDelta.events[0].title, '不应覆盖');
   assert.equal(typeof cold.runtime.deleteQianshiEvent, 'function', '聚合事件删除复用所属楼的人工事务');
 });
 
-test('正式事件仍与带关系的旧审核候选完全同签名时，文字编辑明确拒绝且不提交 revision', async () => {
+test('正式事件人工文字同步同基线旧候选并保留合法关系与待决', async () => {
   const utility = options => {
     const request = JSON.parse(options.taskMessages[0].content);
     if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
@@ -9770,13 +12360,17 @@ test('正式事件仍与带关系的旧审核候选完全同签名时，文字�
   await cold.runtime.start();
   const latestGraph = await cold.store.readReachable({ mode: 'runtime' });
   const latest = latestGraph.floorMemories.find(value => value.floorId === floor.floorId);
-  await assert.rejects(cold.runtime.editQianshiEventText({ eventId: event.id,
-    expected: { memoryId: latest.id, title: event.title, description: event.description, object: event.object }, title: '更改标题', description: '修改经过。', object: event.object }),
-  { code: 'QIANSHI_TEXT_EDIT_RELATION_CONFLICT' });
+  await cold.runtime.editQianshiEventText({ eventId: event.id,
+    expected: { memoryId: latest.id, title: event.title, description: event.description, object: event.object }, title: '更改标题', description: '修改经过。', object: event.object });
   const after = await cold.store.readReachable({ mode: 'runtime' });
-  assert.equal(after.rootRevision, latestGraph.rootRevision);
-  assert.deepEqual(after.floorMemories.find(value => value.floorId === floor.floorId), latest);
-  assert.notEqual(JSON.stringify(original), JSON.stringify(latest), 'fixture确实包含旧审核候选');
+  assert.ok(after.rootRevision > latestGraph.rootRevision);
+  const edited = after.floorMemories.find(value => value.floorId === floor.floorId);
+  assert.equal(edited.qianshiDelta.events[0].title, '更改标题');
+  assert.equal(edited.qianshiDelta.historyReview.candidates[0].decision, 'pending', '真正待决仍保留');
+  const finalCold = harness({ sharedBackend: h.backend, sharedContext: h.context }); await finalCold.runtime.start();
+  assert.equal(finalCold.runtime.getQianshiSnapshot().events[0].title, '更改标题');
+  assert.ok(projectQianshiGraph(await finalCold.store.readReachable({ mode: 'runtime' })).relations.some(relation => relation.id === '11111111-1111-4111-8111-111111111111'), '兼容候选原有效边冷读仍在');
+
 });
 
 test('旧 pending 草稿冷读进入千事覆盖与召回，并跳过历史补齐', async () => {
@@ -10075,6 +12669,11 @@ test('千事整线与事件状态人工修订经冷读保存并按稳定 ID 合�
   const floor = h.runtime.getState().floors[0];
   await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
   const initial = h.runtime.getQianshiSnapshot(), matter = initial.matters[0], firstEvent = initial.events.find(item => item.title === '归还旧书');
+  for (const pendingHeader of ['[相关跟进事项]', '[相关未完事项]', '[当前待接续]']) {
+    const selectedRecall = h.runtime.getQianshiRecall({ selectedEventIds: [], selectedMatterIds: [matter.matterId], pendingHeader });
+    assert.ok(selectedRecall.text.includes(pendingHeader), 'memory-runtime 所选事项入口保留三种合法标题');
+    assert.deepEqual(selectedRecall.matterIds, [matter.matterId]);
+  }
   const rootBefore = (await h.store.readReachable({ mode: 'runtime' })).rootRevision;
   assert.equal((await h.runtime.setQianshiMatterFollowing({ matterId: matter.matterId, following: false, expectedFollowing: true })).status, 'saved');
   const stoppedCold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => assert.fail('冷读不得调用模型') });
@@ -10161,8 +12760,90 @@ test('千事整线与事件状态人工修订经冷读保存并按稳定 ID 合�
   assert.match(warnings.at(-1)?.text ?? '', /旧千事记录已保留，摘要仍已保存/u, '冲突通过 runtime 用户回执提示');
 });
 
+test('人工人物与约定时间独立保存，旧名参与者可明确清空并经冷读重提重判保留', async () => {
+  let reextract = false;
+  const utility = options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (request.task !== 'extractFloorSemantics') {
+      assert.ok(request.floors[0].records, '重判逐楼携带旧记录');
+      return { jsonData: { qianshi: { events: request.floors[0].records.map(record => ({ key: record.key, status: 'inProgress', actionStatus: 'occurred', matter: true })), order: [] } } };
+    }
+    return { jsonData: { summary: reextract ? '新的摘要。' : '旧摘要。', people: [
+      { name: '林岚', role: 'user' }, { name: '旅店老板', role: 'npc' },
+    ], qianshi: { events: [
+      { key: 'plan', title: '周末会面', description: '林岚约好周末会面。', status: 'planned', matter: true,
+        people: ['林岚'], storyTime: '2026年7月1日', scheduledTime: reextract ? '下周' : '周末' },
+    ], order: [] } } };
+  };
+  const h = harness({ modernAnchors: true, initialChat: [user('继续'), assistant('林岚约好周末会面。'), user('稳定')], utility });
+  await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  const first = h.runtime.getQianshiSnapshot().events[0];
+  assert.equal(first.people[0]?.name, '林岚', '旧记录中的姓名参与者没有稳定身份时仍保留原值');
+  const person = h.runtime.getQianshiEditPeople().find(value => value.name === '林岚');
+  assert.ok(person, '当前已加载人物目录提供真实可选身份');
+  assert.ok(h.runtime.getQianshiEditPeople().some(value => value.name === '旅店老板'), '人物选择包括已识别 NPC，不限重要人物');
+  const expected = { memoryId: first.sourceFloorMemoryId, title: first.title, description: first.description, object: first.object,
+    status: first.status, actionStatus: first.actionStatus ?? first.status, storyTime: first.storyTime,
+    scheduledTime: first.scheduledTime, people: first.people };
+  const calls = h.calls.length, beforeRevision = (await h.store.readReachable({ mode: 'runtime' })).rootRevision;
+  assert.equal((await h.runtime.editQianshiEventText({ eventId: first.id,
+    expected: Object.fromEntries(Object.entries(expected).filter(([key]) => !['scheduledTime', 'people'].includes(key))),
+    title: first.title, description: `${first.description} 已核对。`, object: first.object })).status, 'saved', '旧调用未提供新字段仍可编辑正文');
+  let edited = h.runtime.getQianshiSnapshot().events.find(event => event.id === first.id);
+  assert.equal(edited.scheduledTime, '周末', '未提供约定时间的旧调用逐字保留相对值');
+  assert.deepEqual(edited.people, first.people, '未提供人物的旧调用保留原参与者');
+  const latestExpected = { ...expected, memoryId: edited.sourceFloorMemoryId, title: edited.title, description: edited.description };
+  const request = { eventId: first.id, expected, title: first.title, description: first.description, object: first.object,
+    scheduledTime: '下周三', people: [{ entityId: person.entityId, name: person.name }] };
+  request.expected = latestExpected; request.title = edited.title; request.description = edited.description;
+  assert.equal((await h.runtime.editQianshiEventText(request)).status, 'saved');
+  assert.equal(h.calls.length, calls, '人工编辑不调用模型');
+  edited = h.runtime.getQianshiSnapshot().events.find(event => event.id === first.id);
+  assert.deepEqual(edited.people, [{ entityId: person.entityId, name: person.name }], '人物使用明确选择的实体 ID，姓名相同不会自动绑定');
+  assert.equal(edited.scheduledTime, '下周三', '约定时间可单独填写');
+  const filledRevision = (await h.store.readReachable({ mode: 'runtime' })).rootRevision;
+  const filledExpected = { ...latestExpected, memoryId: edited.sourceFloorMemoryId, title: edited.title, description: edited.description,
+    scheduledTime: edited.scheduledTime, people: edited.people };
+  assert.equal((await h.runtime.editQianshiEventText({ ...request, expected: filledExpected })).status, 'unchanged', '相同字段不产生额外版本');
+  assert.equal((await h.store.readReachable({ mode: 'runtime' })).rootRevision, filledRevision);
 
-test('重判旧条目错引用按条保留并继续后楼，坏状态坏编号和不可解析返回仍整组零写', async () => {
+  const clearRequest = { ...request, expected: filledExpected, scheduledTime: null, people: [] };
+  assert.equal((await h.runtime.editQianshiEventText(clearRequest)).status, 'saved', '人物可以明确取消到空数组');
+  edited = h.runtime.getQianshiSnapshot().events.find(event => event.id === first.id);
+  assert.deepEqual(edited.people, []);
+  assert.equal(edited.scheduledTime, null, '约定时间明确清空后不借发生时间补回');
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  const override = saved.floorMemories[0].qianshiDelta.manualEventOverrides.find(item => item.eventId === first.id);
+  assert.deepEqual(override, { eventId: first.id, description: `${first.description} 已核对。`, scheduledTime: null, people: [] });
+  assert.ok(saved.rootRevision > beforeRevision);
+  const unchangedRevision = saved.rootRevision;
+  const secondExpected = { ...expected, memoryId: edited.sourceFloorMemoryId, title: edited.title, description: edited.description,
+    scheduledTime: edited.scheduledTime, people: edited.people };
+  assert.equal((await h.runtime.editQianshiEventText({ ...clearRequest, expected: secondExpected })).status, 'unchanged', '相同的空人物集合不产生无谓版本');
+  assert.equal((await h.store.readReachable({ mode: 'runtime' })).rootRevision, unchangedRevision);
+
+  reextract = true;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  const afterReextract = h.runtime.getQianshiSnapshot().events.find(event => event.id === first.id);
+  assert.deepEqual(afterReextract.people, []);
+  assert.equal(afterReextract.scheduledTime, null, '重提的新约定不能覆盖人工明确清空');
+  const plan = await h.runtime.prepareQianshiRejudge();
+  const rejudged = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(rejudged.status, 'completed', JSON.stringify(rejudged));
+  const afterRejudge = h.runtime.getQianshiSnapshot().events.find(event => event.id === first.id);
+  assert.deepEqual(afterRejudge.people, []);
+  assert.equal(afterRejudge.scheduledTime, null);
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => assert.fail('冷读不调用模型') });
+  await cold.runtime.start();
+  const recalled = cold.runtime.getQianshiRecall({ queryContext: { latestUserText: '周末会面' } });
+  assert.ok(recalled.text.includes('周末会面'), '现有召回读到人工字段修订后的同一事件');
+  assert.deepEqual(cold.runtime.getQianshiSnapshot().events.find(event => event.id === first.id).people, []);
+  assert.equal(cold.runtime.getQianshiSnapshot().events.find(event => event.id === first.id).scheduledTime, null);
+});
+
+
+test('重判旧条目错引用保旧并继续后楼，坏状态编号及不可解析结果保存待续范围', async () => {
   let mode = 'summary';
   const h = harness({ initialChat: [user('旧书计划'), assistant('先约好归还旧书。'), assistant('后来已经交还旧书。'), user('稳定楼')], utility: options => {
     if (mode === 'summary') return options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
@@ -10173,31 +12854,34 @@ test('重判旧条目错引用按条保留并继续后楼，坏状态坏编号�
       order: i ? [] : [{ before: 'event-1', after: 'event-2', certainty: 'explicit' }],
     } })) } };
     if (mode === 'badShape') return { jsonData: { unrelated: [] } };
-    const events = request.records.map(record => {
-      const event = { key: mode === 'badKey' ? 'record-999' : record.key, status: mode === 'badStatus' ? 'invalid' : 'completed', actionStatus: 'completed', matter: false };
-      if (mode === 'badRef' && request.floor === 'floor-1') event.links = [{ target: 'candidate-does-not-exist', type: 'progress' }];
-      if (mode === 'badKind') event.links = [{ target: 'candidate-does-not-exist', type: 'invalid' }];
-      return event;
+    return rejudgeBatchResponse(request, request => {
+      const events = request.records.map(record => {
+        const event = { key: mode === 'badKey' ? 'record-999' : record.key, status: mode === 'badStatus' ? 'invalid' : 'completed', actionStatus: 'completed', matter: false };
+        if (mode === 'badRef' && request.floor === 'floor-1') event.links = [{ target: 'candidate-does-not-exist', type: 'progress' }];
+        if (mode === 'badKind') event.links = [{ target: 'candidate-does-not-exist', type: 'invalid' }];
+        return event;
     });
-    return { jsonData: { qianshi: { events, order: [] } } };
+    return { events, order: [] };
+    });
   } });
   await h.runtime.start();
   for (const value of h.runtime.getState().floors) await h.runtime.extractFloor(value.floorId);
   mode = 'history'; const history = await h.runtime.prepareQianshiHistory(); await h.runtime.startQianshiHistory(history.planId);
   const original = await h.store.readReachable({ mode: 'runtime' });
   mode = 'badRef'; const plan = await h.runtime.prepareQianshiRejudge(); const result = await h.runtime.startQianshiRejudge(plan.planId);
-  assert.equal(result.status, 'partial');assert.equal(result.calls, 2, '旧记录引用错误不能阻止后楼处理');
+  assert.equal(result.status, 'completed');assert.equal(result.calls, plan.historyApiCalls + result.followup.calls, '坏引用不阻止后楼和全局收尾');
   assert.equal(result.outcomes[0].status, 'saved-partial');assert.equal(result.outcomes[1].status, 'saved-complete');
   const saved = await h.store.readReachable({ mode: 'runtime' });
   assert.deepEqual(saved.floorMemories[0].qianshiDelta.events, original.floorMemories[0].qianshiDelta.events, '错引用条目完整保留原值，不伪造新线');
   assert.deepEqual(saved.floorMemories[0].qianshiDelta.relations, original.floorMemories[0].qianshiDelta.relations, '保留旧条目时也保留其楼内关系');
   assert.equal(saved.floorMemories[1].qianshiDelta.events[0].status, 'completed', '后楼有效判断一起保存');
   const rootPuts = () => h.backend.calls.filter(c => c[0] === 'put' && c[2] === 'v3-root').length;
-  const committed = rootPuts();
   for (mode of ['badStatus', 'badKey', 'badKind', 'badShape']) {
+    const committed = rootPuts();
     const invalidPlan = await h.runtime.prepareQianshiRejudge();const rejected = await h.runtime.startQianshiRejudge(invalidPlan.planId);
-    assert.equal(rejected.status, 'failed', mode);assert.equal(rejected.calls, 1, mode);
-    assert.equal(rootPuts(), committed, `${mode} 整组零写`);
+    assert.equal(rejected.status, 'partial', mode);assert.equal(rejected.calls, 1, mode);
+    assert.equal(rootPuts(), committed + 1, `${mode} 原事实及待续范围可靠保存`);
+    assert.equal(rejected.savedFloors, 0); assert.equal(rejected.failedFloors, 2);
   }
 });
 
@@ -10210,8 +12894,8 @@ test('人工清空原本缺省的千事时间会落盘，冷读、重提、重�
       { key: 'book', title: '归还旧书', description: '准备归还旧书。', status: 'planned', matter: true,
         ...(reextract ? { storyTime: '2027年3月5日 07:45' } : {}) },
     ], order: [] } } };
-    assert.ok(request.records, '重判使用既有接口');
-    return { jsonData: { qianshi: { events: request.records.map(record => ({ key: record.key, status: 'inProgress', actionStatus: 'occurred', matter: true })), order: [] } } };
+    assert.ok(request.floors[0].records, '重判逐楼携带旧记录');
+    return { jsonData: { qianshi: { events: request.floors[0].records.map(record => ({ key: record.key, status: 'inProgress', actionStatus: 'occurred', matter: true })), order: [] } } };
   };
   const h = harness({ modernAnchors: true, initialChat: [user('开始'), assistant('准备归还旧书。'), user('稳定')], utility });
   await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
@@ -10225,7 +12909,7 @@ test('人工清空原本缺省的千事时间会落盘，冷读、重提、重�
   const calls = h.calls.length;
   assert.equal((await h.runtime.editQianshiEventText(request)).status, 'saved', '缺省 null 转为人工明确未知也必须持久化');
   assert.equal(h.calls.length, calls, '人工时间不调用模型');
-  await assert.rejects(() => h.runtime.editQianshiEventText(request), error => error.code === 'QIANSHI_TEXT_EDIT_TARGET_CHANGED');
+  assert.equal((await h.runtime.editQianshiEventText(request)).status, 'unchanged', '旧版本号不阻断同一稳定事件的幂等人工提交');
   request.expected.memoryId = h.runtime.getQianshiSnapshot().events[0].sourceFloorMemoryId;
   assert.equal((await h.runtime.editQianshiEventText(request)).status, 'unchanged');
   const after = await h.store.readReachable({ mode: 'runtime' });
@@ -10249,7 +12933,7 @@ test('人工清空原本缺省的千事时间会落盘，冷读、重提、重�
   assert.equal(finalCold.runtime.getQianshiSnapshot().events[0].timeManuallyEdited, true);
 });
 
-test('正式事件删除仅落所属楼标记，取消旧版本/来源变化，冷读仍隐藏且删除不调用模型', async () => {
+test('正式事件删除按稳定目标落标记，原文变化不否决明确人工删除', async () => {
   const utility = options => {
     const request = JSON.parse(options.taskMessages[0].content);
     if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
@@ -10259,14 +12943,13 @@ test('正式事件删除仅落所属楼标记，取消旧版本/来源变化，�
     ], order: [{ before: 'one', after: 'two' }] } } };
   };
   const h = harness({ modernAnchors: true, initialChat: [user('开始'), assistant('两条记录。'), user('稳定')], utility });
-  await h.runtime.start(); const floor = h.runtime.getState().floors[0];
+  await h.foundationRuntime.reconcile('typed-space-seed'); await h.runtime.start(); const floor = h.runtime.getState().floors[0];
   await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
   const before = await h.store.readReachable({ mode: 'runtime' }), old = before.floorMemories[0];
   const first = h.runtime.getQianshiSnapshot().events[0];
   const expected = { memoryId: first.sourceFloorMemoryId, title: first.title, description: first.description, object: first.object,
     status: first.status, actionStatus: first.actionStatus ?? first.status, storyTime: first.storyTime };
-  await assert.rejects(h.runtime.deleteQianshiEvent({ eventId: first.id, expected: { ...expected, memoryId: 'changed-memory' } }), { code: 'QIANSHI_TEXT_EDIT_TARGET_CHANGED' });
-  assert.equal((await h.store.readReachable({ mode: 'runtime' })).rootRevision, before.rootRevision);
+  expected.memoryId = 'changed-memory';
   const calls = h.calls.length;
   assert.equal((await h.runtime.deleteQianshiEvent({ eventId: first.id, expected })).status, 'saved');
   const after = await h.store.readReachable({ mode: 'runtime' }), saved = after.floorMemories[0];
@@ -10285,8 +12968,9 @@ test('正式事件删除仅落所属楼标记，取消旧版本/来源变化，�
     cold.context.chat[floor.messageIndex].swipes[0] = cold.context.chat[floor.messageIndex].mes;
     cold.backend.setBeforePut(null);
   });
-  await assert.rejects(cold.runtime.deleteQianshiEvent({ eventId: kept.id }), { code: 'QIANSHI_TEXT_EDIT_SOURCE_CHANGED' });
-  assert.equal((await cold.store.readReachable({ mode: 'runtime' })).rootRevision, revision);
+  await cold.runtime.deleteQianshiEvent({ eventId: kept.id });
+  assert.ok((await cold.store.readReachable({ mode: 'runtime' })).rootRevision > revision);
+  assert.equal(cold.runtime.getQianshiSnapshot().events.length, 0);
 });
 
 test('已有断链楼照常展示且可人工删除异常记录，不因旧坏引用拒绝删除事务', async () => {
@@ -10296,7 +12980,7 @@ test('已有断链楼照常展示且可人工删除异常记录，不因旧坏�
     return { jsonData: { summary: '原摘要。', qianshi: { events: [{ key: 'wrong', title: '误记事项', description: '误收录。', status: 'planned', matter: true }], order: [] } } };
   };
   const h = harness({ modernAnchors: true, initialChat: [user('开始'), assistant('一条记录。'), user('稳定')], utility });
-  await h.runtime.start(); const floor = h.runtime.getState().floors[0];
+  await h.foundationRuntime.reconcile('typed-space-seed'); await h.runtime.start(); const floor = h.runtime.getState().floors[0];
   await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
   const source = await h.store.readReachable({ mode: 'runtime' }), old = source.floorMemories[0];
   const key = `chat-${CHAT}/v3-floor-memory-${old.id}`, record = h.backend.records.get(key);
@@ -10312,7 +12996,7 @@ test('已有断链楼照常展示且可人工删除异常记录，不因旧坏�
 });
 
 test('只读准备：真实memory与recall在后台inspect挂起时借用精确匹配foundation图', async t => {
-  for (const cacheMode of ['sameRoot', 'newFoundation', 'staleFoundation']) await t.test(cacheMode, async () => {
+  for (const cacheMode of ['sameRoot', 'ownMemory', 'newFoundation', 'staleFoundation']) await t.test(cacheMode, async () => {
     const seed = harness({ initialChat: [user('继续'), assistant('裴晚生提醒带伞。'), assistant('钟楼仍在等待。'), assistant('确认上一楼稳定。')] });
     await seed.runtime.start(); const floors = seed.runtime.getState().floors;
     await seed.runtime.extractFloor(floors[0].floorId, { analyzeState: false });
@@ -10338,20 +13022,24 @@ test('只读准备：真实memory与recall在后台inspect挂起时借用精确�
       sourceReader: options => { directReads += 1; return readRecallSource(options); },
       selector: async options => {
         selects += 1;
-        if (cacheMode === 'sameRoot') {
+        if (['sameRoot', 'ownMemory'].includes(cacheMode)) {
           await seed.runtime.extractFloor(floors[1].floorId, { analyzeState: false });
           await memory.refreshStatus({ preferCached: false }); await waitFor(() => memory.getState().memorySyncStatus === 'idle');
         }
         held = true; pendingRefresh = memory.refreshStatus({ preferCached: false }); await heldStarted;
-        if (cacheMode !== 'sameRoot') await seed.runtime.extractFloor(floors[1].floorId, { analyzeState: false });
-        if (cacheMode === 'staleFoundation') exposeStaleFoundation = true;
+        if (!['sameRoot', 'ownMemory'].includes(cacheMode)) await seed.runtime.extractFloor(floors[1].floorId, { analyzeState: false });
+        if (['ownMemory', 'staleFoundation'].includes(cacheMode)) exposeStaleFoundation = true;
         const rootResult = await seed.store.readRoot(); beforeInspects = inspectCalls; beforeReads = seed.readReachableModes.length;
         if (cacheMode === 'newFoundation') {
           assert.ok(memory.getState().stableCount < seed.foundationRuntime.getReachable().floors.length, 'memory自己的投影仍落后一楼');
         }
         const readonly = await memory.prepareCurrent({ rootResult, allowRefresh: false });
         assert.equal(readonly.status, cacheMode === 'staleFoundation' ? 'unavailable' : 'ready');
-        if (cacheMode !== 'staleFoundation') assert.equal(readonly.reachable, seed.foundationRuntime.getReachable(), '只借与fresh root匹配的foundation已验证图');
+        if (cacheMode === 'ownMemory') {
+          assert.notEqual(readonly.reachable, foundationRuntime.getReachable(), 'foundation落后时借自己的精确已校验图');
+          assert.equal(readonly.reachable.rootRevision, rootResult.revision);
+          assert.equal(readonly.reachable.checkpoint.id, rootResult.data.headCheckpointId);
+        } else if (cacheMode !== 'staleFoundation') assert.equal(readonly.reachable, seed.foundationRuntime.getReachable(), '只借与fresh root匹配的foundation已验证图');
         const mismatchedRoot = { ...rootResult, data: { ...rootResult.data, sourceSnapshotFingerprint: `sha256:${'f'.repeat(64)}` } };
         assert.equal((await memory.prepareCurrent({ rootResult: mismatchedRoot, allowRefresh: false })).status, 'unavailable', '来源指纹不匹配时不借旧图');
         assert.equal(inspectCalls, beforeInspects); assert.equal(seed.readReachableModes.length, beforeReads);
@@ -10373,4 +13061,5796 @@ test('只读准备：真实memory与recall在后台inspect挂起时借用精确�
     await memory.prepareCurrent({ preferCached: false, rootResult: { ...rootResult, revision: rootResult.revision + 1 } });
     assert.equal(inspectCalls, before + 1, '默认prepare仍完整刷新');
   });
+});
+
+
+test('前文差异只标已证实的业务字段，记录标识和表示差异不冒充正文或身份', () => {
+  const snapshot = () => ({ chatId: 'private-chat', targetFloorId: 'floor-5', targetFloorGeneration: 'private-generation',
+    floorDependencies: Array.from({ length: 5 }, (_, index) => ({ id: `floor-${index + 1}`, assistantSeq: index + 1,
+      rawFingerprint: 'raw-before', canonicalFingerprint: 'canonical-before', liveRawFingerprint: 'live-before',
+      hostLocator: { messageIndex: index, swipeId: 0, selectedSwipeIndex: 0 }, storyClockSignature: 'clock-before' })),
+    targetMemory: { id: 'private-memory', summary: { aiText: 'PRIVATE_SUMMARY', userText: null, effectiveSource: 'ai' }, updatedAt: 'old' },
+    scopedEntities: [{ id: 'private-person', displayName: 'PRIVATE_NAME', aliases: [{ name: '别名甲' }, { name: '别名乙' }], entityType: 'person', specialRole: 'char', updatedAt: 'old' }],
+    userIdentity: { displayName: 'PRIVATE_USER', aliases: ['甲', '乙'], personaIdentifier: 'private-persona', source: 'SillyTavern' },
+    identityProjection: { identityRedirectsByEntityId: { first: 'target', second: 'target' }, deletedEntityIds: ['a', 'b'], manualAliasesByEntityId: { target: ['甲称', '乙称'] } },
+    promptGuidance: 'PRIVATE_PROMPT', storyClockReferenceTags: ['Time'] });
+  const before = snapshot(), metadata = structuredClone(before);
+  metadata.targetMemory.id = 'another-record'; metadata.targetMemory.updatedAt = 'new';
+  metadata.scopedEntities[0].updatedAt = 'new'; metadata.scopedEntities[0].aliases.reverse();
+  metadata.userIdentity.source = 'Luker'; metadata.userIdentity.aliases.reverse();
+  metadata.identityProjection.identityRedirectsByEntityId = { second: 'target', first: 'target' };
+  metadata.identityProjection.deletedEntityIds.reverse();
+  metadata.identityProjection.manualAliasesByEntityId.target.reverse();
+  const aliasesChanged = structuredClone(before);
+  aliasesChanged.identityProjection.manualAliasesByEntityId.target = [];
+  assert.deepEqual(describePrefixDifference(before, aliasesChanged).categories, ['identityProjection']);
+  assert.deepEqual(describePrefixDifference(before, metadata).categories, ['recordInformation']);
+  const reordered = structuredClone(before);
+  const { id, ...rest } = reordered.targetMemory; reordered.targetMemory = { ...rest, id };
+  assert.deepEqual(describePrefixDifference(before, reordered).categories, ['recordInformation'], '标识字段排列不同不能说摘要或正文变了');
+  reordered.targetMemory.summary = { effectiveSource: 'ai', userText: null, aiText: 'PRIVATE_SUMMARY' };
+  assert.deepEqual(describePrefixDifference(before, reordered).categories, ['memoryRecord'], '未归一的记录表示差异不冒充已证实业务变化');
+  const changed = structuredClone(before);
+  for (const floor of changed.floorDependencies) floor.liveRawFingerprint = 'live-new';
+  changed.floorDependencies[1].storyClockSignature = 'clock-new';
+  changed.userIdentity.displayName = 'ANOTHER_USER';
+  changed.scopedEntities[0].displayName = 'ANOTHER_NAME';
+  changed.identityProjection.identityRedirectsByEntityId.first = 'other-target';
+  const diagnostic = describePrefixDifference(before, changed);
+  assert.deepEqual(diagnostic.categories, ['bodyVersion', 'timeEvidence', 'entityDirectory', 'userIdentity', 'identityProjection']);
+  assert.deepEqual(diagnostic.assistantSeqs, [1, 2, 3]); assert.equal(diagnostic.relatedFloorCount, 5); assert.equal(diagnostic.truncated, true);
+  assert.deepEqual(describePrefixDifference(before, null, { kind: 'sourceUnavailable', assistantSeq: 2 }), {
+    categories: ['sourceUnavailable'], assistantSeqs: [2], relatedFloorCount: 1, truncated: false,
+  });
+  assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE|private-|ANOTHER|live-new|clock-new|target/u);
+});
+
+test('既有目标快照无法对应时只带已知AI楼序穿过stale catch', async () => {
+  let release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const h = harness({ modernAnchors: true, initialChat: [assistant('原始目标。'), user('确认'), assistant('尾楼')],
+    utility: options => {
+      if (options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
+      entered(); return new Promise(resolve => { release = () => resolve({ jsonData: { summary: '不应保存的摘要。' } }); });
+    } });
+  await h.runtime.start();
+  const floor = h.runtime.getState().floors[0];
+  const pending = h.runtime.extractFloor(floor.floorId, { analyzeState: false }); await started;
+  h.context.chat[0].swipes.push('另一段来源。'); h.context.chat[0].swipe_id = 1;
+  release(); const state = await pending;
+  assert.equal(state.lastExtractorError.code, 'V3_MEMORY_PREFIX_CHANGED');
+  assert.deepEqual(state.lastExtractorError.prefixDifference, { categories: ['snapshotUnavailable'], assistantSeqs: [1], relatedFloorCount: 1, truncated: false });
+  assert.equal((await h.store.readReachable({ mode: 'runtime' })).floorMemories.length, 0, '原拒写行为保持');
+});
+
+
+test('全局破限独立千事补齐与重判在最终transport单次注入且保留事件与来源', async () => {
+  for (const configured of ['千事共用第一版', '千事共用第二版', '  \n ']) {
+    let processing = configured, mode = 'summary';
+    const taskCalls = [];
+    const transport=processingTransport({processingPrompt:()=>processing,respond:options=>{
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (mode === 'summary') return { jsonData: { summary: '顾舟答应归还旧书。' } };
+      taskCalls.push(options);
+      processing = '在途变化';
+      if (request.task === 'rejudgeStoredQianshiV1') return rejudgeBatchResponse(request, row => ({ events: row.records.map(record => ({ key: record.key, status: 'completed', actionStatus: 'completed', matter: false })), order: [] }));
+      return { jsonData: { floors: request.floors.map(row => ({ floorKey: row.floorKey, qianshi: { events: [{ key: 'return-book', title: '归还旧书', description: '顾舟答应明日归还旧书。', status: 'planned', matter: true }], order: [] } })) } };
+    }});
+    const h=harness({processingPrompt:()=>processing,initialChat:[user('开始'),assistant('顾舟答应明日归还旧书。'),user('稳定')],utility:options=>transport.generate(options)});
+    await h.runtime.start(); await h.runtime.extractNext({ analyzeState: false });
+    const history = await h.runtime.prepareQianshiHistory(); mode = 'history';
+    const saved = await h.runtime.startQianshiHistory(history.planId);
+    assert.equal(saved.status, 'completed', JSON.stringify(saved));
+    const old = (await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].qianshiDelta.events[0];
+    processing = configured;
+    const plan = await h.runtime.prepareQianshiRejudge(); mode = 'rejudge';
+    const judged = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(judged.status, 'completed', JSON.stringify(judged));
+    assert.equal(taskCalls.length, 2);
+    const prefix = configured.trim() ? configured : BASE_PROCESSING_PROMPT;
+    for (const body of transport.bodies.slice(1)) { const system=body.messages[0].content;assert.ok(system.startsWith(prefix+'\n\n'));assert.equal(system.split(prefix).length-1,1); }
+    for(const call of taskCalls)assert.equal(call.systemPrompt.includes(BASE_PROCESSING_PROMPT),false);
+    const event = (await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].qianshiDelta.events[0];
+    assert.equal(event.id, old.id); assert.equal(event.sourceFloorId, old.sourceFloorId); assert.equal(event.status, 'completed');
+  }
+});
+
+test('前文核对失败自动通知使用短提示并保留内部错误', async () => {
+  const notices = [];
+  const h = harness({ notifyUser: value => notices.push(value), utility: () => { throw Object.assign(new Error('目标楼或其依赖前文已经变化，迟到摘要不会写入。'), { code: 'V3_MEMORY_PREFIX_CHANGED' }); } });
+  await h.runtime.start(); await h.runtime.startHistoricalRebuild();
+  await waitFor(() => !h.runtime.getState().activeAutoMemory);
+  const failure = h.runtime.getState().lastExtractorError;
+  assert.equal(failure.code, 'V3_MEMORY_PREFIX_CHANGED');
+  assert.match(failure.message, /目标楼或其依赖前文/);
+  const notice = notices.find(value => value.text.includes('摘要提取失败'));
+  assert.ok(notice, JSON.stringify(notices));
+  assert.match(notice.text, /摘要未保存，请重试该楼。/);
+  assert.doesNotMatch(notice.text, /目标楼或其依赖前文|复制状态诊断/);
+});
+
+
+test('前文核对准备阶段拒发请求的外层通知也给短提示且不覆盖原诊断', async () => {
+  const notices = []; let h;
+  h = harness({ notifyUser: value => notices.push(value), extractorPromptGuidance: () => { h.context.name1 = '更新后的用户称呼'; return ''; } });
+  await h.runtime.start();
+  const ui = viewHarness(h.runtime, { page: 'management' });
+  const button = ui.flatten(ui.container).find(node => node.textContent === '补齐缺失');
+  assert.ok(button); await button.click();
+  await waitFor(() => h.runtime.getState().lastAutoMemory?.status === 'failed' && !h.runtime.getState().activeAutoMemory);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.calls.length, 0, '准备阶段拒发，未调用模型');
+  const state = h.runtime.getState();
+  assert.equal(state.lastAutomationError.code, 'V3_MEMORY_PREFIX_CHANGED');
+  assert.equal(state.lastAutomationError.message, '摘要未保存，请重试该楼。');
+  assert.match(state.lastAutoMemory.message, /摘要未保存，请重试该楼。/);
+  const notice = notices.find(value => value.text.includes('千千结自动记忆未完成'));
+  assert.ok(notice, JSON.stringify(notices));
+  assert.match(notice.text, /摘要未保存，请重试该楼。/);
+  assert.doesNotMatch(notice.text, /复制状态诊断|目标楼或其依赖前文/);
+  assert.doesNotMatch(notice.text, /点击继续/);
+  const page = ui.flatten(ui.container).map(node => node.textContent).join('|');
+  assert.match(page, /补齐缺失未完成/);
+  assert.match(page, /复制状态诊断/);
+  ui.view.deactivate();
+});
+
+
+test('外层准备错误的新公开文案仍沿既有过滤脱敏中文凭证', async () => {
+  const notices = [];
+  const h = harness({ notifyUser: value => notices.push(value), extractorPromptGuidance: () => { throw new Error('资料准备失败 api_key=PRIVATE_KEY_SENTINEL token=PRIVATE_TOKEN_SENTINEL'); } });
+  await h.runtime.start();
+  const ui = viewHarness(h.runtime, { page: 'management' });
+  await ui.flatten(ui.container).find(node => node.textContent === '补齐缺失').click();
+  await waitFor(() => h.runtime.getState().lastAutoMemory?.status === 'failed' && !h.runtime.getState().activeAutoMemory);
+  await new Promise(resolve => setImmediate(resolve));
+  const state = h.runtime.getState();
+  assert.equal(h.calls.length, 0);
+  assert.match(state.lastAutoMemory.message, /1 楼摘要未完成.*没有可保存的新结果/u);
+  assert.doesNotMatch(state.lastAutoMemory.message, /PRIVATE_KEY_SENTINEL|PRIVATE_TOKEN_SENTINEL/);
+  assert.doesNotMatch(JSON.stringify(notices), /PRIVATE_KEY_SENTINEL|PRIVATE_TOKEN_SENTINEL/);
+  assert.doesNotMatch(ui.flatten(ui.container).map(node => node.textContent).join('|'), /PRIVATE_KEY_SENTINEL|PRIVATE_TOKEN_SENTINEL/);
+  ui.view.deactivate();
+});
+
+
+test('有效别名：新摘要请求和编译使用人工或已审AI全集，保留旧记录与身份引用', async () => {
+  for (const source of ['manual', 'reviewed']) {
+  let projection = {}, request;
+  const h = harness({
+    initialChat: [user('开始'), assistant('阿青首次出现。'), assistant('新称递来地图。'), assistant('用于确认上一楼稳定。')],
+    identityProjectionProvider: async () => projection,
+    utility: options => {
+      request = JSON.parse(options.taskMessages[0].content);
+      return request.payload.canonicalContent.includes('首次')
+        ? { jsonData: { summary: '阿青首次出现。', people: [{ name: '阿青', aliases: ['旧称'], presence: 'present' }] } }
+        : { jsonData: { summary: '新称递来地图。', people: [{ name: '新称', presence: 'present' }], actions: [{ actor: '新称', action: '递来地图' }] } };
+    },
+  });
+  await h.runtime.start(); let state = h.runtime.getState();
+  await h.runtime.extractFloor(state.floors[0].floorId, { analyzeState: false });
+  let reachable = await h.store.readReachable({ mode: 'runtime' });
+  const person = reachable.entities.find(e => e.displayName === '阿青'); assert.ok(person);
+  projection = { profilesByEntityId: { [person.id]: { aliases: '新称', manualFields: source === 'manual' ? ['aliases'] : [], ...(source === 'reviewed' ? { aliasesComplete: true } : {}) } } };
+  state = h.runtime.getState();
+  await h.runtime.extractFloor(state.floors[1].floorId, { analyzeState: false });
+  const catalog = request.payload.knownPeople.find(e => e.displayName === '阿青');
+  assert.deepEqual(catalog.aliases, ['新称']);
+  reachable = await h.store.readReachable({ mode: 'runtime' });
+  const saved = reachable.floorMemories.find(m => m.floorId === state.floors[1].floorId && m.recordStatus === 'active');
+  assert.equal(saved.participants[0].entityId, person.id); assert.equal(saved.actions[0].actorEntityId, person.id);
+  assert.ok(reachable.entities.find(e => e.id === person.id).aliases.some(a => a.name === '旧称'));
+  assert.equal(reachable.entities.filter(e => e.displayName === '新称' && e.status !== 'merged').length, 0);
+  }
+});
+
+test('人物姓名：摘要模型有旧正式名参照，历史称名归原ID并参与实际召回实体识别', async () => {
+  let projection = {}, request;
+  const h = harness({ initialChat: [user('开始'), assistant('阿青首次出现。'), assistant('阿青归还地图。'), assistant('确认前楼。')],
+    identityProjectionProvider: async () => projection, utility: options => {
+      request = JSON.parse(options.taskMessages[0].content);
+      return { jsonData: { summary: request.payload.canonicalContent, people: [{ name: '阿青', presence: 'present', ...(request.payload.canonicalContent.includes('首次') ? { aliases: ['旧杂称'] } : {}) }] } };
+    } });
+  await h.runtime.start(); const floors = h.runtime.getState().floors;
+  await h.runtime.extractFloor(floors[0].floorId, { analyzeState: false });
+  const before = await h.store.readReachable({ mode: 'runtime' }), person = before.entities.find(item => item.displayName === '阿青');
+  projection = { profilesByEntityId: { [person.id]: { name: '青禾', aliases: '', aliasesComplete: true, manualFields: [] } } };
+  await h.runtime.extractFloor(floors[1].floorId, { analyzeState: false });
+  const entry = request.payload.knownPeople.find(item => item.displayName === '青禾');
+  assert.equal(entry.previousName, '阿青'); assert.deepEqual(entry.aliases, []);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(after.floorMemories.find(item => item.floorId === floors[1].floorId).participants[0].entityId, person.id);
+  const source = await readRecallSource({ store: h.store, identityProjection: projection, now: () => new Date(NOW) });
+  const current = source.entities.find(item => item.entityId === person.id);
+  assert.equal(current.displayName, '青禾'); assert.deepEqual(current.aliases, []);
+  const scoringSource = { ...source, coverage: { ...source.coverage, cseCurrent: true }, currentState: [{ subjectEntityId: person.id,
+    core: [], adaptive: [], situational: [{ text: '谨慎处理委托', visibility: 'private', reason: '', towardEntityId: null }] }] };
+  assert.ok(cseSelectionContext(scoringSource, { text: '阿青现在在哪里？' }).states[0].score > 0, '旧正式名仍有实体相关性');
+  assert.equal(cseSelectionContext(scoringSource, { text: '旧杂称现在在哪里？' }).states[0].score, 0, '已清除别名不贡献相关性；主体仍统一拥有候选资格');
+});
+
+test('独立状态明确确认同值仍保存既有人工action覆盖，普通同值编辑保持不变', async () => {
+  const utility = options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
+    return { jsonData: { summary: '当时正在整理文件。', qianshi: { events: [
+      { key: 'record', title: '整理文件', description: '当时正在整理文件。', status: 'inProgress', actionStatus: 'inProgress', matter: false },
+    ], order: [] } } };
+  };
+  const h = harness({ initialChat: [user('开始'), assistant('正在整理文件。'), user('稳定')], utility });
+  await h.foundationRuntime.reconcile('typed-space-seed'); await h.runtime.start(); const floor = h.runtime.getState().floors[0];
+  await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const event = h.runtime.getQianshiSnapshot().events[0];
+  const input = { eventId: event.id, expected: { memoryId: event.sourceFloorMemoryId, title: event.title, description: event.description, object: event.object, status: event.status, actionStatus: event.actionStatus },
+    title: event.title, description: event.description, object: event.object, actionStatus: event.actionStatus };
+  const unchanged = await h.runtime.editQianshiEventText(input);
+  assert.equal(unchanged.status, 'unchanged');
+  await h.runtime.editQianshiEventText({ ...input, confirmActionStatus: true });
+  const snapshot = h.runtime.getQianshiSnapshot(), confirmed = snapshot.events.find(value => value.id === event.id);
+  assert.equal(confirmed.statusManuallyEdited, true);
+  assert.equal(confirmed.actionStatus, 'inProgress');
+  const source = await h.store.readReachable({ mode: 'runtime' });
+  const memory = source.floorMemories.find(value => value.id === confirmed.sourceFloorMemoryId);
+  assert.deepEqual(memory.qianshiDelta.manualEventOverrides.find(value => value.eventId === event.id), { eventId: event.id, actionStatus: 'inProgress' });
+});
+
+test('已知人物临时称呼只供本轮绑定，显式稳定别名与身份简介独立保存', async () => {
+  const known = { id: '10000000-0000-4000-8000-000000000091', chatId: CHAT, narrativeGeneration: GENERATION,
+    entityType: 'person', displayName: '青禾', aliases: [], specialRole: 'none', firstSeenFloorId: null,
+    lastSeenFloorId: null, status: 'established', recordStatus: 'active' };
+  const temporary = await direct({ summary: '那个人递来地图。', people: [
+    { name: '那个人', sameAsEntityKey: 'catalog-1', identityBrief: '药铺学徒。', identityBriefEvidence: [{ quoteSegments: ['那个人是药铺学徒'], supports: '明确职业', evidenceMode: 'explicit', sourceMentionKey: null }] },
+  ], actions: [{ actor: '那个人', action: '递来地图' }] }, { entities: [known], content: '那个人是药铺学徒，递来地图。' });
+  assert.equal(temporary.memory.actions[0].actorEntityId, known.id);
+  const directory = buildEntityIdentityDirectory({ entities: [known, ...temporary.newEntities] });
+  assert.deepEqual(directory[0].aliases, [], '临时surface不进入永久目录');
+  assert.equal(directory[0].identityBrief, '药铺学徒。', '跳过surface学习仍接纳独立身份简介');
+  const explicit = await direct({ summary: '青禾递来地图。', people: [
+    { name: '阿禾', aliases: ['阿禾'], sameAsEntityKey: 'catalog-1' },
+  ], actions: [{ actor: '阿禾', action: '递来地图' }] }, { entities: [known], content: '阿禾递来地图。' });
+  assert.equal(explicit.memory.actions[0].actorEntityId, known.id);
+  assert.deepEqual(buildEntityIdentityDirectory({ entities: [known, ...explicit.newEntities] })[0].aliases, ['阿禾'], '显式稳定别名即使与本轮surface相同仍可学习');
+  const newcomer = await direct({ summary: '戴斗笠的人递来地图。', people: [{ name: '戴斗笠的人' }],
+    actions: [{ actor: '戴斗笠的人', action: '递来地图' }] }, { content: '戴斗笠的人递来地图。' });
+  assert.equal(newcomer.newEntities[0].displayName, '戴斗笠的人', '未知实名不阻止新人物按当前称呼建档');
+  assert.equal(newcomer.memory.actions[0].actorEntityId, newcomer.newEntities[0].id);
+  const userEntity = { ...known, id: '10000000-0000-4000-8000-000000000093', displayName: '林岚', specialRole: 'user' };
+  const maskedUser = await direct({ summary: '戴帽子的人递来地图。', people: [
+    { name: '戴帽子的人', aliases: ['林岚'], role: 'user' },
+  ], actions: [{ actor: '戴帽子的人', action: '递来地图' }] }, { entities: [userEntity], content: '戴帽子的人递来地图。' });
+  assert.equal(maskedUser.memory.actions[0].actorEntityId, userEntity.id);
+  const userLabels = buildEntityIdentityDirectory({ entities: [userEntity, ...maskedUser.newEntities] })[0].aliases;
+  assert.ok(!userLabels.includes('戴帽子的人'), 'host主名归一不得把raw临时name变为长期别名');
+  assert.ok(userLabels.includes('你'), 'host明确提供的身份别名保持');
+});
+
+test('同一已知人物多条临时称呼全部绑定但不变成长久别名', async () => {
+  const known = { id: '10000000-0000-4000-8000-000000000092', chatId: CHAT, narrativeGeneration: GENERATION,
+    entityType: 'person', displayName: '青禾', aliases: [], specialRole: 'none', firstSeenFloorId: null,
+    lastSeenFloorId: null, status: 'established', recordStatus: 'active' };
+  const result = await direct({ summary: '他递来地图，那位青年说出关键口令。', people: [
+    { name: '他', sameAsEntityKey: 'catalog-1' }, { name: '那位青年', sameAsEntityKey: 'catalog-1' },
+  ], actions: [{ actor: '那位青年', action: '递来地图' }],
+  exactQuotes: [{ exactText: '秋水为凭', kind: 'codePhrase', speaker: '那位青年', whyPreserve: '后续核对口令' }],
+  observations: [{ subject: '那位青年', description: '仍拿着地图' }] },
+  { entities: [known], content: '他递来地图，那位青年说：“秋水为凭”，仍拿着地图。' });
+  assert.equal(result.memory.actions[0].actorEntityId, known.id);
+  assert.equal(result.memory.exactAnchors[0].speakerEntityId, known.id);
+  assert.equal(result.memory.observations[0].subjectEntityId, known.id);
+  assert.equal(result.memory.participants.length, 1);
+  assert.equal(result.newEntities.length, 0, '临时多称呼不产生永久alias修订');
+});
+
+test('实际派发破限指纹让A准备B派发的待存结果在B重用、改回A重新生成', async () => {
+  const {createCompactApiClient}=await import('../src/compact-api-client.js');
+  const {createTaskRouter}=await import('../src/api-routing.js');
+  for(const [dispatchedPrompt,retryPrompt,expected] of [['B','B',1],['B','A',2],['',BASE_PROCESSING_PROMPT,1],[BASE_PROCESSING_PROMPT,'',1]]) {
+    let processing='A',dispatches=0,actualSystem='';
+    const client=createCompactApiClient({processingPrompt:()=>processing,fetchImpl:async(_path,options)=>{dispatches++;actualSystem=JSON.parse(options.body).messages[0].content;return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({summary:'已完成的本楼摘要。'})},finish_reason:'stop'}]}),{headers:{'content-type':'application/json'}});}});
+    const router=createTaskRouter({resolver:{resolveUtility:()=>({kind:'independent',source:'test',config:{url:'https://fixture.invalid',key:'fixture',model:'fixture'}}),resolve:()=>({kind:'independent'})},compactClient:client});
+    let first=true;
+    const h=harness({processingPrompt:()=>processing,utility:options=>{if(first){first=false;processing=dispatchedPrompt;}return router.generateUtilityTask(options);}});
+    await h.runtime.start();const floorId=h.runtime.getState().floors[0].floorId;
+    let failOnce=true;h.backend.setBeforePut(({key})=>{if(failOnce&&key.startsWith('v3-index-')){failOnce=false;throw Object.assign(new Error('fixture save failure'),{status:504,code:'BACKEND_TIMEOUT'});}});
+    await h.runtime.extractFloor(floorId,{analyzeState:false});assert.equal(dispatches,1);
+    h.backend.setBeforePut(null);processing=retryPrompt;
+    const state=await h.runtime.extractFloor(floorId,{analyzeState:false});assert.equal(state.rememberedCount,1,JSON.stringify(state.lastExtractorError));assert.equal(dispatches,expected);
+    const provenance=h.foundationRuntime.getReachable().run.diagnostics.floorProvenance[floorId];
+    assert.equal(provenance.systemPromptFingerprint,`sha256:${createHash('sha256').update(actualSystem).digest('hex')}`);
+  }
+});
+
+
+test('摘要准备复用已验证记录不全图深复制，固定模型材料和旧记录保持不变', async () => {
+  const h = harness({ utility: () => ({ jsonData: { summary: '轻量任务摘要' } }) });
+  await h.foundationRuntime.start(); await h.runtime.start();
+  const prepared = await h.runtime.prepareCurrent();
+  const previous = prepared.reachable, before = JSON.stringify(previous);
+  const originalClone = globalThis.structuredClone;
+  let graphClones = 0;
+  globalThis.structuredClone = (value, ...options) => {
+    if (value?.root && Array.isArray(value.floors) && Array.isArray(value.floorMemories)) graphClones++;
+    return originalClone(value, ...options);
+  };
+  try { await h.runtime.extractFloor(previous.floors[0].id, { analyzeState: false }); }
+  finally { globalThis.structuredClone = originalClone; }
+  assert.equal(graphClones, 0, '准备摘要无需深复制整份可达图');
+  assert.equal(JSON.stringify(previous), before, '准备、编译及提交不原地修改旧记录');
+  const graph = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(graph.floorMemories[0].summary.aiText, '轻量任务摘要');
+  assert.equal(JSON.parse(h.calls[0].taskMessages[0].content).payload.canonicalContent, previous.floors[0].content.canonicalContent);
+  assert.equal(h.calls.length, 1);
+});
+
+test('无新AI的END和STOP也发布终止通知，界面可重新读取已清宿主busy', async () => {
+  for (const event of ['GENERATION_ENDED', 'GENERATION_STOPPED']) {
+    let live = false, native = false;
+    const h = harness({ initialChat: [assistant('已存在正文'), user('稳定锚'), assistant('未改尾楼')], readOnlyLifecycle: false,
+      automation: { enabled: false, batchSize: 1 }, isMainGenerationActive: () => native, readMainGenerationState: () => live });
+    await h.runtime.start();
+    live = true; native = true; h.emit('GENERATION_STARTED', 'normal', {}, false);
+    await h.runtime.refreshAutomation();
+    const published = []; const unsubscribe = h.runtime.subscribe(state => published.push(state)); published.length = 0;
+    native = false; h.emit(event);
+    assert.ok(published.length > 0, `${event}无新增内容仍须通知已挂载界面重新采样`);
+    assert.equal(published.at(-1).mainGenerationActive, true, 'END发出时宿主finally尚未清完整计数，业务互斥仍保留');
+    assert.equal(published.at(-1).memoryWorkBusy, false);
+    live = false; assert.equal(h.runtime.getState().mainGenerationActive, false);
+    assert.equal(h.calls.length, 0); unsubscribe();
+  }
+});
+
+test('用户独有固定设施同次编译并逐字保来源，设施坏项不丢摘要', async () => {
+  const quote = '东区公寓卧室里有独立卫生间，靠窗固定一张木书桌。';
+  const snapshot = { messages: [{ content: quote, messageIndex: 0, swipeId: null, selectedSwipeIndex: null }] };
+  const response = { summary: '他答应休息。', spatialFacts: {
+    places: [{ key: 'place-mention-1', name: '东区公寓卧室', identity: 'new', exactQuote: quote, source: 'precedingUserInput', sourceFloorKey: 'floor-1' }],
+    containments: [], positions: [], features: [
+      { key: 'feature-1', placeKey: 'place-mention-1',kind: 'stable', text: '房内有独立卫生间。', replacesKeys: [], exactQuote: quote, source: 'precedingUserInput', sourceFloorKey: 'floor-1' },
+      { key: 'feature-2', placeKey: 'place-mention-1',kind: 'stable', text: '靠窗固定木书桌。', replacesKeys: [], exactQuote: '原文中不存在的设备', source: 'precedingUserInput', sourceFloorKey: 'floor-1' },
+    ] } };
+  const result = await direct(response, { content: '他答应休息。', sourceUserInputSnapshot: snapshot });
+  assert.equal(result.memory.summary.aiText, response.summary);
+  assert.equal(result.memory.spatialFacts?.features?.length, 1, '仅合法的设施事实应保存');
+  const feature = result.memory.spatialFacts.features[0];
+  assert.equal(feature.text, '房内有独立卫生间。'); assert.deepEqual(feature.replacesItemIds, []);
+  assert.equal(feature.placeEntityId, result.newEntities.find(entity => entity.entityType === 'place').id);
+  assert.equal(feature.evidenceRefs[0].quotedText, quote); assert.equal(feature.evidenceRefs[0].sourceType, 'precedingUser'); assert.equal(feature.evidenceRefs[0].sourceSnapshotIndex, 0);
+  assert.match(buildExtractorSystemPrompt('合成自定义指导'), /spatialFacts.features.*precedingUserInput/u);
+  const invalid=structuredClone(result.memory);invalid.spatialFacts.features[0].evidenceRefs[0].evidenceMode='privateCognition';assert.throws(()=>validateFloorMemory(invalid),error=>error.code==='V3_FLOORMEMORY_INVALID');
+  const old = structuredClone(result.memory); delete old.spatialFacts.features;
+  assert.deepEqual(validateFloorMemory(old), old, '旧空间记录不补features或迁移字段');
+});
+
+test('固定设施经真实连续提取累计，明确替换保其它设施、冷读与安全诊断', async () => {
+ const quotes=['东区公寓卧室内有独立卫生间。','东区公寓卧室内添置固定木书桌。','东区公寓卧室内的独立卫生间已拆除。'];
+ const requests=[];
+ const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:quotes.flatMap(quote=>[user(quote),assistant('林岚仍在东区公寓卧室。')]).concat([user('继续')]),utility:options=>{
+  if(options.systemPrompt!==EXTRACTOR_SYSTEM_PROMPT)return {jsonData:{noMaterialChange:true}};
+  const payload=JSON.parse(options.taskMessages[0].content).payload;requests.push(payload);const index=quotes.findIndex(quote=>payload.precedingUserInput.some(item=>item.content===quote));const known=payload.knownPlaces.find(item=>item.displayName==='东区公寓卧室');
+  return {jsonData:{summary:'林岚仍在东区公寓卧室。',people:[{name:'林岚',role:'user',presence:'present'}],locations:[{name:'东区公寓卧室',change:'present',people:['林岚']}],spatialFacts:{places:[{key:'place-mention-1',name:'东区公寓卧室',identity:known?'existing':'new',...(known?{sameAsPlaceKey:known.entityKey}:{}),exactQuote:quotes[index],source:'precedingUserInput',sourceFloorKey:payload.sourceFloorKey}],containments:[],positions:[],features:[{key:'feature-1',placeKey:'place-mention-1',kind: 'stable',text:quotes[index],replacesKeys:index===2?[known.features.find(item=>item.text===quotes[0]).key]:[],exactQuote:quotes[index],source:'precedingUserInput',sourceFloorKey:payload.sourceFloorKey}]}}};
+ }});
+ await h.foundationRuntime.reconcile('features-seed');await h.runtime.start();
+ for(const floor of h.runtime.getState().floors)await h.runtime.extractFloor(floor.floorId,{analyzeState:false});
+ assert.equal(requests.length,3);assert.equal(h.calls.length,3,'只复用原每楼一次摘要，无额外分析');
+ assert.deepEqual(requests[1].knownPlaces[0].features.map(item=>item.text),[quotes[0]]);assert.equal(requests[1].knownPlaces[0].features[0].sourceAssistantSeq,1);
+ const graph=await h.store.readReachable({mode:'full'});const {projectPlaceFeatures}=await import('../src/v3/spatial-domain.js');
+ assert.deepEqual(projectPlaceFeatures({floorMemories:graph.floorMemories,floors:graph.floors}).map(item=>item.text),[quotes[1],quotes[2]]);
+ assert.deepEqual(projectPlaceFeatures({floorMemories:graph.floorMemories,floors:graph.floors,throughAssistantSeq:1}).map(item=>item.text),[quotes[0]]);
+ const original=JSON.stringify(graph.floorMemories);const last=h.runtime.getState().floors.at(-1);
+ const safe=JSON.parse(h.runtime.copySafeDiagnostic(last.floorId));assert.ok(safe.floorMemory.spatialFacts.features[0].evidenceRefs.every(ref=>ref.quotedText.startsWith('[已隐藏原文')));assert.doesNotMatch(JSON.stringify(safe.floorMemory.sourceUserInputSnapshot),new RegExp(quotes[2]));
+ assert.equal(JSON.stringify((await h.store.readReachable({mode:'full'})).floorMemories),original,'诊断与投影不写原楼');
+ const prefix=await projectFoundationPrefix({source:graph,floors:graph.floors.slice(0,2),chatId:CHAT,narrativeGeneration:graph.root.narrativeGeneration,now:NOW,currentStateId:'98989898-9898-4989-8989-989898989898'});
+ assert.deepEqual(projectPlaceFeatures({floorMemories:prefix.floorMemories,floors:graph.floors.slice(0,2)}).map(item=>item.text),quotes.slice(0,2),'真实分支/删尾前缀不继承后楼拆除');
+ const retained=graph.floorMemories.at(-1),place=retained.spatialFacts.features[0].placeEntityId,redirect='98989898-9898-4989-8989-989898989899';
+ assert.equal(projectFloorMemoryIdentityReferences(retained,{identityRedirectsByEntityId:{[place]:redirect},deletedEntityIds:[]}).spatialFacts.features[0].placeEntityId,redirect);
+ assert.deepEqual(projectFloorMemoryIdentityReferences(retained,{identityRedirectsByEntityId:{},deletedEntityIds:[place]}).spatialFacts.features,[]);
+ await h.runtime.editSummary(last.floorId,'人工修订当前结果。');assert.equal(h.runtime.getState().floors.at(-1).memory.spatialFacts,undefined,'人工改摘要沿原合同降级本楼自动空间事实');assert.equal(h.calls.length,3);
+
+});
+
+test('聚合设施同次先建后拆可明确对位，未来或跨地点替换只隔离坏项', async () => {
+ const texts=['东屋内有独立卫生间。','东屋内卫生间已拆除。'];
+ const floors=texts.map((text,index)=>({id:`0000000${index+1}-1111-4111-8111-111111111119`,chatId:CHAT,narrativeGeneration:GENERATION,assistantSeq:index+1,hostLocator:{messageIndex:index*2+1},content:{canonicalContent:text,rawFingerprint:'sha256:'+createHash('sha256').update(text).digest('hex')}}));
+ const floor=floors[1],envelope=await createExtractorEnvelope({batchId:'33333333-3333-4333-8333-333333333333',chatId:CHAT,narrativeGeneration:GENERATION,floor,sourceFloors:floors.map(floor=>({floor}))});
+ const response={summary:'东屋设施发生变化。',spatialFacts:{places:[{key:'place-mention-1',name:'东屋',identity:'new',exactQuote:texts[0],source:'canonicalContent',sourceFloorKey:'floor-1'}],containments:[],positions:[],features:[
+  {key:'feature-1',placeKey:'place-mention-1',kind: 'stable',text:'有独立卫生间。',replacesKeys:[],exactQuote:texts[0],source:'canonicalContent',sourceFloorKey:'floor-1'},
+  {key:'feature-2',placeKey:'place-mention-1',kind: 'stable',text:'卫生间已拆除。',replacesKeys:['feature-1'],exactQuote:texts[1],source:'canonicalContent',sourceFloorKey:'floor-2'},
+ ]}};
+ const compile=response=>normalizeExtractorResponse({response,envelope,floor,expectedScope:envelope.scope,now:NOW});
+ const result=await compile(response),features=result.memory.spatialFacts.features;
+ assert.equal(features.length,2);assert.deepEqual(features[1].replacesItemIds,[features[0].itemId]);
+ const {projectPlaceFeatures}=await import('../src/v3/spatial-domain.js');
+ assert.deepEqual(projectPlaceFeatures({floorMemories:[result.memory],floors,throughAssistantSeq:1}).map(item=>item.text),['有独立卫生间。']);
+ assert.deepEqual(projectPlaceFeatures({floorMemories:[result.memory],floors}).map(item=>item.text),['卫生间已拆除。']);
+ const bad=structuredClone(response);bad.spatialFacts.features[0].replacesKeys=['feature-2'];
+ const isolated=await compile(bad);assert.equal(isolated.memory.summary.aiText,response.summary);assert.equal(isolated.memory.spatialFacts,undefined,'未来引用及依赖坏项的更正均不写入');
+ const self=structuredClone(response);self.spatialFacts.features[1].replacesKeys=['feature-2'];assert.equal((await compile(self)).memory.spatialFacts.features.length,1);
+ const cross=structuredClone(response);cross.spatialFacts.places.push({key:'place-mention-2',name:'西屋',identity:'new',exactQuote:texts[1],source:'canonicalContent',sourceFloorKey:'floor-2'});cross.spatialFacts.features[1].placeKey='place-mention-2';assert.equal((await compile(cross)).memory.spatialFacts.features.length,1);
+});
+
+test('搬家携带摘要不复制冻结原楼设施，归档与设施来源及替换ID完整保留', async () => {
+ const quote='东屋内有固定木桌。';
+ const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('设定房间'),assistant(quote),user('继续')],utility:options=>({jsonData:{summary:quote,spatialFacts:{places:[{key:'place-mention-1',name:'东屋',identity:'new',exactQuote:quote,source:'canonicalContent',sourceFloorKey:JSON.parse(options.taskMessages[0].content).payload.sourceFloorKey}],containments:[],positions:[],features:[{key:'feature-1',placeKey:'place-mention-1',kind: 'stable',text:'有固定木桌。',replacesKeys:[],exactQuote:quote,source:'canonicalContent',sourceFloorKey:JSON.parse(options.taskMessages[0].content).payload.sourceFloorKey}]}}})});
+ await h.foundationRuntime.reconcile('migration-feature-source');await h.runtime.start();const floor=h.runtime.getState().floors[0];await h.runtime.extractFloor(floor.floorId,{analyzeState:false});
+ const source=await h.store.readReachable({mode:'full'}),original=structuredClone(source.floorMemories[0]);
+ const target='ffffffff-eeee-4eee-8eee-eeeeeeeeeeee',sourceIdentity={chatId:CHAT,hostChatId:h.context.chatId,characterLocator:'character.png',personaLocator:'persona.png'},targetIdentity={...sourceIdentity,chatId:target,hostChatId:'migrated'};
+ const store=createFoundationStore({client:h.backend.client,contextProvider:()=>targetIdentity});let id=500;
+ const migrated=await initializeMigrationGraph({store,sourceIdentity,targetIdentity,sourceReachable:source,targetChat:[user('设定房间'),assistant(quote)],carriedSummary:{sourceFloorId:floor.floorId,sourceMemoryId:original.id,targetMessageIndex:1},now:()=>new Date(NOW),newUuid:()=>`${(++id).toString(16).padStart(8,'0')}-0000-4000-8000-000000000000`});
+ const frozen=migrated.reachable.floorMemories.find(item=>item.floorId===original.floorId),live=migrated.reachable.floorMemories.find(item=>item.floorId!==original.floorId);
+ assert.deepEqual(frozen.spatialFacts,original.spatialFacts);assert.equal(live.spatialFacts,undefined,'新live摘要不再复制原归档的空间事实');
+ const {projectPlaceFeatures}=await import('../src/v3/spatial-domain.js');assert.deepEqual(projectPlaceFeatures({floorMemories:migrated.reachable.floorMemories,floors:migrated.reachable.floors}).map(item=>item.text),['有固定木桌。']);
+ assert.deepEqual((await h.store.readReachable({mode:'full'})).floorMemories[0],original,'源图不回写');
+});
+
+test('设施对照跨空地点摘要延续最新可信场景，明确离开后不继续附旧设施', async () => {
+ for(const leave of [false,true]) {
+ const scenes=[{user:'东屋内有独立卫生间。',ai:'林岚在东屋。'},{user:'继续',ai:leave?'林岚离开东屋，去向未知。':'他点头。'},{user:'房内卫生间拆掉了。',ai:'他答应休息。'}],requests=[];
+ const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:scenes.flatMap(scene=>[user(scene.user),assistant(scene.ai)]).concat([user('继续')]),utility:options=>{
+  const payload=JSON.parse(options.taskMessages[0].content).payload;requests.push(payload);const index=scenes.findIndex(scene=>scene.ai===payload.canonicalContent);
+  if(index===1){
+   if(!leave)return {jsonData:{summary:'他点头。'}};
+   const room=payload.knownPlaces.find(item=>item.displayName==='东屋');
+   return {jsonData:{summary:scenes[1].ai,people:[{name:'林岚',role:'user'}],spatialFacts:{places:[{key:'place-mention-1',name:'东屋',identity:'existing',sameAsPlaceKey:room.entityKey,exactQuote:scenes[1].ai,source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey}],containments:[],positions:[{subject:'林岚',placeKey:'place-mention-1',status:'leftUnknown',exactQuote:scenes[1].ai,source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey}]}}};
+  }
+  if(index===2&&leave)return {jsonData:{summary:scenes[2].ai}};
+  const room=payload.knownPlaces.find(item=>item.displayName==='东屋'),old=room?.features?.find(item=>item.text==='房内有独立卫生间。');
+  return {jsonData:{summary:scenes[index].ai,...(index===0?{people:[{name:'林岚',role:'user',presence:'present'}]}:{}),spatialFacts:{places:[{key:'place-mention-1',name:'东屋',identity:index===0?'new':'existing',...(room?{sameAsPlaceKey:room.entityKey}:{}),exactQuote:scenes[index].user,source:'precedingUserInput',sourceFloorKey:payload.sourceFloorKey}],containments:[],positions:index===0?[{subject:'林岚',placeKey:'place-mention-1',status:'confirmed',exactQuote:scenes[0].ai,source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey}]:[],features:[{key:'feature-1',placeKey:'place-mention-1',kind: 'stable',text:index===0?'房内有独立卫生间。':'房内卫生间已拆除。',replacesKeys:old?[old.key]:[],exactQuote:scenes[index].user,source:'precedingUserInput',sourceFloorKey:payload.sourceFloorKey}]}}};
+ }});
+ await h.foundationRuntime.reconcile('scene-gap');await h.runtime.start();for(const floor of h.runtime.getState().floors)await h.runtime.extractFloor(floor.floorId,{analyzeState:false});
+ assert.equal(requests.length,3);assert.equal(requests[2].knownPlaces.find(item=>item.displayName==='东屋').features?.length,leave?undefined:1,'无新地点保对照键，明确离开后不把旧房间当当前场景');
+ const graph=await h.store.readReachable({mode:'full'}),{projectPlaceFeatures}=await import('../src/v3/spatial-domain.js');assert.deepEqual(projectPlaceFeatures({floorMemories:graph.floorMemories,floors:graph.floors}).map(item=>item.text),[leave?'房内有独立卫生间。':'房内卫生间已拆除。']);
+ }
+});
+
+test('摘要等待期间人物资料独立完成，同名和无冲突新别名不废弃同次绑定结果', async () => {
+ let peopleStore,identity,release,entered;const started=new Promise(resolve=>{entered=resolve;});let calls=0;
+ const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant('顾砚在场。'),user('继续'),assistant('顾先生递来信，顾砚点头。'),user('继续')],identityProjectionProvider:async()=>peopleStore?(await peopleStore.read(identity)).data??{}:{},utility:options=>{
+  calls++;const payload=JSON.parse(options.taskMessages[0].content).payload;
+  if(payload.canonicalContent==='顾砚在场。')return {jsonData:{summary:'顾砚在场。',people:[{name:'顾砚',presence:'present'}]}};
+  entered();return new Promise(resolve=>{release=()=>resolve({jsonData:{summary:'顾砚递来信。',people:[{name:'顾砚',aliases:['顾先生'],presence:'present'}],actions:[{actor:'顾砚',action:'递来信件',completion:'completed'}]}});});
+ }});
+ peopleStore=createPeopleWorkspaceStore({client:h.backend.client});identity={hostChatId:h.context.chatId,chatId:CHAT,characterLocator:'character.png',personaLocator:'persona.png'};
+ await h.foundationRuntime.reconcile('identity-parallel');await h.runtime.start();const floors=h.runtime.getState().floors;await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});
+ const person=(await h.store.readReachable({mode:'runtime'})).entities.find(item=>item.displayName==='顾砚');
+ const pending=h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});await started;
+ await peopleStore.put(identity,{schemaVersion:3,kind:'qqj-v3-people-workspace',chatId:CHAT,selectedEntityIds:[person.id],personOrderEntityIds:[person.id],profilesByEntityId:{[person.id]:{entityId:person.id,name:'顾砚',aliases:'顾先生、阿砚、少爷、老板',aliasesComplete:true,manualFields:[],source:'generated',createdAt:NOW,updatedAt:NOW}},avatarsByEntityId:{},identityRedirectsByEntityId:{},deletedEntityIds:[],createdAt:NOW,updatedAt:NOW},0);
+ h.emit('MESSAGE_UPDATED',3);await new Promise(resolve=>setImmediate(resolve));
+ release();const state=await pending,graph=await h.store.readReachable({mode:'full'});
+ assert.equal(state.lastExtractorError,null,'正常并行资料初建不拒绝已付费摘要');assert.equal(graph.floorMemories.find(item=>item.floorId===floors[1].floorId)?.summary.aiText,'顾砚递来信。');assert.equal(calls,2,'第二楼仍只用原一次模型调用');
+ assert.equal((await peopleStore.read(identity)).data.profilesByEntityId[person.id].aliases,'顾先生、阿砚、少爷、老板');
+});
+
+
+test('摘要只依赖实际绑定，人工身份决定保字面摘要且歧义仅影响对应结构', async t => {
+ for(const scenario of ['rename','merge','delete','revokeUsed','bodyChanged','revoke','reviewedEmpty','collision','newClaimed','unrelated']) await t.test(scenario,async()=>{
+  let projection={},release,entered,stage=0;const started=new Promise(resolve=>{entered=resolve;});
+  const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant('顾砚与周宁在场。'),user('继续'),assistant('顾砚接过陌客的信。'),user('继续')],identityProjectionProvider:()=>projection,utility:()=>{
+   if(stage++===0)return {jsonData:{summary:'顾砚与周宁在场。',people:[{name:'顾砚',presence:'present'},{name:'周宁',presence:'present'}]}};
+   entered();return new Promise(resolve=>{release=()=>resolve({jsonData:{summary:'顾砚接信。',people:[{name:scenario==='revokeUsed'?'顾先生':'顾砚',presence:'present'},{name:'周宁',presence:'present'},...(scenario==='newClaimed'?[{name:'陌客',presence:'present'}]:[])],actions:[{actor:scenario==='revokeUsed'?'顾先生':'顾砚',action:'接信',completion:'completed'},{actor:'周宁',action:'还书',completion:'completed'},...(scenario==='newClaimed'?[{actor:'陌客',action:'递信',completion:'completed'}]:[])]}});});
+  }});
+  await h.foundationRuntime.reconcile('identity-guard');await h.runtime.start();const floors=h.runtime.getState().floors;await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});
+  const entities=(await h.store.readReachable({mode:'runtime'})).entities,person=entities.find(item=>item.displayName==='顾砚'),other=entities.find(item=>item.displayName==='周宁');
+  projection={reviewedAliasesByEntityId:{[person.id]:['顾先生']}};
+  const pending=h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});await started;
+  if(scenario==='rename')projection={...projection,currentNamesByEntityId:{[person.id]:'顾远'}};
+  if(scenario==='merge')projection={...projection,identityRedirectsByEntityId:{[person.id]:other.id}};
+  if(scenario==='delete')projection={...projection,deletedEntityIds:[person.id]};
+  if(scenario==='revokeUsed')projection={manualAliasesByEntityId:{[person.id]:[]}};
+  if(scenario==='bodyChanged'){h.context.chat[3].mes='正文确已改变';h.context.chat[3].swipes[0]='正文确已改变';}
+  if(scenario==='revoke')projection={manualAliasesByEntityId:{[person.id]:[]}};
+  if(scenario==='reviewedEmpty')projection={reviewedAliasesByEntityId:{[person.id]:[]}};
+  if(scenario==='collision')projection={...projection,reviewedAliasesByEntityId:{[person.id]:['顾先生'],[other.id]:['顾砚']}};
+  if(scenario==='newClaimed')projection={reviewedAliasesByEntityId:{[person.id]:['顾先生','陌客']}};
+  if(scenario==='unrelated')projection={...projection,manualAliasesByEntityId:{[other.id]:['周先生']},currentNamesByEntityId:{[other.id]:'周远'},identityRedirectsByEntityId:{'ffffffff-ffff-4fff-8fff-ffffffffffff':other.id},deletedEntityIds:['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee']};
+  release();const state=await pending,graph=await h.store.readReachable({mode:'full'}),saved=graph.floorMemories.find(item=>item.floorId===floors[1].floorId);
+  if(scenario==='bodyChanged'){assert.ok(state.lastExtractorError);assert.equal(saved,undefined);assert.equal(stage,2);return;}
+  assert.equal(state.lastExtractorError,null);assert.equal(saved?.summary.aiText,'顾砚接信。');
+  assert.ok(saved.actions.some(item=>item.action==='还书'),'健康人物动作继续保存');
+  assert.equal(saved.actions.some(item=>item.action==='接信'),!['collision','revokeUsed'].includes(scenario));
+  if(scenario==='newClaimed')assert.equal(saved.actions.some(item=>item.action==='递信'),false);
+  assert.equal(stage,2,'一次请求，不新增模型重试');
+ });
+});
+
+test('后台memory诊断快照不读取宿主正文，保安全失败和请求阶段',async()=>{
+ const h=harness({utility:()=>{throw Object.assign(new Error('PRIVATE_BODY api_key=PRIVATE_KEY'),{code:'QQJ_TIMEOUT'});}});
+ await h.runtime.start();await h.runtime.extractNext({analyzeState:false});const before=h.snapshotCount();
+ const snapshot=h.runtime.getDiagnosticState();for(let i=0;i<10;i++)assert.deepEqual(h.runtime.getDiagnosticState(),snapshot);
+ assert.equal(h.snapshotCount(),before);assert.equal(snapshot.lastExtractorError.code,'QQJ_TIMEOUT');assert.equal(snapshot.extractorRequest.outcome,'failed');assert.doesNotMatch(JSON.stringify(snapshot),/PRIVATE_BODY|PRIVATE_KEY|裴晚生|canonicalContent|prompt/u);
+});
+
+
+test('已付费pending摘要遇兼容人物资料更新仍复用原结果',async()=>{
+ let projection={},stage=0;
+ const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant('顾砚在场。'),user('继续'),assistant('顾砚点头。'),user('继续')],identityProjectionProvider:()=>projection,utility:()=>({jsonData:{summary:stage++===0?'顾砚在场。':'顾砚点头。',people:[{name:'顾砚',presence:'present'}]}})});
+ await h.foundationRuntime.reconcile('identity-pending');await h.runtime.start();const floors=h.runtime.getState().floors;await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});
+ const person=(await h.store.readReachable({mode:'runtime'})).entities.find(item=>item.displayName==='顾砚');
+ let fail=true;h.backend.setBeforePut(({key})=>{if(fail&&key.startsWith('v3-index-')){fail=false;throw Object.assign(new Error('index timeout'),{code:'BACKEND_TIMEOUT'});}});
+ await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});assert.equal(h.runtime.getState().rememberedCount,1);assert.equal(stage,2);
+ projection={currentNamesByEntityId:{[person.id]:'顾砚'},reviewedAliasesByEntityId:{[person.id]:['顾先生']}};h.backend.setBeforePut(null);
+ const state=await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});assert.equal(state.lastExtractorError,null);assert.equal(state.rememberedCount,2);assert.equal(stage,2,'兼容更新不丢已付费pending结果');
+});
+
+test('真实CSE失败轻诊断和持久回落不扫全历史，保run/count/time且不调用模型重试',async()=>{
+ const storage=browserStorage();const utility=options=>{if(options.systemPrompt===EXTRACTOR_SYSTEM_PROMPT)return {jsonData:{summary:'裴晚生提醒你带伞。',people:[{name:'裴晚生'},{name:'你',role:'user'}]}};throw Object.assign(new TypeError('读取记忆失败，无法连接记忆存储服务。请到记忆管理复制状态诊断。'),{code:'BACKEND_NETWORK'});};
+ const h=harness({failureStorage:storage,utility});await h.runtime.start();await h.runtime.extractNext();const state=h.runtime.getState(),n=h.snapshotCount(),diag=h.runtime.getDiagnosticState();
+ assert.equal(state.lastCseError.code,'BACKEND_NETWORK');assert.equal(diag.lastCseError.code,'BACKEND_NETWORK');assert.equal(diag.cseRequest.runId,diag.lastCseError.runId);assert.equal(diag.lastCseError.count,1);assert.equal(diag.lastCseError.lastFailedAt,NOW);for(let i=0;i<8;i++)h.runtime.getDiagnosticState();assert.equal(h.snapshotCount(),n);assert.doesNotMatch(JSON.stringify(diag),/裴晚生|提醒|复制状态诊断|systemPrompt/);
+ const cold=harness({sharedBackend:h.backend,sharedContext:h.context,failureStorage:storage,utility:()=>assert.fail('冷读取不能重试模型')});await cold.runtime.start();const restored=cold.runtime.getDiagnosticState();assert.equal(restored.lastCseError.code,'BACKEND_NETWORK');assert.equal(restored.lastCseError.runId,diag.lastCseError.runId);assert.equal(restored.lastCseError.count,1);assert.equal(restored.lastCseError.lastFailedAt,NOW);
+});
+
+
+test('真实CSE人工保存失败重抛保本次run和楼身份且不借旧请求耗时', async () => {
+  const h = harness({ utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+    ? { jsonData: { summary: '本楼摘要', people: [{ name: '裴晚生' }] } }
+    : { jsonData: { noMaterialChange: true } } });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId); await h.runtime.analyzeNextState();
+  const state = h.runtime.getState(), subject = state.cseSubjects[0];
+  assert.ok(subject && state.currentStateId);
+  const failure = Object.assign(new TypeError('保存记忆失败，无法连接记忆存储服务。'), { code: 'BACKEND_NETWORK' });
+  const previous = h.runtime.getDiagnosticState().cseRequest; assert.ok(previous?.runId);
+  let release, started; const pending = new Promise(resolve => { release = resolve; }), saving = new Promise(resolve => { started = resolve; });
+  h.backend.setBeforePut(async ({ key }) => { if (key === 'v3-root') { started(); await pending; throw failure; } });
+  const correction = h.runtime.correctSubjectState(subject.subjectEntityId, {
+    expectedCurrentStateId: state.currentStateId, expectedCurrentStateFingerprint: state.currentStateFingerprint,
+    core: subject.core, adaptive: subject.adaptive,
+    situational: [...subject.situational, { text: '本次人工记录', reason: '用户输入', visibility: 'private', towardEntityId: null }],
+  });
+  const rejected = assert.rejects(correction, error => {
+    const saved = h.runtime.getState().lastCseError;
+    assert.equal(error, failure); assert.ok(error.runId); assert.equal(error.runId, saved.runId); assert.equal(error.floorId, saved.floorId); return true;
+  });
+  await saving;
+  const during = h.runtime.getDiagnosticState();
+  release(); await rejected;
+  assert.equal(during.cseRequest.runId, previous.runId, '上次LLM请求仍归原run，不标成当前manual run');
+  assert.notEqual(during.activeCse.runId, during.cseRequest.runId);
+  const after = h.runtime.getDiagnosticState();
+  assert.equal(after.cseRequest.runId, previous.runId); assert.notEqual(after.lastCseError.runId, after.cseRequest.runId);
+});
+
+function precisionPlace(index, displayName, aliases = []) {
+  return { schemaVersion: 3, recordType: 'entity', id: `${String(index).padStart(8, '0')}-7777-4777-8777-777777777777`, chatId: CHAT, narrativeGeneration: GENERATION,
+    entityType: 'place', displayName, aliases: aliases.map(name => ({ name, normalized: name, kind: 'uncertain', evidenceRefs: [], baselineClaimIds: [] })), specialRole: 'none',
+    firstSeenFloorId: '11111111-1111-4111-8111-111111111111', lastSeenFloorId: '11111111-1111-4111-8111-111111111111', status: 'provisional', mergedIntoEntityId: null,
+    mergeEvidenceRefs: [], baselineClaimIds: [], createdAt: NOW, updatedAt: NOW, recordStatus: 'active', supersedes: null };
+}
+
+function place194Fixture() {
+ const first='城区内的电视台大楼开始录制。',room='3号待机室的门打开。',stage='演播大厅的门打开。';
+ const content=first+room+'中间剧情。'.repeat(500)+stage+'你站在演播大厅舞台上。';
+ const ev=exactQuote=>({source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote});
+ const names=['电视台大楼','电视台大楼3号待机室','电视台大楼演播大厅舞台'];
+ const packet={summary:'你进入电视台大楼并在舞台停下。',people:[{name:'林岚'}],spatialFacts:{places:names.map((name,i)=>({key:`place-mention-${i+1}`,name,identity:'new',...ev([first,room,stage][i])})),containments:[1,2].map(i=>({placeKey:`place-mention-${i+1}`,parentPlaceKey:'place-mention-1',...ev(first+'……'+[room,stage][i-1])})),positions:[{subject:'林岚',placeKey:'place-mention-3',status:'confirmed',...ev('你站在演播大厅舞台上。')}],features:[{key:'feature-1',placeKey:'place-mention-2',kind:'stable',text:'门已打开',replacesKeys:[],...ev(room)}]},placePaths:[1,2].map(i=>({path:[{name:'城区'},{name:names[0]},{name:names[i]}],evidence:[ev(first+'……'+[room,stage][i-1])]}))};
+ return {content,packet};
+}
+
+test('194同次正文显式父子后缀桥接无placeKey路径，地点身份与位置设施共用且只保短引文',async()=>{
+ const {content,packet}=place194Fixture(),result=await direct(packet,{content});
+ assert.deepEqual(result.isolated.filter(item=>item.code!=='V3_EXTRACTOR_ENTITY_KIND_DEFAULTED'),[]);
+ const places=result.newEntities.filter(item=>item.entityType==='place');assert.equal(places.length,4);
+ for(const name of ['城区','电视台大楼','电视台大楼3号待机室','电视台大楼演播大厅舞台'])assert.equal(places.filter(place=>place.displayName===name).length,1);
+ const ids=new Map(places.map(place=>[place.displayName,place.id])),spatial=result.memory.spatialFacts;
+ assert.equal(new Set(spatial.containments.map(edge=>`${edge.placeEntityId}:${edge.parentEntityId}`)).size,3,'同一父边的独立证据保留，按实体边去重后仍是三条正确归属');assert.ok(spatial.containments.some(edge=>edge.placeEntityId===ids.get('电视台大楼')&&edge.parentEntityId===ids.get('城区')));
+ for(const name of ['电视台大楼3号待机室','电视台大楼演播大厅舞台'])assert.ok(spatial.containments.some(edge=>edge.placeEntityId===ids.get(name)&&edge.parentEntityId===ids.get('电视台大楼')));
+ assert.equal(spatial.positions[0].placeEntityId,ids.get('电视台大楼演播大厅舞台'));assert.equal(spatial.features[0].placeEntityId,ids.get('电视台大楼3号待机室'));
+ assert.ok(spatial.containments.every(edge=>edge.evidenceRefs.every(ref=>content.includes(ref.quotedText)&&ref.quotedText.length<100)));
+ assert.equal(result.memory.summary.aiText,packet.summary);
+});
+
+test('省略重复父边可共用唯一地点，同名多候选错来源与坏显式key仍隔离',async()=>{
+ for(const variant of ['no-parent','two-leaves','wrong-parent','wrong-source','uncertain-leaf','bad-key']){
+  const {content,packet}=place194Fixture();packet.placePaths=packet.placePaths.slice(0,1);
+  if(variant==='no-parent')packet.spatialFacts.containments=[];
+  if(variant==='two-leaves')packet.spatialFacts.places.push({...packet.spatialFacts.places[1],key:'place-mention-4'});
+  if(variant==='wrong-parent')packet.placePaths[0].path[1].sameAsPlaceKey='missing-parent-key';
+  if(variant==='wrong-source')packet.placePaths[0].evidence[0].sourceFloorKey='floor-2';
+  if(variant==='uncertain-leaf')packet.spatialFacts.places[1].identity='uncertain';
+  if(variant==='bad-key'){packet.spatialFacts.places[1].key='bad-key';packet.spatialFacts.containments[0].placeKey='bad-key';packet.placePaths[0].placeKey='bad-key';}
+  const result=await direct(packet,{content});
+  if(variant==='no-parent'){
+   assert.deepEqual(result.isolated.filter(item=>item.field==='placePaths'),[],'path自己的明确父链不要求重复空间父边');
+   const ids=new Map(result.newEntities.map(place=>[place.displayName,place.id]));
+   assert.ok(result.memory.spatialFacts.containments.some(edge=>edge.placeEntityId===ids.get('电视台大楼3号待机室')&&edge.parentEntityId===ids.get('电视台大楼')));
+   continue;
+  }
+  assert.ok(result.isolated.some(item=>item.field==='placePaths'),'真正错引用隔离：'+variant);
+  assert.equal(result.newEntities.filter(place=>place.displayName==='城区').length,0);
+ }
+});
+
+test('194省略引用只接空间，普通事件仍不修拼接引文且跨用户来源不拼段',async()=>{
+ const content='甲楼内有客房。中间经过。客房内有书桌。',ev={source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:'甲楼内有客房。……客房内有书桌。'};
+ const result=await direct({summary:'已有合法摘要',events:[{title:'本楼事项',description:'进入客房',...ev}],spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'new',...ev}],containments:[],positions:[],features:[{key:'feature-1',placeKey:'place-mention-1',text:'有书桌',kind:'stable',replacesKeys:[],...ev}]}},{content});
+ assert.equal(result.memory.eventFragments[0].evidenceRefs.length,0);assert.equal(result.memory.spatialFacts.features[0].evidenceRefs.length,2);
+ const split=await direct({summary:'已有合法摘要',spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'new',...ev,source:'precedingUserInput'}],containments:[],positions:[]}},{content:'无地点',sourceUserInputSnapshot:{messages:[{content:'甲楼内有客房。',messageIndex:0},{content:'客房内有书桌。',messageIndex:1}]}});
+ assert.ok(split.isolated.some(item=>item.code==='V3_EXTRACTOR_SPATIAL_EVIDENCE_INVALID'));assert.equal(split.newEntities.length,0);
+});
+
+test('同来源完整路径可独立受理，跨建筑局部边的原证据同时保留',async()=>{
+ const a='甲楼一楼设有客房。',b='乙楼一楼也设有客房。',content=a+b,ev=exactQuote=>({source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote});
+ for(const edgeQuote of [b,content]){
+  const response={summary:content,spatialFacts:{places:[{key:'place-mention-1',name:'一楼',identity:'new',...ev(b)},{key:'place-mention-2',name:'客房',identity:'new',...ev(b)}],containments:[{placeKey:'place-mention-2',parentPlaceKey:'place-mention-1',...ev(edgeQuote)}],positions:[]},placePaths:[{path:[{name:'甲楼'},{name:'一楼'},{name:'客房'}],...ev(content)}]};
+  const result=await direct(response,{content});assert.deepEqual(result.isolated.filter(item=>item.field==='placePaths'),[]);
+  const ids=new Map(result.newEntities.map(place=>[place.displayName,place.id]));assert.ok(ids.get('甲楼'));
+  const edges=result.memory.spatialFacts.containments;
+  assert.ok(edges.some(edge=>edge.placeEntityId===ids.get('一楼')&&edge.parentEntityId===ids.get('甲楼')),'模型完整path的明确父链单独受理');
+  assert.ok(edges.some(edge=>edge.placeEntityId===ids.get('客房')&&edge.parentEntityId===ids.get('一楼')&&edge.evidenceRefs.some(ref=>ref.quotedText===edgeQuote)),'原空间局部父边与其原证据保留');
+  assert.equal(result.memory.summary.aiText,content);
+ }
+});
+
+test('地点40候选之外的同名和别名冲突不能制造唯一绑定', async () => {
+  for (const aliasCollision of [false, true]) {
+    const other = Array.from({ length: 39 }, (_, index) => precisionPlace(index + 1, `编号${index + 1}号会馆`));
+    const name = '重名阅览室', first = precisionPlace(40, name), second = precisionPlace(41, aliasCollision ? '西楼阅览室' : name, aliasCollision ? [name] : []);
+    const content = `${other.map(entity => entity.displayName).join('，')}，重名阅览室有人等候。`;
+    const response = { summary: '有人在阅览室等候。', locations: [{ name, change: 'mentioned' }], spatialFacts: { places: [
+      { key: 'place-mention-1', name, identity: 'existing', exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+    ], containments: [], positions: [] } };
+    const result = await direct(response, { content, entities: [...other, first, second] });
+    assert.equal(result.memory.locations[0].entityId, null, '完整目录有另一同名/别名，即使本次40条仅剩一个也不能绑定');
+    assert.equal(result.newEntities.filter(entity => entity.entityType === 'place').length, 0);
+  }
+});
+
+test('全目录歧义仍允许已提供的明确地点key，候选外key与uncertain不回绑', async () => {
+  const name = '重名阅览室', entities = [precisionPlace(1, name), precisionPlace(2, name)];
+  const content = '此处重名阅览室有人等候。';
+  const floor = { id: '11111111-1111-4111-8111-111111111111', chatId: CHAT, narrativeGeneration: GENERATION, assistantSeq: 1, content: { canonicalContent: content } };
+  const envelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333333', chatId: CHAT, narrativeGeneration: GENERATION, checkpointId: null, floor, entities });
+  const key = envelope.scope.placeCatalogBindings.find(binding => binding.entityId === entities[1].id).entityKey;
+  for (const [identity, sameAsPlaceKey, expected] of [['existing', key, entities[1].id], ['existing', 'place-99', null], ['uncertain', key, null]]) {
+    const response = { summary: '有人等候。', locations: [{ name, change: 'mentioned' }], spatialFacts: { places: [
+      { key: 'place-mention-1', name, identity, sameAsPlaceKey, exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+    ], containments: [], positions: [] } };
+    const result = await normalizeExtractorResponse({ response, envelope, floor, existingEntities: entities, now: NOW, expectedScope: envelope.scope });
+    assert.equal(result.memory.locations[0].entityId, expected);
+  }
+  assert.equal(envelope.request.payload.knownPlaces.length, 2);
+  assert.ok(envelope.request.payload.knownPlaces.every(place => place.identityAmbiguous === true));
+  assert.match(buildExtractorSystemPrompt('合成自定义指导'), /knownPlaces 只是最多40项的候选子集/u);
+  assert.equal(Object.keys(envelope.request.payload).some(key => /conflict|fullPlace|placeIdentity/iu.test(key)), false, '全量冲突资料只供本地编译，不能扩大模型输入');
+});
+
+test('新设施稳定与临时分型，未知类型只隔离自身且旧记录不补类型', async () => {
+  const content = '东屋有固定书桌，门外此时有访客等候。';
+  const response = { summary: '他继续整理资料。', spatialFacts: { places: [{ key: 'place-mention-1', name: '东屋', identity: 'new', exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' }], containments: [], positions: [], features: [
+    { key: 'feature-1', placeKey: 'place-mention-1', kind: 'stable', text: '有固定书桌。', replacesKeys: [], exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+    { key: 'feature-2', placeKey: 'place-mention-1', kind: 'temporary', text: '门外此时有访客等候。', replacesKeys: [], exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+    { key: 'feature-3', placeKey: 'place-mention-1', kind: 'unknown-kind', text: '错误类型不保存。', replacesKeys: [], exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+  ] } };
+  const { memory } = await direct(response, { content });
+  assert.deepEqual(memory.spatialFacts.features.map(item => item.kind), ['stable', 'temporary']);
+  assert.equal(memory.summary.aiText, response.summary);
+  const old = structuredClone(memory); old.spatialFacts.features = [old.spatialFacts.features[0]]; delete old.spatialFacts.features[0].kind;
+  assert.deepEqual(validateFloorMemory(old), old, '旧无kind不读时迁移或补stable');
+  const { projectPlaceFeatures } = await import('../src/v3/spatial-domain.js');
+  const floors = [{ id: memory.floorId, assistantSeq: 1 }];
+  assert.deepEqual(projectPlaceFeatures({ floorMemories: [memory], floors }).map(item => item.kind), ['stable']);
+  assert.deepEqual(projectPlaceFeatures({ floorMemories: [old], floors }), [], 'legacy仅历史，不当当前固定设施');
+});
+
+test('空间关系分型保楼层和双参照，引用收集与身份投影不当parent', async () => {
+  const content = '东屋位于主楼二层，食堂在生活区和工作区之间，东屋在走廊尽头。';
+  const names = ['东屋', '主楼', '食堂', '生活区', '工作区', '走廊'];
+  const response = { summary: '这些地点关系已明确。', spatialFacts: { places: names.map((name, index) => ({ key: `place-mention-${index + 1}`, name, identity: 'new', exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' })), containments: [], positions: [], relations: [
+    { kind: 'onFloor', placeKey: 'place-mention-1', referencePlaceKeys: ['place-mention-2'], text: '位于主楼二层。', exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+    { kind: 'relative', placeKey: 'place-mention-3', referencePlaceKeys: ['place-mention-4', 'place-mention-5'], text: '在生活区与工作区之间。', exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+    { kind: 'relative', placeKey: 'place-mention-1', referencePlaceKeys: ['place-mention-6'], text: '位于走廊尽头。', exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+    { kind: 'locatedIn', placeKey: 'place-mention-1', referencePlaceKeys: ['place-mention-2'], text: '位于主楼。', exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+    { kind: 'relative', placeKey: 'place-mention-1', referencePlaceKeys: ['place-mention-99'], text: '坏引用。', exactQuote: content, source: 'canonicalContent', sourceFloorKey: 'floor-1' },
+  ] } };
+  const { memory, newEntities } = await direct(response, { content });
+  assert.equal(memory.spatialFacts.relations.length, 4);
+  assert.equal(memory.spatialFacts.containments.length, 0);
+  const between = memory.spatialFacts.relations.find(item => item.referencePlaceEntityIds.length === 2);
+  assert.equal(between.kind, 'relative');
+  const refs = collectFloorMemoryEntityIds(memory);
+  for (const entity of newEntities) assert.ok(refs.has(entity.id), '仅被关系引用的全部地点须保留');
+  const removed = projectFloorMemoryIdentityReferences(memory, { deletedEntityIds: [between.referencePlaceEntityIds[1]] });
+  assert.equal(removed.spatialFacts.relations.length, 3, '删参照后整条between隔离，不偷降成一个参照');
+  const redirectedId = precisionPlace(98, '新归属').id;
+  const redirected = projectFloorMemoryIdentityReferences(memory, { identityRedirectsByEntityId: { [between.referencePlaceEntityIds[1]]: redirectedId } });
+  assert.ok(redirected.spatialFacts.relations.some(item => item.referencePlaceEntityIds.includes(redirectedId)));
+  const { expandPlaceParents } = await import('../src/v3/spatial-domain.js');
+  assert.deepEqual([...expandPlaceParents(new Set([between.placeEntityId]), [memory], Infinity, [{ id: memory.floorId, assistantSeq: 1 }])], [between.placeEntityId]);
+});
+
+test('旧结构化空间关系坏参照仅隔离该项，合法摘要与兄弟关系保留', async () => {
+  const content = '东屋位于主楼二层。', evidence = [{ quoteSegments: [content], supports: '地点关系', evidenceMode: 'explicit', sourceMentionKey: null, sourceFloorKey: 'floor-1' }];
+  const arrays = Object.fromEntries(['chronology', 'locations', 'participants', 'actions', 'observations', 'informationTransfers', 'privateCognition', 'commitments', 'eventFragments', 'exactAnchors', 'openLoops', 'ambiguities', 'cseSignals'].map(key => [key, []]));
+  const response = { schemaVersion: 3, task: 'extractFloorMemory', promptVersion: EXTRACTOR_PROMPT_VERSION, floors: [{ ...arrays, status: 'ok', summary: '合法摘要仍须保存。', summaryEvidence: [], entityMentions: ['东屋', '主楼'].map((surface, i) => ({ mentionKey: `place-${i+1}`, surface, aliases: [], entityType: 'place', identity: 'new', entityKey: null, evidence })), spatialFacts: { places: [{ placeMentionKey: 'place-1' }, { placeMentionKey: 'place-2' }], containments: [], positions: [], relations: [
+    { kind: 'relative', placeMentionKey: 'place-1', referenceMentionKeys: {}, text: '坏参照。', evidence },
+    { kind: 'onFloor', placeMentionKey: 'place-1', referenceMentionKeys: ['place-2'], text: '位于主楼二层。', evidence },
+  ] } }] };
+  const { memory } = await direct(response, { content });
+  assert.equal(memory.summary.aiText, '合法摘要仍须保存。');
+  assert.equal(memory.spatialFacts.relations.length, 1); assert.equal(memory.spatialFacts.relations[0].kind, 'onFloor');
+});
+
+test('新空间分型经真实保存冷读、分支引用与人工修订失效，普通诊断清原文', async () => {
+  const userQuote = '东屋内有独立卫生间。';
+  const body = '东屋位于主楼二层，门外此时有重要访客等候。';
+  const h = harness({ modernAnchors: true, readOnlyLifecycle: true, initialChat: [user(userQuote), assistant(body), user('继续')], utility: options => {
+    const payload = JSON.parse(options.taskMessages[0].content).payload, sourceFloorKey = payload.sourceFloorKey;
+    return { jsonData: { summary: '他继续整理文件。', spatialFacts: { places: ['东屋', '主楼'].map((name, i) => ({ key: `place-mention-${i+1}`, name, identity: 'new', exactQuote: body, source: 'canonicalContent', sourceFloorKey })), containments: [], positions: [], features: [
+      { key: 'feature-1', placeKey: 'place-mention-1', kind: 'stable', text: '有独立卫生间。', replacesKeys: [], exactQuote: userQuote, source: 'precedingUserInput', sourceFloorKey },
+      { key: 'feature-2', placeKey: 'place-mention-1', kind: 'temporary', text: '门外此时有重要访客等候。', replacesKeys: [], exactQuote: body, source: 'canonicalContent', sourceFloorKey },
+    ], relations: [{ kind: 'onFloor', placeKey: 'place-mention-1', referencePlaceKeys: ['place-mention-2'], text: '位于主楼二层。', exactQuote: body, source: 'canonicalContent', sourceFloorKey }] } } };
+  } });
+  await h.foundationRuntime.reconcile('typed-space-seed'); await h.runtime.start(); const floor = h.runtime.getState().floors[0];
+  await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const graph = await h.store.readReachable({ mode: 'runtime' }), memory = graph.floorMemories[0];
+  assert.deepEqual(memory.spatialFacts.features.map(item => item.kind), ['stable', 'temporary']);
+  assert.equal(memory.spatialFacts.relations[0].kind, 'onFloor');
+  const source = await readRecallSource({ store: h.store, now: () => new Date(NOW) });
+  assert.deepEqual(source.floorMemories[0].spatialFacts.features.map(item => item.kind), ['stable', 'temporary']);
+  assert.equal(source.floorMemories[0].spatialFacts.relations[0].referencePlaceEntityIds.length, 1);
+  const relationTarget = memory.spatialFacts.relations[0].referencePlaceEntityIds[0];
+  const projected = await projectFoundationPrefix({ source: { ...graph, entities: graph.entities.map(entity => entity.id === relationTarget ? { ...entity, firstSeenFloorId: '99999999-9999-4999-8999-999999999999' } : entity) }, floors: graph.floors,
+    chatId: graph.root.chatId, narrativeGeneration: graph.root.narrativeGeneration, now: NOW, currentStateId: precisionPlace(99, '无关').id });
+  assert.ok(projected.entities.some(entity => entity.id === relationTarget), '只有新关系引用的地点仍须在前缀保留');
+  const safe = JSON.parse(h.runtime.copySafeDiagnostic(floor.floorId));
+  assert.ok(safe.floorMemory.spatialFacts.relations.every(item => item.evidenceRefs.every(ref => ref.quotedText.startsWith('[已隐藏原文'))));
+  await h.runtime.editSummary(floor.floorId, '人工修订后只保人工摘要。');
+  assert.equal(h.runtime.getState().floors[0].memory.spatialFacts, undefined);
+  assert.equal(h.calls.length, 1, '空间分类/保存/冷读/人工修订均不新增模型轮次');
+});
+
+test('所属范围：同批新商场不能借旧通道key学习异地别名', async () => {
+  const entities = [precisionPlace(81, '上岩洞商场'), precisionPlace(82, '员工通道')];
+  const content = '汝矣岛商场的员工通道又称后台通路，众人走入其中。';
+  const floor = { id: '11111111-1111-4111-8111-111111111111', chatId: CHAT, narrativeGeneration: GENERATION, assistantSeq: 2, content: { canonicalContent: content } };
+  const envelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333333', chatId: CHAT, narrativeGeneration: GENERATION, floor, entities,
+    previousFloorContext: { parentEntityIdsByPlaceId: new Map([[entities[1].id, new Set([entities[0].id])]]), locationReference: ['上岩洞商场'], placeBindings: [{placeEntityId: entities[1].id, name:'员工通道'}] }, locationReference: ['汝矣岛商场'] });
+  const key = envelope.scope.placeCatalogBindings.find(item => item.entityId === entities[1].id).entityKey;
+  const response = { summary: content, locations: [{name:'员工通道', change:'entered'}], spatialFacts: { places: [
+    {key:'place-mention-1',name:'员工通道',aliases:['后台通路'],identity:'existing',sameAsPlaceKey:key,exactQuote:content,source:'canonicalContent',sourceFloorKey:'floor-1'},
+    {key:'place-mention-2',name:'汝矣岛商场',identity:'new',exactQuote:content,source:'canonicalContent',sourceFloorKey:'floor-1'}], containments: [], positions: [], relations: [
+    {kind:'locatedIn',placeKey:'place-mention-1',referencePlaceKeys:['place-mention-2'],text:'员工通道属于汝矣岛商场',exactQuote:content,source:'canonicalContent',sourceFloorKey:'floor-1'}] } };
+  const result = await normalizeExtractorResponse({response,envelope,floor,existingEntities:entities,now:NOW,expectedScope:envelope.scope});
+  assert.equal(result.memory.locations[0].entityId,null);
+  assert.equal(result.newEntities.some(item => item.id === entities[1].id || item.supersedes === entities[1].id), false);
+  assert.equal(result.memory.summary.aiText,content);
+});
+
+async function scopedPlaceResult({parents,childName='员工通道',parentIndex=2,childIdentity='existing',withParent=true,locationReference,previousReference,topName,identityBasis}) {
+  const entities=[precisionPlace(91,topName??'员工通道'),precisionPlace(92,'上岩洞商场'),precisionPlace(93,'汝矣岛商场'),precisionPlace(94,'首尔')];
+  const content=topName?`众人隔几天后明确返回${topName}。`:`${entities[parentIndex].displayName}内的${childName}有人等候。`;
+  const floor={id:'11111111-1111-4111-8111-111111111111',chatId:CHAT,narrativeGeneration:GENERATION,assistantSeq:8,content:{canonicalContent:content}};
+  const envelope=await createExtractorEnvelope({batchId:'33333333-3333-4333-8333-333333333333',chatId:CHAT,narrativeGeneration:GENERATION,floor,entities,locationReference,
+    previousFloorContext:{parentEntityIdsByPlaceId:parents?.(entities)??new Map(),placeSourceLocationReferencesById:new Map(previousReference?[[entities[0].id,previousReference]]:[])}});
+  const key=index=>envelope.scope.placeCatalogBindings.find(item=>item.entityId===entities[index].id).entityKey;
+  const places=[{key:'place-mention-1',name:topName??childName,identity:childIdentity,...(childIdentity==='existing'?{sameAsPlaceKey:key(0)}:{}),...(identityBasis?{identityBasis}:{}),exactQuote:content,source:'canonicalContent',sourceFloorKey:'floor-1'}];
+  if(withParent) places.push({key:'place-mention-2',name:entities[parentIndex].displayName,identity:'existing',sameAsPlaceKey:key(parentIndex),exactQuote:content,source:'canonicalContent',sourceFloorKey:'floor-1'});
+  const response={summary:content,locations:[{name:topName??childName,change:'present'}],spatialFacts:{places,containments:withParent?[{placeKey:'place-mention-1',parentPlaceKey:'place-mention-2',exactQuote:content,source:'canonicalContent',sourceFloorKey:'floor-1'}]:[],positions:[]}};
+  return {entities,envelope,result:await normalizeExtractorResponse({response,envelope,floor,existingEntities:entities,now:NOW,expectedScope:envelope.scope})};
+}
+
+test('所属范围：同城兄弟建筑的通道仍是异地，不能因共有城市而复用',async()=>{
+  const {result}=await scopedPlaceResult({parents:entities=>new Map([[entities[0].id,new Set([entities[1].id])],[entities[1].id,new Set([entities[3].id])],[entities[2].id,new Set([entities[3].id])]])});
+  assert.equal(result.memory.locations[0].entityId,null);
+});
+
+test('所属范围：无父顶级完整地名隔楼明确返回可复用，同地父级与新身份保持',async()=>{
+  for(const topName of ['首尔','星河艺术中心']) {
+    const {result,entities}=await scopedPlaceResult({topName,withParent:false});assert.equal(result.memory.locations[0].entityId,entities[0].id);
+  }
+  const same=await scopedPlaceResult({parentIndex:1,parents:entities=>new Map([[entities[0].id,new Set([entities[1].id])]])});assert.equal(same.result.memory.locations[0].entityId,same.entities[0].id);
+  const fresh=await scopedPlaceResult({childIdentity:'new'});assert.notEqual(fresh.result.memory.locations[0].entityId,fresh.entities[0].id);assert.ok(fresh.result.memory.spatialFacts.containments.length);
+  const unknown=await scopedPlaceResult({withParent:false,locationReference:['汝矣岛商场'],previousReference:['上岩洞商场']});assert.equal(unknown.result.memory.locations[0].entityId,unknown.entities[0].id);assert.equal(unknown.result.newEntities.length,0);
+});
+
+test('所属范围：locatedIn保实际来源截止，全部环节点未定，楼层方位不作父链',async()=>{
+  const {projectPlaceOwnership}=await import('../src/v3/spatial-domain.js');
+  const ref=seq=>({floorId:`floor-${seq}`,assistantSeq:seq});
+  const memory={floorId:'floor-1',assistantSeq:1,recordStatus:'active',spatialFacts:{containments:[{placeEntityId:'a',parentEntityId:'b',evidenceRefs:[ref(1)]},{placeEntityId:'b',parentEntityId:'a',evidenceRefs:[ref(1)]}],relations:[
+    {kind:'locatedIn',placeEntityId:'c',referencePlaceEntityIds:['venue'],evidenceRefs:[ref(1)]},{kind:'onFloor',placeEntityId:'d',referencePlaceEntityIds:['floor'],evidenceRefs:[ref(1)]},
+    {kind:'locatedIn',placeEntityId:'c',referencePlaceEntityIds:['future'],evidenceRefs:[ref(3)]}]}};
+  const result=projectPlaceOwnership([memory],2);assert.equal(result.get('a').size,0);assert.equal(result.get('b').size,0);assert.deepEqual([...result.get('c')],['venue']);assert.equal(result.has('d'),false);
+});
+
+test('所属范围：旧范围未知不能只凭来源楼标注差异否定existing声明',async()=>{
+  for(const withParent of [true,false]) {
+    const {result,entities,envelope}=await scopedPlaceResult({withParent,locationReference:['汝矣岛商场·员工通道'],previousReference:['上岩洞商场·员工通道']});
+    assert.equal(result.memory.locations[0].entityId,entities[0].id);assert.equal(result.newEntities.length,0);
+    assert.deepEqual(envelope.request.payload.knownPlaces.find(item=>item.displayName==='员工通道').sourceLocationReference,['上岩洞商场·员工通道']);
+  }
+});
+
+test('所属范围：父子都在本次新建可正常保存，无需额外模型请求',async()=>{
+  const content='汝矣岛商场内有员工通道。';
+  const ev={exactQuote:content,source:'canonicalContent',sourceFloorKey:'floor-1'};
+  const result=await direct({summary:content,locations:[{name:'员工通道',change:'present'}],spatialFacts:{places:[{key:'place-mention-1',name:'员工通道',identity:'new',...ev},{key:'place-mention-2',name:'汝矣岛商场',identity:'new',...ev}],containments:[{placeKey:'place-mention-1',parentPlaceKey:'place-mention-2',...ev}],positions:[]}},{content});
+  assert.equal(result.newEntities.length,2);const edge=result.memory.spatialFacts.containments[0];assert.equal(edge.placeEntityId,result.memory.locations[0].entityId);assert.notEqual(edge.placeEntityId,edge.parentEntityId);
+});
+
+
+test('所属范围：带真实旧新header的明确同地依据保顶级和房间复用，兄弟父级仍挡',async()=>{
+  for(const topName of ['星河艺术中心','苏柯的房间']) {
+    const {result,entities}=await scopedPlaceResult({topName,withParent:false,previousReference:[topName],locationReference:[`${topName} · 大厅`],identityBasis:'explicitSamePlace'});
+    assert.equal(result.memory.locations[0].entityId,entities[0].id);
+  }
+  const {result}=await scopedPlaceResult({identityBasis:'explicitSamePlace',parents:entities=>new Map([[entities[0].id,new Set([entities[1].id])],[entities[1].id,new Set([entities[3].id])],[entities[2].id,new Set([entities[3].id])]])});
+  assert.equal(result.memory.locations[0].entityId,null);
+});
+
+async function continuityPlaceFixture({name='客房',oldHeader='云杉公寓 · 客房',newHeader='云杉公寓 · 客房门前至室内',parentNew=false,parentKnown=false,alias=null,identity='existing'}={}) {
+  const place=precisionPlace(151,name),parent=precisionPlace(152,'云杉公寓'),entities=parentKnown?[place,parent]:[place];
+  const content=`林岚仍在${name}，${alias?`该处又称${alias}，`:''}${parentNew||parentKnown?'云杉公寓内的':''}${name}有固定书桌。`;
+  const floor={id:'11111111-1111-4111-8111-111111111111',chatId:CHAT,narrativeGeneration:GENERATION,assistantSeq:2,content:{canonicalContent:content}};
+  const envelope=await createExtractorEnvelope({batchId:'33333333-3333-4333-8333-333333333333',chatId:CHAT,narrativeGeneration:GENERATION,floor,entities,locationReference:newHeader?[newHeader]:undefined,
+    previousFloorContext:{parentEntityIdsByPlaceId:new Map(parentKnown?[[place.id,new Set([parent.id])]]:[]),placeSourceLocationReferencesById:new Map([[place.id,[oldHeader]]]),placeBindings:[{placeEntityId:place.id,name}],locationReference:[oldHeader]}});
+  const key=envelope.scope.placeCatalogBindings.find(item=>item.entityId===place.id).entityKey,ev={exactQuote:content,source:'canonicalContent',sourceFloorKey:'floor-1'};
+  const response={summary:content,people:[{name:'林岚',role:'user',presence:'present'}],locations:[{name,change:'present',people:['林岚']}],spatialFacts:{
+    places:[{key:'place-mention-1',name,identity,...(alias?{aliases:[alias]}:{}),...(identity==='existing'?{sameAsPlaceKey:key}:{}),...ev},...(parentNew||parentKnown?[{key:'place-mention-2',name:'云杉公寓',identity:parentKnown?'existing':'new',...(parentKnown?{sameAsPlaceKey:envelope.scope.placeCatalogBindings.find(item=>item.entityId===parent.id).entityKey}:{}),...ev}]:[])],
+    containments:parentNew||parentKnown?[{placeKey:'place-mention-1',parentPlaceKey:'place-mention-2',...ev}]:[],positions:[{subject:'林岚',placeKey:'place-mention-1',status:'confirmed',...ev}],
+    features:[{key:'feature-1',placeKey:'place-mention-1',kind:'stable',text:'有固定书桌',replacesKeys:[],...ev}]}};
+  return{place,entities,floor,envelope,response,result:await normalizeExtractorResponse({response,envelope,floor,existingEntities:entities,now:NOW,expectedScope:envelope.scope})};
+}
+
+test('地点承接回归：普通客房厨房车辆标注变化无需额外同地flag',async()=>{
+  for(const options of [
+    {},{name:'厨房',oldHeader:'云杉公寓 · 开放式厨房',newHeader:'云杉公寓厨房 · 清晨'},
+    {name:'工作车',oldHeader:'工作车 · 东区大道',newHeader:'工作车 · 西区会馆门前'},
+    {name:'地下车库',oldHeader:'云杉公寓地下车库',newHeader:'云杉公寓地下车库 · 车位旁'},
+    {name:'星河艺术中心',oldHeader:'星河艺术中心',newHeader:'星河艺术中心 · 大厅'},
+    {newHeader:null},
+  ]) {
+    const {place,response,result}=await continuityPlaceFixture(options);
+    assert.equal(response.spatialFacts.places[0].identityBasis,undefined);
+    assert.equal(result.memory.locations[0].entityId,place.id,options.name??'客房');
+    assert.equal(result.memory.spatialFacts.positions[0].placeEntityId,place.id);
+    assert.equal(result.memory.spatialFacts.features[0].placeEntityId,place.id);
+  }
+});
+
+test('地点承接回归：旧所属未知可承接同批新父级，new和uncertain仍按语义选择',async()=>{
+  const same=await continuityPlaceFixture({parentNew:true});assert.equal(same.result.memory.locations[0].entityId,same.place.id);assert.ok(same.result.memory.spatialFacts.containments[0]);
+  const other=await continuityPlaceFixture({name:'员工通道',oldHeader:'甲区会馆 · 员工通道',newHeader:'乙区会馆 · 员工通道',identity:'new'});
+  assert.notEqual(other.result.memory.locations[0].entityId,other.place.id);assert.equal(other.result.newEntities.some(entity=>entity.supersedes===other.place.id||entity.mergedIntoEntityId===other.place.id),false);
+  const unknown=await continuityPlaceFixture({identity:'uncertain'});assert.equal(unknown.result.memory.locations[0].entityId,null);
+});
+
+test('地点承接回归：knownPlaces提供完整有界历史标注，不暴露内部Map或实体UUID',async()=>{
+  const {place,envelope}=await continuityPlaceFixture();
+  assert.deepEqual(envelope.request.payload.knownPlaces[0].sourceLocationReference,['云杉公寓 · 客房']);
+  assert.equal(JSON.stringify(envelope.request).includes(place.id),false);
+  const entities=Array.from({length:40},(_,i)=>precisionPlace(200+i,`会馆${i}`));
+  const references=new Map(entities.map((entity,i)=>[entity.id,[`${'甲'.repeat(480)} · 区域${i}`]]));
+  const floor={id:'11111111-1111-4111-8111-111111111111',chatId:CHAT,narrativeGeneration:GENERATION,assistantSeq:2,content:{canonicalContent:'各处地点资料均保留。'}};
+  const bounded=await createExtractorEnvelope({batchId:'33333333-3333-4333-8333-333333333333',chatId:CHAT,narrativeGeneration:GENERATION,floor,entities,previousFloorContext:{placeSourceLocationReferencesById:references}});
+  const hints=bounded.request.payload.knownPlaces.flatMap(item=>item.sourceLocationReference??[]);
+  assert.ok(hints.length>0);assert.ok(hints.join('').length<=4000);assert.ok(hints.every(value=>[...references.values()].some(list=>list.includes(value))),'逐条保原整串，不截断/拆地名');
+});
+
+
+test('地点承接回归：来源楼跨场景仍可保厨房所属，普通同地别名无需flag学习',async()=>{
+  const kitchen=await continuityPlaceFixture({name:'厨房',oldHeader:'西区饭馆 · 包间',newHeader:'云杉公寓 · 厨房',parentKnown:true});
+  assert.equal(kitchen.result.memory.locations[0].entityId,kitchen.place.id);assert.equal(kitchen.result.memory.spatialFacts.containments[0].placeEntityId,kitchen.place.id);
+  const alias=await continuityPlaceFixture({name:'北侧卧室',alias:'北屋'});
+  assert.ok(alias.result.newEntities.some(entity=>entity.mergedIntoEntityId===alias.place.id&&[entity.displayName,...entity.aliases.map(item=>item.name)].includes('北屋')));
+});
+
+
+test('地点承接回归：原一次提取正常保存冷读并供既有召回消费',async()=>{
+  const scenes=[['甲城 · 工作车','林岚坐在工作车内，车内有固定急救柜。'],['乙城 · 工作车门前','林岚仍坐在同一辆工作车内，准备取用急救柜。']];const requests=[];
+  const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:scenes.flatMap(([header,text])=>[user('继续'),assistant(`<location>${header}</location><content>${text}</content>`)]).concat([user('稳定')]),utility:options=>{
+    const payload=JSON.parse(options.taskMessages[0].content).payload;requests.push(payload);const old=payload.knownPlaces.find(item=>item.displayName==='工作车');const ev={exactQuote:payload.canonicalContent,source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey};
+    return{jsonData:{summary:payload.canonicalContent,people:[{name:'林岚',role:'user',presence:'present'}],locations:[{name:'工作车',change:'present',people:['林岚']}],spatialFacts:{places:[{key:'place-mention-1',name:'工作车',identity:old?'existing':'new',...(old?{sameAsPlaceKey:old.entityKey}:{}),...ev}],containments:[],positions:[{subject:'林岚',placeKey:'place-mention-1',status:'confirmed',...ev}],features:old?[]:[{key:'feature-1',placeKey:'place-mention-1',kind:'stable',text:'车内有固定急救柜',replacesKeys:[],...ev}]}}};
+  }});
+  await h.foundationRuntime.reconcile('continuity-save');await h.runtime.start();const floors=h.runtime.getState().floors;assert.equal(floors.length,2);
+  for(const floor of floors)await h.runtime.extractFloor(floor.floorId,{analyzeState:false});
+  assert.equal(h.calls.length,2);assert.deepEqual(requests[1].knownPlaces.find(item=>item.displayName==='工作车').sourceLocationReference,['甲城 · 工作车']);
+  const saved=await h.store.readReachable({mode:'runtime'}),place=saved.entities.find(item=>item.entityType==='place'&&item.displayName==='工作车');
+  assert.ok(saved.floorMemories.every(item=>item.locations[0].entityId===place.id));
+  const source=await readRecallSource({store:h.store,now:()=>new Date(NOW)});assert.ok(source.floorMemories.every(item=>item.spatialFacts.positions[0].placeEntityId===place.id));
+  const {historySelectionContext}=await import('../src/v3/recall-selector.js');
+  assert.ok(historySelectionContext(source,{text:'工作车急救柜',latestUserText:'工作车急救柜',messageCount:1}).facts.some(item=>item.kind==='placeFeature'&&item.text.includes('急救柜')));
+});
+
+ test('千窗同步getter复用已加载图，不读Store不请求模型且切聊清旧地点', async()=>{
+ const h=harness(); await h.runtime.start(); await h.runtime.extractNext();
+ const reads=h.readReachableModes.length,calls=h.calls.length,backendCalls=h.backend.calls.length;
+ assert.equal(typeof h.runtime.getQianchuangSnapshot,'function');
+ const first=h.runtime.getQianchuangSnapshot(),second=h.runtime.getQianchuangSnapshot();
+ assert.equal(first.status,'ready'); assert.equal(first.chatId,CHAT);
+ assert.equal(first.projectionRevision,second.projectionRevision);
+ assert.equal(h.readReachableModes.length,reads);assert.equal(h.calls.length,calls);assert.equal(h.backend.calls.length,backendCalls);
+ h.context.chatMetadata.qianqianjie.chatId='99999999-1111-4111-8111-111111111111';
+ const changed=h.runtime.getQianchuangSnapshot();assert.equal(changed.places.length,0);assert.notEqual(changed.chatId,CHAT);
+ });
+
+test('千窗已有缓存仍显示foundation错误或待核对，不伪装健康空库',async()=>{
+ const h=harness();await h.runtime.start();await h.runtime.extractNext();
+ const original=h.foundationRuntime.getState,ready=original(),before=h.runtime.getQianchuangSnapshot();
+ for(const status of ['error','needsReview']){
+  h.foundationRuntime.getState=()=>({...ready,status,lastError:{code:'QQJ_NETWORK'}});
+  const snapshot=h.runtime.getQianchuangSnapshot();assert.equal(snapshot.status,status);assert.ok(snapshot.error);assert.deepEqual(snapshot.places,before.places);
+ }
+ h.foundationRuntime.getState=original;
+});
+
+test('千窗真实savePlace同HEAD刷新名称描述，召回与下一次knownPlaces同用人工版本',async()=>{
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('旧房间内配有床。'),user('继续'),assistant('旧房间新增书桌。'),user('稳定')],utility:options=>{const payload=JSON.parse(options.taskMessages[0].content).payload,known=payload.knownPlaces[0],ev={exactQuote:payload.canonicalContent,source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey};return {jsonData:{summary:payload.canonicalContent,locations:[{name:known?.displayName??'旧房间',change:'present',people:[]}],spatialFacts:{places:[{key:'place-mention-1',name:known?.displayName??'旧房间',identity:known?'existing':'new',...(known?{sameAsPlaceKey:known.entityKey}:{}),...ev}],containments:[],positions:[],features:[{key:'feature-1',placeKey:'place-mention-1',kind:'stable',text:known?'新增书桌':'配有床',replacesKeys:[],...ev}]}}};}});
+ await h.foundationRuntime.reconcile('place-edit');await h.runtime.start();const floors=h.runtime.getState().floors;await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});
+ const before=h.runtime.getQianchuangSnapshot(),id=before.places[0].entityId,head=before.rootRevision;await h.runtime.savePlace(id,{name:'人工房间',description:'独立卫浴',relations:'一楼走廊末端',parentEntityId:null},h.runtime.getPlaceEditContext(id));
+ const after=h.runtime.getQianchuangSnapshot();assert.equal(after.rootRevision,head);assert.equal(after.places[0].displayName,'人工房间');assert.deepEqual(after.places[0].features.map(item=>item.text),['独立卫浴']);assert.deepEqual(after.mapRootIds,[id]);
+ const value=await h.placeWorkspaceStore.read({chatId:CHAT}),source=await readRecallSource({store:h.store,now:()=>new Date(NOW),identityProjection:{placeWorkspace:value.data,placeWorkspaceRevision:value.revision}});assert.equal(source.entities.find(entity=>entity.entityId===id).displayName,'人工房间');assert.equal(source.floorMemories[0].spatialFacts.features.length,0);
+ await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});const request=JSON.parse(h.calls.at(-1).taskMessages[0].content).payload;assert.equal(request.knownPlaces[0].displayName,'人工房间');assert.equal(request.knownPlaces[0].manualCurrentFacts.description,'独立卫浴');assert.deepEqual(h.runtime.getQianchuangSnapshot().places[0].features.map(item=>item.text),['独立卫浴','新增书桌']);
+ const cold=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,initialChat:h.context.chat,modernAnchors:true,readOnlyLifecycle:true});await cold.runtime.start();assert.equal(cold.runtime.getQianchuangSnapshot().places[0].displayName,'人工房间');assert.equal(cold.calls.length,0);
+});
+
+test('人工新增楼层真实挂父并在原提取引用时首次发布Core实体，删除父级保孩子',async()=>{
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('房间配有床。'),user('继续'),assistant('房间位于一楼内。'),user('稳定')],utility:options=>{
+  const p=JSON.parse(options.taskMessages[0].content).payload,room=p.knownPlaces.find(x=>x.displayName==='房间'),level=p.knownPlaces.find(x=>x.displayName==='一楼'),ev={exactQuote:p.canonicalContent,source:'canonicalContent',sourceFloorKey:p.sourceFloorKey};
+  return {jsonData:{summary:p.canonicalContent,locations:[{name:'房间',change:'present',people:[]}],spatialFacts:{places:[{key:'place-mention-1',name:'房间',identity:room?'existing':'new',...(room?{sameAsPlaceKey:room.entityKey}:{}),...ev},...(level?[{key:'place-mention-2',name:'一楼',identity:'existing',sameAsPlaceKey:level.entityKey,...ev}]:[])],containments:level?[{placeKey:'place-mention-1',parentPlaceKey:'place-mention-2',...ev}]:[],positions:[],features:[]}}};
+ }});
+ await h.foundationRuntime.reconcile('manual-level');await h.runtime.start();const floors=h.runtime.getState().floors;await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});
+ const room=h.runtime.getQianchuangSnapshot().places[0].entityId;
+ const level=await h.runtime.createPlace({name:'一楼',description:'一楼设有书桌',relations:'',parentEntityId:null},h.runtime.getPlaceEditContext(null));
+ await h.runtime.savePlace(room,{parentEntityId:level.entityId},h.runtime.getPlaceEditContext(room));
+ assert.equal(h.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===room).parentEntityId,level.entityId);
+ assert.equal((await h.store.readReachable({mode:'runtime'})).entities.some(entity=>entity.id===level.entityId),false,'人工创建尚不伪造剧情实体写入');
+ await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});
+ const saved=await h.store.readReachable({mode:'runtime'});assert.ok(saved.entities.some(entity=>entity.id===level.entityId),'同一次真实提取发布被引用的固定seed');
+ await h.runtime.deletePlace(level.entityId,h.runtime.getPlaceEditContext(level.entityId));
+ const snapshot=h.runtime.getQianchuangSnapshot();assert.equal(snapshot.places.some(p=>p.entityId===level.entityId),false);assert.equal(snapshot.places.find(p=>p.entityId===room).parentEntityId,null);assert.deepEqual(snapshot.mapRootIds,[room]);
+});
+
+test('忘记的父地点在新来源重收后可再次被选为所属地点',async()=>{
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('房间有床。'),user('继续'),assistant('房间新增书桌。'),user('稳定')],utility:options=>{const p=JSON.parse(options.taskMessages[0].content).payload,known=p.knownPlaces[0],ev={exactQuote:p.canonicalContent,source:'canonicalContent',sourceFloorKey:p.sourceFloorKey};return {jsonData:{summary:p.canonicalContent,locations:[{name:'房间',change:'present',people:[]}],spatialFacts:{places:[{key:'place-mention-1',name:'房间',identity:known?'existing':'new',...(known?{sameAsPlaceKey:known.entityKey}:{}),...ev}],containments:[],positions:[],features:[{key:'feature-1',placeKey:'place-mention-1',kind:'stable',text:known?'新增书桌':'有床',replacesKeys:[],...ev}]}}};}});
+ await h.foundationRuntime.reconcile('place-return');await h.runtime.start();const floors=h.runtime.getState().floors;for(const floor of floors)await h.runtime.extractFloor(floor.floorId,{analyzeState:false});const id=h.runtime.getQianchuangSnapshot().places[0].entityId;
+ // A persisted forget from the first source remains while the second, new source has recorded the place again.
+ await h.placeWorkspaceStore.put({chatId:CHAT},{schemaVersion:1,kind:'qqj-v3-place-workspace',chatId:CHAT,placesByEntityId:{},deletionsByEntityId:{[id]:{coveredFloorIds:[floors[0].floorId]}}},0);await h.runtime.refreshStatus({preferCached:false});
+ assert.ok(h.runtime.getQianchuangSnapshot().places.some(place=>place.entityId===id));
+ const child=await h.runtime.createPlace({name:'内部地点',description:'',relations:'',parentEntityId:id},h.runtime.getPlaceEditContext(null));assert.equal(h.runtime.getQianchuangSnapshot().places.find(place=>place.entityId===child.entityId).parentEntityId,id);
+});
+
+
+async function intermediateParentFixture({ levels = ['二楼'], anchorIndex = 0, manualNull = false } = {}) {
+  const entities = [precisionPlace(601, '甲楼'), precisionPlace(602, '客房'), precisionPlace(603, '乙楼'),
+    precisionPlace(604, '城区'), precisionPlace(605, '甲楼东翼'), precisionPlace(606, '客房')];
+  const content = '甲楼的客房经由新走廊和二楼，位于甲楼东翼内部。甲楼和乙楼都在城区。林岚在客房，房内有书桌。相同引文。相同引文。';
+  const floor = { id: '11111111-1111-4111-8111-111111111111', chatId: CHAT, narrativeGeneration: GENERATION, assistantSeq: 8, content: { canonicalContent: content } };
+  const parents = new Map([[entities[1].id, new Set(manualNull ? [] : [entities[0].id])],
+    [entities[0].id, new Set([entities[3].id])], [entities[2].id, new Set([entities[3].id])],
+    [entities[4].id, new Set([entities[0].id])], [entities[5].id, new Set([entities[2].id])]]);
+  const envelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333333', chatId: CHAT,
+    narrativeGeneration: GENERATION, floor, entities, userIdentity: { displayName: '林岚', aliases: ['林岚'] },
+    previousFloorContext: { parentEntityIdsByPlaceId: parents } });
+  const catalogKey = index => envelope.scope.placeCatalogBindings.find(item => item.entityId === entities[index].id).entityKey;
+  const evidence = { source: 'canonicalContent', sourceFloorKey: 'floor-1', exactQuote: content };
+  const places = [{ key: 'place-mention-1', name: entities[anchorIndex].displayName, identity: 'existing', sameAsPlaceKey: catalogKey(anchorIndex), ...evidence },
+    ...levels.map((name, index) => ({ key: `place-mention-${index + 2}`, name, identity: 'new', ...evidence }))];
+  const roomKey = `place-mention-${places.length + 1}`;
+  places.push({ key: roomKey, name: '客房', identity: 'existing', sameAsPlaceKey: catalogKey(1), ...evidence });
+  const containments = places.slice(1).map((place, index) => ({ placeKey: place.key, parentPlaceKey: places[index].key, ...evidence }));
+  const response = { summary: '林岚走进甲楼客房。', people: [{ name: '林岚', entityKind: 'individual', role: 'user', presence: 'present' }],
+    locations: [{ name: '客房', change: 'present', ...evidence }], spatialFacts: { places, containments,
+      positions: [{ subject: '林岚', placeKey: roomKey, status: 'confirmed', ...evidence }],
+      features: [{ key: 'feature-1', placeKey: roomKey, kind: 'stable', text: '房内有书桌', replacesKeys: [], ...evidence }] } };
+  return { entities, floor, envelope, response, roomKey, catalogKey, evidence,
+    normalize: () => normalizeExtractorResponse({ response, envelope, floor, existingEntities: entities, now: NOW, expectedScope: envelope.scope }) };
+}
+
+test('新中间父链：旧房间经一层或多层新节点仍属于原建筑，位置设施和同名异楼身份保持', async () => {
+  for (const levels of [['二楼'], ['二楼', '新走廊']]) {
+    const fixture = await intermediateParentFixture({ levels });
+    const result = await fixture.normalize(), roomId = fixture.entities[1].id;
+    assert.deepEqual(result.isolated, []);
+    assert.equal(result.memory.locations[0].entityId, roomId);
+    assert.equal(result.memory.spatialFacts.containments.length, levels.length + 1);
+    assert.equal(result.memory.spatialFacts.positions[0].placeEntityId, roomId);
+    assert.equal(result.memory.spatialFacts.features[0].placeEntityId, roomId);
+    assert.equal(result.newEntities.filter(entity => entity.entityType === 'place').length, levels.length);
+    assert.ok(result.memory.spatialFacts.containments.every(edge => edge.placeEntityId !== fixture.entities[5].id));
+  }
+});
+
+test('新中间父链：可接原建筑内部已知节点，直接已知父仍容许原有粗述', async () => {
+  const inside = await intermediateParentFixture({ anchorIndex: 4 });
+  const result = await inside.normalize();
+  assert.deepEqual(result.isolated, []);
+  assert.equal(result.memory.locations[0].entityId, inside.entities[1].id);
+  for (const anchorIndex of [0, 3]) {
+    const direct = await intermediateParentFixture({ levels: [], anchorIndex });
+    const normalized = await direct.normalize();
+    assert.deepEqual(normalized.isolated, []);
+    assert.equal(normalized.memory.spatialFacts.containments[0].parentEntityId, direct.entities[anchorIndex].id);
+  }
+});
+
+test('新中间父链：共同城区、异楼、人工空父、环与多父仍不证明旧房间所属', async () => {
+  for (const variant of ['common-city', 'other-building', 'manual-null', 'cycle', 'multiple-parents']) {
+    const fixture = await intermediateParentFixture({ anchorIndex: variant === 'common-city' ? 3 : variant === 'other-building' ? 2 : 0, manualNull: variant === 'manual-null' });
+    if (variant === 'cycle') fixture.response.spatialFacts.containments[0].parentPlaceKey = fixture.roomKey;
+    if (variant === 'multiple-parents') fixture.response.spatialFacts.containments.push({ placeKey: 'place-mention-2', parentPlaceKey: fixture.roomKey, ...fixture.evidence });
+    const result = await fixture.normalize();
+    assert.ok(result.isolated.some(issue => issue.code === 'V3_EXTRACTOR_SPATIAL_PLACE_SCOPE_CONFLICT'), variant);
+    assert.equal(result.memory.locations[0].entityId, null, variant);
+    assert.equal(result.memory.spatialFacts?.containments?.some(edge => edge.placeEntityId === fixture.entities[1].id) ?? false, false, variant);
+  }
+});
+
+test('新中间父链：非法来源或非唯一引文不能证明新层所属，locatedIn使用相同已核链', async () => {
+  for (const variant of ['wrong-floor', 'missing-quote', 'ambiguous-quote', 'locatedIn']) {
+    const fixture = await intermediateParentFixture();
+    const parentEdge = fixture.response.spatialFacts.containments[0];
+    if (variant === 'wrong-floor') parentEdge.sourceFloorKey = 'floor-999';
+    if (variant === 'missing-quote') parentEdge.exactQuote = '原文没有这个引文。';
+    if (variant === 'ambiguous-quote') parentEdge.exactQuote = '相同引文。';
+    if (variant === 'locatedIn') {
+      fixture.response.spatialFacts.containments.shift();
+      fixture.response.spatialFacts.relations = [{ kind: 'locatedIn', placeKey: parentEdge.placeKey, referencePlaceKeys: [parentEdge.parentPlaceKey], text: '二楼位于甲楼内部', ...fixture.evidence }];
+    }
+    const result = await fixture.normalize();
+    if (variant === 'locatedIn') {
+      assert.deepEqual(result.isolated, []);
+      assert.equal(result.memory.locations[0].entityId, fixture.entities[1].id);
+      assert.equal(result.memory.spatialFacts.relations.length, 1);
+    } else {
+      assert.equal(result.memory.locations[0].entityId, null, variant);
+      assert.equal(result.memory.spatialFacts?.containments?.some(edge => edge.placeEntityId === fixture.entities[1].id) ?? false, false, variant);
+    }
+  }
+});
+
+test('新中间父链：普通空间关系与等价placePaths均保存同一旧房间和新层', async () => {
+  const fixture = await intermediateParentFixture();
+  const spatial = await fixture.normalize();
+  const path = await direct({ summary: '林岚走进甲楼客房。', placePaths: [{ path: [
+    { name: '甲楼', sameAsPlaceKey: fixture.catalogKey(0) }, { name: '二楼' }, { name: '客房', sameAsPlaceKey: fixture.catalogKey(1) }], ...fixture.evidence }] },
+    { entities: fixture.entities, content: fixture.floor.content.canonicalContent,
+      previousFloorContext: { parentEntityIdsByPlaceId: fixture.envelope.scope.parentEntityIdsByPlaceId } });
+  for (const result of [spatial, path]) {
+    assert.deepEqual(result.isolated, []);
+    assert.equal(result.memory.spatialFacts.containments.length, 2);
+    assert.equal(result.newEntities.filter(entity => entity.entityType === 'place').length, 1);
+    assert.ok(result.memory.spatialFacts.containments.some(edge => edge.placeEntityId === fixture.entities[1].id));
+  }
+});
+
+test('新中间父链：正常runtime提取把新楼层和旧房间父边保存且冷读保留，只调用原两次摘要', async () => {
+  const first = '林岚走进甲楼客房，客房在甲楼内部。';
+  const second = '林岚走进甲楼二楼的客房，二楼位于甲楼内部。';
+  const h = harness({ withPlaces: true, modernAnchors: true, readOnlyLifecycle: true,
+    initialChat: [user('继续'), assistant(first), user('继续'), assistant(second), user('稳定')],
+    utility: options => {
+      const payload = JSON.parse(options.taskMessages[0].content).payload;
+      const refining = payload.canonicalContent === second;
+      const evidence = { source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey, exactQuote: payload.canonicalContent };
+      const place = (name, key) => {
+        const known = payload.knownPlaces.find(item => item.displayName === name);
+        return { key, name, identity: known ? 'existing' : 'new', ...(known ? { sameAsPlaceKey: known.entityKey } : {}), ...evidence };
+      };
+      const roomKey = refining ? 'place-mention-3' : 'place-mention-2';
+      return { jsonData: { summary: '林岚走进甲楼客房。', people: [{ name: '林岚', entityKind: 'individual', role: 'user', presence: 'present' }],
+        locations: [{ name: '客房', change: 'present', ...evidence }], spatialFacts: {
+          places: [place('甲楼', 'place-mention-1'), ...(refining ? [place('二楼', 'place-mention-2')] : []), place('客房', roomKey)],
+          containments: refining
+            ? [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', ...evidence }, { placeKey: roomKey, parentPlaceKey: 'place-mention-2', ...evidence }]
+            : [{ placeKey: roomKey, parentPlaceKey: 'place-mention-1', ...evidence }],
+          positions: [{ subject: '林岚', placeKey: roomKey, status: 'confirmed', ...evidence }],
+          features: [{ key: 'feature-1', placeKey: roomKey, kind: 'stable', text: '房内有书桌', replacesKeys: [], ...evidence }],
+        } } };
+    } });
+  await h.foundationRuntime.reconcile('intermediate-parent');
+  await h.runtime.start();
+  const floors = h.runtime.getState().floors;
+  await h.runtime.extractFloor(floors[0].floorId, { analyzeState: false });
+  const roomId = h.runtime.getQianchuangSnapshot().places.find(place => place.displayName === '客房').entityId;
+  await h.runtime.extractFloor(floors[1].floorId, { analyzeState: false });
+  assert.equal(h.calls.length, 2);
+  await h.runtime.refreshStatus({ preferCached: false });
+  const snapshot = h.runtime.getQianchuangSnapshot();
+  const level = snapshot.places.find(place => place.displayName === '二楼');
+  assert.ok(level);
+  assert.equal(snapshot.places.find(place => place.entityId === roomId).parentEntityId, level.entityId);
+  const saved = await h.store.readReachable();
+  const memory = saved.floorMemories.find(item => item.floorId === floors[1].floorId);
+  assert.equal(memory.spatialFacts.containments.length, 2);
+  assert.equal(memory.spatialFacts.positions[0].placeEntityId, roomId);
+  assert.equal(memory.spatialFacts.features[0].placeEntityId, roomId);
+  assert.ok(memory.spatialFacts.containments.some(edge => edge.placeEntityId === roomId && edge.parentEntityId === level.entityId));
+});
+
+async function explicitLeafPathFixture({ variant = 'full' } = {}) {
+  const content = '山麓的林间宅院内有客房。林岚进入林间宅院深处的客房，屋内有书桌。另一栋别院也有客房。';
+  const evidence = { source: 'canonicalContent', sourceFloorKey: 'floor-1', exactQuote: content };
+  const response = { summary: '林岚进入客房。', people: [{ name: '林岚', entityKind: 'individual', role: 'user', presence: 'present' }],
+    locations: [{ name: '客房', change: 'present', ...evidence }], spatialFacts: {
+      places: [{ key: 'place-mention-1', name: '山麓林间宅院', identity: 'new', ...evidence },
+        { key: 'place-mention-2', name: '客房', identity: 'new', ...evidence }],
+      containments: [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', ...evidence }],
+      positions: [{ subject: '林岚', placeKey: 'place-mention-2', status: 'confirmed', ...evidence }],
+      features: [{ key: 'feature-1', placeKey: 'place-mention-2', kind: 'stable', text: '屋内有书桌', replacesKeys: [], ...evidence }],
+    }, placePaths: [{ placeKey: 'place-mention-2', path: [{ name: '山麓' }, { name: '林间宅院' }, { name: '客房' }], ...evidence }] };
+  if (variant === 'single-description') response.placePaths[0].path = [{ name: '客房', description: '屋内有书桌。' }];
+  if (variant === 'invalid-source') response.placePaths[0].sourceFloorKey = 'floor-999';
+  if (variant === 'two-full-paths') response.placePaths.push({ placeKey: 'place-mention-2', path: [{ name: '别院' }, { name: '客房' }], ...evidence });
+  return { response, content, result: await direct(response, { content }) };
+}
+
+test('显式叶完整路径：父名长短不同仍按已验证path挂接，原父身份不靠名字合并，位置设施保留', async () => {
+  const { result } = await explicitLeafPathFixture();
+  assert.deepEqual(result.isolated, []);
+  const places = new Map(result.newEntities.filter(entity => entity.entityType === 'place').map(entity => [entity.displayName, entity.id]));
+  assert.notEqual(places.get('山麓林间宅院'), places.get('林间宅院'));
+  assert.equal(result.memory.locations[0].entityId, places.get('客房'));
+  assert.equal(result.memory.spatialFacts.positions[0].placeEntityId, places.get('客房'));
+  assert.equal(result.memory.spatialFacts.features[0].placeEntityId, places.get('客房'));
+  assert.ok(result.memory.spatialFacts.containments.some(edge => edge.placeEntityId === places.get('客房') && edge.parentEntityId === places.get('林间宅院')));
+  assert.equal(result.memory.spatialFacts.containments.some(edge => edge.placeEntityId === places.get('客房') && edge.parentEntityId === places.get('山麓林间宅院')), false);
+});
+
+test('显式叶完整路径：单节点描述或无效路径不撤原父，多条完整路径真冲突仍隔离', async () => {
+  for (const variant of ['single-description', 'invalid-source']) {
+    const { result } = await explicitLeafPathFixture({ variant });
+    const places = new Map(result.newEntities.filter(entity => entity.entityType === 'place').map(entity => [entity.displayName, entity.id]));
+    assert.equal(result.memory.locations[0].entityId, places.get('客房'), variant);
+    assert.ok(result.memory.spatialFacts.containments.some(edge => edge.placeEntityId === places.get('客房') && edge.parentEntityId === places.get('山麓林间宅院')), variant);
+    assert.equal(result.memory.spatialFacts.positions[0].placeEntityId, places.get('客房'), variant);
+  }
+  const conflicting = await explicitLeafPathFixture({ variant: 'two-full-paths' });
+  assert.ok(conflicting.result.isolated.some(issue => issue.code === 'V3_EXTRACTOR_SPATIAL_PLACE_SCOPE_CONFLICT'));
+  assert.equal(conflicting.result.memory.locations[0].entityId, null);
+});
+
+test('显式路径和locatedIn分别保物理关系，明确同父的粗path保raw细链', async () => {
+  const fixture = await explicitLeafPathFixture();
+  const response = structuredClone(fixture.response);
+  response.spatialFacts.relations = [{ kind: 'locatedIn', placeKey: 'place-mention-2', referencePlaceKeys: ['place-mention-1'], text: '客房位于宅院', ...response.spatialFacts.containments[0] }];
+  response.spatialFacts.containments = [];
+  const located = await direct(response, { content: fixture.content });
+  assert.deepEqual(located.isolated, []);
+  assert.equal(located.memory.spatialFacts.relations?.length ?? 0, 0);
+  assert.equal(located.memory.spatialFacts.containments.length, 2);
+  const finer = structuredClone(fixture.response);
+  finer.spatialFacts.places[0].name = '林间宅院';
+  finer.spatialFacts.places.push({ ...finer.spatialFacts.places[0], key: 'place-mention-3', name: '二楼' });
+  finer.spatialFacts.containments[0].parentPlaceKey = 'place-mention-3';
+  finer.spatialFacts.containments.push({ ...finer.spatialFacts.containments[0], placeKey: 'place-mention-3', parentPlaceKey: 'place-mention-1' });
+  finer.placePaths[0].path = [{ name: '林间宅院', placeKey: 'place-mention-1' }, { name: '客房' }];
+  const result = await direct(finer, { content: fixture.content });
+  assert.deepEqual(result.isolated, []);
+  const ids = new Map(result.newEntities.filter(entity => entity.entityType === 'place').map(entity => [entity.displayName, entity.id]));
+  assert.ok(result.memory.spatialFacts.containments.some(edge => edge.placeEntityId === ids.get('客房') && edge.parentEntityId === ids.get('二楼')));
+  const { projectPlaceParentLinks } = await import('../src/v3/place-foundation.js');
+  const projectedParents = projectPlaceParentLinks([result.memory], null, new Map([[result.memory.floorId, 1]]));
+  assert.deepEqual([...projectedParents.get(ids.get('客房')).parents.keys()], [ids.get('二楼')]);
+});
+
+async function nodeBoundPathFixture(variant = 'valid') {
+  const fixture = await explicitLeafPathFixture();
+  const response = structuredClone(fixture.response);
+  delete response.placePaths[0].placeKey;
+  response.placePaths[0].path[1].placeKey = 'place-mention-1';
+  response.placePaths[0].path[2].placeKey = 'place-mention-2';
+  const extra = () => ({ path: [{ name: '山麓' }, { name: '林间宅院', placeKey: 'place-mention-1' }, { name: '客房', placeKey: 'place-mention-2' }], evidence: [{ source: 'canonicalContent', sourceFloorKey: 'floor-1', exactQuote: fixture.content }] });
+  if (variant === 'unknown-key') response.placePaths[0].path[1].placeKey = 'place-mention-99';
+  if (variant === 'repeated-key') response.placePaths[0].path[0].placeKey = 'place-mention-1';
+  if (variant === 'entry-leaf-conflict') response.placePaths[0].placeKey = 'place-mention-1';
+  if (variant === 'entry-fallback-repeat') {
+    response.placePaths[0].placeKey = 'place-mention-1';
+    delete response.placePaths[0].path[2].placeKey;
+  }
+  if (variant === 'same-key-two-paths') response.placePaths.push(extra());
+  if (variant === 'two-parents') {
+    const path = extra();
+    path.path[0].name = '另一山麓';
+    response.placePaths.push(path);
+  }
+  let entities = [];
+  if (variant === 'stable-identity-conflict') {
+    entities = [precisionPlace(611, '原宅院'), precisionPlace(612, '另一宅院')];
+    response.spatialFacts.places[0].identity = 'existing';
+    response.spatialFacts.places[0].sameAsPlaceKey = 'place-1';
+    response.placePaths[0].path[1].sameAsPlaceKey = 'place-2';
+  }
+  return { response, result: await direct(response, { content: fixture.content, entities }) };
+}
+
+test('路径节点显式key：长短父名由模型关联共用身份，node叶key兼容且同key多path一致复用', async () => {
+  for (const variant of ['valid', 'same-key-two-paths']) {
+    const { result } = await nodeBoundPathFixture(variant);
+    assert.deepEqual(result.isolated, []);
+    const places = result.newEntities.filter(entity => entity.entityType === 'place' && !entity.mergedIntoEntityId);
+    assert.equal(places.length, 3);
+    const ids = new Map(places.map(entity => [entity.displayName, entity.id]));
+    assert.equal(result.memory.locations[0].entityId, ids.get('客房'));
+    assert.equal(new Set(result.memory.spatialFacts.containments.map(edge => `${edge.placeEntityId}:${edge.parentEntityId}`)).size, 2);
+    assert.equal(result.memory.spatialFacts.positions[0].placeEntityId, ids.get('客房'));
+  }
+});
+
+test('路径节点显式key：未知key重复环叶引用冲突与既有身份冲突不接受路径，真多父仍隔离', async () => {
+  for (const variant of ['unknown-key', 'repeated-key', 'entry-leaf-conflict', 'entry-fallback-repeat', 'stable-identity-conflict']) {
+    const { result } = await nodeBoundPathFixture(variant);
+    assert.ok(result.isolated.some(issue => issue.field === 'placePaths'), variant);
+  }
+  const conflicting = await nodeBoundPathFixture('two-parents');
+  assert.ok(conflicting.result.isolated.some(issue => issue.code === 'V3_EXTRACTOR_SPATIAL_PLACE_SCOPE_CONFLICT'));
+});
+
+test('路径显式key保原surface：中间节点长名location和旧entry叶长名均绑定已确认身份', async () => {
+  const fixture = await explicitLeafPathFixture();
+  for (const middle of [true, false]) {
+    const response = structuredClone(fixture.response);
+    const originalName = middle ? '山麓林间宅院' : '林间宅院客房';
+    if (middle) {
+      response.placePaths[0].path[1].placeKey = 'place-mention-1';
+      response.locations.push({ ...response.locations[0], name: originalName });
+    } else {
+      response.spatialFacts.places[1].name = originalName;
+      response.locations[0].name = originalName;
+    }
+    const result = await direct(response, { content: fixture.content });
+    assert.deepEqual(result.isolated, []);
+    const entity = result.newEntities.find(entity => entity.displayName === (middle ? '林间宅院' : '客房'));
+    assert.equal(result.memory.locations.find(location => location.name === originalName).entityId, entity.id);
+  }
+});
+
+test('路径显式key二十别名：原长名路径短名首末alias均可绑定，不裁合法别名', async () => {
+  const fixture = await explicitLeafPathFixture(), response = structuredClone(fixture.response);
+  const aliases = Array.from({ length: 20 }, (_, index) => `明确别称${index}`);
+  response.spatialFacts.places[0].aliases = aliases;
+  response.placePaths[0].path[1].placeKey = 'place-mention-1';
+  const names = ['山麓林间宅院', '林间宅院', aliases[0], aliases.at(-1)];
+  response.locations.push(...names.map(name => ({ ...response.locations[0], name })));
+  const result = await direct(response, { content: fixture.content });
+  assert.deepEqual(result.isolated, []);
+  const parent = result.newEntities.find(entity => entity.displayName === '林间宅院' && !entity.mergedIntoEntityId);
+  for (const name of names) assert.equal(result.memory.locations.find(location => location.name === name).entityId, parent.id, name);
+  const alias = result.newEntities.find(entity => entity.mergedIntoEntityId === parent.id);
+  assert.ok(alias);
+  assert.ok([alias.displayName, ...alias.aliases.map(item => item.name)].includes(aliases.at(-1)));
+});
+
+test('路径显式key旧兼容：uncertain单节点由有效路径定身份，未定或new可沿path明确known解析', async () => {
+  const fixture = await explicitLeafPathFixture();
+  const uncertain = structuredClone(fixture.response);
+  uncertain.spatialFacts.places[1].identity = 'uncertain';
+  uncertain.placePaths[0].path = [{ name: '客房', description: '屋内有书桌。' }];
+  const resolved = await direct(uncertain, { content: fixture.content });
+  assert.ok(resolved.memory.locations[0].entityId);
+  assert.equal(resolved.isolated.some(issue => issue.field === 'placePaths'), false);
+  const room = precisionPlace(621, '旧客房');
+  for (const identity of ['uncertain', 'new']) {
+    const response = structuredClone(uncertain);
+    response.spatialFacts.places[1].identity = identity;
+    response.placePaths[0].path = [{ name: '客房', sameAsPlaceKey: 'place-1', placeKey: 'place-mention-2' }];
+    const result = await direct(response, { content: fixture.content, entities: [room] });
+    assert.equal(result.memory.locations[0].entityId, room.id, identity);
+    assert.equal(result.isolated.some(issue => issue.field === 'placePaths'), false, identity);
+  }
+});
+
+test('显式路径正常runtime：原长短父包与node中间key均保存父链两人位置设施并冷读', async () => {
+  for (const nodeKeys of [false, true]) {
+    const fixture = await explicitLeafPathFixture();
+    const response = structuredClone(fixture.response);
+    response.people.push({ name: '周慎', entityKind: 'individual', presence: 'present' });
+    response.spatialFacts.positions.push({ ...response.spatialFacts.positions[0], subject: '周慎' });
+    if (nodeKeys) {
+      delete response.placePaths[0].placeKey;
+      response.placePaths[0].path[1].placeKey = 'place-mention-1';
+      response.placePaths[0].path[2].placeKey = 'place-mention-2';
+      response.spatialFacts.places[0].aliases = Array.from({ length: 20 }, (_, index) => `明确别称${index}`);
+      response.locations.push(...['山麓林间宅院', '林间宅院', '明确别称0', '明确别称19'].map(name => ({ ...response.locations[0], name })));
+    }
+    const h = harness({ withPlaces: true, modernAnchors: true, readOnlyLifecycle: true,
+      initialChat: [user('继续'), assistant(fixture.content), user('稳定')], utility: () => ({ jsonData: response }) });
+    await h.foundationRuntime.reconcile('explicit-path-runtime');
+    await h.runtime.start();
+    const floorId = h.runtime.getState().floors[0].floorId;
+    await h.runtime.extractFloor(floorId, { analyzeState: false });
+    assert.equal(h.calls.length, 1);
+    await h.runtime.refreshStatus({ preferCached: false });
+    const saved = await h.store.readReachable(), memory = saved.floorMemories.find(item => item.floorId === floorId);
+    const snapshot = h.runtime.getQianchuangSnapshot();
+    const room = snapshot.places.find(place => place.displayName === '客房');
+    const parent = snapshot.places.find(place => place.displayName === '林间宅院');
+    assert.ok(room && parent);
+    assert.equal(room.parentEntityId, parent.entityId);
+    assert.equal(memory.spatialFacts.positions.length, 2);
+    assert.ok(memory.spatialFacts.positions.every(position => position.placeEntityId === room.entityId));
+    assert.equal(memory.spatialFacts.features.length, 1);
+    assert.equal(memory.spatialFacts.features[0].placeEntityId, room.entityId);
+    assert.ok(memory.spatialFacts.containments.some(edge => edge.placeEntityId === room.entityId && edge.parentEntityId === parent.entityId));
+    assert.equal(snapshot.places.filter(place => place.displayName === '山麓林间宅院').length, nodeKeys ? 0 : 1);
+    assert.equal(snapshot.places.length, nodeKeys ? 3 : 4);
+    if (nodeKeys) for (const name of ['山麓林间宅院', '林间宅院', '明确别称0', '明确别称19']) assert.equal(memory.locations.find(location => location.name === name).entityId, parent.entityId, name);
+  }
+});
+
+test('完整正文路径细化旧包含：旧宿舍→新一楼→旧客房保UUID，无描述中间层真实入Core facts', async()=>{
+ const entities=[precisionPlace(1,'宿舍'),precisionPlace(2,'客房')], content='走进宿舍一楼的客房。';
+ const context={parentEntityIdsByPlaceId:new Map([[entities[1].id,new Set([entities[0].id])]])};
+ const result=await direct({summary:'走进客房。',placePaths:[{path:[{name:'宿舍',sameAsPlaceKey:'place-1'},{name:'一楼'},{name:'客房',sameAsPlaceKey:'place-2'}],source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content}]},{entities,content,previousFloorContext:context});
+ assert.equal(result.memory.spatialFacts.containments.length,2);assert.equal(result.newEntities.length,1);
+ const level=result.newEntities[0];assert.equal(level.displayName,'一楼');
+ assert.ok(result.memory.spatialFacts.containments.some(x=>x.placeEntityId===entities[1].id&&x.parentEntityId===level.id));
+ assert.deepEqual(result.foundationPatch.facts,[]);
+});
+
+test('同次世界书路径与正文place引用共享UUID，WB描述不冒充本楼事实',async()=>{
+ const content='你走进客房。', wb={sourceKey:'worldbook-1',locator:'地图:18',sourceName:'地图',fingerprint:'sha256:test',content:'宿舍一楼客房内有独立浴室。'};
+ const result=await direct({summary:'进入客房。',locations:[{name:'客房',change:'entered',exactQuote:content,source:'canonicalContent',sourceFloorKey:'floor-1'}],spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'new',source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content}],positions:[],containments:[]},placePaths:[{placeKey:'place-mention-1',path:[{name:'宿舍'},{name:'一楼'},{name:'客房'}],description:'内有独立浴室。',source:'worldbook',sourceKey:wb.sourceKey,exactQuote:wb.content}]},{content,placeWorldbookSources:[wb]});
+ assert.equal(result.memory.spatialFacts?.features?.length??0,0);assert.equal(result.memory.spatialFacts?.containments?.length??0,0);
+ const room=result.foundationPatch.entities.find(x=>x.displayName==='客房');
+ assert.equal(result.newEntities.filter(x=>x.displayName==='客房').length,1);assert.ok(result.newEntities.some(x=>x.id===room.id));
+ assert.equal(result.foundationPatch.facts.find(x=>x.kind==='feature').source.kind,'worldbook');
+});
+
+
+const foundationBookCandidate={id:'worldbook:地图:18',kind:'worldbook',world:'地图',locator:'地图:18',fingerprint:'sha256:fixture',content:'宿舍一楼客房内有独立浴室。',primaryKeys:['客房','宿舍'],hostEnabled:true};
+
+test('182整理必须复核已有未分类大场景，同次单节点增量经真实runtime保存分图且冷读稳定',async()=>{
+ const content='远航构造体甲包含生活舱，生活舱有休息室。候选星乙包含登陆点。野外小屋丙有储物间。',book={...foundationBookCandidate,content,primaryKeys:['地图'],constant:true};let phase='initial',captured;
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你查看地图。'),user('稳定')],placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[book],macros:{}}),utility:options=>{
+  const request=JSON.parse(options.taskMessages[0].content),p=request.payload,ev={source:'worldbook',sourceKey:p.placeWorldbookSources[0].sourceKey,exactQuote:content};
+  if(request.task!=='organizePlaces'){
+   assert.doesNotMatch(options.systemPrompt,/独立地图范围复核/u);
+   return{jsonData:{summary:'你查看地图。',mapStyle:'sci-fi',placePaths:[
+    {path:[{name:'远航构造体甲',mapRole:'area',description:'完整的远航构造体内部。'},{name:'生活舱',mapRole:'site'},{name:'休息室',mapRole:'interior'}],...ev},
+    {path:[{name:'候选星乙',mapRole:'area',description:'独立行星地表。'},{name:'登陆点',mapRole:'site'}],...ev},
+    {path:[{name:'野外小屋丙',mapRole:'area'},{name:'储物间',mapRole:'interior'}],...ev}]}};
+  }
+  captured=request;const known=name=>p.knownPlaces.find(node=>node.displayName===name);
+  assert.match(options.systemPrompt,/独立地图范围复核/u);assert.match(options.systemPrompt,/必须返回/u);assert.doesNotMatch(options.systemPrompt,/独立浏览的大场景范围可给scope/u);
+  assert.equal(known('远航构造体甲').mapRole,'area');assert.equal(known('候选星乙').mapRole,'area');assert.equal(known('休息室').mapRole,'interior');assert.equal(known('野外小屋丙').manualCurrentFacts.mapLevel,null);
+  if(phase==='repeat'){assert.equal(known('远航构造体甲').mapLevel,'scope');assert.equal(known('候选星乙').mapStyle,'alien');return{jsonData:{placePaths:[]}};}
+  assert.equal(Object.hasOwn(known('远航构造体甲'),'mapLevel'),false);
+  return{jsonData:{placePaths:[['远航构造体甲','sci-fi','linear'],['候选星乙','alien','organic']].map(([name,mapStyle,mapLayout])=>({path:[{name,sameAsPlaceKey:known(name).entityKey,mapLevel:'scope',mapStyle,mapLayout}],...ev}))}};
+ }});
+ await h.foundationRuntime.reconcile('scope-fixture');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ const cabin=h.runtime.getQianchuangSnapshot().places.find(node=>node.displayName==='野外小屋丙');await h.runtime.savePlace(cabin.entityId,{mapLevel:null},h.runtime.getPlaceEditContext(cabin.entityId));
+ const {projectQianchuangSheets}=await import('../src/ui/qianchuang-city-sheets.js'),{QIANCHUANG_MAP_ASSETS}=await import('../src/qianchuang-map-assets.js');
+ const before=h.runtime.getQianchuangSnapshot(),beforeParents=before.places.map(node=>[node.entityId,node.parentEntityId]);assert.equal(projectQianchuangSheets(before).sheets.length,1);assert.equal(projectQianchuangSheets(before).sheets[0].id,'legacy');
+ h.backend.calls.length=0;const modelCalls=h.calls.length;phase='classify';assert.equal((await h.runtime.organizePlaces()).status,'saved');assert.equal(h.calls.length,modelCalls+1);assert.equal(captured.task,'organizePlaces');
+ assert.equal(h.backend.calls.filter(row=>row[0]==='put').length,1);assert.equal(h.backend.calls.filter(row=>row[0]==='put'&&row[2]==='v3-place-workspace').length,1);
+ const after=h.runtime.getQianchuangSnapshot(),byName=new Map(after.places.map(node=>[node.displayName,node])),ship=byName.get('远航构造体甲'),planet=byName.get('候选星乙'),sheets=projectQianchuangSheets(after);
+ assert.deepEqual(after.places.map(node=>[node.entityId,node.parentEntityId]),beforeParents);assert.equal(after.mapStyle,'sci-fi');assert.equal(ship.mapLevel,'scope');assert.equal(planet.mapLevel,'scope');assert.equal(QIANCHUANG_MAP_ASSETS[ship.mapAssetId].family,'sci-fi');assert.equal(QIANCHUANG_MAP_ASSETS[planet.mapAssetId].family,'terrain');
+ assert.equal(sheets.placeSheets.get(byName.get('休息室').entityId),ship.entityId);assert.equal(sheets.placeSheets.get(byName.get('登陆点').entityId),planet.entityId);assert.equal(sheets.placeSheets.get(cabin.entityId),null);assert.equal(sheets.sheets.filter(sheet=>sheet.rootPlaceId).length,2);
+ const selected=[ship.mapAssetId,planet.mapAssetId];phase='repeat';await h.runtime.organizePlaces();assert.deepEqual(h.runtime.getQianchuangSnapshot().places.filter(node=>[ship.entityId,planet.entityId].includes(node.entityId)).map(node=>node.mapAssetId),selected);
+ const cold=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,modernAnchors:true,readOnlyLifecycle:true,utility:()=>{throw Error('冷读不发模型');}});await cold.runtime.start();const snapshot=cold.runtime.getQianchuangSnapshot();assert.equal(projectQianchuangSheets(snapshot).sheets.filter(sheet=>sheet.rootPlaceId).length,2);assert.deepEqual(snapshot.places.filter(node=>[ship.entityId,planet.entityId].includes(node.entityId)).map(node=>node.mapAssetId),selected);assert.equal(cold.calls.length,0);
+});
+
+test('初始化无允许世界书时不改读整段角色卡，也不建立零root或调用模型',async()=>{
+ const card={sourceKey:'card-description',kind:'characterCard',field:'description',locator:'character:test:description',fingerprint:'sha256:card',content:'牵星号设有休息舱，舱内有软榻。'};
+ const h=harness({withPlaces:true,initialChat:[],readOnlyLifecycle:true,placeWorldInfoProvider:async options=>{assert.equal(options.organize,false);return{chatId:CHAT,candidates:[],macros:{},characterCardSources:[card]};},utility:()=>{throw Error('无世界书不调模型');}});
+ await h.runtime.start();assert.equal((await h.runtime.organizePlaces({mode:'initialize'})).reason,'no-worldbook');assert.equal(h.calls.length,0);assert.equal(h.foundationRuntime.getReachable()?.root??null,null);assert.equal(h.runtime.getQianchuangSnapshot().places.length,0);
+});
+
+test('整理已有地点style-only遇workspace并发修改返回skipped而不称saved',async()=>{
+ let release;const h=harness({withPlaces:true,utility:options=>JSON.parse(options.taskMessages[0].content).task==='organizePlaces'?new Promise(resolve=>{release=()=>resolve({jsonData:{placePaths:[],mapStyle:'sci-fi'}});}):{jsonData:{summary:'你查看房间。'}}});await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});await h.runtime.createPlace({name:'房间'},h.runtime.getPlaceEditContext(null));h.backend.calls.length=0;
+ const pending=h.runtime.organizePlaces();await waitFor(()=>release);
+ const current=await h.placeWorkspaceStore.read({chatId:CHAT});await h.placeWorkspaceStore.put({chatId:CHAT},{schemaVersion:1,kind:'qqj-v3-place-workspace',chatId:CHAT,placesByEntityId:{},deletionsByEntityId:{},mapStyle:'modern-town'},current.revision);
+ release();assert.equal((await pending).status,'skipped');assert.equal((await h.placeWorkspaceStore.read({chatId:CHAT})).data.mapStyle,'modern-town');assert.equal(h.calls.length,2);assert.equal(h.backend.calls.filter(row=>row[0]==='put'&&row[2]==='v3-place-workspace').length,1);
+});
+
+test('初始化世界书不需constant或已知名字，新增设施后手改再整理按当前资料重建',async()=>{
+ let mode='initial',payload;const book={...foundationBookCandidate,constant:false,primaryKeys:['无人提过的港区']};
+ const h=harness({withPlaces:true,placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[book],macros:{}}),utility:options=>{const request=JSON.parse(options.taskMessages[0].content);payload=request.payload;if(request.task!=='organizePlaces')return{jsonData:{summary:'你走进房间。'}};if(mode==='style')return{jsonData:{mapStyle:'old-town',placePaths:[]}};const known=payload.knownPlaces.find(node=>node.displayName==='客房');return{jsonData:{placePaths:[{path:[{name:'宿舍',mapLevel:'scope',mapStyle:'old-town'},{name:'客房',...(known?{sameAsPlaceKey:known.entityKey}:{}),description:'配有沙发。',facilities:[{icon:'Sofa',label:mode==='again'?'新软榻':'沙发'}]}],source:'worldbook',sourceKey:payload.placeWorldbookSources[0].sourceKey,exactQuote:book.content}]}};}});
+ await h.runtime.start();assert.equal(h.runtime.getQianchuangSnapshot().summarizedThroughAssistantSeq,0);const before=h.backend.calls.filter(row=>row[0]==='put'&&row[2]==='v3-place-workspace').length;assert.equal((await h.runtime.organizePlaces({mode:'initialize'})).status,'saved');assert.equal(payload.placeWorldbookSources.length,1);assert.equal(h.backend.calls.filter(row=>row[0]==='put'&&row[2]==='v3-place-workspace').length,before+1);
+ let room=h.runtime.getQianchuangSnapshot().places.find(node=>node.displayName==='客房');assert.equal(room.facilities[0].label,'沙发');
+ // Artificially supply a real summarized boundary only for the existing manual-edit contract.
+ await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const context=h.runtime.getPlaceEditContext(room.entityId);await h.runtime.savePlace(room.entityId,{description:'新手工描述有软榻'},context);room=h.runtime.getQianchuangSnapshot().places.find(node=>node.entityId===room.entityId);assert.equal(Object.hasOwn(room,'facilities'),false);
+ mode='again';await h.runtime.organizePlaces();assert.equal(h.runtime.getQianchuangSnapshot().places.find(node=>node.entityId===room.entityId).facilities[0].label,'新软榻');assert.equal(h.runtime.getQianchuangSnapshot().places.find(node=>node.displayName==='宿舍').mapStyle,'old-town');
+});
+const foundationUtility=options=>{
+ const payload=JSON.parse(options.taskMessages[0].content).payload, source=payload.placeWorldbookSources?.[0], ev={source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey,exactQuote:payload.canonicalContent};
+ return {jsonData:{summary:'你进入客房。',locations:[{name:'客房',change:'entered',...ev}],spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'new',...ev}],containments:[],positions:[]},...(source?{placePaths:[{placeKey:'place-mention-1',path:[{name:'宿舍'},{name:'一楼'},{name:'客房'}],source:'worldbook',sourceKey:source.sourceKey,exactQuote:source.content,description:'内有独立浴室。'}]}:{})}};
+};
+
+test('整理目录人工字段只读一份且保空值，后续独立设施仍完整提供', async t => {
+ for (const manual of [{description:'人工保留的简介。',relations:'门朝东。'},{description:'',relations:''}]) await t.test(JSON.stringify(manual), async () => {
+  let payload;
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你进入客房。'),user('继续'),assistant('客房新增投影仪。'),user('稳定')],placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:options=>{
+   const request=JSON.parse(options.taskMessages[0].content),p=request.payload;
+   if(request.task==='organizePlaces'){payload=p;return{jsonData:{placePaths:[]}};}
+   if(p.canonicalContent==='客房新增投影仪。'){
+    const known=p.knownPlaces.find(place=>place.displayName==='客房'),ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent};
+    return{jsonData:{summary:p.canonicalContent,spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'existing',sameAsPlaceKey:known.entityKey,...ev}],features:[{key:'feature-1',placeKey:'place-mention-1',kind:'stable',text:'新增投影仪。',replacesKeys:[],...ev}],containments:[],positions:[],relations:[]}}};
+   }
+   return foundationUtility(options);
+  }});
+  await h.foundationRuntime.reconcile('place-input-manual');await h.runtime.start();const floors=h.runtime.getState().floors;await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});
+  const room=h.runtime.getQianchuangSnapshot().places.find(place=>place.displayName==='客房');
+  await h.runtime.savePlace(room.entityId,{...manual,parentEntityId:null,mapLevel:null},h.runtime.getPlaceEditContext(room.entityId));
+  await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});await h.runtime.organizePlaces();
+  const known=payload.knownPlaces.find(place=>place.displayName==='客房');
+  assert.equal(Object.hasOwn(known,'pathLabel'),false);assert.equal(Object.hasOwn(known,'description'),false);
+  assert.deepEqual(known.manualCurrentFacts,{...manual,parentKey:null,mapLevel:null});assert.equal(known.parentKey,null);
+  assert.deepEqual(known.features,['新增投影仪。']);assert.deepEqual(known.relations,[]);assert.equal(h.calls.length,3);
+ });
+});
+
+test('整理当前合并简介沿source.references保旧有效证据的相邻上级与楼层', async () => {
+ const nameQuote='客房入口。',oldQuote='书桌固定在墙边。',newQuote='客房天花板有投影仪。';
+ const text=[nameQuote,'入口邻段。','过渡一。','新增教学楼的二层设有资料室。',oldQuote,'书桌邻段。','过渡二。','过渡三。',newQuote,'投影仪邻段。'].join('\n\n');
+ let organizations=0;
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(text),user('稳定')],placeWorldInfoProvider:async()=>({candidates:[],macros:{}}),utility:options=>{
+  const request=JSON.parse(options.taskMessages[0].content),p=request.payload;
+  if(request.task==='organizePlaces'){
+   organizations++;const rows=storedEvidenceRows(p),room=p.knownPlaces.find(place=>place.displayName==='客房');
+   assert.ok(rows.some(row=>row.requiresExactQuote&&row.content.includes('新增教学楼的二层')));
+   if(organizations===2)return{jsonData:{placePaths:[]}};
+   return{jsonData:{placePaths:[{path:[{sameAsPlaceKey:room.entityKey,description:oldQuote+newQuote}],evidence:[newQuote,oldQuote].map(quote=>({source:'storedPlaceEvidence',sourceKey:rows.find(row=>row.content.includes(quote)).sourceKey,exactQuote:quote}))}]}};
+  }
+  const ev=quote=>({source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:quote});
+  return{jsonData:{summary:'你查看客房。',locations:[{name:'客房',change:'present',...ev(nameQuote)}],spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'new',...ev(nameQuote)}],features:[{key:'feature-1',placeKey:'place-mention-1',kind:'stable',text:oldQuote,replacesKeys:[],...ev(oldQuote)}],containments:[],positions:[],relations:[]}}};
+ }});
+ await h.foundationRuntime.reconcile('place-input-merged-source');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});await h.runtime.organizePlaces();
+ const workspace=await h.placeWorkspaceStore.read({chatId:CHAT});assert.ok(workspace.data.foundation.facts.find(fact=>fact.kind==='feature').source.references.some(ref=>ref.quote===oldQuote));
+ await h.runtime.organizePlaces();assert.equal(organizations,2);assert.equal(h.calls.length,3);
+});
+
+test('179普通摘要同次保存style设施但不发整库，人工清空后自动旧hint不复活',async()=>{
+ const h=harness({withPlaces:true,text:'你进入客房。',placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:options=>{
+  const result=foundationUtility(options);result.jsonData.mapStyle='sci-fi';result.jsonData.placePaths[0].path[2].facilities=[{icon:'Sofa',label:'沙发'}];return result;
+ }});
+ await h.runtime.start();const floor=h.runtime.getState().floors[0].floorId;await h.runtime.extractFloor(floor,{analyzeState:false});let snapshot=h.runtime.getQianchuangSnapshot(),room=snapshot.places.find(node=>node.displayName==='客房');assert.equal(snapshot.mapStyle,'sci-fi');assert.deepEqual(room.facilities,[{icon:'Sofa',label:'沙发'}]);
+ const payload=JSON.parse(h.calls[0].taskMessages[0].content).payload;assert.equal(payload.mapStyles.length,8);assert.equal(Object.hasOwn(payload,'facilityIcons'),false);assert.equal(Object.hasOwn(payload,'characterCardSources'),false);
+ await h.runtime.savePlace(room.entityId,{description:''},h.runtime.getPlaceEditContext(room.entityId));await h.runtime.extractFloor(floor,{analyzeState:false});snapshot=h.runtime.getQianchuangSnapshot();room=snapshot.places.find(node=>node.entityId===room.entityId);assert.equal(Object.hasOwn(room,'facilities'),false);assert.equal(room.manualDescription,true);assert.equal(snapshot.mapStyle,'sci-fi');assert.equal(h.calls.length,2);
+});
+
+test('同次摘要接相关WB并保存统一基础图，一次派发且body房间已materialize',async()=>{
+ const h=harness({withPlaces:true,text:'你进入客房。',placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:foundationUtility});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});assert.equal(h.calls.length,1);
+ const payload=JSON.parse(h.calls[0].taskMessages[0].content).payload;assert.equal(payload.placeWorldbookSources.length,1);
+ const saved=await h.store.readReachable({mode:'runtime'}),snapshot=h.runtime.getQianchuangSnapshot();assert.equal(snapshot.places.length,3);
+ const room=snapshot.places.find(x=>x.displayName==='客房'),level=snapshot.places.find(x=>x.displayName==='一楼');assert.equal(room.parentEntityId,level.entityId);
+ assert.ok(saved.entities.some(x=>x.id===room.entityId));assert.equal(saved.floorMemories[0].spatialFacts?.features?.length??0,0);assert.equal(room.features[0].text,'内有独立浴室。');
+ const places=await h.placeWorkspaceStore.read({chatId:CHAT});
+ const recall=await readRecallSource({store:h.store,identityProjection:{placeWorkspace:places.data,placeWorkspaceRevision:places.revision},now:()=>new Date(NOW)});
+ const context=historySelectionContext(recall,{text:'客房 独立浴室',latestUserText:'客房 独立浴室'});
+ assert.ok(context.facts.some(x=>x.kind==='placeFoundation'&&x.text.includes('独立浴室')));
+ const selected=selectRecall({source:recall,queryContext:{text:'客房 独立浴室',latestUserText:'客房 独立浴室'},contextSize:20000});
+ assert.match(selected.injectionText,/地点资料/);assert.ok(selected.manualPlaces.some(x=>x.kind==='placeFoundation'&&!Object.hasOwn(x,'sourceAssistantSeq')));
+});
+
+test('基础CAS失败仍保存付费摘要与body引用seed，模型不重发；WB读取失败也继续body',async()=>{
+ for(const providerFails of [false,true]){
+  const notices=[],backend=backendHarness();if(!providerFails)backend.setBeforePut(({key})=>{if(key==='v3-place-workspace')throw new Error('aux failed');});
+  const h=harness({withPlaces:true,sharedBackend:backend,text:'你进入客房。',notifyUser:value=>notices.push(value),placeWorldInfoProvider:async()=>{if(providerFails)throw new Error('book unavailable');return{chatId:CHAT,candidates:[foundationBookCandidate],macros:{}};},utility:foundationUtility});
+  await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const saved=await h.store.readReachable({mode:'runtime'});
+  assert.equal(h.calls.length,1);assert.equal(saved.floorMemories.length,1);assert.equal(saved.floorMemories[0].summary.aiText,'你进入客房。');
+  const roomId=saved.floorMemories[0].locations[0].entityId;assert.ok(saved.entities.some(x=>x.id===roomId),'辅助失败也不能留下Core悬空引用');assert.ok(notices.some(x=>x.text.includes('地点')));
+ }
+});
+
+test('整理地点一轮复用旧正文sourceKey及最近父短path，保旧UUID和摘要并共用细化父图',async()=>{
+ const content='宿舍一楼设有客房。客房内有固定书桌。';let organizedPayload;
+ const h=harness({withPlaces:true,text:content,placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[],macros:{}}),utility:options=>{
+  const request=JSON.parse(options.taskMessages[0].content),p=request.payload;
+  if(request.task==='organizePlaces'){
+   organizedPayload=p;const known=name=>p.knownPlaces.find(x=>x.displayName===name);
+   const chain=known('一楼')?[{name:'一楼',sameAsPlaceKey:known('一楼').entityKey}]:[{name:'宿舍',sameAsPlaceKey:known('宿舍').entityKey},{name:'一楼'}];
+   return{textData:'<think>示例 {"placePaths":[]}，仅返回变化。</think>'+JSON.stringify({placePaths:[{path:[...chain,{name:'客房',sameAsPlaceKey:known('客房').entityKey}],evidence:[{source:'storedPlaceEvidence',sourceKey:storedEvidenceRows(p)[0].sourceKey,exactQuote:storedEvidenceRows(p)[0].content}]}]}),taskMetadata:{finishReason:'stop'}};
+  }
+  const ev={exactQuote:p.canonicalContent,source:'canonicalContent',sourceFloorKey:p.sourceFloorKey};return{jsonData:{summary:'进入客房。',locations:[{name:'客房',change:'entered',...ev}],spatialFacts:{places:['宿舍','客房'].map((name,i)=>({key:`place-mention-${i+1}`,name,identity:'new',...ev})),containments:[{placeKey:'place-mention-2',parentPlaceKey:'place-mention-1',...ev}],positions:[],features:[]}}};
+ }});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const before=h.runtime.getQianchuangSnapshot(),head=(await h.store.readReachable({mode:'runtime'})).root.headCheckpointId, room=before.places.find(x=>x.displayName==='客房');
+ assert.equal(typeof h.runtime.organizePlaces,'function');await h.runtime.organizePlaces();assert.equal(h.calls.length,2);assert.ok(storedEvidenceRows(organizedPayload)[0].content.includes('一楼'));assert.ok(storedEvidenceRows(organizedPayload).every(fragment=>Array.isArray(fragment.placeKeys)));const organizedRoom=organizedPayload.knownPlaces.find(place=>place.displayName==='客房');assert.equal(Object.hasOwn(organizedRoom,'pathLabel'),false);assert.equal(organizedPayload.knownPlaces.find(place=>place.entityKey===organizedRoom.parentKey).displayName,'宿舍');
+ const after=h.runtime.getQianchuangSnapshot(),level=after.places.find(x=>x.displayName==='一楼');assert.equal(after.places.find(x=>x.entityId===room.entityId).parentEntityId,level.entityId);
+ assert.equal((await h.store.readReachable({mode:'runtime'})).root.headCheckpointId,head,'整理不重摘或改旧摘要');
+ const context=h.runtime.getPlaceEditContext(null),workspace=await h.placeWorkspaceStore.read({chatId:CHAT});
+ const graph=await h.store.readReachable({mode:'runtime'}),projection={placeWorkspace:workspace.data,placeWorkspaceRevision:workspace.revision};
+ const envelope=await createExtractorEnvelope({batchId:GENERATION,chatId:CHAT,narrativeGeneration:GENERATION,floor:graph.floors[0],entities:graph.entities,identityProjection:projection,previousFloorContext:{parentEntityIdsByPlaceId:new Map(after.places.filter(x=>x.parentEntityId).map(x=>[x.entityId,new Set([x.parentEntityId])]))}});
+ assert.ok(envelope.request.payload.knownPlaces.some(x=>x.displayName==='一楼'));
+ const {expandPlaceParents}=await import('../src/v3/spatial-domain.js');assert.ok(expandPlaceParents(new Set([room.entityId]),graph.floorMemories,Infinity,graph.floors,workspace.data).has(level.entityId));
+ await h.runtime.organizePlaces();assert.equal(h.calls.length,3);assert.equal(h.runtime.getQianchuangSnapshot().places.length,3);assert.equal(context.chatId,CHAT);
+});
+
+test('整理取消或世界书读取失败保旧图，取消迟到模型结果不发布',async()=>{
+ const h=harness({withPlaces:true,text:'你进入客房。',placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:foundationUtility});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ const before=await h.placeWorkspaceStore.read({chatId:CHAT}),controller=new AbortController();controller.abort();
+ await assert.rejects(()=>h.runtime.organizePlaces({signal:controller.signal}),error=>error.name==='AbortError');
+ assert.equal(h.calls.length,1);assert.equal((await h.placeWorkspaceStore.read({chatId:CHAT})).revision,before.revision);
+});
+
+test('删除当前地点索引清相关资料并保孩子，读取刷新不会自动重建',async()=>{
+ const h=harness({withPlaces:true,text:'你进入客房。',placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:foundationUtility});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const before=h.runtime.getQianchuangSnapshot(),level=before.places.find(x=>x.displayName==='一楼'),room=before.places.find(x=>x.displayName==='客房');
+ await h.runtime.deletePlace(level.entityId,h.runtime.getPlaceEditContext(level.entityId));
+ let after=h.runtime.getQianchuangSnapshot();assert.equal(after.places.some(x=>x.entityId===level.entityId),false);assert.equal(after.places.find(x=>x.entityId===room.entityId).parentEntityId,null);
+ let workspace=await h.placeWorkspaceStore.read({chatId:CHAT});assert.equal(workspace.data.foundation.entities.some(x=>x.id===level.entityId),false);assert.ok(workspace.data.foundation.facts.every(x=>x.placeEntityId!==level.entityId&&x.parentEntityId!==level.entityId));
+ after=h.runtime.getQianchuangSnapshot();assert.equal(after.places.some(x=>x.entityId===level.entityId),false);assert.equal(after.places.find(x=>x.entityId===room.entityId).parentEntityId,null);assert.equal(h.calls.length,1);
+});
+
+test('排除世界书后同HEAD地图与召回撤基础资料，普通正文地点保持',async()=>{
+ let excluded=false;const filter=sources=>excluded?sources.filter(source=>source.sourceName!=='地图'):sources;
+ const h=harness({withPlaces:true,text:'你进入客房。',filterWorldInfoSources:filter,placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:foundationUtility});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const core=await h.store.readReachable({mode:'runtime'}),before=h.runtime.getQianchuangSnapshot();assert.equal(before.places.length,3);
+ excluded=true;await h.runtime.prepareCurrent();const after=h.runtime.getQianchuangSnapshot();assert.deepEqual(after.places.map(x=>x.displayName),['客房']);assert.equal(after.places[0].features.length,0);assert.equal(h.calls.length,1);assert.equal((await h.store.readReachable({mode:'runtime'})).root.headCheckpointId,core.root.headCheckpointId);
+ const {filterPlaceFoundationSources,placeWorkspaceDependency}=await import('../src/v3/place-foundation.js'),record=await h.placeWorkspaceStore.read({chatId:CHAT}),allowed=filterPlaceFoundationSources(record.data,{filterWorldInfoSources:filter});
+ const projected=await readRecallSource({store:h.store,identityProjection:{placeWorkspace:allowed,placeWorkspaceRevision:record.revision},now:()=>new Date(NOW)});assert.equal(historySelectionContext(projected,{text:'客房 浴室'}).facts.some(x=>x.kind==='placeFoundation'),false);
+ assert.notEqual(await placeWorkspaceDependency(CHAT,record.revision,record.data),await placeWorkspaceDependency(CHAT,record.revision,allowed));
+});
+
+test('后续明确改造同次更新WB当前简介，新独立设施进入统一当前图',async()=>{
+ const requests=[];const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你进入客房。'),user('继续'),assistant('客房的独立浴室已拆除，新增书桌。'),user('继续'),assistant('你在客房看书。'),user('稳定')],placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:options=>{
+  const p=JSON.parse(options.taskMessages[0].content).payload;requests.push(p);if(requests.length===1)return foundationUtility(options);
+  const room=p.knownPlaces.find(x=>x.displayName==='客房'),ev={exactQuote:p.canonicalContent,source:'canonicalContent',sourceFloorKey:p.sourceFloorKey};
+  return{jsonData:{summary:p.canonicalContent,locations:[{name:'客房',change:'present',...ev}],spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'existing',sameAsPlaceKey:room.entityKey,...ev}],containments:[],positions:[],features:requests.length===2?[{key:'feature-1',placeKey:'place-mention-1',kind:'stable',text:'独立浴室已拆除，新增书桌。',replacesKeys:[],...ev}]:[]},...(requests.length===2?{placePaths:[{placeKey:'place-mention-1',path:[{name:'客房',sameAsPlaceKey:room.entityKey,description:'独立浴室已拆除，新增书桌。'}],evidence:[ev]}]}:{})}};
+ }});
+ await h.foundationRuntime.reconcile('base-change');await h.runtime.start();for(const floor of h.runtime.getState().floors)await h.runtime.extractFloor(floor.floorId,{analyzeState:false});
+ assert.equal(h.calls.length,3);assert.equal(requests[1].knownPlaces.find(x=>x.displayName==='客房').description,'内有独立浴室。');
+ const room=h.runtime.getQianchuangSnapshot().places.find(x=>x.displayName==='客房');assert.deepEqual(room.features.map(x=>x.text),['独立浴室已拆除，新增书桌。']);
+ assert.equal(requests[2].knownPlaces.find(x=>x.displayName==='客房').description,'独立浴室已拆除，新增书桌。');const record=await h.placeWorkspaceStore.read({chatId:CHAT});assert.ok(record.data.foundation.facts.find(f=>f.kind==='feature').source.references.some(ref=>ref.kind==='worldbook'),'保旧WB来源关联而不冒充当前正文');
+});
+
+
+test('USER独有完整房间路径与设施进入真实USER来源，AI不复述也不漏层',async()=>{
+ const text='宿舍二楼的客房内设有书桌。',sourceUserInputSnapshot={messages:[{content:text,messageIndex:0,swipeId:null,selectedSwipeIndex:null}]};
+ const result=await direct({summary:'你暂时停下。',placePaths:[{path:[{name:'宿舍'},{name:'二楼'},{name:'客房'}],source:'precedingUserInput',sourceFloorKey:'floor-1',sourceSnapshotIndex:0,exactQuote:text,description:'内设有书桌。'}]},{content:'你暂时停下。',sourceUserInputSnapshot});
+ assert.equal(result.newEntities.length,3);assert.equal(result.memory.spatialFacts.containments.length,2);assert.equal(result.memory.spatialFacts.features[0].text,'内设有书桌。');assert.equal(result.memory.spatialFacts.features[0].source.kind,'body');
+ for(const item of [...result.memory.spatialFacts.containments,...result.memory.spatialFacts.features])for(const ref of item.evidenceRefs){assert.equal(ref.sourceType,'precedingUser');assert.equal(ref.sourceSnapshotIndex,0);assert.equal(ref.quotedText,text);}
+ const brief=result.foundationPatch.facts.find(f=>f.kind==='feature');assert.equal(brief.text,'内设有书桌。');assert.equal(brief.source.kind,'body');assert.equal(brief.source.sourceType,'precedingUser');assert.equal(brief.source.sourceSnapshotIndex,0);assert.equal(brief.source.quote,text);
+});
+
+test('摘要自动基础补充不走人工清召回槽通知，人工修订仍明确失效',async()=>{
+ const changes=[];const h=harness({withPlaces:true,onPlaceChanged:(chatId,change)=>changes.push({chatId,change}),text:'你进入客房。',placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:foundationUtility});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});assert.equal(changes.length,1);assert.deepEqual(changes[0],{chatId:CHAT,change:{automatic:true}});
+ const room=h.runtime.getQianchuangSnapshot().places.find(place=>place.displayName==='客房');await h.runtime.savePlace(room.entityId,{description:'人工确认有书桌'},h.runtime.getPlaceEditContext(room.entityId));assert.equal(changes.length,2);assert.equal(changes[1].change?.automatic===true,false);assert.equal(h.calls.length,1);
+});
+
+test('反复初始化保留未返回地点和UUID，冷读继续保留',async()=>{
+ const {filterPlaceFoundationSources}=await import('../src/v3/place-foundation.js');let version=1;
+ const candidate=()=>({...foundationBookCandidate,constant:true,comment:'地图',fingerprint:`sha256:v${version}`,content:'宿舍内有甲客房和乙客房，分别配有书桌。'});
+ const options={withPlaces:true,text:'你喝茶。',placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[candidate()],macros:{}}),utility:options=>{
+  const request=JSON.parse(options.taskMessages[0].content),p=request.payload;if(request.task!=='organizePlaces')return{jsonData:{summary:'你喝茶。'}};
+  const names=version===1?['甲客房','乙客房']:version===2?['甲客房']:['乙客房'],source=p.placeWorldbookSources[0];
+  return{jsonData:{placePaths:names.map(room=>({path:['宿舍',room].map(name=>({name,...(p.knownPlaces.find(x=>x.displayName===name)?{sameAsPlaceKey:p.knownPlaces.find(x=>x.displayName===name).entityKey}:{})})),source:'worldbook',sourceKey:source.sourceKey,exactQuote:source.content,description:`${room}有书桌。`}))}};
+ }};
+ const h=harness(options);await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});await h.runtime.organizePlaces({mode:'initialize'});const oldB=h.runtime.getQianchuangSnapshot().places.find(x=>x.displayName==='乙客房').entityId;
+ version=2;await h.runtime.prepareCurrent();await h.runtime.organizePlaces({mode:'initialize'});assert.equal(h.runtime.getQianchuangSnapshot().places.find(x=>x.displayName==='乙客房').entityId,oldB);
+ const record=await h.placeWorkspaceStore.read({chatId:CHAT});assert.ok(JSON.parse(JSON.stringify(record.data)).foundation.entities.some(seed=>seed.id===oldB));
+ const cold=harness({...options,sharedBackend:h.backend,sharedContext:h.context,readOnlyLifecycle:true});version=3;await cold.runtime.start();await cold.runtime.prepareCurrent();assert.equal(cold.runtime.getQianchuangSnapshot().places.length,3);await cold.runtime.organizePlaces({mode:'initialize'});assert.equal(cold.runtime.getQianchuangSnapshot().places.find(x=>x.displayName==='乙客房').entityId,oldB);
+});
+
+test('摘要等待模型时地点手改独立保存，回包仍保正文与捕获seed且自动旧rev不顶掉人工',async()=>{
+ let release,providerCalls=0;const candidate={...foundationBookCandidate,content:'宿舍一楼客房内有独立浴室。一楼大厅设有书架。'};
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你进入客房。'),user('继续'),assistant('你走进一楼。'),user('稳定')],placeWorldInfoProvider:async()=>{providerCalls++;return{chatId:CHAT,candidates:[candidate],macros:{}};},utility:(options,count)=>{
+  if(count===1)return foundationUtility(options);
+  const p=JSON.parse(options.taskMessages[0].content).payload,level=p.knownPlaces.find(place=>place.displayName==='一楼'),root=p.knownPlaces.find(place=>place.displayName==='宿舍'),source=p.placeWorldbookSources[0],ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent};
+  return new Promise(resolve=>{release=()=>resolve({jsonData:{summary:p.canonicalContent,locations:[{name:'一楼',change:'entered',...ev}],spatialFacts:{places:[{key:'place-mention-1',name:'一楼',identity:'existing',sameAsPlaceKey:level.entityKey,...ev}],containments:[],positions:[]},placePaths:[{placeKey:'place-mention-1',path:[{name:'宿舍',sameAsPlaceKey:root.entityKey},{name:'一楼',sameAsPlaceKey:level.entityKey}],source:'worldbook',sourceKey:source.sourceKey,exactQuote:source.content,description:'大厅设有书架。'}]}});});
+ }});
+ await h.foundationRuntime.reconcile('place-concurrency');await h.runtime.start();const floors=h.runtime.getState().floors;
+ await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});const level=h.runtime.getQianchuangSnapshot().places.find(place=>place.displayName==='一楼'),context=h.runtime.getPlaceEditContext(level.entityId),pending=h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});
+ await waitFor(()=>typeof release==='function');const callsBefore=providerCalls;
+ await h.runtime.savePlace(level.entityId,{name:'一层大厅',description:'人工确认有圆桌。',parentEntityId:null},context);
+ assert.equal(h.calls.length,2);assert.equal(providerCalls,callsBefore);assert.equal(h.runtime.getQianchuangSnapshot().places.find(place=>place.entityId===level.entityId).displayName,'一层大厅');
+ release();await pending;const source=await h.store.readReachable({mode:'runtime'}),snapshot=h.runtime.getQianchuangSnapshot(),edited=snapshot.places.find(place=>place.entityId===level.entityId);
+ assert.equal(h.calls.length,2);assert.equal(source.floorMemories.find(memory=>memory.floorId===floors[1].floorId).summary.aiText,'你走进一楼。');assert.ok(source.entities.some(entity=>entity.id===level.entityId));
+ assert.equal(edited.displayName,'一层大厅');assert.equal(edited.parentEntityId,null);assert.deepEqual(edited.features.map(item=>item.text),['人工确认有圆桌。']);
+});
+
+test('编辑草稿遇自动索引补充后按最新record合并字段，保自动其他资料且不读世界书',async()=>{
+ let providerCalls=0;
+ const h=harness({withPlaces:true,text:'你进入客房。',placeWorldInfoProvider:async()=>{providerCalls++;return{chatId:CHAT,candidates:[foundationBookCandidate],macros:{}};},utility:options=>{
+  const request=JSON.parse(options.taskMessages[0].content),p=request.payload;if(request.task!=='organizePlaces')return foundationUtility(options);
+  return{jsonData:{placePaths:[{path:['宿舍','一楼','客房'].map(name=>({name,sameAsPlaceKey:p.knownPlaces.find(place=>place.displayName===name).entityKey})),source:'worldbook',sourceKey:p.placeWorldbookSources[0].sourceKey,exactQuote:p.placeWorldbookSources[0].content,description:'独立浴室已确认。'}]}};
+ }});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const room=h.runtime.getQianchuangSnapshot().places.find(place=>place.displayName==='客房'),context=h.runtime.getPlaceEditContext(room.entityId);
+ await h.runtime.organizePlaces();assert.ok(h.runtime.getQianchuangSnapshot().placeWorkspaceRevision>context.expectedRevision);const callsBefore=providerCalls;
+ await h.runtime.savePlace(room.entityId,{name:'客房甲'},context);const edited=h.runtime.getQianchuangSnapshot().places.find(place=>place.entityId===room.entityId);
+ assert.equal(providerCalls,callsBefore);assert.equal(h.calls.length,2);assert.equal(edited.displayName,'客房甲');assert.deepEqual(edited.features.map(item=>item.text),['独立浴室已确认。']);
+});
+
+test('重摘旧楼只用原Core与人工前缀，不把当前自动索引当旧楼已知事实',async()=>{
+ const requests=[];const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你进入客房。'),user('继续'),assistant('你停下。'),user('稳定')],placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:(options,count)=>{
+  requests.push(JSON.parse(options.taskMessages[0].content).payload);return count===1?foundationUtility(options):{jsonData:{summary:'你停下。'}};
+ }});
+ await h.foundationRuntime.reconcile('place-current-only');await h.runtime.start();const floors=h.runtime.getState().floors;
+ await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});
+ await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});
+ assert.equal(requests.length,3);assert.equal(requests[2].placeWorldbookSources?.length??0,0);assert.equal(requests[2].knownPlaces.some(place=>place.displayName==='一楼'),false);
+});
+
+test('手改过的世界书独有地点在排除来源后仍可见可改，编辑不读源也不调模型',async()=>{
+ let excluded=false,sourceReads=0;const filter=sources=>excluded?[]:sources;
+ const h=harness({withPlaces:true,text:'你进入客房。',filterWorldInfoSources:filter,placeWorldInfoProvider:async()=>{sourceReads++;if(excluded)throw new Error('unavailable');return{chatId:CHAT,candidates:[foundationBookCandidate],macros:{}};},utility:foundationUtility});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const level=h.runtime.getQianchuangSnapshot().places.find(place=>place.displayName==='一楼');
+ await h.runtime.savePlace(level.entityId,{description:''},h.runtime.getPlaceEditContext(level.entityId));excluded=true;await h.runtime.prepareCurrent();
+ assert.ok(h.runtime.getQianchuangSnapshot().places.some(place=>place.entityId===level.entityId));const reads=sourceReads;
+ await h.runtime.savePlace(level.entityId,{name:'一层'},h.runtime.getPlaceEditContext(level.entityId));assert.equal(sourceReads,reads);assert.equal(h.calls.length,1);assert.equal(h.runtime.getQianchuangSnapshot().places.find(place=>place.entityId===level.entityId).displayName,'一层');
+});
+
+test('摘要请求期间删除Core地点不丢合法正文，地点删除不占模型工作',async()=>{
+ let release;const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你进入客房。'),user('继续'),assistant('你在客房喝茶。'),user('稳定')],placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[foundationBookCandidate],macros:{}}),utility:(options,count)=>{
+  if(count===1)return foundationUtility(options);const p=JSON.parse(options.taskMessages[0].content).payload,room=p.knownPlaces.find(place=>place.displayName==='客房'),ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent};
+  return new Promise(resolve=>{release=()=>resolve({jsonData:{summary:p.canonicalContent,locations:[{name:'客房',change:'present',...ev}],spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'existing',sameAsPlaceKey:room.entityKey,...ev}],containments:[],positions:[]}}});});
+ }});
+ await h.foundationRuntime.reconcile('delete-during-summary');await h.runtime.start();const floors=h.runtime.getState().floors;await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});const room=h.runtime.getQianchuangSnapshot().places.find(place=>place.displayName==='客房'),pending=h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});await waitFor(()=>typeof release==='function');
+ await h.runtime.deletePlace(room.entityId,h.runtime.getPlaceEditContext(room.entityId));assert.equal(h.calls.length,2);release();await pending;
+ const source=await h.store.readReachable({mode:'runtime'});assert.equal(source.floorMemories.find(memory=>memory.floorId===floors[1].floorId)?.summary.aiText,'你在客房喝茶。');assert.equal(h.calls.length,2);
+});
+
+test('纯正文多来源包含保Core真实引文，当前简介保独立来源且设施归具体段',async()=>{
+ const text='宿舍一楼设有客房。客房内有书桌。';const result=await direct({summary:'你停下。',placePaths:[{path:[{name:'宿舍',mapRole:'site',description:'一楼设有客房。'},{name:'一楼',mapRole:'interior'},{name:'客房',mapRole:'interior',description:'内有书桌。'}],evidence:[{source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:'宿舍一楼设有客房。'},{source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:'客房内有书桌。'}]}]},{content:text});
+ assert.equal(result.memory.spatialFacts.containments.length,2);assert.equal(result.memory.spatialFacts.features.length,2);for(const item of [...result.memory.spatialFacts.containments,...result.memory.spatialFacts.features]){assert.equal(item.evidenceRefs.length,2);assert.ok(item.evidenceRefs.every(ref=>ref.sourceType==='assistant'&&text.includes(ref.quotedText)));}
+ const briefs=result.foundationPatch.facts.filter(fact=>fact.kind==='feature');assert.equal(briefs.length,2);assert.ok(briefs.every(fact=>fact.source.kind==='body'&&fact.source.references.length===2&&fact.source.references.every(ref=>text.includes(ref.quote))));assert.ok(result.foundationPatch.facts.every(fact=>['place','feature'].includes(fact.kind)&&fact.source.kind==='body'));assert.equal(result.foundationPatch.facts.find(fact=>fact.mapRole==='site').placeEntityId,result.newEntities.find(entity=>entity.displayName==='宿舍').id);
+});
+
+test('显式整理同一次CAS只留最近路径区域统计，零返回与全隔离可区分且不删旧资料',async()=>{
+ for(const mode of ['none','invalid','malformed','areas']){
+  const book={...foundationBookCandidate,content:'首尔的汉南洞有宿舍，宿舍一楼客房内有独立浴室。'};
+  const h=harness({withPlaces:true,text:'你进入客房。',placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[book],macros:{}}),utility:options=>{const request=JSON.parse(options.taskMessages[0].content),p=request.payload;if(request.task!=='organizePlaces')return foundationUtility(options);if(mode==='none')return{jsonData:{placePaths:[]}};const home=p.knownPlaces.find(place=>place.displayName==='宿舍');return{jsonData:{placePaths:[{path:mode==='malformed'?'bad':[{name:'首尔',mapRole:'area'},{name:'汉南洞',mapRole:'area'},{name:'宿舍',sameAsPlaceKey:home.entityKey,mapRole:'site'}],evidence:[{source:'worldbook',sourceKey:p.placeWorldbookSources[0].sourceKey,exactQuote:mode==='invalid'?'不存在的引文':book.content}]}]}};}});
+  await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const before=await h.placeWorkspaceStore.read({chatId:CHAT}),head=(await h.store.readReachable({mode:'runtime'})).root.headCheckpointId;assert.equal(before.data.lastOrganization,undefined,'普通摘要不累计整理统计');const writesBefore=h.backend.calls.filter(call=>call[0]==='put'&&call[2]==='v3-place-workspace').length;
+  if(['invalid','malformed'].includes(mode))await assert.rejects(()=>h.runtime.organizePlaces(),error=>error.code==='QQJ_PLACE_PATH_INVALID');else await h.runtime.organizePlaces();
+  const after=await h.placeWorkspaceStore.read({chatId:CHAT}),stats=after.data.lastOrganization;assert.ok(stats);assert.equal(stats.returnedPaths,mode==='none'?0:1);assert.equal(stats.returnedAreaNodes,['none','malformed'].includes(mode)?0:2);assert.equal(stats.acceptedPaths,mode==='areas'?1:0);assert.equal(stats.acceptedAreaNodes,mode==='areas'?2:0);assert.deepEqual(stats.isolatedCodes,['invalid','malformed'].includes(mode)?{QQJ_PLACE_PATH_SOURCE_INVALID:1}:{});assert.equal(h.backend.calls.filter(call=>call[0]==='put'&&call[2]==='v3-place-workspace').length-writesBefore,1);assert.equal(h.calls.length,2);assert.equal((await h.store.readReachable({mode:'runtime'})).root.headCheckpointId,head);assert.equal(JSON.stringify(stats).includes('独立浴室'),false);if(mode!=='areas')assert.deepEqual(after.data.foundation,before.data.foundation);
+ }
+});
+
+test('批量添加子地点一次fresh CAS保子树及最新字段，显式顶层保UUID',async()=>{
+ let changes=0;const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,onPlaceChanged:()=>changes++,initialChat:[user('继续'),assistant('你停下。'),user('稳定')],utility:()=>({jsonData:{summary:'你停下。'}})});await h.foundationRuntime.reconcile('batch-children');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ const create=async(name,parent=null)=>(await h.runtime.createPlace({name,description:`${name}原描述`,relations:'',parentEntityId:parent},h.runtime.getPlaceEditContext(null))).entityId;
+ const p=await create('P'),a=await create('A'),a1=await create('A1',a),b=await create('B'),b1=await create('B1',b),context=h.runtime.getPlaceEditContext(p);await h.runtime.savePlace(a,{description:'A最新描述'},h.runtime.getPlaceEditContext(a));
+ const beforeRoot=h.runtime.getQianchuangSnapshot().rootRevision,modelCalls=h.calls.length;h.backend.calls.length=0;changes=0;let notices=0;const off=h.runtime.subscribe(()=>notices++);assert.equal(typeof h.runtime.attachPlaceChildren,'function');await h.runtime.attachPlaceChildren(p,[a,a1,b],context);off();
+ const after=h.runtime.getQianchuangSnapshot(),by=new Map(after.places.map(p=>[p.entityId,p]));assert.equal(by.get(a).parentEntityId,p);assert.equal(by.get(b).parentEntityId,p);assert.equal(by.get(a1).parentEntityId,a);assert.equal(by.get(b1).parentEntityId,b);assert.ok(by.get(a).features.some(f=>f.text==='A最新描述'));assert.equal(after.rootRevision,beforeRoot);assert.equal(h.calls.length,modelCalls);assert.equal(changes,1);assert.equal(notices,1);assert.equal(h.backend.calls.filter(c=>c[0]==='get'&&c[2]==='v3-place-workspace').length,1);assert.equal(h.backend.calls.filter(c=>c[0]==='put'&&c[2]==='v3-place-workspace').length,1);
+ const saved=structuredClone((await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data);h.backend.calls.length=0;await assert.rejects(h.runtime.attachPlaceChildren(a,[p,b],h.runtime.getPlaceEditContext(a)));assert.equal(h.backend.calls.some(c=>c[0]==='put'),false);assert.deepEqual((await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data,saved);
+ await h.runtime.savePlace(a1,{parentEntityId:null},h.runtime.getPlaceEditContext(a1));assert.ok(h.runtime.getQianchuangSnapshot().mapRootIds.includes(a1));assert.equal((await h.placeWorkspaceStore.read({chatId:CHAT})).data.placesByEntityId[a1].parentEntityId,null);
+});
+
+test('批量挂父按fresh父图归并选根，CAS失败整批保原',async()=>{
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你停下。'),user('稳定')],utility:()=>({jsonData:{summary:'你停下。'}})});await h.foundationRuntime.reconcile('fresh-batch');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ const add=async(name,parent=null)=>(await h.runtime.createPlace({name,parentEntityId:parent},h.runtime.getPlaceEditContext(null))).entityId,p=await add('P'),a=await add('A'),a1=await add('A1',a),c=await add('C'),old=h.runtime.getPlaceEditContext(p);await h.runtime.savePlace(a1,{parentEntityId:c},h.runtime.getPlaceEditContext(a1));await h.runtime.attachPlaceChildren(p,[a,a1],old);let by=new Map(h.runtime.getQianchuangSnapshot().places.map(p=>[p.entityId,p]));assert.equal(by.get(a1).parentEntityId,p,'旧ctx里A1属A，fresh已移到C，不能再被当A的下级跳过');
+ const saved=structuredClone((await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data);h.backend.setBeforePut(({key})=>{if(key==='v3-place-workspace')throw Object.assign(Error('CAS冲突'),{status:409});});await assert.rejects(h.runtime.attachPlaceChildren(c,[a,a1],h.runtime.getPlaceEditContext(c)),/CAS冲突/);h.backend.setBeforePut(null);assert.deepEqual((await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data,saved);by=new Map(h.runtime.getQianchuangSnapshot().places.map(p=>[p.entityId,p]));assert.equal(by.get(a).parentEntityId,p);assert.equal(by.get(a1).parentEntityId,p);
+});
+test('原本无父且未归属叶子显式null后登记顶层，冷读保持',async()=>{
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你进入独立叶。'),user('稳定')],utility:options=>{const p=JSON.parse(options.taskMessages[0].content).payload,ev={exactQuote:p.canonicalContent,source:'canonicalContent',sourceFloorKey:p.sourceFloorKey};return{jsonData:{summary:'你进入独立叶。',locations:[{name:'独立叶',change:'present',people:[]}],spatialFacts:{places:[{key:'place-mention-1',name:'独立叶',identity:'new',...ev}],containments:[],positions:[],features:[]}}};}});await h.foundationRuntime.reconcile('explicit-top');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const before=h.runtime.getQianchuangSnapshot(),id=before.places[0].entityId;assert.ok(before.unassignedPlaceIds.includes(id));await h.runtime.savePlace(id,{parentEntityId:null},h.runtime.getPlaceEditContext(id));assert.ok(h.runtime.getQianchuangSnapshot().mapRootIds.includes(id));const value=await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true});assert.equal(Object.hasOwn(value.data.placesByEntityId[id],'parentEntityId'),true);assert.equal(value.data.placesByEntityId[id].parentEntityId,null);assert.equal(h.runtime.getQianchuangSnapshot().rootRevision,before.rootRevision);
+ const cold=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,initialChat:h.context.chat,modernAnchors:true,readOnlyLifecycle:true});await cold.runtime.start();assert.ok(cold.runtime.getQianchuangSnapshot().mapRootIds.includes(id));assert.equal(cold.calls.length,0);
+});
+
+
+test('编辑字段和多子地点合并一次fresh CAS通知，保整枝及最新描述，空草稿零写',async()=>{
+ let changes=0;const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,onPlaceChanged:()=>changes++,initialChat:[user('继续'),assistant('你停下。'),user('稳定')],utility:()=>({jsonData:{summary:'你停下。'}})});await h.foundationRuntime.reconcile('editor-children');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ const add=async(name,parent=null)=>(await h.runtime.createPlace({name,description:`${name}原描述`,parentEntityId:parent},h.runtime.getPlaceEditContext(null))).entityId,p=await add('P'),oldChild=await add('已有下级',p),a=await add('A'),a1=await add('A1',a),b=await add('B'),ctx=h.runtime.getPlaceEditContext(p);await h.runtime.savePlace(a,{description:'A最新描述'},h.runtime.getPlaceEditContext(a));
+ const root=h.runtime.getQianchuangSnapshot().rootRevision,models=h.calls.length;h.backend.calls.length=0;changes=0;let notices=0;const off=h.runtime.subscribe(()=>notices++);await h.runtime.savePlace(p,{name:'新P',description:'P新描述',relations:'院落东侧'},ctx,{childIds:[a,a1,b]});off();
+ const by=new Map(h.runtime.getQianchuangSnapshot().places.map(p=>[p.entityId,p]));assert.equal(by.get(p).displayName,'新P');assert.ok(by.get(p).features.some(f=>f.text==='P新描述'));assert.ok(by.get(p).relations.some(f=>f.text==='院落东侧'));assert.equal(by.get(oldChild).parentEntityId,p);assert.equal(by.get(a).parentEntityId,p);assert.equal(by.get(a1).parentEntityId,a);assert.equal(by.get(b).parentEntityId,p);assert.ok(by.get(a).features.some(f=>f.text==='A最新描述'));assert.equal(h.backend.calls.filter(c=>c[0]==='get'&&c[2]==='v3-place-workspace').length,1);assert.equal(h.backend.calls.filter(c=>c[0]==='put'&&c[2]==='v3-place-workspace').length,1);assert.equal(changes,1);assert.equal(notices,1);assert.equal(h.calls.length,models);assert.equal(h.runtime.getQianchuangSnapshot().rootRevision,root);
+ h.backend.calls.length=0;await h.runtime.savePlace(p,{},h.runtime.getPlaceEditContext(p),{childIds:[]});assert.equal(h.backend.calls.filter(c=>c[0]==='put').length,0);
+});
+
+test('编辑同时选父和子成环或CAS失败时整份草稿不落盘',async()=>{
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你停下。'),user('稳定')],utility:()=>({jsonData:{summary:'你停下。'}})});await h.foundationRuntime.reconcile('editor-children-fail');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ const add=async(name)=>(await h.runtime.createPlace({name},h.runtime.getPlaceEditContext(null))).entityId,p=await add('P'),a=await add('A'),saved=structuredClone((await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data);h.backend.calls.length=0;
+ await assert.rejects(h.runtime.savePlace(p,{name:'不应保存',parentEntityId:a},h.runtime.getPlaceEditContext(p),{childIds:[a]}),/循环/);assert.equal(h.backend.calls.filter(c=>c[0]==='put').length,0);assert.deepEqual((await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data,saved);
+ h.backend.setBeforePut(({key})=>{if(key==='v3-place-workspace')throw Object.assign(Error('合并CAS失败'),{status:409});});await assert.rejects(h.runtime.savePlace(p,{description:'不应保存'},h.runtime.getPlaceEditContext(p),{childIds:[a]}),/合并CAS失败/);h.backend.setBeforePut(null);assert.deepEqual((await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data,saved);assert.equal(h.runtime.getQianchuangSnapshot().places.find(n=>n.entityId===a).parentEntityId,null);
+});
+
+test('城市国家提示随原一次摘要入索引，人工普通null同CAS并进入下次knownPlaces',async()=>{
+ let requests=[];const text='你进入中国上海的青石馆。',h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(text),user('继续'),assistant('你继续留在青石馆。'),user('稳定')],utility:options=>{requests.push(JSON.parse(options.taskMessages[0].content));const payload=requests.at(-1).payload;if(requests.length>1)return{jsonData:{summary:payload.canonicalContent}};return{jsonData:{summary:text,placePaths:[{path:[{name:'中国',mapLevel:'country',mapRole:'area'},{name:'上海',mapLevel:'city',mapRole:'area'},{name:'青石馆',mapRole:'site'}],source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey,exactQuote:payload.canonicalContent}]}};}});await h.foundationRuntime.reconcile('city-level');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});let s=h.runtime.getQianchuangSnapshot();const country=s.places.find(p=>p.displayName==='中国'),city=s.places.find(p=>p.displayName==='上海');assert.equal(country.mapLevel,'country');assert.equal(city.mapLevel,'city');assert.equal(requests.length,1);const root=s.rootRevision;h.backend.calls.length=0;await h.runtime.savePlace(city.entityId,{mapLevel:null},h.runtime.getPlaceEditContext(city.entityId));s=h.runtime.getQianchuangSnapshot();assert.equal(s.places.find(p=>p.entityId===city.entityId).mapLevel,null);assert.equal(s.rootRevision,root);assert.equal(h.backend.calls.filter(c=>c[0]==='put'&&c[2]==='v3-place-workspace').length,1);
+ await h.runtime.extractFloor(h.runtime.getState().floors[1].floorId,{analyzeState:false});assert.equal(requests.length,2);assert.equal(requests.at(-1).payload.knownPlaces.find(p=>p.displayName==='上海').manualCurrentFacts.mapLevel,null);
+ const cold=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,initialChat:h.context.chat,modernAnchors:true,readOnlyLifecycle:true});await cold.runtime.start();assert.equal(cold.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===city.entityId).mapLevel,null);assert.equal(cold.calls.length,0);
+});
+test('手工新增城市同一次create保层级且不触Core或额外模型',async()=>{const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你停下。'),user('稳定')],utility:()=>({jsonData:{summary:'你停下。'}})});await h.foundationRuntime.reconcile('create-city');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const root=h.runtime.getQianchuangSnapshot().rootRevision,calls=h.calls.length;h.backend.calls.length=0;const created=await h.runtime.createPlace({name:'星槎港',mapLevel:'city',parentEntityId:null},h.runtime.getPlaceEditContext(null));assert.equal(h.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===created.entityId).mapLevel,'city');assert.equal(h.backend.calls.filter(c=>c[0]==='put'&&c[2]==='v3-place-workspace').length,1);assert.equal(h.calls.length,calls);assert.equal(h.runtime.getQianchuangSnapshot().rootRevision,root);});
+
+test('187同一摘要与整理请求带题材和中文地貌目录，coast沿原hint保存且选稳定港镇图',async()=>{
+ const content='港镇甲临河口，设有客栈。',book={...foundationBookCandidate,content,primaryKeys:['港镇甲'],constant:true},requests=[];
+ const h=harness({withPlaces:true,text:'你查看港镇甲。',placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[book],macros:{}}),utility:options=>{
+  const request=JSON.parse(options.taskMessages[0].content),p=request.payload;requests.push(request);
+  const old=p.mapStyles.find(row=>row.id==='old-town'),town=p.mapStyles.find(row=>row.id==='modern-town');
+  assert.ok(old.tags.includes('西幻'));assert.ok(old.tags.includes('江湖'));assert.match(old.layoutLabels.coast,/河口港镇/u);assert.match(town.layoutLabels.coast,/滨湾/u);const palace=p.mapStyles.find(row=>row.id==='palace');assert.ok(palace.layouts.includes('honmaru'));assert.match(palace.layoutLabels.honmaru,/本丸.*Touken Ranbu/u);
+  assert.doesNotMatch(JSON.stringify(p.mapStyles),/\.svg|mapAssetId|<path/u);
+  const ev={source:'worldbook',sourceKey:p.placeWorldbookSources[0].sourceKey,exactQuote:content};
+  if(request.task==='organizePlaces'){
+   const known=p.knownPlaces.find(node=>node.displayName==='港镇甲');return{jsonData:{placePaths:[{path:[{name:'港镇甲',sameAsPlaceKey:known.entityKey,mapRole:'area',mapLevel:'city',mapStyle:'old-town',mapLayout:'coast'}],...ev}]}};
+  }
+  return{jsonData:{summary:'你查看港镇甲。',placePaths:[{path:[{name:'港镇甲',mapRole:'area',mapLevel:'city',mapStyle:'old-town',mapLayout:'coast'},{name:'客栈',mapRole:'site'}],...ev}]}};
+ }});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ let root=h.runtime.getQianchuangSnapshot().places.find(place=>place.displayName==='港镇甲');assert.equal(root.mapStyle,'old-town');assert.equal(root.mapLayout,'coast');assert.equal(root.mapAssetId,'old-town-coast');const id=root.entityId;
+ const before=h.backend.calls.filter(call=>call[0]==='put'&&call[2]==='v3-place-workspace').length;
+ assert.equal((await h.runtime.organizePlaces()).status,'saved');root=h.runtime.getQianchuangSnapshot().places.find(place=>place.entityId===id);assert.equal(root.mapAssetId,'old-town-coast');assert.equal(h.calls.length,2);assert.equal(requests[1].task,'organizePlaces');assert.equal(h.backend.calls.filter(call=>call[0]==='put'&&call[2]==='v3-place-workspace').length,before+1);
+});
+
+test('196显式整理统一复核自动值且同次补firstSeen原文，短引文挂回原身份并冷读null',async()=>{
+ const quote='甲城内的甲楼设有客房。',text='先前剧情。'.repeat(500)+quote+'后续剧情。'.repeat(500);let mode='scope',organizations=0;
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(text),user('稳定')],utility:options=>{
+  const r=JSON.parse(options.taskMessages[0].content),p=r.payload;
+  if(r.task!=='organizePlaces'){const ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:quote};return{jsonData:{summary:'你查看甲楼与客房。',locations:[{name:'甲楼',change:'present'},{name:'甲楼客房',change:'present'}],spatialFacts:{places:[{key:'place-mention-1',name:'甲楼',identity:'new',...ev},{key:'place-mention-2',name:'甲楼客房',identity:'new',...ev}],containments:[],positions:[]}}};}
+  organizations++;assert.match(options.systemPrompt,/统一校对整棵knownPlaces/u);assert.match(options.systemPrompt,/普通城市中的宿舍、公寓、公司楼、电视台/u);const full=storedEvidenceRows(p).filter(s=>s.requiresExactQuote);assert.equal(full.length,1);assert.equal(full[0].content,text);assert.ok(full[0].placeKeys.length>=2);
+  const parent=p.knownPlaces.find(x=>x.displayName==='甲楼'),room=p.knownPlaces.find(x=>x.displayName==='甲楼客房');if(mode===null)assert.equal(parent.mapLevel,'scope');
+  return{jsonData:{placePaths:[{path:[{name:'甲城',mapLevel:'city'},{sameAsPlaceKey:parent.entityKey,mapLevel:mode},{sameAsPlaceKey:room.entityKey}],source:'storedPlaceEvidence',sourceKey:full[0].sourceKey,exactQuote:quote}]}};
+ }});
+ await h.foundationRuntime.reconcile('196-source');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const before=h.runtime.getQianchuangSnapshot(),ids=new Map(before.places.map(p=>[p.displayName,p.entityId]));await h.runtime.organizePlaces();mode=null;await h.runtime.organizePlaces();const after=h.runtime.getQianchuangSnapshot();assert.equal(after.places.find(p=>p.entityId===ids.get('甲楼')).mapLevel,null);assert.equal(after.places.find(p=>p.entityId===ids.get('甲楼客房')).parentEntityId,ids.get('甲楼'));assert.equal(organizations,2);assert.equal(h.calls.length,3);
+ const workspace=await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true});assert.ok(workspace.data.foundation.facts.filter(f=>f.source.kind==='body').every(f=>f.source.quote.length<=2000&&f.source.quote===quote));
+ const cold=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,modernAnchors:true,readOnlyLifecycle:true});await cold.runtime.start();assert.equal(cold.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===ids.get('甲楼')).mapLevel,null);assert.equal(cold.calls.length,0);
+});
+
+test('整理修订同一父合同保存改回祖先及撤销，后楼补新父、人工顶层与冷读有限历史保真', async () => {
+  const first='主楼三楼设有客房，院内另有别馆。核对后客房实际直接属于主楼，旧三楼归属为误记。另一次校对暂无法确认客房所属。',second='客房现在位于别馆。';let mode='ancestor';
+  const book={...foundationBookCandidate,content:'客房实际直接属于主楼，旧三楼归属为误记。另一次校对暂无法确认客房所属。',constant:true};
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant(first),user('继续'),assistant(second),user('稳定')],
+    placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[book],macros:{}}),utility:options=>{
+      const r=JSON.parse(options.taskMessages[0].content),p=r.payload;
+      const known=name=>p.knownPlaces.find(place=>place.displayName===name).entityKey;
+      if(r.task==='organizePlaces'){
+        const quote=mode==='clear'?'另一次校对暂无法确认客房所属。':'客房实际直接属于主楼，旧三楼归属为误记。';const row=storedEvidenceRows(p).find(row=>row.content.includes(quote));assert.ok(row);const ev={source:'storedPlaceEvidence',sourceKey:row.sourceKey,exactQuote:quote};
+        return{jsonData:{placePaths:[mode==='clear'?{path:[{sameAsPlaceKey:known('客房')}],identityChange:'ownershipChanged',parentPlaceKey:null,...ev}:{path:[{sameAsPlaceKey:known('主楼')},{sameAsPlaceKey:known('客房')}],...ev}]}};
+      }
+      const ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent};
+      if(p.canonicalContent===first)return{jsonData:{summary:first,spatialFacts:{places:['主楼','三楼','客房','别馆'].map((name,i)=>({key:`place-mention-${i+1}`,name,identity:'new',...ev})),containments:[[3,2],[2,1]].map(([child,parent])=>({placeKey:`place-mention-${child}`,parentPlaceKey:`place-mention-${parent}`,...ev})),positions:[]}}};
+      return{jsonData:{summary:second,spatialFacts:{places:['客房','别馆'].map((name,i)=>({key:`place-mention-${i+1}`,name,identity:'existing',sameAsPlaceKey:known(name),...ev})),containments:[{placeKey:'place-mention-1',parentPlaceKey:'place-mention-2',...ev}],positions:[]}}};
+    }});
+  await h.foundationRuntime.reconcile('parent-revisions');await h.runtime.start();const floors=h.runtime.getState().floors;
+  await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});
+  const original=(await h.store.readReachable({mode:'runtime'})).floorMemories[0],originalBytes=JSON.stringify(original);
+  const nodes=new Map(h.runtime.getQianchuangSnapshot().places.map(place=>[place.displayName,place.entityId])),room=nodes.get('客房');
+  const current=()=>h.runtime.getQianchuangSnapshot().places.find(place=>place.entityId===room);
+  assert.equal(current().parentEntityId,nodes.get('三楼'));
+  await h.runtime.organizePlaces();assert.equal(current().parentEntityId,nodes.get('主楼'));
+  mode='clear';await h.runtime.organizePlaces();assert.equal(current().parentEntityId,null);
+  let stored=await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true});const clear=stored.data.foundation.facts.find(f=>f.kind==='containment'&&f.placeEntityId===room);
+  assert.equal(clear.parentEntityId,null);assert.equal(clear.identityChange,'ownershipChanged');assert.ok(clear.replacesItemIds.includes(original.spatialFacts.containments[0].itemId));
+  await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});assert.equal(current().parentEntityId,nodes.get('别馆'),'自动撤销不会把下一楼新父当多父歧义');
+  await h.runtime.savePlace(room,{parentEntityId:null},h.runtime.getPlaceEditContext(room));mode='ancestor';await h.runtime.organizePlaces();assert.equal(current().parentEntityId,null);
+  const graph=await h.store.readReachable({mode:'runtime'});assert.equal(JSON.stringify(graph.floorMemories.find(m=>m.id===original.id)),originalBytes);
+  stored=await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true});const finite=projectQianchuangSnapshot(graph,{throughAssistantSeq:1,identityProjection:{placeWorkspace:stored.data}});
+  assert.equal(finite.places.find(place=>place.entityId===room).parentEntityId,nodes.get('三楼'));
+  const cold=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,modernAnchors:true,readOnlyLifecycle:true});await cold.runtime.start();assert.equal(cold.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===room).parentEntityId,null);assert.equal(cold.calls.length,0);
+  assert.equal(h.calls.length,5,'两次摘要和三次整理仍各用一次请求');
+});
+
+test('189地点双输出复用明确同实体父引用，新旧父都不产生假多父',async()=>{
+ const content='乙楼内部的客房内有钢琴。',ev={source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content};
+ for(const knownParent of [true,false]){
+  const entities=knownParent?[precisionPlace(201,'乙楼')]:[];
+  const response={summary:content,spatialFacts:{places:[{key:'place-mention-1',name:'乙楼',identity:knownParent?'existing':'new',...(knownParent?{sameAsPlaceKey:'place-1'}:{}),...ev},{key:'place-mention-2',name:'客房',identity:'new',...ev}],containments:[{placeKey:'place-mention-2',parentPlaceKey:'place-mention-1',...ev}],positions:[]},placePaths:[{placeKey:'place-mention-2',path:[{name:'乙楼',...(knownParent?{sameAsPlaceKey:'place-1'}:{})},{name:'客房',mapRole:'site',facilities:[{icon:'Piano',label:'钢琴'}]}],evidence:[ev]}]};
+  const result=await direct(response,{content,entities});assert.deepEqual(result.isolated,[]);
+  const edge=result.memory.spatialFacts.containments[0];assert.ok(edge);assert.equal(result.memory.spatialFacts.containments.length,1);
+  assert.equal([...entities,...result.newEntities].find(row=>row.id===edge.parentEntityId).displayName,'乙楼');
+  assert.equal(result.foundationPatch.facts.find(row=>row.kind==='place').placeEntityId,edge.placeEntityId);
+ }
+});
+
+test('189真实不同父即便同名也继续隔离，不以名称复用身份',async()=>{
+ const content='两处会馆各有独立身份，客房的所属尚有冲突。',ev={source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content};
+ const result=await direct({summary:content,spatialFacts:{places:[{key:'place-mention-1',name:'会馆',identity:'existing',sameAsPlaceKey:'place-1',...ev},{key:'place-mention-2',name:'会馆',identity:'existing',sameAsPlaceKey:'place-2',...ev},{key:'place-mention-3',name:'客房',identity:'new',...ev}],containments:[{placeKey:'place-mention-3',parentPlaceKey:'place-mention-1',...ev},{placeKey:'place-mention-3',parentPlaceKey:'place-mention-2',...ev}],positions:[]}}, {content,entities:[precisionPlace(202,'会馆'),precisionPlace(203,'会馆')]});
+ assert.ok(result.isolated.some(row=>row.code==='V3_EXTRACTOR_SPATIAL_PLACE_SCOPE_CONFLICT'));assert.equal(result.memory.spatialFacts?.containments?.length??0,0);
+});
+
+test('189坏可选空间places只局部隔离，合法summary和另一条好辅助仍保留',async()=>{
+ const content='乙楼内部有客房。',ev={source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content};
+ for(const places of [[null,{key:'place-mention-1',name:'乙楼',identity:'new',...ev}],'bad']){
+  const result=await direct({summary:content,spatialFacts:{places,containments:[],positions:[]},locations:[{name:'乙楼',change:'present'}]},{content});
+  assert.equal(result.memory.summary.aiText,content);assert.ok(result.memory.locations.length);assert.ok(result.isolated.some(row=>row.field==='spatialFacts.places'));
+  if(Array.isArray(places))assert.ok(result.newEntities.some(row=>row.displayName==='乙楼'));
+ }
+});
+
+test('189人工类型显式保存、自动恢复和冷读共享存储，后端缺省不推断',async()=>{
+ const captured=[],h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('你在大厅内室停下。'),user('继续下一楼'),assistant('之后你仍停在原处。'),user('稳定')],utility:options=>{const request=JSON.parse(options.taskMessages[0].content);captured.push(request);if(request.task==='organizePlaces')return{jsonData:{placePaths:[]}};if(request.payload.canonicalContent.includes('之后'))return{jsonData:{summary:request.payload.canonicalContent}};return{jsonData:{summary:'你在大厅内室停下。',placePaths:[{path:[{name:'大厅',mapRole:'site'},{name:'内室',mapRole:'interior'}],source:'canonicalContent',sourceFloorKey:request.payload.sourceFloorKey,exactQuote:request.payload.canonicalContent}]}};}});
+ await h.foundationRuntime.reconcile('manual-role');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ let snapshot=h.runtime.getQianchuangSnapshot(),hall=snapshot.places.find(p=>p.displayName==='大厅'),room=snapshot.places.find(p=>p.displayName==='内室');assert.equal(room.mapRole,'interior');
+ const boundary=await h.runtime.createPlace({name:'独立地域',mapLevel:'scope',mapRole:'area'},h.runtime.getPlaceEditContext(null));const child=await h.runtime.createPlace({name:'新场地',parentEntityId:boundary.entityId,mapRole:'site'},h.runtime.getPlaceEditContext(null));const inside=await h.runtime.createPlace({name:'新室内',parentEntityId:hall.entityId,mapRole:'interior'},h.runtime.getPlaceEditContext(null));
+ const omitted=await h.runtime.createPlace({name:'未指定类型',parentEntityId:boundary.entityId},h.runtime.getPlaceEditContext(null));assert.equal(Object.hasOwn((await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data.placesByEntityId[omitted.entityId],'mapRole'),false);
+ const by=()=>new Map(h.runtime.getQianchuangSnapshot().places.map(p=>[p.entityId,p]));assert.equal(by().get(boundary.entityId).mapRole,'area');assert.equal(by().get(child.entityId).mapRole,'site');assert.equal(by().get(inside.entityId).mapRole,'interior');
+ const modelCount=h.calls.length;await h.runtime.savePlace(room.entityId,{mapRole:'site'},h.runtime.getPlaceEditContext(room.entityId));assert.equal(by().get(room.entityId).mapRole,'site');assert.equal(h.calls.length,modelCount);
+ await h.runtime.extractFloor(h.runtime.getState().floors[1].floorId,{analyzeState:false});const ordinary=captured.at(-1).payload.knownPlaces.find(p=>p.displayName==='内室');assert.equal(ordinary.manualCurrentFacts.mapRole,'site');assert.equal(by().get(room.entityId).mapRole,'site');
+ await h.runtime.organizePlaces();const manual=captured.at(-1).payload.knownPlaces.find(p=>p.entityId===room.entityId||p.displayName==='内室');assert.equal(manual.manualCurrentFacts.mapRole,'site');
+ await h.runtime.savePlace(room.entityId,{mapRole:null},h.runtime.getPlaceEditContext(room.entityId));assert.equal(by().get(room.entityId).mapRole,'interior');assert.equal(by().get(room.entityId).manualMapRole,false);
+ const cold=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,initialChat:h.context.chat,modernAnchors:true,readOnlyLifecycle:true});await cold.runtime.start();const coldBy=new Map(cold.runtime.getQianchuangSnapshot().places.map(p=>[p.entityId,p]));assert.equal(coldBy.get(room.entityId).mapRole,'interior');assert.equal(coldBy.get(child.entityId).mapRole,'site');assert.equal(cold.calls.length,0);
+});
+
+test('190空待办清单人工新建独立事项，同楼重提保人工并接新自动事件',async()=>{
+ let reextract=false;const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant('你坐在大厅。'),user('继续'),assistant('你坐在大厅。'),user('稳定')],utility:options=>JSON.parse(options.taskMessages[0].content).task==='rejudgeStoredQianshiV1'?{jsonData:{qianshi:{events:[]}}}:({jsonData:{summary:reextract?'重提摘要':'原摘要',qianshi:{manualEventIds:['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'],events:reextract?[{key:'new-event',title:'新自动事件',description:'你坐在大厅。',status:'occurred',matter:false}]:[]}}})});
+ await h.foundationRuntime.reconcile('manual-todo');await h.runtime.start();await assert.rejects(h.runtime.createQianshiTodo({title:'归还书',description:'手工登记归还书',people:[]}),/初始化/u);
+ const floors=h.runtime.getState().floors;for(const row of floors)await h.runtime.extractFloor(row.floorId,{analyzeState:false});const floor=floors.at(-1),models=h.calls.length;assert.ok((await h.store.readReachable({mode:'runtime'})).floorMemories.every(memory=>!memory.qianshiDelta?.manualEventIds?.length));
+ const made=await h.runtime.createQianshiTodo({title:'归还书',description:'手工登记归还书',people:[],storyTime:null,scheduledTime:null});assert.equal(made.status,'saved');assert.equal(h.calls.length,models);
+ let snapshot=h.runtime.getQianshiSnapshot(),event=snapshot.events.find(e=>e.id===made.eventId);assert.equal(event.manuallyCreated,true);assert.equal(event.sourceFloorId,floor.floorId);assert.equal(event.status,'planned');assert.equal(snapshot.matters.find(m=>m.matterId===made.matterId).following,true);assert.equal(event.storyTime,null);assert.ok(snapshot.timeline.undatedEventIds.includes(made.eventId));assert.equal(snapshot.matters[0].manualStatusOverride,null);
+ reextract=true;await h.runtime.extractFloor(floor.floorId,{analyzeState:false});snapshot=h.runtime.getQianshiSnapshot();assert.ok(snapshot.events.some(e=>e.id===made.eventId&&e.title==='归还书'));assert.ok(snapshot.events.some(e=>e.title==='新自动事件'));assert.deepEqual((await h.store.readReachable({mode:'runtime'})).floorMemories.find(memory=>memory.floorId===floor.floorId).qianshiDelta.manualEventIds,[made.eventId]);
+ const plan=await h.runtime.prepareQianshiRejudge();assert.ok(plan.planId);await h.runtime.startQianshiRejudge(plan.planId);assert.ok(h.runtime.getQianshiSnapshot().events.some(e=>e.id===made.eventId&&e.manuallyCreated));
+ const cold=harness({sharedBackend:h.backend,sharedContext:h.context,utility:()=>assert.fail('冷读不调用模型')});await cold.runtime.start();assert.ok(cold.runtime.getQianshiSnapshot().events.some(e=>e.id===made.eventId&&e.manuallyCreated));
+});
+
+test('190人工待办不把原待补千事冒记已自动检查',async()=>{
+ const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant('你在大厅。'),user('稳定')],utility:()=>({jsonData:{summary:'你在大厅。'}})});await h.foundationRuntime.reconcile('manual-pending');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ await h.runtime.createQianshiTodo({title:'人工计划',description:'人工登记新计划',people:[]});const source=await h.store.readReachable({mode:'runtime'});assert.equal(source.floorMemories[0].qianshiDelta.status,'pending');assert.equal(source.floorMemories[0].qianshiDelta.manualEventIds.length,1);
+});
+
+test('201人工地点资料按同UUID保留Core地点身份，目录不依赖后续删楼而当前位置不伪造',async()=>{
+ const text='甲楼旁有客房。',h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(text),user('稳定')],utility:options=>{const p=JSON.parse(options.taskMessages[0].content).payload,ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:text};return{jsonData:{summary:'你查看甲楼和客房。',locations:[{name:'甲楼',change:'present'},{name:'客房',change:'present'}],spatialFacts:{places:[{key:'place-mention-1',name:'甲楼',identity:'new',...ev},{key:'place-mention-2',name:'客房',identity:'new',...ev}],containments:[]}}};}});
+ await h.foundationRuntime.reconcile('201-library');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const graph=await h.store.readReachable(),before=JSON.stringify(graph),map=h.runtime.getQianchuangSnapshot(),parent=map.places.find(p=>p.displayName==='甲楼'),room=map.places.find(p=>p.displayName==='客房');
+ await h.runtime.savePlace(room.entityId,{parentEntityId:parent.entityId,description:'人工房间资料'},h.runtime.getPlaceEditContext(room.entityId));const library=(await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data;
+ for(const id of [parent.entityId,room.entityId]){assert.equal(library.placesByEntityId[id].createdEntity.id,id);assert.equal(library.placesByEntityId[id].createdEntity.firstSeenFloorId,null);}
+ const {projectQianchuangSnapshot}=await import('../src/v3/qianchuang-domain.js'),cut=projectQianchuangSnapshot({...graph,floors:[],floorMemories:[],entities:[]},{identityProjection:{placeWorkspace:library}});
+ assert.equal(cut.places.length,2);assert.equal(cut.places.find(p=>p.entityId===room.entityId).parentEntityId,parent.entityId);assert.equal(cut.userPosition.status,'unknown');assert.equal(h.calls.length,1);assert.equal(JSON.stringify(await h.store.readReachable()),before,'资料保存不改Core摘要/地点身份');
+});
+
+for(const kind of ['manual','body'])for(const prior of [true,false])test(`202普通摘要读取最新${kind}地点库，${prior?'历史重摘仍截止':'无前楼也不丢父树'}`,async()=>{
+ const root={...precisionPlace(601,'匿名楼'),firstSeenFloorId:null,lastSeenFloorId:null},room={...precisionPlace(602,'休息室'),firstSeenFloorId:null,lastSeenFloorId:null},foreign='f0000000-0000-4000-8000-000000000000';let phase=prior?'setup':'current';const captured=[];
+ const chat=prior?[user('开始'),assistant('第一段原文。'),user('继续'),assistant('第二段原文。'),user('继续'),assistant('休息室内新设了排练室。'),user('稳定')]:[user('开始'),assistant('休息室内新设了排练室。'),user('稳定')];
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:chat,utility:options=>{const p=JSON.parse(options.taskMessages[0].content).payload;if(phase==='setup')return{jsonData:{summary:p.canonicalContent}};captured.push({phase,p,prompt:options.systemPrompt});if(phase==='history')return{jsonData:{summary:p.canonicalContent}};
+  const known=p.knownPlaces.find(place=>place.displayName==='休息室');
+  const ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent};return{jsonData:{summary:p.canonicalContent,spatialFacts:{places:[{key:'place-mention-1',name:'休息室',identity:'existing',sameAsPlaceKey:known.entityKey,...ev},{key:'place-mention-2',name:'排练室',identity:'new',...ev}],containments:[{placeKey:'place-mention-2',parentPlaceKey:'place-mention-1',...ev}]}}};}});
+ await h.foundationRuntime.reconcile('202-current-library');await h.runtime.start();const floors=h.runtime.getState().floors;
+ if(prior){await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});}
+ const workspace={schemaVersion:1,kind:'qqj-v3-place-workspace',chatId:CHAT,placesByEntityId:{},deletionsByEntityId:{}},scope={knownThroughFloorId:foreign,coveredFloorIds:[foreign],coveredItemIds:[]};
+ if(kind==='manual'){workspace.placesByEntityId[root.id]={createdEntity:root,parentEntityId:null,scopes:{parentEntityId:scope}};workspace.placesByEntityId[room.id]={createdEntity:room,parentEntityId:root.id,scopes:{parentEntityId:scope}};}
+ else workspace.foundation={schemaVersion:1,entities:[root,room],facts:[{itemId:precisionPlace(603,'').id,kind:'containment',placeEntityId:room.id,parentEntityId:root.id,knownFromFloorId:prior?floors[0].floorId:null,source:{kind:'body',floorId:foreign,sourceType:'assistant',locator:'floor:'+foreign,fingerprint:'saved-source',quote:'匿名楼内有休息室。'}}]};
+ await h.placeWorkspaceStore.put({chatId:CHAT},workspace,0);h.runtime.setIdentityProjection({placeWorkspace:workspace,placeWorkspaceRevision:1});assert.ok(h.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===room.id),JSON.stringify(h.runtime.getQianchuangSnapshot()));assert.equal(h.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===room.id).parentEntityId,root.id);phase='current';
+ await h.runtime.extractFloor(floors.at(-1).floorId,{analyzeState:false});const current=captured.find(value=>value.phase==='current'),known=current.p.knownPlaces.find(place=>place.displayName==='休息室'),parent=current.p.knownPlaces.find(place=>place.displayName==='匿名楼');assert.equal(known.ownershipStatus,'known');assert.deepEqual(known.parentPlaceKeys,[parent.entityKey]);assert.equal(known.pathLabel,'匿名楼 / 休息室');assert.match(current.prompt,/走出、相邻、经由.*不作包含/u);assert.equal(h.runtime.getQianchuangSnapshot().places.find(p=>p.displayName==='排练室').parentEntityId,room.id,'人工父级不阻新增子地点');
+ if(prior){phase='history';await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});const old=captured.at(-1).p.knownPlaces.find(p=>p.displayName==='休息室');assert.ok(!old||old.ownershipStatus==='unknown'&&!old.parentPlaceKeys?.length);assert.equal(h.calls.length,4);}else assert.equal(h.calls.length,1);
+});
+
+test('202通行句不因已有父地点而被补成包含，错误改挂既有房间仍隔离',async()=>{
+ const content='从休息室走出后，经过十来步走廊。',building=precisionPlace(611,'匿名楼'),room=precisionPlace(612,'休息室'),ev={source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content};
+ const result=await direct({summary:content,spatialFacts:{places:[{key:'place-mention-1',name:'休息室',identity:'existing',sameAsPlaceKey:'place-2',...ev},{key:'place-mention-2',name:'走廊',identity:'new',...ev}],containments:[{placeKey:'place-mention-1',parentPlaceKey:'place-mention-2',...ev}]}},{content,entities:[building,room],previousFloorContext:{priorityPlaceEntityIds:[building.id,room.id],parentEntityIdsByPlaceId:new Map([[room.id,new Set([building.id])]])}});
+ assert.ok(result.isolated.some(item=>item.code==='V3_EXTRACTOR_SPATIAL_PLACE_SCOPE_CONFLICT'));assert.equal(result.memory.spatialFacts?.containments?.length??0,0);assert.equal(result.foundationPatch.facts.length,0);
+});
+
+test('当前地点简介在整理和普通同次摘要中合并更新，冷读保旧设施和新窗且Core原证据不改',async()=>{
+ const oldText='客房原有床、独立卫浴、衣帽间和净化器，位于走廊尽头。',newText='客房新增窗帘和双层玻璃窗。',brief1='客房有床、独立卫浴、衣帽间和净化器。',brief2='客房有床、独立卫浴、衣帽间、净化器、窗帘和双层玻璃窗。';
+ let organizations=0;const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(oldText),user('继续'),assistant(newText),user('继续'),assistant('你仍在客房。'),user('稳定')],placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[],macros:{}}),utility:options=>{
+  const r=JSON.parse(options.taskMessages[0].content),p=r.payload;
+  if(r.task==='organizePlaces'){organizations++;const room=p.knownPlaces.find(x=>x.displayName==='客房');return{jsonData:{placePaths:[{path:[{name:'客房',sameAsPlaceKey:room.entityKey,description:organizations===1?brief1:brief2,relations:['位于走廊尽头。']}],source:'storedPlaceEvidence',sourceKey:storedEvidenceRows(p)[0].sourceKey,exactQuote:storedEvidenceRows(p)[0].content}]}};}
+  const known=p.knownPlaces.find(x=>x.displayName==='客房'),ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent},place={key:'place-mention-1',name:'客房',identity:known?'existing':'new',...(known?{sameAsPlaceKey:known.entityKey}:{}),...ev};
+  const fresh=p.canonicalContent===newText;if(fresh){assert.equal(known.description,brief1);assert.ok((known.features??[]).every(f=>f.text!==brief1),'多事实简介不作为单项可替换设施key');}
+  return{jsonData:{summary:p.canonicalContent,locations:[{name:'客房',change:'present',...ev}],spatialFacts:{places:[place],containments:[],positions:[],features:p.canonicalContent.startsWith('你仍')?[]:[{key:'feature-1',placeKey:place.key,kind:'stable',text:fresh?'新窗帘和双层玻璃窗':'床、独立卫浴、衣帽间和净化器',replacesKeys:[],...ev}],relations:fresh||p.canonicalContent.startsWith('你仍')?[]:[{placeKey:place.key,kind:'relative',referencePlaceKeys:[],text:'位于走廊尽头。',...ev}]},...(fresh?{placePaths:[{placeKey:place.key,path:[{name:'客房',sameAsPlaceKey:known.entityKey,description:brief2}],evidence:[ev]}]}:{})}};
+ }});
+ await h.foundationRuntime.reconcile('current-place-description');await h.runtime.start();const floors=h.runtime.getState().floors;await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});const before=await h.store.readReachable({mode:'runtime'}),oldMemory=JSON.stringify(before.floorMemories[0]);
+ await h.runtime.organizePlaces();let room=h.runtime.getQianchuangSnapshot().places.find(p=>p.displayName==='客房');assert.deepEqual(room.features.map(x=>x.text),[brief1]);assert.deepEqual(room.relations.map(x=>x.text),['位于走廊尽头。']);assert.equal(JSON.stringify((await h.store.readReachable({mode:'runtime'})).floorMemories[0]),oldMemory);
+ await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});room=h.runtime.getQianchuangSnapshot().places.find(p=>p.displayName==='客房');assert.deepEqual(room.features.map(x=>x.text),[brief2]);assert.ok(room.relations.some(r=>r.text==='位于走廊尽头。'));
+ const revision=h.runtime.getQianchuangSnapshot().placeWorkspaceRevision;await h.runtime.extractFloor(floors[2].floorId,{analyzeState:false});assert.equal(h.runtime.getQianchuangSnapshot().placeWorkspaceRevision,revision);await h.runtime.organizePlaces();room=h.runtime.getQianchuangSnapshot().places.find(p=>p.displayName==='客房');assert.deepEqual(room.features.map(x=>x.text),[brief2]);assert.equal(h.calls.length,5,'三个摘要和两次整理各沿一次请求');
+ const cold=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,sharedBackend:h.backend,sharedContext:h.context});await cold.runtime.start();assert.deepEqual(cold.runtime.getQianchuangSnapshot().places.find(p=>p.displayName==='客房').features.map(x=>x.text),[brief2]);assert.equal(cold.calls.length,0);
+});
+
+test('完整地点简介局部换书桌保床卫浴，旧式纯增量仍可保存但不覆盖整段简介',async()=>{
+ for(const mode of [true,false,'same']){
+  const full=mode===true,repeated=mode==='same';
+  const first='客房有床、旧书桌和卫浴。',second=full?'客房把旧书桌换成新书桌。':'客房新增一盏落地灯。',brief=full?'客房有床、新书桌和卫浴。':first;
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(first),user('继续'),assistant(second),user('稳定')],utility:options=>{const p=JSON.parse(options.taskMessages[0].content).payload,known=p.knownPlaces.find(x=>x.displayName==='客房'),ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent},name={key:'place-mention-1',name:'客房',identity:known?'existing':'new',...(known?{sameAsPlaceKey:known.entityKey}:{}),...ev};if(known){assert.equal(known.description,first);assert.equal((known.features??[]).some(f=>f.text===first),false);}
+   return{jsonData:{summary:p.canonicalContent,locations:[{name:'客房',change:'present',...ev}],spatialFacts:{places:[name],containments:[],positions:[],features:[{key:'feature-1',placeKey:name.key,kind:'stable',text:known?(full?'新书桌':'新增落地灯'):'床、旧书桌和卫浴',replacesKeys:[],...ev}]},...(!known||full||repeated?{placePaths:[{placeKey:name.key,path:[{name:'客房',...(known?{sameAsPlaceKey:known.entityKey}:{}),description:known?brief:first}],evidence:[ev]}]}:{})}};
+  }});await h.foundationRuntime.reconcile('current-place-replacement');await h.runtime.start();for(const f of h.runtime.getState().floors)await h.runtime.extractFloor(f.floorId,{analyzeState:false});const room=h.runtime.getQianchuangSnapshot().places.find(p=>p.displayName==='客房');assert.deepEqual(new Set(room.features.map(f=>f.text)),new Set(full?[brief]:[first,'新增落地灯']));assert.equal(h.calls.length,2);
+ }
+});
+
+test('仅path简介的新设施保Core当时来源，后楼更新后旧楼历史和设施候选仍可见且不前移',async()=>{
+ const texts=['客房有床和卫浴，位于走廊尽头。','客房新增窗帘。','客房新增双层玻璃窗。'],briefs=['客房有床和卫浴。','客房有床、卫浴和窗帘。','客房有床、卫浴、窗帘和双层玻璃窗。'];
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(texts[0]),user('继续'),assistant(texts[1]),user('继续'),assistant(texts[2]),user('稳定')],utility:options=>{const p=JSON.parse(options.taskMessages[0].content).payload,known=p.knownPlaces.find(x=>x.displayName==='客房'),ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent};return{jsonData:{summary:'你查看客房。',locations:[{name:'客房',change:'present',...ev}],placePaths:[{path:[{name:'客房',...(known?{sameAsPlaceKey:known.entityKey}:{}),description:briefs[texts.indexOf(p.canonicalContent)],relations:['位于走廊尽头。']}],evidence:[ev]}]}};}});
+ await h.foundationRuntime.reconcile('path-only-history');await h.runtime.start();const floors=h.runtime.getState().floors;for(const f of floors)await h.runtime.extractFloor(f.floorId,{analyzeState:false});const graph=await h.store.readReachable({mode:'runtime'}),record=await h.placeWorkspaceStore.read({chatId:CHAT}),second=graph.floorMemories.find(m=>m.floorId===floors[1].floorId);
+ assert.ok(second.spatialFacts.features.some(f=>f.text===briefs[1]),'path-only新增必须有原时点Core快照');const snap=second.spatialFacts.features.find(f=>f.text===briefs[1]);assert.ok(snap.evidenceRefs.every(ref=>ref.floorId===floors[1].floorId));assert.ok(snap.source.references.some(ref=>ref.floorId===floors[0].floorId),'旧事实保原出处而不伪作当前quote');
+ const {projectQianchuangSnapshot}=await import('../src/v3/qianchuang-domain.js'),{projectPlaceFeatures,projectPlaceRelations}=await import('../src/v3/spatial-domain.js');
+ const at=n=>projectQianchuangSnapshot(graph,{identityProjection:{placeWorkspace:record.data},throughAssistantSeq:n}).places.find(p=>p.displayName==='客房');assert.deepEqual(at(1).features.map(f=>f.text),[briefs[0]]);assert.deepEqual(at(2).features.map(f=>f.text),[briefs[1]]);assert.deepEqual(at(2).relations.map(f=>f.text),['位于走廊尽头。']);
+ assert.deepEqual(projectPlaceFeatures({floorMemories:graph.floorMemories,floors:graph.floors,throughAssistantSeq:2}).map(f=>f.text),[briefs[1]]);assert.ok(projectPlaceRelations({floorMemories:graph.floorMemories,floors:graph.floors,throughAssistantSeq:2}).some(f=>f.text==='位于走廊尽头。'));assert.equal(h.calls.length,3);
+});
+
+test('模型同文复述当前简介方位不推进内容版本，整理仍保存本次统计',async()=>{
+ const brief='客房有床和卫浴。',relations=['走廊尽头。','邻近客厅。'];
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(brief+'客房位于走廊尽头，邻近客厅。'),user('继续'),assistant('你仍查看客房原有的床和卫浴。'),user('稳定')],placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[],macros:{}}),utility:options=>{const r=JSON.parse(options.taskMessages[0].content),p=r.payload,known=p.knownPlaces.find(x=>x.displayName==='客房');if(r.task==='organizePlaces')return{jsonData:{placePaths:[{path:[{name:'客房',sameAsPlaceKey:known.entityKey,description:brief,relations,mapRole:'interior'}],source:'storedPlaceEvidence',sourceKey:storedEvidenceRows(p)[0].sourceKey,exactQuote:storedEvidenceRows(p)[0].content}]}};return{jsonData:{summary:p.canonicalContent,locations:[{name:'客房',change:'present'}],placePaths:[{path:[{name:'客房',...(known?{sameAsPlaceKey:known.entityKey}:{}),description:brief,relations,mapRole:'interior'}],source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent}]}};}});
+ await h.foundationRuntime.reconcile('current-place-noop');await h.runtime.start();const floors=h.runtime.getState().floors;await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});const revision=h.runtime.getQianchuangSnapshot().placeWorkspaceRevision,writes=()=>h.backend.calls.filter(c=>c[0]==='put'&&c[2]==='v3-place-workspace').length,before=writes();await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});assert.equal(h.runtime.getQianchuangSnapshot().placeWorkspaceRevision,revision);const beforeData=(await h.placeWorkspaceStore.read({chatId:CHAT})).data;await h.runtime.organizePlaces();const afterData=(await h.placeWorkspaceStore.read({chatId:CHAT})).data;assert.deepEqual(afterData.foundation,beforeData.foundation);assert.equal(afterData.lastOrganization.returnedPaths,1);assert.equal(afterData.lastOrganization.acceptedPaths,1);assert.equal(writes(),before+1);
+});
+
+test('内部完整简介快照保长字段和满额raw事实，正式召回DTO保尾部知识及当前时点',async()=>{
+ const features=Array.from({length:40},(_,i)=>`客房有设备${i}。`),relations=Array.from({length:40},(_,i)=>`客房的方位参照${i}明确。`),description=features.join('')+'客房保留固定书柜。'.repeat(120)+'尾部设备标记。',direction=relations.join('')+'客房位于走廊末端。'.repeat(90)+'尾部方位标记。',content=description+direction;
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(content),user('稳定')],utility:options=>{const p=JSON.parse(options.taskMessages[0].content).payload,ev=quote=>({source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:quote});return{jsonData:{summary:'你查看客房现有设备与方位。',locations:[{name:'客房',change:'present',...ev(features[0])}],spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'new',...ev(features[0])}],containments:[],positions:[],features:features.map((text,i)=>({key:'feature-'+(i+1),placeKey:'place-mention-1',kind:'stable',text,replacesKeys:[],...ev(text)})),relations:relations.map(text=>({placeKey:'place-mention-1',referencePlaceKeys:[],kind:'relative',text,...ev(text)}))},placePaths:[{placeKey:'place-mention-1',path:[{name:'客房',description,relations:[direction]}],evidence:[ev(description),ev(direction)]}]}};}});
+ await h.foundationRuntime.reconcile('current-place-capacity');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});const graph=await h.store.readReachable({mode:'runtime'}),memory=graph.floorMemories[0];assert.equal(memory.spatialFacts.features.length,41);assert.equal(memory.spatialFacts.relations.length,41);assert.ok(memory.spatialFacts.features.find(f=>f.source).text.endsWith('尾部设备标记。'));assert.ok(memory.spatialFacts.relations.find(f=>f.source).text.endsWith('尾部方位标记。'));
+ const {projectRecallSource}=await import('../src/v3/recall-source.js'),{projectPlaceFeatures,projectPlaceRelations}=await import('../src/v3/spatial-domain.js'),dto=await projectRecallSource(graph,()=>new Date(NOW));const options={floorMemories:dto.floorMemories,throughAssistantSeq:1};assert.deepEqual(projectPlaceFeatures(options).map(f=>f.text),[description]);assert.deepEqual(projectPlaceRelations(options).map(f=>f.text),[direction]);assert.equal(projectPlaceFeatures({...options,throughAssistantSeq:0}).length,0);assert.ok(dto.floorMemories[0].spatialFacts.features.filter(f=>f.source).every(f=>!Object.hasOwn(f.source,'references')&&!Object.hasOwn(f.source,'quote')));
+});
+
+test('旧世界书长引文可作为内部继承来源，本次body仍单独定位新变化',async()=>{
+ const entities=[precisionPlace(501,'客房')],oldQuote='客房设有床和卫浴。'+'原设定细节。'.repeat(400),content='客房新增窗帘。';
+ const result=await direct({summary:content,placePaths:[{path:[{name:'客房',sameAsPlaceKey:'place-1',description:'客房有床、卫浴和窗帘。'}],source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content}]},{content,entities,previousFloorContext:{placeFeatures:[{itemId:'00000502-0000-4000-8000-000000000000',placeEntityId:entities[0].id,kind:'stable',text:'客房有床和卫浴。',replacesItemIds:[],source:{kind:'worldbook',locator:'book:1',quote:oldQuote}}]}});
+ const snapshot=result.memory.spatialFacts.features.find(f=>f.source);assert.ok(snapshot);assert.ok(snapshot.source.references.some(ref=>ref.kind==='worldbook'&&ref.quote===oldQuote));assert.ok(snapshot.evidenceRefs.every(ref=>ref.quotedText===content&&ref.sourceType==='assistant'));
+});
+
+test('整理同文材料只读一份且覆盖保全旧IDs，引文表逐列无损并同文三轮不增长',async()=>{
+ const text='客房内有床和卫浴。\n  窗前有书桌。',brief='客房内有床和卫浴。',requests=[];
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(text),user('稳定')],placeWorldInfoProvider:async()=>({candidates:[],macros:{}}),utility:options=>{
+  const r=JSON.parse(options.taskMessages[0].content),p=r.payload;
+  if(r.task==='organizePlaces'){
+   assert.match(options.systemPrompt,/已有描述或方位重复时，返回完整归并字段以覆盖旧段落/u); const room=p.knownPlaces.find(x=>x.displayName==='客房');assert.deepEqual(room.features,requests.length?[]:[brief]);
+   assert.deepEqual(p.storedPlaceEvidence.columns,['sourceKey','sourceType','content','placeKeys','requiresExactQuote']);const rows=storedEvidenceRows(p);assert.equal(rows.length,1);assert.equal(rows[0].content,text);assert.equal(rows[0].sourceType,'assistant');assert.deepEqual(rows[0].placeKeys,[room.entityKey]);assert.equal(rows[0].requiresExactQuote,true);
+   assert.deepEqual(room.features,requests.length?[]:[brief]);if(requests.length)assert.equal(room.description,brief);requests.push(options.taskMessages[0].content);
+   return{jsonData:{placePaths:[{path:[{sameAsPlaceKey:room.entityKey,description:brief}],source:'storedPlaceEvidence',sourceKey:rows[0].sourceKey,exactQuote:rows[0].content}]}};
+  }
+  const ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent};return{jsonData:{summary:'查看客房。',locations:[{name:'客房',change:'present',...ev}],spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'new',...ev}],features:[{key:'feature-1',placeKey:'place-mention-1',kind:'stable',text:brief,replacesKeys:[],...ev}],positions:[],containments:[]}}};
+ }});
+ await h.foundationRuntime.reconcile('organization-material-test');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ const source=await h.store.readReachable({mode:'runtime'}),oldMemory=JSON.stringify(source.floorMemories[0]),room=source.entities.find(e=>e.displayName==='客房'),coreItem=source.floorMemories[0].spatialFacts.features[0],legacyIds=[1,2,3].map(n=>`0000000${n}-2222-4222-8222-222222222222`);
+ await h.placeWorkspaceStore.put({chatId:CHAT},{schemaVersion:1,kind:'qqj-v3-place-workspace',chatId:CHAT,placesByEntityId:{},deletionsByEntityId:{},foundation:{schemaVersion:1,entities:[],facts:legacyIds.map(itemId=>({itemId,kind:'feature',placeEntityId:room.id,text:brief,source:{kind:'body',floorId:source.floors[0].id,quote:text}}))}},0);
+ await h.runtime.refreshStatus({preferCached:false});for(let i=0;i<3;i++)await h.runtime.organizePlaces();
+ assert.equal(requests.length,3);assert.equal(requests[1],requests[2]);const workspace=await h.placeWorkspaceStore.read({chatId:CHAT}),current=workspace.data.foundation.facts.find(f=>f.kind==='feature');assert.deepEqual(new Set(current.replacesItemIds),new Set([...legacyIds,coreItem.itemId]));assert.equal(h.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===room.id).features.length,1);assert.equal(JSON.stringify((await h.store.readReachable({mode:'runtime'})).floorMemories[0]),oldMemory);
+});
+
+
+test('Extractor业务格式重做沿连接零次及四次重试，共享真实HTTP预算', async () => {
+  const floor = { id: '11111111-1111-4111-8111-111111111111', chatId: CHAT, narrativeGeneration: GENERATION, assistantSeq: 1, content: { canonicalContent: '同一份正文。' } };
+  const envelope = await createExtractorEnvelope({ batchId: '32323232-3232-4232-8232-323232323232', chatId: CHAT, narrativeGeneration: GENERATION, floor, userIdentity: { displayName: '甲' } });
+  for (const retryCount of [0, 1, 4]) {
+    let calls = 0;
+    const route = { kind: 'independent', config: { url: 'https://fixture.invalid', key: 'fixture', model: 'fixture', qqjRetryCount: retryCount } };
+    const router = createTaskRouter({ resolver: { resolve: () => route, resolveUtility: () => route }, compactClient: createCompactApiClient({ retryWait: async () => {}, fetchImpl: async () => { calls++; return compactResponse(calls <= retryCount ? '{}' : '{"summary":"最终有效摘要。"}'); } }) });
+    const result = await runExtractorRequest({ generateUtilityTask: router.generateUtilityTask, envelope, floor, expectedScope: envelope.scope, now: NOW });
+    assert.equal(calls, retryCount + 1); assert.equal(result.transportAttempts, calls); assert.equal(result.memory.summary.aiText, '最终有效摘要。');
+    calls = 0;
+    const failure = createTaskRouter({ resolver: { resolve: () => route, resolveUtility: () => route }, compactClient: createCompactApiClient({ retryWait: async () => {}, fetchImpl: async () => { calls++; return compactResponse('{}'); } }) });
+    await assert.rejects(runExtractorRequest({ generateUtilityTask: failure.generateUtilityTask, envelope, floor, expectedScope: envelope.scope, now: NOW }));
+    assert.equal(calls, retryCount + 1);
+  }
+});
+
+test('明确建筑楼层的同批房间同时保物理所属与onFloor，共用一个父地点身份', async () => {
+  const text = '示例学校内的东楼二层设甲教室与乙教室。';
+  const h = harness({ withPlaces: true, initialChat: [user('继续'), assistant(text), user('稳定')], modernAnchors: true, readOnlyLifecycle: true,
+    utility: options => {
+      assert.match(options.systemPrompt, /onFloor另记楼层，不代替包含父链/u);
+      assert.match(options.systemPrompt, /同一父级在本次places中只用一个key/u);
+      assert.match(options.systemPrompt, /建筑外\/上方\/附近不造包含/u);
+      const p = JSON.parse(options.taskMessages[0].content).payload;
+      const ev = { source: 'canonicalContent', sourceFloorKey: p.sourceFloorKey, exactQuote: text };
+      return { jsonData: { summary: text, spatialFacts: {
+        places: ['示例学校', '东楼', '二层', '甲教室', '乙教室'].map((name, index) => ({ key: `place-mention-${index + 1}`, name, identity: 'new', ...ev })),
+        containments: [[2, 1], [3, 2], [4, 3], [5, 3]].map(([child, parent]) => ({ placeKey: `place-mention-${child}`, parentPlaceKey: `place-mention-${parent}`, ...ev })),
+        positions: [], relations: [4, 5].map(key => ({ kind: 'onFloor', placeKey: `place-mention-${key}`, referencePlaceKeys: ['place-mention-2'], text: '东楼二层', ...ev })),
+      } } };
+    } });
+  await h.foundationRuntime.reconcile('common-parent'); await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const snapshot = h.runtime.getQianchuangSnapshot(), building = snapshot.places.find(p => p.displayName === '东楼'), floor = snapshot.places.find(p => p.displayName === '二层');
+  assert.equal(snapshot.places.filter(p => p.displayName === '东楼').length, 1);
+  assert.equal(snapshot.places.filter(p => p.displayName === '二层').length, 1);
+  assert.equal(floor.parentEntityId, building.entityId);
+  for (const name of ['甲教室', '乙教室']) assert.equal(snapshot.places.find(p => p.displayName === name).parentEntityId, floor.entityId);
+  const graph = await h.store.readReachable({ mode: 'full' });
+  assert.deepEqual(graph.floorMemories[0].spatialFacts.relations.map(r => r.kind), ['onFloor', 'onFloor']);
+  assert.equal(h.calls.length, 1);
+  const cold = harness({ withPlaces: true, sharedBackend: h.backend, sharedContext: h.context, readOnlyLifecycle: true, utility() { throw Error('冷读不调模型'); } });
+  await cold.runtime.start(); assert.deepEqual(cold.runtime.getQianchuangSnapshot().places, snapshot.places);
+});
+
+for (const manualNull of [false, true]) test(`整理把有据但缺父的旧房间归共同楼层，保UUID原证据和人工null：${manualNull}`, async () => {
+  const text = '示例学校内的东楼二层设甲教室与乙教室。';
+  const book = { kind: 'worldbook', world: '合成校园地图', locator: 'synthetic:common-parent', fingerprint: 'sha256:synthetic-common-parent', hostEnabled: true, content: text };
+  const h = harness({ withPlaces: true, initialChat: [user('继续'), assistant(text), user('稳定')], modernAnchors: true, readOnlyLifecycle: true,
+    placeWorldInfoProvider: async () => ({ chatId: CHAT, candidates: [book], macros: {} }),
+    utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content), p = request.payload;
+      if (request.task === 'organizePlaces') {
+        assert.match(options.systemPrompt, /已有地点缺父、仅有楼层或方位而未登记有据所属，也属于本次需纠正的变化/u);
+        const known = new Map(p.knownPlaces.map(place => [place.displayName, place]));
+        assert.equal(known.get('乙教室').parentKey, null);
+        assert.equal(p.placeWorldbookSources.length,0,'整理只读已存原文，不再读取完整世界书');
+        const evidence=storedEvidenceRows(p).find(row=>row.content.includes(text));assert.ok(evidence);
+        return { jsonData: { placePaths: ['甲教室', '乙教室'].map(name => ({
+          path: [{ name: '东楼', sameAsPlaceKey: known.get('东楼').entityKey }, { name: '二层', mapRole: 'interior' }, { name, sameAsPlaceKey: known.get(name).entityKey }],
+          evidence: [{ source: 'storedPlaceEvidence', sourceKey: evidence.sourceKey, exactQuote: text }],
+        })) } };
+      }
+      const ev = { source: 'canonicalContent', sourceFloorKey: p.sourceFloorKey, exactQuote: text };
+      return { jsonData: { summary: text, spatialFacts: {
+        places: ['示例学校', '东楼', '甲教室', '乙教室'].map((name, index) => ({ key: `place-mention-${index + 1}`, name, identity: 'new', ...ev })),
+        containments: [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', ...ev }], positions: [],
+        relations: [3, 4].map((key, index) => ({ kind: 'onFloor', placeKey: `place-mention-${key}`, referencePlaceKeys: ['place-mention-2'], text: '东楼二层', ...ev })),
+      } } };
+    } });
+  await h.foundationRuntime.reconcile('missing-parent'); await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const before = h.runtime.getQianchuangSnapshot(), ids = new Map(before.places.map(p => [p.displayName, p.entityId]));
+  if (manualNull) await h.runtime.savePlace(ids.get('甲教室'), { parentEntityId: null }, h.runtime.getPlaceEditContext(ids.get('甲教室')));
+  const coreBefore = JSON.stringify((await h.store.readReachable({ mode: 'full' })).floorMemories);
+  const writesBefore = h.backend.calls.filter(c => c[0] === 'put' && c[2] === 'v3-place-workspace').length;
+  assert.equal((await h.runtime.organizePlaces()).status, 'saved');
+  const after = h.runtime.getQianchuangSnapshot();
+  for (const [name, id] of ids) assert.equal(after.places.find(p => p.displayName === name).entityId, id);
+  assert.equal(after.places.filter(p => p.displayName === '二层').length, 1);
+  const floor = after.places.find(p => p.displayName === '二层');
+  assert.equal(floor.parentEntityId, ids.get('东楼'));
+  assert.equal(after.places.find(p => p.displayName === '乙教室').parentEntityId, floor.entityId);
+  assert.equal(after.places.find(p => p.displayName === '甲教室').parentEntityId, manualNull ? null : floor.entityId);
+  assert.equal(JSON.stringify((await h.store.readReachable({ mode: 'full' })).floorMemories), coreBefore);
+  assert.equal(h.backend.calls.filter(c => c[0] === 'put' && c[2] === 'v3-place-workspace').length, writesBefore + 1);
+  assert.equal(h.calls.length, 2, '一次摘要与一次整理，没有附加请求');
+  const cold = harness({ withPlaces: true, sharedBackend: h.backend, sharedContext: h.context, readOnlyLifecycle: true, utility() { throw Error('冷读不调模型'); } });
+  await cold.runtime.start(); assert.deepEqual(cold.runtime.getQianchuangSnapshot().places, after.places);
+});
+
+
+test('同次摘要用USER独有结果完成原事项，AI未复述也保来源并冷读同一事项', async () => {
+  const requests = [];
+  const h = harness({ initialChat: [user('两人约好一起唱歌。'), assistant('他们走进活动室。'),
+    user('他们唱完歌之后去吃饭了。'), assistant('餐厅里灯光明亮。'), user('继续。')], utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content); requests.push(request);
+    const candidate = request.payload.qianshiCandidates[0];
+    return { jsonData: { summary: candidate ? '两人已经唱完歌，转去吃饭。' : '两人约好唱歌。', qianshi: { events: [
+      { key: 'event-1', title: '一起唱歌', description: candidate ? 'USER已叙明唱完并转去吃饭。' : '约好一起唱歌。',
+        status: candidate ? 'completed' : 'planned', matter: true, following: !candidate,
+        ...(candidate ? { links: [{ candidateKey: candidate.key, kind: 'progress' }] } : {}) },
+    ], order: [] } } };
+  } });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1].payload.precedingUserInput.map(item => item.content), ['他们唱完歌之后去吃饭了。']);
+  const stored = await h.store.readReachable({ mode: 'runtime' });
+  const matter = projectQianshiGraph(stored).matters[0];
+  assert.equal(projectQianshiGraph(stored).matters.length, 1);
+  assert.equal(matter.status, 'completed'); assert.equal(matter.following, false);
+  assert.equal(stored.floorMemories.at(-1).sourceUserInputSnapshot.messages[0].content, '他们唱完歌之后去吃饭了。');
+  const cold = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(projectQianshiGraph(cold).matters, projectQianshiGraph(stored).matters);
+});
+
+test('校园正式摘要及整理同次目录接收三布局，已有compact改布局重选且楼层树原样',async()=>{
+ for(const layout of ['compact','garden','university']){
+  const content='示例市的示例校园由教学楼、运动场、庭园、宿舍及院系组成，教学楼二楼有教室。',book={...foundationBookCandidate,content,primaryKeys:['示例校园'],constant:true},requests=[];
+  const h=harness({withPlaces:true,text:'你走进示例校园的教室。',placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[book],macros:{}}),utility:options=>{
+   const request=JSON.parse(options.taskMessages[0].content),p=request.payload;requests.push(request);
+   const campus=p.mapStyles.find(row=>row.id==='campus');assert.deepEqual(campus.layouts,['compact','garden','university']);assert.match(campus.layoutLabels.garden,/私立不等于/u);
+   assert.doesNotMatch(JSON.stringify(p.mapStyles),/\.svg|mapAssetId|<path/u);assert.match(options.systemPrompt,/普通学校缺布局信息用compact/u);assert.match(options.systemPrompt,/结合叙事重心和空间组织，判断地点是否需要独立浏览；普通地点随父级地图展示/u);assert.doesNotMatch(options.systemPrompt,/校园是否scope|不因学校名称拆页/u);
+   const ev={source:'worldbook',sourceKey:p.placeWorldbookSources[0].sourceKey,exactQuote:content};
+   if(request.task==='organizePlaces'){
+    const school=p.knownPlaces.find(row=>row.displayName==='示例校园');assert.equal(school.mapLayout,'compact');
+    return{jsonData:{placePaths:[{path:[{name:'示例校园',sameAsPlaceKey:school.entityKey,mapStyle:'校园',mapLayout:{compact:'紧凑校园',garden:'园林校园',university:'综合大学'}[layout]}],...ev}]}};
+   }
+   return{jsonData:{summary:'你走进示例校园的教室。',placePaths:[{path:[{name:'示例市',mapLevel:'city'},{name:'示例校园',mapLevel:'scope',mapStyle:'campus',mapLayout:'compact'},{name:'教学楼',mapRole:'site'},{name:'二楼',mapRole:'interior'},{name:'教室',mapRole:'interior'}],...ev}]}};
+  }});
+  await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+  const before=h.runtime.getQianchuangSnapshot(),school=before.places.find(row=>row.displayName==='示例校园');assert.equal(school.mapAssetId,'campus-compact');
+  const parentIds=new Map(before.places.map(row=>[row.entityId,row.parentEntityId]));
+  assert.equal((await h.runtime.organizePlaces()).status,'saved');
+  const after=h.runtime.getQianchuangSnapshot();assert.equal(after.places.find(row=>row.entityId===school.entityId).mapAssetId,'campus-'+layout);
+  assert.deepEqual(new Map(after.places.map(row=>[row.entityId,row.parentEntityId])),parentIds);assert.equal(h.calls.length,2);assert.deepEqual(requests.map(r=>r.task),['extractFloorSemantics','organizePlaces']);
+ }
+});
+
+test('整理显示元数据回执记录原提出与编译结果，学校同义词/省略/未知/隔离不改来源合同', async () => {
+  const content = '示例学校有教学楼及读书庭院。', book = { ...foundationBookCandidate, content, primaryKeys: ['示例学校'], constant: true };
+  for (const mode of ['campus', '学校', ' SCHOOL ', 'omitted', 'unknown', 'invalid', 'multi']) {
+    let packet, payload;
+    const h = harness({ withPlaces: true, text: '你进入示例学校。', placeWorldInfoProvider: async () => ({ chatId: CHAT, candidates: [book], macros: {} }), utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content), p = request.payload;
+      const evidence = { source: 'worldbook', sourceKey: p.placeWorldbookSources[0].sourceKey, exactQuote: content };
+      if (request.task !== 'organizePlaces') return { jsonData: { summary: '你进入示例学校。', placePaths: [{ path: [{ name: '示例学校', mapLevel: 'scope', mapStyle: 'modern' }, { name: '教学楼' }], ...evidence }] } };
+      payload = p;
+      const school = p.knownPlaces.find(row => row.displayName === '示例学校'), building = p.knownPlaces.find(row => row.displayName === '教学楼');
+      const metadata = mode === 'omitted' ? {} : { mapStyle: mode === 'unknown' ? 'unlisted-style' : mode === 'multi' || mode === 'invalid' ? '学校' : mode, ...(mode === 'unknown' ? {} : { mapLayout: 'compact' }) };
+      packet = { placePaths: [{ path: [{ sameAsPlaceKey: school.entityKey, ...metadata }], ...evidence, ...(mode === 'invalid' ? { exactQuote: '不在来源内的句子' } : {}) }] };
+      if (mode === 'multi') packet.placePaths.push(
+        { path: [{ sameAsPlaceKey: building.entityKey }, { name: '读书庭院', mapLevel: null }], ...evidence },
+        { path: [{ sameAsPlaceKey: school.entityKey, mapStyle: 'campus', mapLayout: 'university' }], ...evidence, exactQuote: '不在来源内的句子' }
+      );
+      return { jsonData: packet };
+    } });
+    await h.runtime.start();
+    await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+    const before = await h.placeWorkspaceStore.read({ chatId: CHAT }), head = (await h.store.readReachable({ mode: 'runtime' })).root.headCheckpointId;
+    const writes = h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-place-workspace').length;
+    if (mode === 'invalid') await assert.rejects(h.runtime.organizePlaces(), { code: 'QQJ_PLACE_PATH_INVALID' });
+    else await h.runtime.organizePlaces();
+    const after = await h.placeWorkspaceStore.read({ chatId: CHAT }), receipt = after.data.lastOrganization.displayMetadata;
+    assert.equal(receipt.promptVersion, EXTRACTOR_PROMPT_VERSION); assert.equal(receipt.compilerVersion, EXTRACTOR_VERSION);
+    assert.deepEqual(receipt.offeredStyleIds, payload.mapStyles.map(row => row.id)); assert.ok(receipt.offeredStyleIds.includes('campus'));
+    assert.equal(h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-place-workspace').length - writes, 1);
+    assert.equal(h.calls.length, 2); assert.equal((await h.store.readReachable({ mode: 'runtime' })).root.headCheckpointId, head);
+    assert.equal(JSON.stringify(receipt).includes(content), false); assert.equal(JSON.stringify(receipt).includes('不在来源内的句子'), false);
+    if (mode === 'omitted') { assert.deepEqual(receipt.proposed, []); assert.deepEqual(receipt.compiled, []); }
+    else {
+      assert.equal(receipt.proposed[0].pathIndex, 0); assert.equal(receipt.proposed[0].nodeIndex, 0);
+      assert.equal(receipt.proposed[0].knownKey, payload.knownPlaces.find(row => row.displayName === '示例学校').entityKey);
+      assert.equal(receipt.proposed[0].mapStyle, packet.placePaths[0].path[0].mapStyle);
+      assert.equal(Object.hasOwn(receipt.proposed[0], 'name'), false);
+    }
+    if (mode === 'invalid') {
+      assert.deepEqual(receipt.compiled, []); assert.deepEqual(receipt.isolated, [{ pathIndex: 0, code: 'QQJ_PLACE_PATH_SOURCE_INVALID' }]);
+      assert.deepEqual(after.data.foundation, before.data.foundation);
+    } else if (mode !== 'omitted') {
+      const compiled = receipt.compiled[0], fact = after.data.foundation.facts.find(row => row.kind === 'place' && row.placeEntityId === compiled.entityId);
+      assert.equal(compiled.pathIndex, 0); assert.equal(compiled.nodeIndex, 0);
+      assert.equal(compiled.mapStyle, mode === 'unknown' ? 'modern' : 'campus');
+      for (const key of ['mapLevel', 'mapStyle', 'mapLayout', 'mapAssetId']) assert.equal(compiled[key], fact[key]);
+      if (mode === 'multi') {
+        assert.deepEqual(receipt.proposed.map(row => [row.pathIndex, row.nodeIndex]), [[0, 0], [1, 1], [2, 0]]);
+        assert.deepEqual(receipt.compiled.map(row => [row.pathIndex, row.nodeIndex]), [[0, 0]]);
+        assert.equal(receipt.proposed[1].name, '读书庭院'); assert.equal(receipt.proposed[1].mapLevel, null);
+        assert.equal(after.data.foundation.entities.some(row => row.displayName === '读书庭院'),false,'整理不顺手新建库外下级');
+        assert.deepEqual(receipt.isolated, [{ pathIndex: 1, code: 'QQJ_PLACE_PATH_SCOPE_CONFLICT' }, { pathIndex: 2, code: 'QQJ_PLACE_PATH_SOURCE_INVALID' }]);
+      } else assert.deepEqual(receipt.isolated, []);
+    }
+  }
+});
+
+test('正常摘要与整理同次路径混合引用只存合法来源，坏引用不连坐且不额外请求', async () => {
+  const content = '示例城的示例校区内有教学楼。', book = { ...foundationBookCandidate, content, primaryKeys:['教学楼'], constant: true };
+  const h = harness({ withPlaces:true, text:'你进入教学楼。', placeWorldInfoProvider:async()=>({chatId:CHAT,candidates:[book],macros:{}}), utility:options=>{
+    const request = JSON.parse(options.taskMessages[0].content), p=request.payload;
+    const evidence = [{source:'worldbook',sourceKey:'not-provided',exactQuote:content},{source:'worldbook',sourceKey:p.placeWorldbookSources[0].sourceKey,exactQuote:content}];
+    if(request.task === 'organizePlaces') {
+      const known = p.knownPlaces.find(row=>row.displayName==='示例校区');
+      return {jsonData:{placePaths:[{path:[{sameAsPlaceKey:known.entityKey,mapStyle:'campus',mapLayout:'garden'}],evidence}]}};
+    }
+    return {jsonData:{summary:'你进入教学楼。',placePaths:[{path:[{name:'示例城',mapLevel:'city'},{name:'示例校区',mapLevel:'scope',mapStyle:'campus',mapLayout:'compact'},{name:'教学楼'}],evidence}]}};
+  }});
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+  let saved = await h.placeWorkspaceStore.read({chatId:CHAT}), school=h.runtime.getQianchuangSnapshot().places.find(row=>row.displayName==='示例校区');
+  assert.equal(school.mapAssetId,'campus-compact'); const parent=school.parentEntityId;
+  assert.equal((await h.runtime.organizePlaces()).status,'saved'); saved=await h.placeWorkspaceStore.read({chatId:CHAT});
+  assert.equal(saved.data.lastOrganization.acceptedPaths,1); assert.deepEqual(saved.data.lastOrganization.isolatedCodes,{});
+  assert.equal(saved.data.lastOrganization.displayMetadata.compiled[0].mapAssetId,'campus-garden');
+  assert.equal(h.runtime.getQianchuangSnapshot().places.find(row=>row.entityId===school.entityId).parentEntityId,parent);
+  for(const fact of saved.data.foundation.facts)for(const ref of [fact.source,...(fact.source.references??[])])assert.equal(ref.quote,content);
+  assert.equal(h.calls.length,2); assert.deepEqual(h.calls.map(call=>JSON.parse(call.taskMessages[0].content).task),['extractFloorSemantics','organizePlaces']);
+});
+
+
+test('地点整理显式合并：原一次模型选择将两已有ID归一，子级位置旧名双资料同CAS冷读', async () => {
+  const content = '松风公寓与松风之家指这处住所。卧室属于松风公寓，林岚站在住所里，室内有书桌和木床。';
+  let mergeKeys;
+  const h = harness({ withPlaces: true, modernAnchors: true, readOnlyLifecycle: true,
+    initialChat: [user('继续'), assistant(content), user('稳定')],
+    utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content), payload = request.payload;
+      if (request.task === 'organizePlaces') {
+        assert.match(options.systemPrompt, /placeMerges.*sourceKey.*targetKey/u);
+        assert.match(options.systemPrompt, /target已有人工字段含空值优先/u);
+        const source = payload.knownPlaces.find(place => place.displayName === '松风公寓');
+        const target = payload.knownPlaces.find(place => place.displayName === '松风之家');
+        mergeKeys = { sourceKey: source.entityKey, targetKey: target.entityKey };
+        return { jsonData: { placePaths: [], placeMerges: [mergeKeys] } };
+      }
+      const evidence = { source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey, exactQuote: content };
+      return { jsonData: { summary: '林岚在住所里。', people: [{ name: '林岚', entityKind: 'individual', role: 'user', presence: 'present' }],
+        locations: [{ name: '松风公寓', change: 'present', ...evidence }], spatialFacts: {
+          places: ['松风公寓', '松风之家', '卧室'].map((name, index) => ({ key: `place-mention-${index + 1}`, name, identity: 'new', ...evidence })),
+          containments: [{ placeKey: 'place-mention-3', parentPlaceKey: 'place-mention-1', ...evidence }],
+          positions: [{ subject: '林岚', placeKey: 'place-mention-1', status: 'confirmed', ...evidence }],
+          features: [{ key: 'feature-1', placeKey: 'place-mention-1', kind: 'stable', text: '有书桌', replacesKeys: [], ...evidence },
+            { key: 'feature-2', placeKey: 'place-mention-2', kind: 'stable', text: '有木床', replacesKeys: [], ...evidence }],
+        } } };
+    } });
+  await h.foundationRuntime.reconcile('place-merges'); await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const before = h.runtime.getQianchuangSnapshot();
+  const source = before.places.find(place => place.displayName === '松风公寓'), target = before.places.find(place => place.displayName === '松风之家');
+  const graphBefore = await h.store.readReachable();
+  const result = await h.runtime.organizePlaces();
+  assert.equal(result.status, 'saved');
+  assert.ok(mergeKeys);
+  assert.equal(h.calls.length, 2, '一次原摘要加一次原整理，不增加模型轮次');
+  h.placeWorkspaceStore.invalidate(CHAT); await h.runtime.refreshStatus({ preferCached: false });
+  const snapshot = h.runtime.getQianchuangSnapshot(), current = snapshot.places.find(place => place.entityId === target.entityId);
+  assert.equal(snapshot.places.length, 2);
+  assert.equal(snapshot.places.some(place => place.entityId === source.entityId), false);
+  assert.ok(current.aliases.includes('松风公寓'));
+  assert.equal(snapshot.places.find(place => place.displayName === '卧室').parentEntityId, target.entityId);
+  assert.equal(snapshot.userPosition.placeEntityId, target.entityId);
+  assert.deepEqual(new Set(current.features.map(feature => feature.text)), new Set(['有书桌', '有木床']));
+  const saved = await h.placeWorkspaceStore.read({ chatId: CHAT }, { fresh: true });
+  assert.equal(saved.data.identityRedirectsByEntityId[source.entityId], target.entityId);
+  const recall = await readRecallSource({ store: h.store, identityProjection: { placeWorkspace: saved.data, placeWorkspaceRevision: saved.revision }, now: () => new Date(NOW) });
+  assert.equal(recall.entities.some(entity => entity.entityId === source.entityId), false);
+  assert.ok(recall.entities.find(entity => entity.entityId === target.entityId).aliases.includes('松风公寓'));
+  assert.equal(recall.floorMemories[0].spatialFacts.positions[0].placeEntityId, target.entityId);
+  const graphAfter = await h.store.readReachable();
+  assert.equal(graphAfter.root.headCheckpointId, graphBefore.root.headCheckpointId, '地点合并沿workspace单CAS，旧Core原记录保留');
+});
+
+async function placeMergeRuntimeFixture() {
+  const sourceQuote='松风公寓有书桌。',targetQuote='松风之家有木床。';
+  const content=`${sourceQuote}${targetQuote}松风公寓属于父乙，松风之家属于父甲，卧室属于松风公寓。林岚站在松风公寓。`;
+  let organization=()=>({placePaths:[]}),extraction=null;
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(content),user('稳定')],utility:async options=>{
+    const request=JSON.parse(options.taskMessages[0].content),payload=request.payload;
+    if(request.task==='organizePlaces')return {jsonData:await organization(payload)};
+    if(extraction)return {jsonData:await extraction(payload)};
+    const evidence=exactQuote=>({source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey,exactQuote});
+    return {jsonData:{summary:'林岚在住所里。',people:[{name:'林岚',entityKind:'individual',role:'user',presence:'present'}],
+      locations:[{name:'松风公寓',change:'present',...evidence('林岚站在松风公寓。')}],spatialFacts:{
+        places:['松风公寓','松风之家','卧室','父甲','父乙'].map((name,index)=>({key:`place-mention-${index+1}`,name,identity:'new',...evidence(content)})),
+        containments:[['place-mention-1','place-mention-5'],['place-mention-2','place-mention-4'],['place-mention-3','place-mention-1']].map(([placeKey,parentPlaceKey])=>({placeKey,parentPlaceKey,...evidence(content)})),
+        positions:[{subject:'林岚',placeKey:'place-mention-1',status:'confirmed',...evidence('林岚站在松风公寓。')}],
+        features:[{key:'feature-1',placeKey:'place-mention-1',kind:'stable',text:'有书桌',replacesKeys:[],...evidence(sourceQuote)},
+          {key:'feature-2',placeKey:'place-mention-2',kind:'stable',text:'有木床',replacesKeys:[],...evidence(targetQuote)}],
+      }}};
+  }});
+  await h.foundationRuntime.reconcile('place-merge-fixture');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+  const nodes=new Map(h.runtime.getQianchuangSnapshot().places.map(place=>[place.displayName,place]));
+  const keys=payload=>({sourceKey:payload.knownPlaces.find(place=>place.displayName==='松风公寓').entityKey,targetKey:payload.knownPlaces.find(place=>place.displayName==='松风之家').entityKey});
+  const evidence=payload=>{const {columns,rows}=payload.storedPlaceEvidence,index=columns.indexOf('sourceKey'),contentIndex=columns.indexOf('content'),row=rows.find(row=>row[contentIndex].includes(sourceQuote));return {source:'storedPlaceEvidence',sourceKey:row[index],exactQuote:sourceQuote};};
+  return {h,nodes,content,sourceQuote,targetQuote,keys,evidence,setOrganization(value){organization=value;},setExtraction(value){extraction=value;}};
+}
+
+test('地点合并runtime父归属：target旧有效外父优先，同包source键路径可明确修正自动父',async()=>{
+ for(const newPath of [false,true]){
+  const f=await placeMergeRuntimeFixture(),{h}=f;
+  f.setOrganization(payload=>({placeMerges:[f.keys(payload)],...(newPath?{placePaths:[{path:[{name:'父乙',sameAsPlaceKey:payload.knownPlaces.find(place=>place.displayName==='父乙').entityKey},{name:'松风公寓',sameAsPlaceKey:f.keys(payload).sourceKey}],evidence:[f.evidence(payload)]}]}:{})}));
+  await h.runtime.organizePlaces();h.placeWorkspaceStore.invalidate(CHAT);await h.runtime.refreshStatus({preferCached:false});
+  const current=h.runtime.getQianchuangSnapshot(),target=current.places.find(place=>place.entityId===f.nodes.get('松风之家').entityId);
+  assert.equal(target.parentEntityId,f.nodes.get(newPath?'父乙':'父甲').entityId);
+  assert.equal(current.places.find(place=>place.displayName==='卧室').parentEntityId,target.entityId);
+  const saved=await h.placeWorkspaceStore.read({chatId:CHAT});assert.equal(Object.hasOwn(saved.data.placesByEntityId[target.entityId]??{},'parentEntityId'),false,'自动父归属不能伪装成人工字段');
+ }
+});
+
+test('地点合并和简介同包：新简介承接双方原引文与替换ID，旧source键正常归canonical',async()=>{
+ const f=await placeMergeRuntimeFixture(),{h}=f;
+ const original=await h.store.readReachable(),oldItems=original.floorMemories[0].spatialFacts.features.map(item=>item.itemId);
+ f.setOrganization(payload=>({placeMerges:[f.keys(payload)],placePaths:[{path:[{name:'松风公寓',sameAsPlaceKey:f.keys(payload).sourceKey,description:'有书桌和木床'}],evidence:[f.evidence(payload)]}]}));
+ await h.runtime.organizePlaces();await h.runtime.refreshStatus({preferCached:false});
+ const saved=await h.placeWorkspaceStore.read({chatId:CHAT}),targetId=f.nodes.get('松风之家').entityId;
+ const fact=saved.data.foundation.facts.find(fact=>fact.kind==='feature'&&fact.placeEntityId===targetId&&fact.text==='有书桌和木床');
+ assert.ok(fact);assert.ok(oldItems.every(id=>fact.replacesItemIds.includes(id)));
+ const quotes=new Set((fact.source.references??[fact.source]).map(ref=>ref.quote));assert.ok(quotes.has(f.sourceQuote));assert.ok(quotes.has(f.targetQuote));
+ const texts=h.runtime.getQianchuangSnapshot().places.find(place=>place.entityId===targetId).features.map(item=>item.text);assert.deepEqual(texts,['有书桌和木床']);
+});
+
+test('地点合并人工优先：target空描述空父级保留，source独有方位补入且旧人工稿仍在',async()=>{
+ const f=await placeMergeRuntimeFixture(),{h}=f,sourceId=f.nodes.get('松风公寓').entityId,targetId=f.nodes.get('松风之家').entityId;
+ await h.runtime.savePlace(sourceId,{description:'源人工书桌',relations:'人工方位',mapLevel:'scope'},h.runtime.getPlaceEditContext(sourceId));
+ await h.runtime.savePlace(targetId,{description:'',parentEntityId:null,mapLevel:null},h.runtime.getPlaceEditContext(targetId));
+ f.setOrganization(payload=>({placeMerges:[f.keys(payload)],placePaths:[{path:[{name:'松风之家',sameAsPlaceKey:f.keys(payload).targetKey,description:'模型旧描述',relations:['模型旧方位']}],evidence:[f.evidence(payload)]}]}));
+ await h.runtime.organizePlaces();await h.runtime.refreshStatus({preferCached:false});
+ const snapshot=h.runtime.getQianchuangSnapshot(),target=snapshot.places.find(place=>place.entityId===targetId);
+ assert.equal(target.parentEntityId,null);assert.equal(target.mapLevel,null);assert.deepEqual(target.features,[]);assert.deepEqual(target.relations.map(item=>item.text),['人工方位']);
+ const saved=await h.placeWorkspaceStore.read({chatId:CHAT});assert.equal(saved.data.placesByEntityId[sourceId].description,'源人工书桌');assert.equal(saved.data.placesByEntityId[targetId].description,'');assert.equal(saved.data.placesByEntityId[targetId].relations,'人工方位');
+});
+
+test('地点合并后二次整理和新摘要：source独有原句仍绑定canonical，旧名复用同ID',async()=>{
+ const f=await placeMergeRuntimeFixture(),{h}=f,targetId=f.nodes.get('松风之家').entityId;
+ f.setOrganization(payload=>({placeMerges:[f.keys(payload)]}));await h.runtime.organizePlaces();
+ f.setOrganization(payload=>{
+  const target=payload.knownPlaces.find(place=>place.displayName==='松风之家');assert.ok(target.aliases.includes('松风公寓'));assert.equal(payload.knownPlaces.some(place=>place.displayName==='松风公寓'),false);
+  const {columns,rows}=payload.storedPlaceEvidence,contentIndex=columns.indexOf('content'),keysIndex=columns.indexOf('placeKeys');assert.ok(rows.some(row=>row[contentIndex].includes(f.sourceQuote)&&row[keysIndex].includes(target.entityKey)));
+  return {placePaths:[]};
+ });await h.runtime.organizePlaces();
+ f.setExtraction(payload=>{const known=payload.knownPlaces.find(place=>place.aliases.includes('松风公寓'));assert.ok(known);const evidence={source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey,exactQuote:payload.canonicalContent};return {summary:'旧称地点正常承接。',locations:[{name:'松风公寓',change:'present',...evidence}],spatialFacts:{places:[{key:'place-mention-1',name:'松风公寓',identity:'existing',sameAsPlaceKey:known.entityKey,...evidence}],containments:[],positions:[]}};});
+ h.context.chat.push(assistant('松风公寓里添了一把椅子。'),user('新楼稳定'));await h.foundationRuntime.reconcile('after-place-merge');await h.runtime.refreshStatus({preferCached:false});const floor=h.runtime.getState().floors.at(-1);await h.runtime.extractFloor(floor.floorId,{analyzeState:false});
+ const saved=await h.store.readReachable();assert.equal(saved.floorMemories.find(memory=>memory.floorId===floor.floorId).locations[0].entityId,targetId);assert.equal(h.calls.length,4);
+});
+
+test('地点合并坏指令局部隔离并同存合法路径，旧无merge包保持独立身份',async()=>{
+ const old=await placeMergeRuntimeFixture();old.setOrganization(()=>({placePaths:[]}));await old.h.runtime.organizePlaces();assert.equal(old.h.runtime.getQianchuangSnapshot().places.length,5);
+ const f=await placeMergeRuntimeFixture();f.setOrganization(payload=>({placeMerges:[f.keys(payload),{sourceKey:'missing',targetKey:f.keys(payload).targetKey},{sourceKey:f.keys(payload).targetKey,targetKey:f.keys(payload).targetKey}],placePaths:[{path:[{name:'松风之家',sameAsPlaceKey:f.keys(payload).targetKey,description:'有书桌和木床'}],evidence:[f.evidence(payload)]}]}));
+ const result=await f.h.runtime.organizePlaces();assert.equal(result.status,'saved');assert.equal(result.isolatedCount,2);assert.equal(f.h.runtime.getQianchuangSnapshot().places.length,4);assert.equal(f.h.calls.length,2);
+});
+
+test('地点合并保存失败与在途删除切聊：无半份redirect，不覆盖新人工删除，不增加模型调用',async()=>{
+ const conflict=await placeMergeRuntimeFixture();conflict.setOrganization(payload=>({placeMerges:[conflict.keys(payload)]}));const before=JSON.stringify((await conflict.h.placeWorkspaceStore.read({chatId:CHAT})).data);
+ conflict.h.backend.setBeforePut(({key})=>{if(key==='v3-place-workspace')throw Object.assign(Error('CAS conflict'),{status:409});});await assert.rejects(conflict.h.runtime.organizePlaces());conflict.h.placeWorkspaceStore.invalidate(CHAT);assert.equal(JSON.stringify((await conflict.h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true})).data),before);assert.equal(conflict.h.calls.length,2);
+ for(const action of ['delete','chat']){
+  const f=await placeMergeRuntimeFixture();let release,started;const gate=new Promise(resolve=>{started=resolve;});f.setOrganization(payload=>new Promise(resolve=>{release=()=>resolve({placeMerges:[f.keys(payload)]});started();}));
+  const pending=f.h.runtime.organizePlaces();const outcome=pending.then(value=>({value}),error=>({error}));await gate;
+  if(action==='delete'){const id=f.nodes.get('松风之家').entityId;await f.h.runtime.deletePlace(id,f.h.runtime.getPlaceEditContext(id));}else f.h.context.chatMetadata.qianqianjie.chatId='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  release();const result=await outcome;assert.ok(result.error||result.value.status==='skipped');const saved=await f.h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true});assert.equal(Object.keys(saved.data?.identityRedirectsByEntityId??{}).length,0);assert.equal(f.h.calls.length,2);
+ }
+});
+
+test('地点独立库不可读时首轮摘要与CSE继续，地点更新暂停且人物读取仍严格', async () => {
+  let h;
+  const provider = async (identity, { includePlaces = true, allowUnavailablePlaces = false } = {}) => {
+    if (!includePlaces) return {};
+    try {
+      const value = await h.placeWorkspaceStore.read(identity ?? { chatId: CHAT });
+      return { placeWorkspace: value.data, placeWorkspaceRevision: value.revision };
+    } catch (error) {
+      if (allowUnavailablePlaces) return { unavailableSources: ['places'] };
+      throw error;
+    }
+  };
+  h = harness({ withPlaces: true, identityProjectionProvider: provider, utility: options => ({ jsonData: options.systemPrompt === CSE_SYSTEM_PROMPT
+    ? { noMaterialChange: true }
+    : { summary: '裴晚生提醒用户带伞。', people: [{ name: '裴晚生' }, { name: '你', role: 'user' }],
+      placePaths: [{ path: [{ name: '未知旧人工地点' }], source: 'canonicalContent', sourceFloorKey: 'floor-1', exactQuote: '裴晚生提醒你带伞。' }] } }) });
+  await h.runtime.start();
+  const floorId = h.runtime.getState().floors[0].floorId;
+  h.backend.setBeforeGet(({ key }) => { if (key === 'v3-place-workspace') throw Object.assign(new Error('place read unavailable'), { code: 'QQJ_PLACE_READ_FAILURE' }); });
+  h.placeWorkspaceStore.invalidate(CHAT);
+  const prepared = await h.runtime.prepareCurrent();
+  assert.equal(prepared.status, 'ready');
+  assert.equal(h.runtime.getQianchuangSnapshot().status, 'error');
+  const beforePuts = h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-place-workspace').length;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  assert.equal(h.calls.length, 1);
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.floorMemories.length, 1);
+  assert.equal(saved.entities.some(entity => entity.entityType === 'place'), false);
+  assert.equal(h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-place-workspace').length, beforePuts);
+  await h.runtime.retryStateAnalysis(floorId);
+  assert.equal(h.calls.length, 2);
+  assert.equal((await h.store.readReachable({ mode: 'runtime' })).stateDeltas.length, 1);
+  assert.equal(h.runtime.shouldBlockMainGeneration(), false);
+});
+
+test('整个地点编译抛错保同份摘要人物及千事，只消耗一次原请求', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const sourceUrl = new URL('../src/v3/extractor.js', import.meta.url);
+  let source = await readFile(sourceUrl, 'utf8');
+  source = source.replace('import { expandPlacePaths,', 'import { expandPlacePaths as originalExpandPlacePaths,');
+  source = source.replace(/from '([^']+)'/gu, (all, name) => name.startsWith('.') ? `from '${new URL(name, sourceUrl).href}'` : all);
+  source += '\nasync function expandPlacePaths(){throw Object.assign(new Error("place compile unavailable"),{code:"QQJ_PLACE_ALGORITHM_FAILURE"});}\n//# sourceURL=qqj-place-fault-test.mjs\n';
+  const injected = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+  const floor = { id: '11111111-1111-4111-8111-111111111111', chatId: CHAT, narrativeGeneration: GENERATION, assistantSeq: 1, content: { canonicalContent: '裴晚生提醒你带伞。' } };
+  const envelope = await createExtractorEnvelope({ batchId: '33333333-3333-4333-8333-333333333333', chatId: CHAT, narrativeGeneration: GENERATION, floor, entities: [] });
+  let requests = 0;
+  const result = await injected.runExtractorRequest({ generateUtilityTask: async ({ transportBudget }) => {
+    requests += 1; transportBudget.used += 1; transportBudget.remaining -= 1;
+    return { jsonData: { summary: '合法摘要。', people: [{ name: '裴晚生' }], events: [{ title: '提醒', description: '裴晚生提醒你带伞。' }] } };
+  }, envelope, floor, now: NOW, expectedScope: envelope.scope });
+  assert.equal(requests, 1);
+  assert.equal(result.memory.summary.aiText, '合法摘要。');
+  assert.ok(result.newEntities.some(entity => entity.displayName === '裴晚生'));
+  assert.ok(result.memory.eventFragments.length > 0);
+  assert.ok(result.isolated.some(issue => issue.field === 'places'));
+});
+
+test('locatedIn最近所属只参与身份判断，不能删掉有据物理包含边', async () => {
+  const content = '甲馆内有客房和二楼，客房归二楼管理。';
+  const evidence = { source: 'canonicalContent', sourceFloorKey: 'floor-1', exactQuote: content };
+  const result = await direct({ summary: content, spatialFacts: {
+    places: ['甲馆', '客房', '二楼'].map((name, index) => ({ key: `place-mention-${index + 1}`, name, identity: 'new', ...evidence })),
+    containments: [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', ...evidence }, { placeKey: 'place-mention-3', parentPlaceKey: 'place-mention-1', ...evidence }],
+    positions: [], relations: [{ kind: 'locatedIn', placeKey: 'place-mention-2', referencePlaceKeys: ['place-mention-3'], text: '客房归二楼管理', ...evidence }],
+  } }, { content });
+  assert.deepEqual(result.isolated, []);
+  const ids = new Map(result.newEntities.map(entity => [entity.displayName, entity.id]));
+  assert.ok(result.memory.spatialFacts.containments.some(edge => edge.placeEntityId === ids.get('客房') && edge.parentEntityId === ids.get('甲馆')));
+  assert.equal(result.memory.spatialFacts.relations[0].referencePlaceEntityIds[0], ids.get('二楼'));
+});
+
+test('重复引文的无效父边不作为粗细归约证明，旧合法父继续保留', async () => {
+  const entities = [precisionPlace(701, '甲馆'), precisionPlace(702, '客房'), precisionPlace(703, '二楼')];
+  const content = '甲馆内有客房。客房在二楼内部。二楼属于甲馆。二楼属于甲馆。';
+  const evidence = exactQuote => ({ source: 'canonicalContent', sourceFloorKey: 'floor-1', exactQuote });
+  const previous = new Map([[entities[1].id, new Set([entities[0].id])]]);
+  const result = await direct({ summary: content, spatialFacts: {
+    places: entities.map((entity, index) => ({ key: `place-mention-${index + 1}`, name: entity.displayName, identity: 'existing', sameAsPlaceKey: `place-${index + 1}`, ...evidence(content) })),
+    containments: [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', ...evidence('甲馆内有客房。') },
+      { placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-3', ...evidence('客房在二楼内部。') },
+      { placeKey: 'place-mention-3', parentPlaceKey: 'place-mention-1', ...evidence('二楼属于甲馆。') }], positions: [],
+  } }, { entities, content, previousFloorContext: { parentEntityIdsByPlaceId: previous } });
+  assert.ok(result.isolated.some(issue => issue.code === 'V3_EXTRACTOR_SPATIAL_PLACE_SCOPE_CONFLICT'));
+  assert.equal(result.memory.spatialFacts?.containments?.some(edge => edge.placeEntityId === entities[1].id) ?? false, false);
+});
+
+test('未解析身份的父端点不能消掉同包合法包含，保已有房间位置', async () => {
+  const content = '甲馆二楼内设有客房。林岚仍在客房。';
+  const evidence = { source: 'canonicalContent', sourceFloorKey: 'floor-1', exactQuote: content };
+  const result = await direct({ summary: content, people: [{ name: '林岚', role: 'user' }], spatialFacts: {
+    places: [{ key: 'place-mention-1', name: '甲馆', identity: 'existing', sameAsPlaceKey: 'place-1', ...evidence },
+      { key: 'place-mention-2', name: '客房', identity: 'existing', sameAsPlaceKey: 'place-2', ...evidence },
+      { key: 'place-mention-3', name: '二楼', identity: 'uncertain', ...evidence }],
+    containments: [{ placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-1', ...evidence },
+      { placeKey: 'place-mention-2', parentPlaceKey: 'place-mention-3', ...evidence }, { placeKey: 'place-mention-3', parentPlaceKey: 'place-mention-1', ...evidence }],
+    positions: [{ subject: '林岚', placeKey: 'place-mention-2', status: 'confirmed', ...evidence }],
+  } }, { entities: [precisionPlace(711, '甲馆'), precisionPlace(712, '客房')], content,
+    previousFloorContext: { parentEntityIdsByPlaceId: new Map([[precisionPlace(712, '客房').id, new Set([precisionPlace(711, '甲馆').id])]]) } });
+  assert.ok(result.isolated.some(issue => issue.code === 'V3_EXTRACTOR_SPATIAL_PLACE_IDENTITY_UNRESOLVED'));
+  assert.equal(result.memory.spatialFacts.containments.length, 1);
+  assert.equal(result.memory.spatialFacts.containments[0].parentEntityId, precisionPlace(711, '甲馆').id);
+  assert.equal(result.memory.spatialFacts.positions.length, 1);
+});
+
+test('请求前地点树或父投影整体异常仍保摘要及CSE正常入口，不派地点写入', async () => {
+  const { readFile } = await import('node:fs/promises');
+  for (const projector of ['projectQianchuangSnapshot', 'projectPlaceOwnership']) {
+    const sourceUrl = new URL('../src/v3/memory-runtime.js', import.meta.url);
+    let source = await readFile(sourceUrl, 'utf8');
+    source = source.replace(new RegExp(`\\b${projector}([, }])`, 'u'), `${projector} as originalPlaceProjection$1`);
+    source = source.replace(/from '([^']+)'/gu, (all, name) => name.startsWith('.') ? `from '${new URL(name, sourceUrl).href}'` : all);
+    source += `\nlet armed = false; export const armPlaceFault = () => { armed = true; };\nfunction ${projector}(...args) { if (armed) throw Object.assign(new Error('place projection unavailable'), { code: 'QQJ_PLACE_ALGORITHM_FAILURE' }); return originalPlaceProjection(...args); }\n//# sourceURL=qqj-place-preparation-fault-${projector}.mjs\n`;
+    const injected = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+    const h = harness({ withPlaces: true, memoryRuntimeFactory: injected.createV3MemoryRuntime,
+      utility: options => ({ jsonData: options.systemPrompt === CSE_SYSTEM_PROMPT ? { noMaterialChange: true } : { summary: '裴晚生提醒用户带伞。' } }) });
+    await h.runtime.start();
+    const floorId = h.runtime.getState().floors[0].floorId;
+    // Ensure previous-place context has a saved floor to inspect on the second run.
+    await h.runtime.extractFloor(floorId, { analyzeState: false });
+    const beforeRequests = h.calls.length;
+    const beforePlaceWrites = h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-place-workspace').length;
+    injected.armPlaceFault();
+    await h.runtime.prepareCurrent();
+    await h.runtime.extractFloor(floorId, { analyzeState: false });
+    assert.equal(h.calls.length - beforeRequests, 1, projector);
+    assert.equal((await h.store.readReachable({ mode: 'runtime' })).floorMemories.length, 1);
+    assert.equal(h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-place-workspace').length, beforePlaceWrites);
+    await h.runtime.retryStateAnalysis(floorId);
+    assert.equal(h.calls.length - beforeRequests, 2, projector);
+  }
+});
+
+test('地点库故障普通召回在首轮正常准备继续，只隔离地点来源', async () => {
+  let h;
+  const provider = async (identity, { includePlaces = true, allowUnavailablePlaces = false, allowUnavailable = false } = {}) => {
+    if (!includePlaces) return {};
+    try {
+      const value = await h.placeWorkspaceStore.read(identity ?? { chatId: CHAT });
+      return { placeWorkspace: value.data, placeWorkspaceRevision: value.revision };
+    } catch (error) {
+      if (allowUnavailablePlaces || allowUnavailable) return { unavailableSources: ['places'] };
+      throw error;
+    }
+  };
+  h = harness({ withPlaces: true, identityProjectionProvider: provider,
+    initialChat: [user('继续'), ...Array.from({ length: 5 }, (_, index) => [assistant(index === 0 ? '裴晚生提醒你带伞。' : `后来第${index + 1}楼继续走路。`), user(index === 4 ? '他当时说过什么？' : '继续')]).flat()] });
+  await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  h.backend.setBeforeGet(({ key }) => { if (key === 'v3-place-workspace') throw new Error('place unavailable'); });
+  h.placeWorkspaceStore.invalidate(CHAT);
+  h.context.constants = { promptTypes: { IN_CHAT: 1 }, promptRoles: { SYSTEM: 1 } };
+  h.context.setExtensionPrompt = () => {}; h.context.saveChat = async () => {};
+  const preparations = []; let selections = 0, aborts = 0;
+  const recall = createV3RecallRuntime({ store: h.store, hostAdapter: h.hostAdapter, identityProjectionProvider: provider,
+    prepareMemory: options => { preparations.push(options.allowRefresh); return h.runtime.prepareCurrent(options); },
+    selector: input => { selections += 1; return selectRecall(input); }, now: () => new Date(NOW), pluginVersion: 'place-isolation-test', logger: { warn() {} } });
+  const result = await recall.intercept(h.context.chat, 12000, () => { aborts += 1; }, 'normal');
+  assert.equal(preparations[0], true);
+  assert.equal(result.lastRecall.attemptDiagnostics.length, 1);
+  assert.ok(result.lastRecall.timings.preparationAttempts.every(attempt => attempt.status === 'ready'));
+  assert.equal(selections, 1); assert.equal(aborts, 0);
+  assert.equal(result.lastRecall.status, 'ready');
+  assert.ok(result.lastRecall.injectionText.length > 0);
+});
+
+test('地点候选算法异常局限地点，正常召回首轮保摘要且筛选一次', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const sourceUrl = new URL('../src/v3/recall-selector.js', import.meta.url);
+  let source = await readFile(sourceUrl, 'utf8');
+  source = source.replace('function placeFeatureCandidates(source, queryContext, entityById, queries, memories) {', "function placeFeatureCandidates(source, queryContext, entityById, queries, memories) { throw Object.assign(new Error('place candidate unavailable'), { code: 'QQJ_PLACE_ALGORITHM_FAILURE' });");
+  source = source.replace(/from '([^']+)'/gu, (all, name) => name.startsWith('.') ? `from '${new URL(name, sourceUrl).href}'` : all);
+  source += '\n//# sourceURL=qqj-place-selection-fault.mjs\n';
+  const injected = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+  const h = harness({ initialChat: [user('继续'), ...Array.from({ length: 5 }, (_, index) => [assistant(index === 0 ? '裴晚生提醒你带伞。' : `后来第${index + 1}楼继续走路。`), user(index === 4 ? '他当时说过什么？' : '继续')]).flat()] });
+  await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  h.context.constants = { promptTypes: { IN_CHAT: 1 }, promptRoles: { SYSTEM: 1 } };
+  h.context.setExtensionPrompt = () => {}; h.context.saveChat = async () => {};
+  let selections = 0, aborts = 0;
+  const recall = createV3RecallRuntime({ store: h.store, hostAdapter: h.hostAdapter,
+    prepareMemory: options => h.runtime.prepareCurrent(options), selector: input => { selections += 1; return injected.selectRecall(input); },
+    now: () => new Date(NOW), pluginVersion: 'place-selection-fault-test', logger: { warn() {} } });
+  const result = await recall.intercept(h.context.chat, 12000, () => { aborts += 1; }, 'normal');
+  assert.equal(aborts, 0); assert.equal(selections, 1);
+  assert.equal(result.lastRecall.status, 'ready');
+  assert.ok(result.lastRecall.injectionText.length > 0);
+  assert.ok(result.lastRecall.skipReasons.includes('placeSourceUnavailable'));
+});
+
+test('共享父级算法整体故障时正常摘要分析及非地点召回继续，必需域仍走原验证', async t => {
+  const { cp, mkdtemp, writeFile, symlink, rm } = await import('node:fs/promises');
+  const { pathToFileURL, fileURLToPath } = await import('node:url');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const temporary = await mkdtemp(join(tmpdir(), 'qqj-place-parent-fault-'));
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  await cp(new URL('../src', import.meta.url), `${temporary}/src`, { recursive: true });
+  await symlink(fileURLToPath(new URL('../node_modules', import.meta.url)), `${temporary}/node_modules`, process.platform === 'win32' ? 'junction' : 'dir');
+  const parentUrl = new URL('../src/v3/place-parent.js', import.meta.url).href;
+  await writeFile(`${temporary}/src/v3/place-parent.js`, `import { resolvePlaceParentBatch as original } from '${parentUrl}';
+let armed = false;
+export const armPlaceFault = () => { armed = true; };
+export function resolvePlaceParentBatch(...args) { if (armed) throw Object.assign(new Error('shared place parent unavailable'), { code: 'QQJ_PLACE_ALGORITHM_FAILURE' }); return original(...args); }
+`);
+  const injectedMemory = await import(pathToFileURL(`${temporary}/src/v3/memory-runtime.js`).href);
+  const injectedRecall = await import(pathToFileURL(`${temporary}/src/v3/recall-runtime.js`).href);
+  const injectedParent = await import(pathToFileURL(`${temporary}/src/v3/place-parent.js`).href);
+  const h = harness({ withPlaces: true, memoryRuntimeFactory: injectedMemory.createV3MemoryRuntime,
+    initialChat: [user('继续'), ...Array.from({ length: 5 }, (_, index) => [assistant(index === 0 ? '裴晚生在甲馆客房，甲馆内有客房。' : `后来第${index + 1}楼继续走路。`), user(index === 4 ? '他当时说过什么？' : '继续')]).flat()],
+    utility: options => {
+      if (options.systemPrompt === CSE_SYSTEM_PROMPT) return { jsonData: { noMaterialChange: true } };
+      const payload = JSON.parse(options.taskMessages[0].content).payload;
+      return { jsonData: { summary: '裴晚生提醒用户带伞。', people: [{ name: '裴晚生' }, { name: '你', role: 'user' }],
+        placePaths: [{ path: [{ name: '甲馆' }, { name: '客房' }], source: 'canonicalContent', sourceFloorKey: payload.sourceFloorKey, exactQuote: payload.canonicalContent }] } };
+    } });
+  await h.runtime.start();
+  const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  const before = h.calls.length;
+  const oldPlaces = structuredClone((await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].spatialFacts);
+  injectedParent.armPlaceFault();
+  await h.runtime.prepareCurrent();
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  assert.equal(h.calls.length - before, 1);
+  assert.deepEqual((await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].spatialFacts, oldPlaces);
+  assert.equal(h.runtime.getQianchuangSnapshot().status, 'error');
+  await h.runtime.retryStateAnalysis(floorId);
+  assert.equal(h.calls.length - before, 2);
+  h.context.constants = { promptTypes: { IN_CHAT: 1 }, promptRoles: { SYSTEM: 1 } };
+  h.context.setExtensionPrompt = () => {}; h.context.saveChat = async () => {};
+  let aborts = 0;
+  const recall = injectedRecall.createV3RecallRuntime({ store: h.store, hostAdapter: h.hostAdapter,
+    prepareMemory: options => h.runtime.prepareCurrent(options), selector: input => selectRecall(input),
+    now: () => new Date(NOW), pluginVersion: 'shared-place-parent-fault', logger: { warn() {} } });
+  const result = await recall.intercept(h.context.chat, 12000, () => { aborts += 1; }, 'normal');
+  assert.equal(aborts, 0); assert.equal(result.lastRecall.status, 'ready');
+  assert.equal(result.lastRecall.attemptDiagnostics.length, 1);
+});
+
+test('地点暂停时USER输入已改的同AI楼不继承旧空间事实', async () => {
+  let h;
+  const provider = async (identity, { includePlaces = true, allowUnavailablePlaces = false } = {}) => {
+    if (!includePlaces) return {};
+    try { const value = await h.placeWorkspaceStore.read(identity ?? { chatId: CHAT }); return { placeWorkspace: value.data, placeWorkspaceRevision: value.revision }; }
+    catch (error) { if (allowUnavailablePlaces) return { unavailableSources: ['places'] }; throw error; }
+  };
+  h = harness({ withPlaces: true, identityProjectionProvider: provider, initialChat: [user('甲馆内有客房。'), assistant('裴晚生提醒你带伞。'), user('稳定')],
+    utility: options => {
+      const payload = JSON.parse(options.taskMessages[0].content).payload;
+      return { jsonData: { summary: '裴晚生提醒用户带伞。', placePaths: [{ path: [{ name: '甲馆' }, { name: '客房' }],
+        source: 'precedingUserInput', sourceFloorKey: payload.sourceFloorKey, sourceSnapshotIndex: 0, exactQuote: payload.precedingUserInput[0].content }] } };
+    } });
+  await h.runtime.start();
+  const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  const old = (await h.store.readReachable({ mode: 'runtime' })).floorMemories[0];
+  assert.ok(old.spatialFacts.containments.length > 0);
+  h.context.chat[0].mes = '乙馆内有客房。';
+  h.backend.setBeforeGet(({ key }) => { if (key === 'v3-place-workspace') throw new Error('place unavailable'); });
+  h.placeWorkspaceStore.invalidate(CHAT);
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  const current = (await h.store.readReachable({ mode: 'runtime' })).floorMemories[0];
+  assert.equal(current.sourceRawFingerprint, old.sourceRawFingerprint);
+  assert.equal(current.sourceUserInputSnapshot.messages[0].content, '乙馆内有客房。');
+  assert.equal(current.spatialFacts, undefined);
+  assert.equal(h.calls.length, 2);
+});
+
+
+test('资料依赖解耦：上一楼CSE自动简介完成时下一楼摘要继续保存并保新简介', async () => {
+  for (const commitPhase of ['模型在途', 'root CAS']) {
+    const firstText = '阿青是北城图书馆管理员。';
+    const secondText = '阿青是药铺学徒，也继续帮林岚找书。';
+    const evidence = quote => [{ quoteSegments: [quote], supports: '稳定身份依据', evidenceMode: 'explicit', sourceMentionKey: null }];
+    let summaryCount = 0;
+    let markSummaryStarted;
+    let releaseSummary;
+    const summaryStarted = new Promise(resolve => { markSummaryStarted = resolve; });
+    const h = harness({
+      initialChat: [assistant(firstText), user('确认一'), assistant(secondText), user('确认二')],
+      utility: options => {
+        const request = JSON.parse(options.taskMessages[0].content);
+        if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
+        summaryCount += 1;
+        if (summaryCount === 1) return { jsonData: { summary: firstText, people: [{ name: '阿青', presence: 'present',
+          identityBrief: '图书馆工作人员。', identityBriefEvidence: evidence(firstText) }] } };
+        const person = request.payload.knownPeople.find(item => item.displayName === '阿青');
+        assert.ok(person);
+        markSummaryStarted();
+        return new Promise(resolve => { releaseSummary = () => resolve({ jsonData: { summary: secondText,
+          people: [{ name: '阿青', sameAsEntityKey: person.entityKey, aliases: ['青哥'], presence: 'present',
+            identityBrief: '药铺学徒。', identityBriefEvidence: evidence(secondText) }] } }); });
+      },
+    });
+    await h.runtime.start();
+    await h.runtime.extractNext();
+    const [first, second] = h.runtime.getState().floors;
+    const before = await h.store.readReachable({ mode: 'runtime' });
+    const person = buildEntityIdentityDirectory({ entities: before.entities }).find(item => item.displayName === '阿青');
+    assert.equal(person.identityBrief, '图书馆工作人员。');
+    const running = h.runtime.extractFloor(second.floorId, { analyzeState: false });
+    await summaryStarted;
+    const writer = harness({ sharedBackend: h.backend, sharedContext: h.context, now: () => new Date(Date.parse(NOW) + 1000), utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      assert.notEqual(request.task, 'extractFloorSemantics', '并发修订沿原CSE请求，不追加摘要');
+      const target = request.payload.identityBriefTargets.find(item => item.name === '阿青');
+      return { jsonData: { noMaterialChange: true, identityBriefUpdates: [{ targetKey: target.key,
+        identityBrief: '北城图书馆管理员。', evidence: [{ source: 'canonicalContent', quote: firstText }] }] } };
+    } });
+    let savedCarrier;
+    let preparedProfile = null;
+    const writeProfile = async () => {
+      await writer.runtime.start();
+      await writer.runtime.retryStateAnalysis(first.floorId);
+      const updated = await writer.store.readReachable({ mode: 'runtime' });
+      const update = buildEntityIdentityDirectory({ entities: updated.entities }).find(item => item.entityId === person.entityId);
+      assert.equal(update.identityBrief, '北城图书馆管理员。', '真实CSE提交一条自动简介carrier');
+      savedCarrier = updated.entities.find(item => item.id === update.identityBriefSource.entityRecordId);
+    };
+    if (commitPhase === 'root CAS') {
+      h.backend.setBeforePut(async ({ key }) => {
+        if (key !== 'v3-root') return;
+        h.backend.setBeforePut(null);
+        preparedProfile = structuredClone([...h.backend.records.values()].map(item => item.data)
+          .find(item => item.recordType === 'entity' && item.firstSeenFloorId === second.floorId && item.identityBrief === '药铺学徒。'));
+        assert.ok(preparedProfile, '先确认带旧简介的不可变candidate已在Phase A耐久');
+        await writeProfile();
+      });
+    } else await writeProfile();
+    releaseSummary();
+    await running;
+    const after = await h.store.readReachable({ mode: 'runtime' });
+    assert.equal(h.runtime.getState().lastExtractorError, null);
+    assert.equal(after.floorMemories.filter(item => item.recordStatus === 'active').length, 2, '并发资料增补不能丢弃下一楼摘要');
+    const directory = buildEntityIdentityDirectory({ entities: after.entities, floorOrder: new Map(after.floors.map((floor, index) => [floor.id, index])) });
+    const current = directory.find(item => item.entityId === person.entityId);
+    assert.equal(current.identityBrief, '北城图书馆管理员。', '迟到旧请求的简介不能替换请求期间已更新的资料');
+    assert.ok(current.aliases.includes('青哥'), '同一返回中合法的新别名仍可累计');
+    assert.deepEqual(after.entities.find(item => item.id === savedCarrier.id), savedCarrier, '当前carrier字节保留');
+    assert.equal(summaryCount, 2, '只用原两次摘要请求');
+    assert.equal(writer.calls.length, 1, '并发资料更新只用原CSE请求');
+    if (preparedProfile) {
+      assert.deepEqual(h.backend.records.get(`chat-${CHAT}/${h.store.recordKey(preparedProfile)}`).data, preparedProfile, '原Phase A孤儿不可被同ID改写');
+      assert.ok(!after.entities.some(entity => entity.id === preparedProfile.id), '重放采用独立别名载体而非旧简介孤儿');
+    }
+  }
+});
+
+
+test('隐藏USER取材：旧手动隐藏与foreign无type隐藏进入新摘要和CSE，旧null档不补写', async () => {
+  for (const kind of ['手动隐藏', 'foreign隐藏']) {
+    const text = '我把备用钥匙放在桌上。';
+    const hidden = { ...user(text), is_system: true, bbs_hidden: true,
+      ...(kind === 'foreign隐藏' ? { extra: { qianqianjieAutoHide: { schemaVersion: 1, chatId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' } } } : {}) };
+    const h = harness({ initialChat: [hidden, assistant('阿青看见桌上的钥匙。'), user('确认这一楼')],
+      utility: options => JSON.parse(options.taskMessages[0].content).task === 'extractFloorSemantics'
+        ? { jsonData: { summary: '阿青看见桌上的钥匙。', people: [{ name: '阿青', presence: 'present' }] } }
+        : { jsonData: { noMaterialChange: true } } });
+    await h.runtime.start();
+    await h.runtime.extractNext();
+    const graph = await h.store.readReachable({ mode: 'runtime' });
+    const saved = graph.floorMemories[0];
+    assert.deepEqual(saved.sourceUserInputSnapshot?.messages.map(message => message.content), [text], kind);
+    const requests = h.calls.map(call => JSON.parse(call.taskMessages[0].content));
+    assert.deepEqual(requests.find(request => request.task === 'extractFloorSemantics').payload.precedingUserInput.map(message => message.content), [text]);
+    assert.deepEqual(requests.find(request => request.task === 'understandCharacterStateAfterFloor').payload.currentUserInput.messages.map(message => message.content), [text]);
+    const stored = h.backend.records.get(`chat-${CHAT}/${h.store.recordKey(saved)}`);
+    assert.ok(stored);
+    stored.data.sourceUserInputSnapshot = null; // A valid legacy record captured before USER snapshots were available.
+    const cold = harness({ sharedBackend: h.backend, sharedContext: h.context,
+      utility: () => { throw new Error('旧null档冷读不得自动重摘'); } });
+    await cold.runtime.start();
+    await cold.runtime.refreshStatus();
+    const legacy = await cold.store.readReachable({ mode: 'runtime' });
+    assert.equal(legacy.floorMemories[0].id, saved.id);
+    assert.equal(legacy.floorMemories[0].sourceUserInputSnapshot, null);
+    assert.equal(cold.calls.length, 0);
+  }
+});
+
+
+test('资料依赖解耦：legacy简介按原楼层选最新版，无并发修改时接受新简介', async () => {
+  const firstText = '阿青曾登记为图书馆工作人员。';
+  const secondText = '阿青是药铺学徒，也以独立记者身份记录采访。';
+  const evidence = quote => [{ quoteSegments: [quote], supports: '当前稳定身份依据', evidenceMode: 'explicit', sourceMentionKey: null }];
+  const h = harness({ initialChat: [assistant(firstText), user('确认一'), assistant(secondText), user('确认二')],
+    utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
+      const isFirst = request.payload.canonicalContent === firstText;
+      return { jsonData: { summary: request.payload.canonicalContent, people: [{ name: '阿青', presence: 'present',
+        identityBrief: isFirst ? '图书馆工作人员。' : '药铺学徒。', identityBriefEvidence: evidence(request.payload.canonicalContent) }] } };
+    } });
+  await h.runtime.start();
+  await h.runtime.extractNext();
+  const second = h.runtime.getState().floors[1];
+  await h.runtime.extractFloor(second.floorId, { analyzeState: false });
+  const graph = await h.store.readReachable({ mode: 'runtime' });
+  const npc = graph.entities.find(entity => entity.displayName === '阿青' && entity.status !== 'merged');
+  for (const entity of graph.entities.filter(entity => entity.id === npc.id || entity.mergedIntoEntityId === npc.id)) {
+    const stored = h.backend.records.get(`chat-${CHAT}/${h.store.recordKey(entity)}`);
+    delete stored.data.identityBriefSource;
+    stored.data.updatedAt = entity.id === npc.id ? '2026-09-02T00:00:20.000Z' : NOW;
+  }
+  let sentBrief;
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, now: () => new Date('2026-09-02T01:00:00.000Z'),
+    utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      sentBrief = request.payload.knownPeople.find(person => person.displayName === '阿青').identityBrief;
+      return { jsonData: { summary: secondText, people: [{ name: '阿青', presence: 'present', identityBrief: '独立记者。',
+        identityBriefEvidence: evidence(secondText) }] } };
+    } });
+  await cold.runtime.start();
+  await cold.runtime.extractFloor(second.floorId, { analyzeState: false });
+  assert.equal(sentBrief, '药铺学徒。', 'legacy输入依原firstSeen楼序选择，较早记录晚updatedAt也不能倒流');
+  const saved = await cold.store.readReachable({ mode: 'runtime' });
+  const current = buildEntityIdentityDirectory({ entities: saved.entities, floorOrder: new Map(saved.floors.map((floor, index) => [floor.id, index])) });
+  assert.equal(current.find(person => person.entityId === npc.id).identityBrief, '独立记者。', '没有并发资料修改时不误跳过正常简介');
+  assert.equal(cold.runtime.getState().lastExtractorError, null);
+});
+
+
+test('普通临时事项同次摘要停追保事实与原时间，冷读和后续候选留住重要目标及人工选择', async () => {
+  assertQianshiLifecycleGuidance(EXTRACTOR_SYSTEM_PROMPT);
+  const requests = [];
+  const definitions = [
+    { key: 'routine-planned', title: '午后庭院散步', status: 'planned', storyTime: '2026年9月1日 12:00', scheduledTime: '2026年9月1日 午后' },
+    { key: 'routine-running', title: '整理会客茶具', status: 'inProgress', storyTime: '2026年9月1日 12:00' },
+    { key: 'debt', title: '归还借款', status: 'planned', scheduledTime: '2026年10月1日' },
+    { key: 'delivery', title: '交付修订稿', status: 'inProgress' },
+    { key: 'future', title: '月底钟楼会面', status: 'planned', scheduledTime: '2026年9月30日' },
+    { key: 'manual-following', title: '整理花架', status: 'inProgress' },
+    { key: 'important-arrival', title: '队伍抵达研究站', status: 'inProgress' },
+  ];
+  const h = harness({ initialChat: [user('开始。'), assistant('队伍正前往研究站。其余午后安排已经记下，茶具还在整理。'),
+    user('次日来到图书馆。'), assistant('现在是第二天，队伍已在研究站开展例行观测，其他人在图书馆借阅。'),
+    user('继续。'), assistant('管理员说明了馆内借阅规则。'),
+    user('曾经提过午后庭院散步。'), assistant('他们回忆先前的午后庭院散步安排。'),
+    user('今晚重新约定午后庭院散步。'), assistant('他们重新约好午后庭院散步，准备出发。'), user('稳定。')], utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    assert.equal(request.task, 'extractFloorSemantics'); requests.push(request);
+    assertQianshiLifecycleGuidance(options.systemPrompt);
+    const candidates = new Map(request.payload.qianshiCandidates.map(item => [item.title, item]));
+    const number = requests.length;
+    let events = [];
+    if (number === 1) events = definitions.map(item => ({ ...item, description: item.title, matter: true, following: true }));
+    if (number === 2) events = definitions.slice(0, 2).map(item => ({ ...item,
+      description: '原临时场景已离开，这件日常安排已经没有后续跟进价值。', following: false,
+      links: [{ candidateKey: candidates.get(item.title).key, kind: 'progress' }] }));
+    if (number === 2) events.push({ ...definitions[6], status: 'completed', following: false, description: '队伍已在目的地开展观测，抵达目标已实现。',
+      links: [{ candidateKey: candidates.get(definitions[6].title).key, kind: 'progress' }] });
+    if (number === 4 || number === 5) events = [{ ...definitions[0],
+      description: number === 4 ? '回忆先前的安排。' : '重新作出具体约定。', following: number === 5,
+      links: [{ candidateKey: candidates.get(definitions[0].title).key, kind: number === 4 ? 'context' : 'progress' }] }];
+    return { jsonData: { summary: request.payload.canonicalContent, qianshi: { events, order: [] } } };
+  } });
+  await h.runtime.start();
+  const floors = h.runtime.getState().floors;
+  await h.runtime.extractFloor(floors[0].floorId, { analyzeState: false });
+  const initial = h.runtime.getQianshiSnapshot();
+  const manual = initial.matters.find(item => item.title === '整理花架');
+  await h.runtime.setQianshiMatterFollowing({ matterId: manual.matterId, following: false, expectedFollowing: true });
+  await h.runtime.setQianshiMatterFollowing({ matterId: manual.matterId, following: true, expectedFollowing: false });
+  const delivery = initial.matters.find(item => item.title === '交付修订稿');
+  await h.runtime.setQianshiMatterStatus({ matterId: delivery.matterId, status: 'inProgress', expectedStatus: delivery.status, expectedManualStatus: null });
+  await h.runtime.extractFloor(floors[1].floorId, { analyzeState: false });
+  const stopped = h.runtime.getQianshiSnapshot();
+  for (const definition of definitions.slice(0, 2)) {
+    const matter = stopped.matters.find(item => item.title === definition.title);
+    assert.equal(matter.status, definition.status); assert.equal(matter.following, false);
+    assert.equal(matter.storyTime, definition.storyTime); assert.equal(matter.scheduledTime, definition.scheduledTime ?? null);
+    assert.ok(!stopped.currentProgress.matterIds.includes(matter.matterId));
+    assert.deepEqual(h.runtime.getQianshiRecall({ selectedMatterIds: [matter.matterId], selectedEventIds: [] }).matterIds, []);
+    const original = initial.events.find(item => item.title === definition.title);
+    assert.ok(h.runtime.getQianshiRecall({ selectedEventIds: [original.id], selectedMatterIds: [] }).eventIds.includes(original.id), '原记录可作为历史检索结果读取');
+    assert.equal(original.sourceFloorId, floors[0].floorId);
+    assert.equal(stopped.events.find(item => item.id === matter.currentEventId).sourceFloorId, floors[1].floorId);
+  }
+  assert.equal(stopped.events.length, initial.events.length + 3);
+  assert.equal(stopped.matters.find(item => item.title === '队伍抵达研究站').status, 'completed');
+  assert.equal(stopped.matters.find(item => item.title === '队伍抵达研究站').following, false);
+  assert.equal(stopped.matters.length, initial.matters.length);
+  assert.equal(requests[1].payload.qianshiCandidates.find(item => item.title === '整理花架').tracking, 'following');
+  assert.equal(requests[1].payload.qianshiCandidates.find(item => item.title === '交付修订稿').manualStatus, true);
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, readOnlyLifecycle: true, utility: () => assert.fail('冷读不调模型') });
+  await cold.runtime.start();
+  assert.deepEqual(cold.runtime.getQianshiSnapshot().matters, stopped.matters);
+  assert.deepEqual(cold.runtime.getQianshiSnapshot().currentProgress, stopped.currentProgress);
+  await h.runtime.extractFloor(floors[2].floorId, { analyzeState: false });
+  assert.deepEqual(requests[2].payload.qianshiCandidates.map(item => item.title).sort(), definitions.slice(2, 6).map(item => item.title).sort());
+  for (const title of ['归还借款', '交付修订稿', '月底钟楼会面', '整理花架']) assert.equal(h.runtime.getQianshiSnapshot().matters.find(item => item.title === title).following, true);
+  await h.runtime.extractFloor(floors[3].floorId, { analyzeState: false });
+  assert.equal(h.runtime.getQianshiSnapshot().matters.find(item => item.title === definitions[0].title).following, false, '仅历史提及保持停止跟进');
+  await h.runtime.extractFloor(floors[4].floorId, { analyzeState: false });
+  assert.equal(h.runtime.getQianshiSnapshot().matters.find(item => item.title === definitions[0].title).following, true, '具体新约定允许重开');
+  assert.equal(requests.length, 5, '五楼各走原一次摘要调用');
+});
+
+
+test('千事整理101楼293记录按真实材料批处理，预览次数等于实际且逐楼保真', async t => {
+  let rejudging = false;
+  const requests = [], actualTokenCounts = [], initialChat = [user('开始中性记录')];
+  let extractedFloors = 0;
+  for (let index = 0; index < 101; index += 1) {
+    initialChat.push(assistant(`第${index + 1}次观察。${'中性场景中记录物品位置与工作经过。'.repeat(120)}`), user(`确认${index}`));
+  }
+  const h = harness({ modernAnchors: true, initialChat, utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (!rejudging) {
+      if (request.task !== 'extractFloorSemantics') return { jsonData: { noMaterialChange: true } };
+      const index = ++extractedFloors;
+      return { jsonData: { summary: '中性观察摘要。'.repeat(30), qianshi: { events: Array.from({ length: index <= 91 ? 3 : 2 }, (_, offset) => ({
+        key: `event-${offset + 1}`, title: `观察${offset + 1}`, description: '原有事实与物品记录。', status: 'occurred', matter: false,
+        storyTime: '2026年8月1日', scheduledTime: null,
+      })), order: [] } } };
+    }
+    requests.push(request);
+    actualTokenCounts.push(estimateRecallTokens(`${BASE_PROCESSING_PROMPT}\n\n${options.systemPrompt}\n${JSON.stringify(request)}`));
+    assert.ok(actualTokenCounts.at(-1) <= 70000);
+    assert.equal(options.maxTokens, 30000);
+    assert.ok(request.floors.length > 0);
+    assert.equal(new Set(request.qianshiCandidates.map(candidate => candidate.key)).size, request.qianshiCandidates.length);
+    assert.equal(new Set(request.qianshiCandidates.map(({ key, ...candidate }) => JSON.stringify(candidate))).size, request.qianshiCandidates.length, '共享候选正文不会按楼重复发送');
+    return { jsonData: { floors: request.floors.map(floor => ({ floorKey: floor.floorKey, qianshi: { events: floor.records.map(record => ({
+      key: record.key, status: 'completed', actionStatus: 'occurred', matter: false,
+    })), order: [] } })) } };
+  } });
+  await h.runtime.start();
+  // 每楼明确建立2/3条记录，总量293，与真实整理规模相同。
+  for (const floor of h.runtime.getState().floors) {
+    await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    h.backend.calls.length = 0; h.calls.length = 0;
+  }
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  const oldEvents = before.floorMemories.flatMap(memory => memory.qianshiDelta.events);
+  assert.equal(oldEvents.length, 293);
+  const plan = await h.runtime.prepareQianshiRejudge();
+  assert.equal(plan.totalFloors, 101);
+  assert.ok(plan.apiCalls < 101, JSON.stringify(plan));
+  assert.ok(plan.apiCalls > 1, '中性长材料覆盖跨批流程');
+  assert.ok(plan.batches.every(batch => batch.estimatedInputTokens + batch.reservedInputTokens <= plan.maxInputTokens
+    && batch.estimatedOutputTokens <= plan.maxOutputTokens));
+  rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(requests.length, plan.historyApiCalls);
+  assert.equal(result.calls, plan.historyApiCalls + result.followup.calls);
+  assert.equal(result.attemptedFloors, 101);
+  assert.equal(requests.flatMap(request => request.floors).length, 101);
+  assert.equal(result.savedCompleteFloors, 101);
+  t.diagnostic(JSON.stringify({ floors: 101, records: 293, batches: plan.apiCalls, batchFloors: plan.batches.map(batch => batch.floorCount),
+    estimatedInputTokens: plan.estimatedInputTokens, actualInputTokens: actualTokenCounts, outputEstimates: plan.batches.map(batch => batch.estimatedOutputTokens) }));
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  const facts = event => [event.id, event.sourceFloorId, event.title, event.description, event.storyTime, event.scheduledTime];
+  assert.deepEqual(saved.floorMemories.flatMap(memory => memory.qianshiDelta.events).map(facts), oldEvents.map(facts));
+  assert.deepEqual(saved.stateDeltas, before.stateDeltas);
+  assert.deepEqual(saved.floorMemories.map(memory => memory.summary), before.floorMemories.map(memory => memory.summary));
+});
+
+test('千事整理同批三楼按明确事件键接续，跨批读取暂存的新漏记事件及状态', async () => {
+  for (const crossBatch of [false, true]) {
+    let rejudging = false;
+    const requests = [];
+    const h = harness({ initialChat: [user('开始'), assistant('约定归还旧书并寻找遗失钥匙。'), user('继续'),
+      assistant('继续寻找遗失钥匙。'), user('继续'), assistant('已经找到遗失钥匙。'), user('稳定')], utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (!rejudging) return { jsonData: { summary: '各楼独立摘要。', qianshi: { events: [
+        { key: 'old', title: '原记录', description: '原始经过。', status: 'planned', matter: true, storyTime: '2026年8月1日' },
+      ], order: [] } } };
+      requests.push(request);
+      return rejudgeBatchResponse(request, row => {
+        const sequence = Number(row.floorKey.slice(6));
+        const priorKey = crossBatch
+          ? row.qianshiCandidates.find(candidate => candidate.origin?.title === '寻找遗失钥匙')?.key
+          : `floor-${sequence - 1}:record-1`;
+        if (sequence > 1) assert.ok(priorKey, '跨批新漏记事件作为真实候选进入下一批');
+        if (crossBatch && sequence === 3) assert.equal(row.qianshiCandidates.find(candidate => candidate.key === priorKey)?.status, 'inProgress');
+        return { events: [{ key: 'record-1', status: sequence === 3 ? 'completed' : 'inProgress', actionStatus: 'occurred',
+          matter: crossBatch && sequence === 1 ? false : true,
+          ...(sequence > 1 ? { links: [{ candidateKey: priorKey, kind: 'progress' }] } : {}) },
+          ...(crossBatch && sequence === 1 ? [{ key: 'event-1', title: '寻找遗失钥匙', description: '开始寻找遗失钥匙。',
+            status: 'planned', actionStatus: 'planned', matter: true }] : [])], order: [] };
+      });
+    } });
+    await h.runtime.start();
+    for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    const plan = await h.runtime.prepareQianshiRejudge(crossBatch ? { maxOutputTokens: 1200 } : {});
+    assert.equal(plan.historyApiCalls, crossBatch ? 3 : 1);
+    rejudging = true;
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.status, 'completed', JSON.stringify(result));
+    assert.equal(result.calls, plan.historyApiCalls + result.followup.calls);
+    const memories = (await h.store.readReachable({ mode: 'runtime' })).floorMemories;
+    const origin = memories[0].qianshiDelta.events[crossBatch ? 1 : 0];
+    const second = memories[1].qianshiDelta.events[0], third = memories[2].qianshiDelta.events[0];
+    assert.equal(second.matterId, origin.matterId);
+    assert.equal(third.matterId, origin.matterId);
+    assert.deepEqual(second.continuesFromEventIds, [origin.id]);
+    assert.deepEqual(third.continuesFromEventIds, [second.id]);
+    assert.equal(third.status, 'completed');
+    assert.deepEqual(memories.map(memory => memory.qianshiDelta.events[0].sourceFloorId), memories.map(memory => memory.floorId));
+  }
+});
+
+test('千事整理批响应按已知楼局部保存，无法解析保旧待续，取消仍零提交', async () => {
+  let mode = 'summary';
+  const h = harness({ initialChat: [user('开始'), assistant('第一份稳定事实。'), user('继续'), assistant('第二份稳定事实。'), user('稳定')], utility: async options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (mode === 'summary') return { jsonData: { summary: '已有摘要。', qianshi: { events: [
+      { key: 'old', title: '原事实', description: '原始经过。', status: 'occurred', matter: false },
+    ], order: [] } } };
+    const reply = rejudgeBatchResponse(request, row => ({ events: row.records.map(record => ({ key: record.key,
+      status: 'completed', actionStatus: 'occurred', matter: false })), order: [] }));
+    if (mode === 'missing') reply.jsonData.floors.pop();
+    if (mode === 'duplicate') reply.jsonData.floors[1].floorKey = reply.jsonData.floors[0].floorKey;
+    if (mode === 'unknown') reply.jsonData.floors[1].floorKey = 'floor-999';
+    if (mode === 'flat') return { jsonData: { qianshi: reply.jsonData.floors[0].qianshi } };
+    if (mode === 'failure') throw new Error('模拟批请求失败');
+    if (mode === 'cancel') {
+      setTimeout(() => h.runtime.stopQianshiHistory(), 0);
+      await new Promise(resolve => options.signal.addEventListener('abort', resolve, { once: true }));
+    }
+    return reply;
+  } });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const rootPuts = () => h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length;
+  for (mode of ['missing', 'duplicate', 'unknown', 'flat', 'failure', 'cancel']) {
+    const before = await h.store.readReachable({ mode: 'runtime' }), initialPuts = rootPuts();
+    const plan = await h.runtime.prepareQianshiRejudge();
+    assert.equal(plan.historyApiCalls, 1);
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.status, mode === 'cancel' ? 'stopped' : 'partial', mode);
+    assert.equal(result.calls, 1);
+    const after = await h.store.readReachable({ mode: 'runtime' });
+    assert.equal(rootPuts(), initialPuts + (mode === 'cancel' ? 0 : 1), mode);
+    if (mode === 'cancel') assert.deepEqual(after.floorMemories, before.floorMemories);
+    else {
+      const healthy = ['missing', 'unknown'].includes(mode) ? 1 : 0;
+      assert.equal(result.savedFloors, healthy, mode); assert.equal(result.failedFloors, 2 - healthy, mode);
+      assert.deepEqual(after.floorMemories.flatMap(memory => memory.qianshiDelta.events.map(event => [event.id, event.title])), before.floorMemories.flatMap(memory => memory.qianshiDelta.events.map(event => [event.id, event.title])));
+    }
+  }
+});
+
+test('千事整理容量边界不漏楼，人工状态跟进和已删事件在批次新图与冷读保留', async () => {
+  let rejudging = false;
+  const h = harness({ initialChat: [user('开始'), assistant('归还旧书与原始杂项。'), user('继续'), assistant('继续归还旧书。'), user('稳定')], utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (!rejudging) return { jsonData: { summary: '人工保护摘要。', qianshi: { events: [
+      { key: 'old', title: '归还旧书', description: '原约定内容。', status: 'planned', matter: true },
+      { key: 'deleted', title: '删除杂项', description: '已删除内容。', status: 'occurred', matter: false },
+    ], order: [] } } };
+    return rejudgeBatchResponse(request, row => {
+      if (row.floorKey === 'floor-1') {
+        assert.equal(row.records[0].manualStatus, true);
+        assert.equal(row.records[0].status, 'completed');
+        assert.equal(row.records[0].tracking, 'unfollowed');
+        assert.equal(row.records[0].following, false);
+        assert.equal(row.records.length, 1, '删除记录不发送给模型');
+      }
+      return { events: row.records.map(record => ({ key: record.key, status: 'inProgress', actionStatus: 'occurred', matter: true,
+        following: true })), order: [] };
+    });
+  } });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const first = h.runtime.getQianshiSnapshot().events.find(event => event.sourceAssistantSeq === 1 && event.title === '归还旧书');
+  await h.runtime.setQianshiMatterFollowing({ matterId: first.matterId, following: false, expectedFollowing: true });
+  await h.runtime.setQianshiMatterStatus({ matterId: first.matterId, status: 'completed', expectedStatus: 'planned', expectedManualStatus: null });
+  const deleted = h.runtime.getQianshiSnapshot().events.find(event => event.sourceAssistantSeq === 1 && event.title === '删除杂项');
+  await h.runtime.deleteQianshiEvent({ eventId: deleted.id });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal((await h.runtime.prepareQianshiRejudge({ maxInputTokens: 8000 })).status, 'ready', '预留不阻止实际可容纳的小请求');
+  const plan = await h.runtime.prepareQianshiRejudge({ maxOutputTokens: 1500 });
+  assert.equal(plan.totalFloors, 2);
+  assert.equal(plan.batches.reduce((sum, batch) => sum + batch.floorCount, 0), 2);
+  rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify({ result, request: JSON.parse(h.calls.at(-1).taskMessages[0].content) }));
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  for (const field of ['manualMatterStatusOverrides', 'trackingOverrides', 'deletedEventIds']) assert.deepEqual(after.floorMemories[0].qianshiDelta[field], before.floorMemories[0].qianshiDelta[field]);
+  assert.deepEqual(after.floorMemories[0].qianshiDelta.events.find(event => event.id === deleted.id), before.floorMemories[0].qianshiDelta.events.find(event => event.id === deleted.id));
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => assert.fail('冷读不调用模型') });
+  await cold.runtime.start();
+  const matter = cold.runtime.getQianshiSnapshot().matters.find(value => value.matterId === first.matterId);
+  assert.equal(matter.status, 'completed');
+  assert.equal(matter.following, false);
+  assert.equal(cold.runtime.getQianshiSnapshot().events.some(event => event.id === deleted.id), false);
+});
+
+test('千事整理预留服从真实容量，小预算及临界单楼可发送且首批按完整材料装箱', async t => {
+  for (const scenario of [
+    { name: '小材料4k预算', lengths: [20], maxInputTokens: 4000, calls: 1 },
+    { name: '60k单楼接近70k容量', lengths: [60000], maxInputTokens: 70000, calls: 1 },
+    { name: '首批两24k楼合包且后批60k楼按余量预留', lengths: [24000, 24000, 60000], maxInputTokens: 70000, calls: 2 },
+  ]) await t.test(scenario.name, async () => {
+    let rejudging = false;
+    const requests = [], initialChat = [user('开始')];
+    for (const length of scenario.lengths) initialChat.push(assistant('中'.repeat(length)), user('稳定'));
+    const h = harness({ initialChat, utility: options => {
+      if (!rejudging) return { jsonData: { summary: '独立摘要。', qianshi: { events: [
+        { key: 'old', title: '原记录', description: '原事实。', status: 'occurred', matter: false },
+      ], order: [] } } };
+      const request = JSON.parse(options.taskMessages[0].content);
+      requests.push(request);
+      assert.ok(estimateRecallTokens(`${BASE_PROCESSING_PROMPT}\n\n${options.systemPrompt}\n${JSON.stringify(request)}`) <= scenario.maxInputTokens);
+      return rejudgeBatchResponse(request, row => ({ events: row.records.map(record => ({ key: record.key,
+        status: 'occurred', actionStatus: 'occurred', matter: false })), order: [] }));
+    } });
+    await h.runtime.start();
+    for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    if (scenario.lengths[0] === 60000) await assert.rejects(h.runtime.prepareQianshiRejudge({ maxInputTokens: 50000 }), error => error.code === 'QIANSHI_REJUDGE_INPUT_BUDGET');
+    const plan = await h.runtime.prepareQianshiRejudge({ maxInputTokens: scenario.maxInputTokens });
+    assert.equal(plan.apiCalls, scenario.calls);
+    assert.equal(plan.batches[0].reservedInputTokens, 0, '首批候选确定，无此前新判结果需要预留');
+    if (scenario.lengths.length === 3) {
+      assert.deepEqual(plan.batches.map(batch => batch.floorCount), [2, 1]);
+      assert.ok(plan.batches[1].reservedInputTokens > 0 && plan.batches[1].reservedInputTokens < 24000);
+      assert.equal(plan.batches[1].estimatedInputTokens + plan.batches[1].reservedInputTokens, scenario.maxInputTokens,
+        '后批临界单楼仍可发送，预留仅使用实际余量');
+    }
+    rejudging = true;
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.status, 'completed', JSON.stringify(result));
+    assert.equal(result.calls, plan.historyApiCalls + result.followup.calls);
+    assert.equal(requests.length, plan.historyApiCalls);
+    assert.equal(result.savedCompleteFloors, scenario.lengths.length);
+  });
+});
+
+test('千事整理manual DTO沿权威楼序投影，floorMemories重排不改变人工状态或跟进', async () => {
+  const observed = [];
+  for (const reversed of [false, true]) {
+    let rejudging = false;
+    const h = harness({ initialChat: [user('开始'), assistant('约好归还旧书。'), user('继续'), assistant('继续归还旧书。'), user('稳定')],
+      memoryRuntimeFactory: options => createV3MemoryRuntime({ ...options, store: { ...options.store, readRoot: undefined,
+        async readReachable(...args) {
+          const source = await options.store.readReachable(...args);
+          if (!rejudging || source.status !== 'ready') return source;
+          const floorOrder = new Map(source.floors.map((floor, index) => [floor.id, index]));
+          const memories = source.floorMemories.map(memory => {
+            const latest = floorOrder.get(memory.floorId) === 1, matterId = memory.qianshiDelta.events[0].matterId;
+            return { ...memory, qianshiDelta: { ...memory.qianshiDelta,
+              manualMatterStatusOverrides: [{ matterId, status: latest ? 'completed' : 'planned' }],
+              trackingOverrides: [{ matterId, following: !latest }] } };
+          });
+          return { ...source, floorMemories: reversed ? memories.reverse() : memories };
+        },
+      } }), utility: options => {
+        const request = JSON.parse(options.taskMessages[0].content);
+        if (!rejudging) {
+          const candidate = request.payload.qianshiCandidates[0];
+          return { jsonData: { summary: '原摘要。', qianshi: { events: [{ key: 'old', title: '归还旧书', description: '原约定。',
+            status: 'planned', matter: true, ...(candidate ? { links: [{ candidateKey: candidate.key, kind: 'progress' }] } : {}) }], order: [] } } };
+        }
+        observed.push(request.floors.map(floor => floor.records.map(record => ({ manualStatus: record.manualStatus,
+          status: record.status, tracking: record.tracking, following: record.following }))));
+        return rejudgeBatchResponse(request, row => ({ events: row.records.map(record => ({ key: record.key,
+          status: 'planned', actionStatus: 'planned', matter: true,
+          ...(row.floorKey === 'floor-2' ? { links: [{ candidateKey: 'floor-1:record-1', kind: 'progress' }] } : {}) })), order: [] }));
+      } });
+    await h.runtime.start();
+    for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    const before = await h.store.readReachable({ mode: 'runtime' });
+    assert.equal(before.floorMemories[0].qianshiDelta.events[0].matterId, before.floorMemories[1].qianshiDelta.events[0].matterId);
+    rejudging = true;
+    const plan = await h.runtime.prepareQianshiRejudge();
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.status, 'completed', JSON.stringify(result));
+  }
+  assert.deepEqual(observed[1], observed[0]);
+  assert.deepEqual(observed[0], [[{ manualStatus: true, status: 'completed', tracking: 'unfollowed', following: false }],
+    [{ manualStatus: true, status: 'completed', tracking: 'unfollowed', following: false }]]);
+});
+
+test('整理继续模式冷读只重判pending楼，固定原目标，补完后空计划且0与范围仍可完整重判', async () => {
+  let rejudging = false;
+  const requests = [], identity = { chatId: CHAT, hostChatId: 'host-chat', characterLocator: 'character.png', personaLocator: 'persona.png' };
+  const utility = options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (!rejudging) {
+    const candidate = request.payload.qianshiCandidates[0];
+    return { jsonData: { summary: '各楼原摘要。', qianshi: { events: [
+      { key: 'old', title: '原记录', description: '原事实。', status: 'planned', actionStatus: 'planned', matter: true, storyTime: '2026年8月1日',
+        ...(candidate ? { links: [{ candidateKey: candidate.key, kind: 'progress' }] } : {}) },
+      ...(request.payload.canonicalContent.includes('待续') ? [{ key: 'bad', title: '无效旧返回', description: '无效状态。', status: 'invalid' }] : []),
+    ], order: [] } } };
+    }
+    requests.push(request);
+    assert.deepEqual(request.floors.map(floor => floor.floorKey), ['floor-1', 'floor-3']);
+    return rejudgeBatchResponse(request, row => {
+      const candidate = row.qianshiCandidates.find(value => value.latestProgress?.sourceAssistantSeq === 2);
+      if (row.floorKey === 'floor-3') assert.ok(candidate, 'partial后楼可引用未重判完整楼的既有进展');
+      return { events: row.records.map(record => ({ key: record.key, status: 'planned', actionStatus: 'planned', matter: true,
+        ...(candidate ? { links: [{ candidateKey: candidate.key, kind: 'progress' }] } : {}) })), order: [] };
+    });
+  };
+  const seed = harness({ initialChat: [user('开始'), assistant('待续第一楼。'), user('继续'), assistant('完整第二楼。'), user('继续'),
+    assistant('待续第三楼。'), user('稳定')], utility, storeIdentityProvider: () => identity });
+  await seed.runtime.start();
+  for (const floor of seed.runtime.getState().floors) await seed.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const archived = await seed.store.readReachable({ mode: 'runtime' });
+  const before = { ...archived, floorMemories: archived.floorMemories.map((memory, index) => index === 1 ? memory : { ...memory, qianshiDelta: { ...memory.qianshiDelta, status: 'pending', reason: '请求未完成，原事件保留。' } }) };
+  for (const memory of before.floorMemories) { const key = `chat-${CHAT}/v3-floor-memory-${memory.id}`; seed.backend.records.set(key, { ...seed.backend.records.get(key), data: memory }); }
+  assert.deepEqual(before.floorMemories.map(memory => memory.qianshiDelta.status), ['pending', 'ready', 'pending']);
+  const cold = harness({ sharedBackend: seed.backend, sharedContext: seed.context, utility, storeIdentityProvider: () => identity });
+  await cold.runtime.start();
+  assert.equal(cold.calls.length, 0, '冷读不重跑模型');
+  const only = await cold.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(only.totalFloors, 2);
+  assert.equal(only.onlyIncomplete, true);
+  assert.deepEqual(only.floors.map(floor => floor.messageIndex), [1, 5]);
+  const all = await cold.runtime.prepareQianshiRejudge({ fromMessageIndex: 0, toMessageIndex: null });
+  assert.equal(all.totalFloors, 3);
+  assert.notEqual(all.planId, only.planId);
+  const range = await cold.runtime.prepareQianshiRejudge({ fromMessageIndex: 3, toMessageIndex: 3 });
+  assert.equal(range.totalFloors, 1);
+  assert.equal(range.floors[0].messageIndex, 3, '显式范围仍可选已完整楼');
+  const plan = await cold.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  const original = { chat: cold.context.chat, chatMetadata: cold.context.chatMetadata, chatId: cold.context.chatId };
+  cold.context.chatId = 'other-host'; cold.context.chatMetadata = { qianqianjie: { schemaVersion: 1, chatId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } };
+  cold.context.chat = [user('前台另一聊'), assistant('其他内容。'), user('稳定')];
+  rejudging = true;
+  const result = await cold.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(result.calls, plan.historyApiCalls + result.followup.calls);
+  assert.equal(requests.length, plan.historyApiCalls);
+  assert.equal(result.savedCompleteFloors, 2);
+  const after = await seed.store.readReachable({ mode: 'runtime' });
+  const completeFloor = before.floorMemories[1];
+  assert.deepEqual(after.floorMemories.find(memory => memory.floorId === completeFloor.floorId), completeFloor, '完整楼不发给模型且存档不重写');
+  const facts = memory => memory.qianshiDelta.events.map(event => [event.id, event.sourceFloorId, event.title, event.description, event.storyTime]);
+  assert.deepEqual(after.floorMemories.map(facts), before.floorMemories.map(facts));
+  const events = after.floorMemories.map(memory => memory.qianshiDelta.events[0]);
+  assert.deepEqual(events[1].continuesFromEventIds, [events[0].id], '未选完整楼仍引用同一前楼事件ID');
+  assert.deepEqual(events[2].continuesFromEventIds, [events[1].id], '续判后楼保持跨完整楼接续');
+  assert.equal(new Set(events.map(event => event.matterId)).size, 1);
+  assert.equal([...cold.backend.records.keys()].some(key => key.startsWith('chat-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/')), false,
+    '前台切聊不会把原目标的整理写到另一聊');
+  Object.assign(cold.context, original);
+  const completed = await cold.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(completed.status, completed.followup.apiCalls ? 'ready' : 'empty');
+  assert.equal(completed.totalFloors, 0);
+  assert.equal(completed.historyApiCalls, 0);
+  assert.equal(completed.apiCalls, completed.followup.apiCalls);
+  assert.equal(requests.length, plan.historyApiCalls, '无剩余楼时不自动发历史重判请求');
+});
+
+test('重判范围外提醒origin或完整楼进展冲突仅保旧归线，独立判断与有效状态跟进照常保存', async t => {
+  for (const kind of ['reminder', 'externalProgress', 'sharedWitness']) await t.test(kind, async () => {
+    let rejudging = false, reminderChangedDuringRequest = false, externalReferences = [];
+    const fixtureOptions = { initialChat: kind === 'reminder'
+      ? [user('开始'), assistant('甲事项。'), user('继续'), assistant('乙事项待续。'), user('稳定')]
+      : [user('开始'), assistant('甲事项待续。'), user('继续'), assistant('甲事项完整进展。'), user('继续'), assistant('甲事项待续后续。'), user('稳定')],
+      qianshiExternalReferenceProvider: () => externalReferences, utility: options => {
+        const request = JSON.parse(options.taskMessages[0].content);
+        if (!rejudging) {
+          const text = request.payload.canonicalContent, isTarget = kind === 'reminder' ? text.includes('乙') : text.includes('待续');
+          const candidate = kind !== 'reminder' ? request.payload.qianshiCandidates.find(value => value.title === '甲事项') : null;
+          return { jsonData: { summary: '原摘要。', qianshi: { events: [
+            { key: 'old', title: text.includes('乙') ? '乙事项' : '甲事项', description: '原事项事实。', status: 'inProgress', actionStatus: 'occurred', matter: true, following: true,
+              ...(candidate ? { links: [{ candidateKey: candidate.key, kind: 'progress' }] } : {}) },
+            ...(isTarget ? [{ key: 'independent', title: '独立记录', description: '独立事实。', status: 'occurred', actionStatus: 'occurred', matter: false },
+              { key: 'bad', title: '无效返回', description: '旧未通过项。', status: 'invalid' }] : []),
+          ], order: [] } } };
+        }
+        if (reminderChangedDuringRequest) externalReferences = externalReferences.map(reference => ({ ...reference, id: 'changed-outside-reminder' }));
+        return rejudgeBatchResponse(request, row => {
+          const candidate = kind === 'reminder' ? row.qianshiCandidates.find(value => value.title === '甲事项')
+            : kind === 'sharedWitness' ? row.qianshiCandidates.find(value => value.latestProgress?.sourceAssistantSeq === 2) : null;
+          return { events: row.records.map(record => ({ key: record.key, status: 'completed', actionStatus: 'completed', following: false,
+            matter: record.key === 'record-1' && kind === 'reminder' || kind === 'sharedWitness' && row.floorKey === 'floor-3' && record.key === 'record-1',
+            ...(record.key === 'record-1' && candidate ? { links: [{ candidateKey: candidate.key, kind: 'progress' }] } : {}) })), order: [] };
+        });
+      } };
+    let h = harness(fixtureOptions);
+    await h.runtime.start();
+    for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    const before = await h.store.readReachable({ mode: 'runtime' });
+    for (const memory of before.floorMemories.filter(memory => memory.qianshiDelta.status === 'partial')) {
+      const key = `chat-${CHAT}/v3-floor-memory-${memory.id}`;
+      h.backend.records.set(key, { ...h.backend.records.get(key), data: { ...memory, qianshiDelta: { ...memory.qianshiDelta, status: 'pending', reason: '本次请求未完成，原值保留。' } } });
+    }
+    const seed = h;
+    h = harness({ ...fixtureOptions, sharedBackend: seed.backend, sharedContext: seed.context }); await h.runtime.start();
+    const targetIndex = kind === 'reminder' ? 1 : 0, old = before.floorMemories[targetIndex].qianshiDelta.events[0];
+    if (kind === 'reminder') externalReferences = [{ id: 'outside-reminder', qianshiRef: { matterId: old.matterId, originEventId: old.id } }];
+    const plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+    rejudging = true;
+    assert.equal(plan.totalFloors, kind === 'reminder' ? 1 : 2);
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.status, 'completed', JSON.stringify(result));
+    assert.equal(result.commitStatus, 'saved');
+    assert.equal(result.calls, plan.historyApiCalls + result.followup.calls);
+    const after = await h.store.readReachable({ mode: 'runtime' });
+    const retained = after.floorMemories.find(memory => memory.floorId === before.floorMemories[targetIndex].floorId).qianshiDelta.events[0];
+    assert.deepEqual([retained.matterId, retained.updatesMatter, retained.continuesFromEventIds], [old.matterId, old.updatesMatter, old.continuesFromEventIds]);
+    assert.equal(retained.status, 'completed'); assert.equal(retained.following, false, '结构保留不吞有效状态和跟进判断');
+    assert.match(result.outcomes.find(row => row.floorId === retained.sourceFloorId).message, /归线.*沿用原值/u);
+    const fullIndex = kind === 'reminder' ? 0 : 1;
+    assert.deepEqual(after.floorMemories.find(memory => memory.floorId === before.floorMemories[fullIndex].floorId), before.floorMemories[fullIndex]);
+    assert.ok(after.floorMemories.flatMap(memory => memory.qianshiDelta.events).filter(event => event.title === '独立记录').every(event => event.status === 'completed'));
+    const graph = projectQianshiGraph(after);
+    assert.deepEqual(graph.diagnostics.danglingRelationIds, []);
+    if (kind === 'reminder') assert.ok(graph.matters.some(matter => matter.matterId === old.matterId && matter.origin.eventId === old.id));
+    else assert.ok(before.floorMemories[1].qianshiDelta.relations.filter(relation => relation.type === 'progress')
+      .every(relation => graph.relations.some(value => value.id === relation.id)), '未选完整楼有效进展关系保持');
+    if (kind === 'reminder') {
+      const pending = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: before.floors[targetIndex].hostLocator.messageIndex, toMessageIndex: before.floors[targetIndex].hostLocator.messageIndex });
+      reminderChangedDuringRequest = true;
+      const retained = await h.runtime.startQianshiRejudge(pending.planId);
+      assert.equal(retained.status, 'completed', JSON.stringify(retained));
+      const current = await h.store.readReachable({ mode: 'runtime' });
+      assert.equal(current.rootRevision, after.rootRevision + 1, '提醒身份变化局部保原归线，健康判断仍一次提交');
+      assert.ok(projectQianshiGraph(current).matters.some(matter => matter.matterId === old.matterId && matter.origin.eventId === old.id));
+    }
+  });
+});
+
+test('重判24楼63旧记录空events保旧结束，显式再审旧判断表完整回填且预算同派发', async () => {
+  let mode = 'seed', extracted = 0, currentPlan;
+  const requests = [], initialChat = [user('开始')];
+  for (let index = 0; index < 24; index += 1) initialChat.push(assistant(`中性原始记录${index + 1}。`), user(`稳定${index}`));
+  const h = harness({ initialChat, utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (mode === 'seed') {
+      extracted += 1;
+      return { jsonData: { summary: '中性摘要。', qianshi: { events: Array.from({ length: extracted <= 15 ? 3 : 2 }, (_, index) => ({ key: `old-${index + 1}`,
+        title: `记录${index + 1}`, description: '原事实。', status: 'occurred', actionStatus: 'occurred', matter: false })), order: [] } } };
+    }
+    requests.push(request);
+    assert.equal(options.jsonSchema, undefined, '不强制供应商原生schema');
+    if (mode === 'empty') return { jsonData: { floors: request.floors.map(floor => ({ floorKey: floor.floorKey, qianshi: { events: [], order: [{ before: 'record-1', after: 'record-2', certainty: 'explicit' }] } })) } };
+    assert.match(options.systemPrompt, /recordDecisions.*record-1.*status.*actionStatus.*matter/u);
+    for (const floor of request.floors) assert.deepEqual(floor.requiredRecordKeys, floor.records.map(record => record.key));
+    const actual = estimateRecallTokens(`${BASE_PROCESSING_PROMPT}\n\n${options.systemPrompt}\n${JSON.stringify(request)}`);
+    assert.equal(actual, currentPlan.batches[0].estimatedInputTokens, '判断表材料由预览和派发同一构建器计算');
+    return { jsonData: { floors: request.floors.map((floor, index) => ({ floorKey: floor.floorKey, qianshi: {
+      recordDecisions: floor.requiredRecordKeys.map(key => ({ key, status: 'occurred', actionStatus: 'occurred', matter: false, links: [] })),
+      ...(index === 0 ? { newEvents: [{ key: 'event-1', title: '漏记事实', description: '同楼原文支持的新事实。', status: 'occurred', actionStatus: 'occurred', matter: false }] } : {}), order: [],
+    } })) } };
+  } });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(before.floorMemories.flatMap(memory => memory.qianshiDelta.events).length, 63);
+  mode = 'empty'; currentPlan = await h.runtime.prepareQianshiRejudge();
+  const empty = await h.runtime.startQianshiRejudge(currentPlan.planId);
+  assert.equal(empty.status, 'completed'); assert.equal(empty.savedCompleteFloors, 0); assert.equal(empty.savedFloors, 24); assert.equal(empty.savedPartialFloors, 24, '质量partial仍记录，但可用保旧结果结束处理');
+  const retained = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(retained.floorMemories.map(memory => memory.qianshiDelta.events), before.floorMemories.map(memory => memory.qianshiDelta.events));
+  const noAutomaticRepeat = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(noAutomaticRepeat.totalFloors, 0); assert.equal(noAutomaticRepeat.apiCalls, 0, '可用保旧结果不强制再付费');
+  mode = 'decisions'; currentPlan = await h.runtime.prepareQianshiRejudge();
+  assert.equal(currentPlan.apiCalls, 1);
+  const complete = await h.runtime.startQianshiRejudge(currentPlan.planId);
+  assert.equal(complete.status, 'completed', JSON.stringify(complete));
+  assert.equal(complete.outcomes.length, 24); assert.equal(complete.savedPartialFloors, 0); assert.equal(complete.calls, 1);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  const oldMemoryIds = new Map(retained.floorMemories.map(memory => [memory.floorId, memory.id]));
+  const changedFloors = after.floorMemories.filter(memory => oldMemoryIds.get(memory.floorId) !== memory.id).length;
+  assert.equal(complete.savedCompleteFloors, changedFloors, '保存数只统计实际变更的楼，未变旧楼不重复写');
+  assert.ok(changedFloors > 0, '合法漏记事实确实发布新记录');
+  const oldIds = new Set(before.floorMemories.flatMap(memory => memory.qianshiDelta.events.map(event => event.id)));
+  const facts = event => [event.id, event.sourceFloorId, event.title, event.description, event.people, event.object, event.storyTime, event.scheduledTime];
+  assert.deepEqual(after.floorMemories.flatMap(memory => memory.qianshiDelta.events).filter(event => oldIds.has(event.id)).map(facts), before.floorMemories.flatMap(memory => memory.qianshiDelta.events).map(facts));
+  assert.equal(after.floorMemories.flatMap(memory => memory.qianshiDelta.events).length, 64);
+});
+
+test('重判分表的未知重复旧键及newEvents冒充旧record不能伪报完整，合法漏记仍保留', async () => {
+  let mode = 'seed';
+  const h = harness({ initialChat: [user('开始'), assistant('两条中性原事实。'), user('稳定')], utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (mode === 'seed') return { jsonData: { summary: '原摘要。', qianshi: { events: [1, 2].map(index => ({ key: `old-${index}`, title: `原记录${index}`,
+      description: '原事实。', status: 'occurred', actionStatus: 'occurred', matter: false })), order: [] } } };
+    const first = { key: 'record-1', status: 'completed', actionStatus: 'completed', matter: false, links: [] };
+    const decisions = mode === 'duplicate' ? [first, { ...first }] : mode === 'unknown' ? [first, { ...first, key: 'record-999' }] : [first];
+    return { jsonData: { floors: request.floors.map(floor => ({ floorKey: floor.floorKey, qianshi: { recordDecisions: decisions,
+      ...(mode === 'impersonation' || mode === 'missing' ? { newEvents: [{ key: mode === 'impersonation' ? 'record-2' : 'event-1',
+        title: '新事实', description: '原文支持的补充。', status: 'occurred', actionStatus: 'occurred', matter: false }] } : {}), order: [] } })) } };
+  } });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const original = (await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].qianshiDelta.events;
+  for (mode of ['duplicate', 'unknown', 'impersonation', 'missing']) {
+    const plan = await h.runtime.prepareQianshiRejudge();
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.status, 'completed', JSON.stringify({ mode, result }));
+    const events = (await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].qianshiDelta.events;
+    assert.equal(events.length, mode === 'missing' ? 3 : 2, mode);
+    assert.deepEqual(events.find(event => event.id === original[1].id), original[1], '旧record-2缺审阅时按原值保留');
+    assert.equal(events.find(event => event.id === original[0].id).status, 'completed', '有效独立旧判断照常保存');
+  }
+});
+
+test('重判只对允许且已绑定的更早前缀做等价归一化，未知和未来context仍保旧partial', async () => {
+  let rejudging = false;
+  const h = harness({ initialChat: [user('开始'), assistant('先约好归还旧书。'), user('继续'), assistant('再处理旧书。'), user('继续'), assistant('中性旁观记录。'), user('稳定')], utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (!rejudging) return { jsonData: { summary: '原摘要。', qianshi: { events: [{ key: 'old', title: '原记录', description: '原事实。',
+      status: 'planned', actionStatus: 'planned', matter: true }], order: [] } } };
+    return { jsonData: { floors: request.floors.map((floor, index) => ({ floorKey: floor.floorKey, qianshi: { recordDecisions: [{ key: 'record-1',
+      status: 'planned', actionStatus: 'planned', matter: true,
+      links: index === 1 ? [{ candidateKey: '更早floor-1:record-1', kind: 'progress' }]
+        : index === 2 ? [{ candidateKey: '更早floor-3:record-1', kind: 'context' }] : [] }],
+      ...(index === 1 ? { newEvents: [{ key: 'event-1', title: '独立事实', description: '有据的新事实。', status: 'occurred', actionStatus: 'occurred', matter: false,
+        links: [{ candidateKey: '更早floor-1:record-1', kind: 'context' }] }],
+        order: [{ before: '更早floor-1:record-1', after: 'event-1', certainty: 'explicit' }] } : { order: [] }) } })) } };
+  } });
+  await h.runtime.start(); for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  const plan = await h.runtime.prepareQianshiRejudge(); rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.deepEqual(result.outcomes.map(outcome => outcome.status), ['saved-complete', 'saved-complete', 'saved-partial']);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(after.floorMemories[1].qianshiDelta.events[0].matterId, after.floorMemories[0].qianshiDelta.events[0].matterId);
+  assert.ok(after.floorMemories[1].qianshiDelta.relations.some(relation => relation.type === 'before'));
+  assert.deepEqual(after.floorMemories[2].qianshiDelta.events, before.floorMemories[2].qianshiDelta.events, '当前/未来楼引用即使带context也按原条保留');
+});
+
+test('重判旧events共享池已知早期context不受相关度子表限制，事实保留且状态接收', async () => {
+  let rejudging = false;
+  const h = harness({ initialChat: [user('开始'), assistant('灯塔。'), user('继续'), assistant('苹果。'), user('继续'), assistant('灯塔。'), user('稳定')], utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (!rejudging) return { jsonData: { summary: '原摘要。', qianshi: { events: [{ key: 'old', title: request.payload.canonicalContent.includes('灯塔') ? '灯塔事实' : '普通事实',
+      description: request.payload.canonicalContent, status: 'occurred', actionStatus: 'occurred', matter: false }], order: [] } } };
+    const restricted = request.qianshiCandidates.find(candidate => !request.floors[0].qianshiCandidateKeys.includes(candidate.key));
+    assert.ok(restricted, '共享池有后楼可用但本楼不允许的候选');
+    return rejudgeBatchResponse(request, row => ({ events: row.records.map(record => ({ key: record.key,
+      status: 'completed', actionStatus: 'completed', matter: false,
+      ...(row.floorKey === 'floor-2' ? { links: [{ candidateKey: restricted.key, kind: 'context' }] } : {}) })), order: [] }));
+  } });
+  await h.runtime.start(); for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  const plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: 3, toMessageIndex: 5 }); rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.deepEqual(result.outcomes.map(outcome => outcome.status), ['saved-complete', 'saved-complete']);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(after.floorMemories[1].qianshiDelta.events[0].description, before.floorMemories[1].qianshiDelta.events[0].description);
+  assert.equal(after.floorMemories[1].qianshiDelta.events[0].status, 'completed');
+  assert.equal(after.floorMemories[2].qianshiDelta.events[0].status, 'completed');
+});
+
+test('受范围外完整楼引用的非origin进展明确keepLine可完成，状态跟进更新且再次继续0API', async () => {
+  let rejudging = false;
+  const fixtureOptions = { initialChat: [user('开始'), assistant('甲事项起点。'), user('继续'), assistant('甲事项待续进展。'), user('继续'), assistant('甲事项完整后续。'), user('稳定')], utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (!rejudging) {
+      const candidate = request.payload.qianshiCandidates[0];
+      return { jsonData: { summary: '原摘要。', qianshi: { events: [{ key: 'old', title: '甲事项', description: '原进展事实。', status: 'inProgress', actionStatus: 'occurred', matter: true, following: true,
+        ...(candidate ? { links: [{ candidateKey: candidate.key, kind: 'progress' }] } : {}) },
+        ...(request.payload.canonicalContent.includes('待续') ? [{ key: 'bad', title: '旧未通过项', description: '旧无效返回。', status: 'invalid' }] : [])], order: [] } } };
+    }
+    assert.equal(request.floors.length, 1);
+    const floor = request.floors[0];
+    assert.equal(floor.floorKey, 'floor-2'); assert.equal(floor.records[0].preserveLine, true);
+    return { jsonData: { floors: [{ floorKey: floor.floorKey, qianshi: { recordDecisions: [{ key: 'record-1', keepLine: true,
+      status: 'completed', actionStatus: 'completed', following: false }] } }] } };
+  } };
+  let h = harness(fixtureOptions);
+  await h.runtime.start(); for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const before = await h.store.readReachable({ mode: 'runtime' }), old = before.floorMemories[1].qianshiDelta.events[0];
+  assert.notEqual(projectQianshiGraph(before).matters[0].origin.eventId, old.id);
+  const pending = h.backend.records.get(`chat-${CHAT}/v3-floor-memory-${before.floorMemories[1].id}`);
+  pending.data.qianshiDelta.status = 'pending'; pending.data.qianshiDelta.reason = '原请求尚未完成，旧记录保留。';
+  const seed = h; h = harness({ ...fixtureOptions, sharedBackend: seed.backend, sharedContext: seed.context }); await h.runtime.start();
+  const plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true }); rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.savedCompleteFloors, 1);
+  const after = await h.store.readReachable({ mode: 'runtime' }), saved = after.floorMemories[1].qianshiDelta.events[0];
+  assert.deepEqual([saved.id, saved.matterId, saved.updatesMatter, saved.continuesFromEventIds], [old.id, old.matterId, old.updatesMatter, old.continuesFromEventIds]);
+  assert.equal(saved.status, 'completed'); assert.equal(saved.following, false);
+  assert.equal(Object.hasOwn(saved, 'keepLine'), false, 'keepLine不进入存档schema');
+  assert.deepEqual(after.floorMemories[0], before.floorMemories[0]); assert.deepEqual(after.floorMemories[2], before.floorMemories[2]);
+  assert.deepEqual(projectQianshiGraph(after).diagnostics.danglingRelationIds, []);
+  const again = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(again.totalFloors, 0); assert.equal(again.historyApiCalls, 0); assert.equal(again.followup.apiCalls, 1);
+});
+
+test('重判未来楼前缀不能归一成可用候选，旧条目坏context仍partial保原值', async () => {
+  let rejudging = false;
+  const h = harness({ initialChat: [user('开始'), assistant('中性旧记录。'), user('稳定')], utility: options => {
+    if (!rejudging) return { jsonData: { summary: '原摘要。', qianshi: { events: [{ key: 'old', title: '原记录', description: '原事实。', status: 'planned', actionStatus: 'planned', matter: true }], order: [] } } };
+    const request = JSON.parse(options.taskMessages[0].content);
+    return { jsonData: { floors: request.floors.map(floor => ({ floorKey: floor.floorKey, qianshi: { recordDecisions: [{ key: 'record-1', status: 'completed', actionStatus: 'completed', matter: false,
+      links: [{ candidateKey: '更早floor-99:record-1', kind: 'context' }] }] } })) } };
+  } });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const before = (await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].qianshiDelta.events;
+  const plan = await h.runtime.prepareQianshiRejudge(); rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.deepEqual((await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].qianshiDelta.events, before);
+});
+
+test('重判完整旧判断中的未知order候选仍标partial，已通过的旧状态照常保存', async () => {
+  let rejudging = false;
+  const h = harness({ initialChat: [user('开始'), assistant('中性旧记录。'), user('稳定')], utility: options => {
+    if (!rejudging) return { jsonData: { summary: '原摘要。', qianshi: { events: [{ key: 'old', title: '原记录', description: '原事实。', status: 'occurred', actionStatus: 'occurred', matter: false }], order: [] } } };
+    const request = JSON.parse(options.taskMessages[0].content);
+    return { jsonData: { floors: request.floors.map(floor => ({ floorKey: floor.floorKey, qianshi: { recordDecisions: [{ key: 'record-1', status: 'completed', actionStatus: 'completed', matter: false }],
+      order: [{ before: '更早floor-99:record-1', after: 'record-1', certainty: 'explicit' }] } })) } };
+  } });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const plan = await h.runtime.prepareQianshiRejudge(); rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  const delta = (await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].qianshiDelta;
+  assert.equal(delta.events[0].status, 'completed'); assert.deepEqual(delta.relations, []);
+});
+
+test('整理n加收尾一次确认计划，零历史仍全局复核并在截止楼追加progress保早期回放', async () => {
+  const reviews = [];
+  const h = harness({ initialChat: [user('先约好归还'), assistant('约好归还旧书。'), user('后来已结束该场景'), assistant('当前转入新场景，借款下周偿还。'), user('稳定')],
+    todoReview: request => {
+      reviews.push(request);
+      assert.equal(request.timeline.length, 2, '全部摘要都进入全局材料');
+      assert.ok(request.users.some(row => row.content.includes('后来已结束')));
+      assert.equal(Object.hasOwn(request, 'source'), false);
+      return { jsonData: { decisions: request.matters.map(matter => ({ key: matter.key, status: matter.status,
+        following: matter.records.some(row => row.title === '归还旧书') ? false : true,
+        reason: matter.records.some(row => row.title === '归还旧书') ? '截至本楼，临时场景已结束，无独立未决后果。' : '下周约定仍待履行。', evidenceFloorKeys: ['floor-2'] })) } };
+    }, utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      return { jsonData: { summary: request.payload.canonicalContent, qianshi: { events: [{ key: 'old',
+        title: request.payload.canonicalContent.includes('旧书') ? '归还旧书' : '偿还借款', description: '原约定事实。',
+        status: 'planned', actionStatus: 'planned', following: true, matter: true, storyTime: '2026年8月1日', scheduledTime: '2026年8月8日' }], order: [] } } };
+    } });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  const plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(plan.status, 'ready', '历史空时尾审可启动');
+  assert.equal(plan.totalFloors, 0);
+  assert.equal(plan.historyApiCalls, 0);
+  assert.equal(plan.followup.apiCalls, 1);
+  assert.equal(plan.apiCalls, 1);
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(result.commitStatus, 'saved');
+  assert.equal(result.calls, plan.historyApiCalls + result.followup.calls);
+  assert.deepEqual([result.followup.evaluated, result.followup.stopped, result.followup.continued, result.followup.missing], [2, 1, 1, 0]);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(after.floorMemories[0], before.floorMemories[0], '不回写早期楼');
+  const last = after.floorMemories.at(-1), oldLast = before.floorMemories.at(-1);
+  assert.deepEqual(last.qianshiDelta.events.slice(0, oldLast.qianshiDelta.events.length), oldLast.qianshiDelta.events);
+  const progress = last.qianshiDelta.events.at(-1), origin = before.floorMemories[0].qianshiDelta.events[0];
+  assert.equal(progress.matterId, origin.matterId);
+  assert.equal(progress.sourceFloorId, before.floors.at(-1).id);
+  assert.deepEqual(progress.continuesFromEventIds, [origin.id]);
+  assert.equal(progress.status, 'planned', '停追不伪造完成');
+  assert.match(progress.description, /跟进复核/u);
+  assert.equal(progress.storyTime, origin.storyTime);
+  assert.equal(progress.scheduledTime, origin.scheduledTime);
+  const graph = projectQianshiGraph(after);
+  assert.equal(graph.matters.find(matter => matter.matterId === origin.matterId).following, false);
+  const prefix = projectQianshiGraph({ ...after, floors: after.floors.slice(0, 1), floorMemories: after.floorMemories.slice(0, 1) });
+  assert.equal(prefix.matters[0].following, true, '回放截止楼以前自然移除晚期判断');
+  const again = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  const againResult = await h.runtime.startQianshiRejudge(again.planId);
+  assert.equal(againResult.status, 'completed');
+  assert.equal(againResult.followup.appended, 0);
+  assert.equal((await h.store.readReachable({ mode: 'runtime' })).rootRevision, after.rootRevision, '无变化不空写');
+  assert.equal(reviews.length, 2);
+});
+
+async function prepareFollowingFixture({ review, historyResult, count = 2, summaryLength = 0, userLength = 0, external = () => [] } = {}) {
+  let rejudging = false;
+  const chat = [];
+  for (let index = 0; index < count; index += 1) chat.push(user(`USER材料${index}${'用'.repeat(userLength)}`), assistant(`中性事项${index}。`));
+  chat.push(user('稳定'));
+  const h = harness({ initialChat: chat, qianshiExternalReferenceProvider: external,
+    todoReview: review,
+    utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (rejudging) return rejudgeBatchResponse(request, row => historyResult?.(row) ?? ({ recordDecisions: row.records.map(record => ({
+        key: record.key, status: 'planned', actionStatus: 'planned', following: true, matter: true, links: [] })) }));
+      return { jsonData: { summary: `摘要${request.payload.canonicalContent}${'材料。'.repeat(summaryLength)}`, qianshi: { events: [
+        { key: 'original', title: request.payload.canonicalContent, description: '保留原事实。', status: 'planned', matter: true, following: true },
+        { key: 'bad', title: '无效项', description: '触发历史partial。', status: 'invalid' },
+      ], order: [] } } };
+    } });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  rejudging = true;
+  return h;
+}
+
+test('整理收尾看历史暂存新图，缺重复坏单项保旧，有效停追与历史partial同次CAS', async () => {
+  let observed = null;
+  const h = await prepareFollowingFixture({ count: 4, historyResult: row => ({ recordDecisions: row.records.map(record => ({
+    key: record.key, status: row.floorKey === 'floor-2' ? 'inProgress' : 'planned', actionStatus: 'planned', following: true, matter: true, links: [] })),
+    ...(row.floorKey === 'floor-1' ? { newEvents: [{ key: 'event-1', title: '一次性漏记', description: '原楼有据新事实。', status: 'occurred', matter: false }] } : {}) }),
+    review: request => {
+      observed = request;
+      const rows = request.matters;
+      assert.ok(rows.some(row => row.status === 'inProgress'), '尾审读取本轮暂存状态');
+      return { jsonData: { decisions: [
+        { key: rows[0].key, status: rows[0].status, following: false, reason: '临时目标已无后续价值。', evidenceFloorKeys: ['floor-4'] },
+        { key: rows[1].key, status: 'planned', following: false, reason: '重复键。', evidenceFloorKeys: [] },
+        { key: rows[1].key, status: 'completed', following: false, reason: '重复键。', evidenceFloorKeys: [] },
+        { key: rows[2].key, status: 'invalid', following: false, reason: '坏状态。', evidenceFloorKeys: [] },
+        { key: 'unknown', status: 'completed', following: false, reason: '未知身份。', evidenceFloorKeys: [] },
+      ] } };
+    } });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  const puts = h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length;
+  const plan = await h.runtime.prepareQianshiRejudge();
+  assert.equal(plan.apiCalls, plan.historyApiCalls + plan.followup.apiCalls);
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'partial', JSON.stringify(result));
+  assert.equal(result.commitStatus, 'saved');
+  assert.equal(result.followup.evaluated, 1);
+  assert.equal(result.followup.missing, 3);
+  assert.equal(result.request.outcome, 'failed');
+  assert.equal(result.request.error.code, 'QIANSHI_FOLLOWUP_PARTIAL');
+  assert.equal(result.followup.appended, 1);
+  assert.equal(result.calls, plan.historyApiCalls + result.followup.calls);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length - puts, 1);
+  assert.ok(observed.timeline.every(row => !Object.hasOwn(row, 'source')));
+  for (const memory of before.floorMemories) assert.deepEqual(after.floorMemories.find(row => row.floorId === memory.floorId).summary, memory.summary);
+  assert.equal(after.floorMemories.at(-1).qianshiDelta.events.length, 2);
+  assert.equal(after.floorMemories[0].qianshiDelta.events.length, 2, '新漏记保留，复核不重拆旧线');
+});
+
+test('整理末阶段失败或无关外部引用变化保健康历史，自身取消仍零提交', async t => {
+  for (const mode of ['failure', 'failureSensitive', 'cancel', 'external']) await t.test(mode, async () => {
+    let h, references = [];
+    h = await prepareFollowingFixture({ external: () => references, review: async (request, options) => {
+      if (mode === 'cancel') {
+        queueMicrotask(() => { void h.runtime.stopQianshiHistory(); });
+        await new Promise(resolve => options.signal.addEventListener('abort', resolve, { once: true }));
+      }
+      if (mode === 'external') references = [{ id: 'new-reminder', qianshiRef: { matterId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', originEventId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } }];
+      throw new TypeError(mode === 'failureSensitive' ? '读取 https://private.test sk-private-token 失败' : "Cannot read properties of undefined (reading 'matters')");
+    } });
+    const before = await h.store.readReachable({ mode: 'runtime' });
+    const plan = await h.runtime.prepareQianshiRejudge();
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    const after = await h.store.readReachable({ mode: 'runtime' });
+    if (mode === 'failure' || mode === 'failureSensitive' || mode === 'external') {
+      assert.equal(result.status, 'partial'); assert.equal(result.commitStatus, 'saved');
+      assert.equal(result.savedFloors, 2); assert.equal(result.followup.status, 'failed');
+      assert.equal(result.request.outcome, 'failed');
+      assert.equal(result.request.error.code, 'QIANSHI_FOLLOWUP_FAILED');
+      assert.equal(after.rootRevision, before.rootRevision + 1);
+      assert.equal(result.failure.stage, 'followup');
+      assert.equal(result.failure.detail, mode === 'failureSensitive' ? '[REDACTED]' : "Cannot read properties of undefined (reading 'matters')");
+      assert.doesNotMatch(JSON.stringify(result), /private\.test|sk-private-token/u);
+    } else {
+      assert.equal(result.status, 'stopped', JSON.stringify(result));
+      assert.deepEqual(after, before, '真实数据变动/取消不发布历史与收尾暂存结果');
+    }
+  });
+});
+
+test('整理全局末阶段按容量扫描全部摘要窗口，末窗承接累计判断且计划实际一致', async () => {
+  const requests = [];
+  const h = await prepareFollowingFixture({ count: 3, summaryLength: 2000, review: request => {
+    requests.push(request);
+    assert.deepEqual(new Set(request.users.map(row => row.key)), new Set(request.timeline.flatMap(row => row.userRefs)), '每窗只携带本窗引用USER');
+    if (requests.length > 1 && request.previousDecisions.length) assert.ok(request.previousDecisions.every(row => row.reason));
+    return { jsonData: { decisions: request.matters.map(matter => ({ key: matter.key, status: matter.status,
+      following: !request.finalWindow, reason: request.finalWindow ? '完整扫描后停止临时跟进。' : '保留前窗评估等待后文。',
+      evidenceFloorKeys: request.timeline.length ? [request.timeline.at(-1).floorKey] : [] })) } };
+  } });
+  const plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true, maxInputTokens: 6500 });
+  assert.ok(plan.followup.apiCalls > 1);
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(result.followup.calls, plan.followup.apiCalls);
+  assert.equal(result.followup.stopped, 3);
+  assert.equal(result.followup.appended, 3);
+  const covered = new Set(requests.flatMap(request => request.timeline.map(row => row.floorKey)));
+  assert.deepEqual([...covered].sort(), ['floor-1', 'floor-2', 'floor-3']);
+  assert.ok(requests.some(request => request.previousDecisions.length), '后窗承接前窗判断');
+});
+
+test('整理末阶段保护人工head状态和整线状态跟进，不借新进展绕过人工权威', async () => {
+  let changing = false, seen;
+  const h = await prepareFollowingFixture({ count: 3, review: request => {
+    seen = request;
+    return { jsonData: { decisions: request.matters.map(matter => ({ key: matter.key,
+      status: changing ? 'completed' : matter.status, following: changing ? false : matter.following,
+      reason: '复核判断。', evidenceFloorKeys: [] })) } };
+  } });
+  let plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  await h.runtime.startQianshiRejudge(plan.planId);
+  let snapshot = h.runtime.getQianshiSnapshot();
+  const first = snapshot.events.find(event => event.assistantSeq === 1 || event.sourceAssistantSeq === 1);
+  await h.runtime.editQianshiEventText({ eventId: first.id, expected: { memoryId: first.sourceFloorMemoryId, title: first.title, description: first.description, object: first.object }, title: first.title, description: first.description, object: first.object, status: 'inProgress' });
+  snapshot = h.runtime.getQianshiSnapshot();
+  const second = snapshot.matters.find(matter => matter.sourceAssistantSeq === 2);
+  await h.runtime.setQianshiMatterFollowing({ matterId: second.matterId, following: false, expectedFollowing: true });
+  await h.runtime.setQianshiMatterFollowing({ matterId: second.matterId, following: true, expectedFollowing: false });
+  const third = h.runtime.getQianshiSnapshot().matters.find(matter => matter.sourceAssistantSeq === 3);
+  await h.runtime.setQianshiMatterStatus({ matterId: third.matterId, status: 'inProgress', expectedStatus: 'planned', expectedManualStatus: null });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(plan.totalFloors, 0); assert.equal(plan.followup.protectedMatters, 1);
+  changing = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(seen.matters.length, 2);
+  snapshot = h.runtime.getQianshiSnapshot();
+  const firstMatter = snapshot.matters.find(matter => matter.currentEventId === first.id);
+  assert.equal(firstMatter.status, 'inProgress'); assert.equal(firstMatter.currentStatusManuallyEdited, true);
+  assert.equal(snapshot.matters.find(matter => matter.matterId === second.matterId).following, true);
+  assert.equal(snapshot.matters.find(matter => matter.matterId === third.matterId).status, 'inProgress');
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  for (const memory of before.floorMemories) {
+    const saved = after.floorMemories.find(row => row.floorId === memory.floorId);
+    for (const field of ['manualEventOverrides', 'manualMatterStatusOverrides', 'trackingOverrides']) assert.deepEqual(saved.qianshiDelta[field], memory.qianshiDelta[field]);
+  }
+});
+
+test('整理零历史时最新楼160事件容量不足在prepare拒绝，零模型零存档写入', async () => {
+  const seed = await prepareFollowingFixture();
+  const source = await seed.store.readReachable({ mode: 'runtime' });
+  for (const memory of source.floorMemories) {
+    const stored = seed.backend.records.get([...seed.backend.records.keys()].find(key => key.endsWith('/' + seed.store.recordKey(memory))));
+    stored.data.qianshiDelta.status = 'ready'; stored.data.qianshiDelta.reason = null;
+    if (memory.floorId === source.floors.at(-1).id) {
+      for (let index = 1; index < 160; index += 1) stored.data.qianshiDelta.events.push({ ...stored.data.qianshiDelta.events[0],
+        id: await deterministicUuid(['followup-capacity', index]), matterId: null, updatesMatter: false, status: 'occurred', following: false });
+    }
+  }
+  const h = harness({ sharedBackend: seed.backend, sharedContext: seed.context, utility: () => { throw new Error('不应调用模型'); } });
+  await h.runtime.start();
+  const puts = h.backend.calls.filter(call => call[0] === 'put').length;
+  await assert.rejects(h.runtime.prepareQianshiRejudge({ onlyIncomplete: true }), error => error.code === 'QIANSHI_FOLLOWUP_CAPACITY');
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.backend.calls.filter(call => call[0] === 'put').length, puts);
+});
+
+test('整理尾审实际容量增长超限不再调用模型，历史有效结果仍一次保存并明确尾审未成', async () => {
+  let reviewCalls = 0;
+  const h = await prepareFollowingFixture({ historyResult: row => ({ recordDecisions: row.records.map(record => ({
+    key: record.key, status: 'planned', actionStatus: 'planned', following: true, matter: true, links: [] })),
+    ...(row.floorKey === 'floor-2' ? { newEvents: Array.from({ length: 158 }, (_, index) => ({ key: `event-${index + 1}`,
+      title: `中性事实${index}`, description: '原楼独立事实。', status: 'occurred', matter: false })) } : {}) }),
+    review: () => { reviewCalls += 1; throw new Error('实际容量不足时不可调用尾审'); } });
+  const plan = await h.runtime.prepareQianshiRejudge();
+  assert.equal(plan.followup.apiCalls, 1);
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'partial', JSON.stringify(result));
+  assert.equal(result.commitStatus, 'saved'); assert.equal(result.savedFloors, 2);
+  assert.equal(result.followup.status, 'failed'); assert.equal(result.followup.reasonCode, 'QIANSHI_FOLLOWUP_CAPACITY');
+  assert.equal(result.followup.totalMatters, 2); assert.equal(reviewCalls, 0);
+  assert.equal(result.calls, plan.historyApiCalls);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(after.rootRevision, before.rootRevision + 1);
+  assert.equal(after.floorMemories.at(-1).qianshiDelta.events.length, 159);
+});
+
+test('整理尾审材料视图空摘要仍保USER和事项线，后楼有据完成可追加进展', async () => {
+  const seed = await prepareFollowingFixture();
+  const source = await seed.store.readReachable({ mode: 'runtime' });
+  for (const memory of source.floorMemories) {
+    const stored = seed.backend.records.get([...seed.backend.records.keys()].find(key => key.endsWith('/' + seed.store.recordKey(memory))));
+    stored.data.qianshiDelta.status = 'ready'; stored.data.qianshiDelta.reason = null;
+    if (memory.floorId === source.floors[1].id) stored.data.summary = { ...stored.data.summary, aiText: '后楼材料明确记载第一项已完成。' };
+  }
+  let requestSeen, returned = false;
+  const h = harness({ sharedBackend: seed.backend, sharedContext: seed.context,
+    // 只对取材视图注入空值。正式schema仍拒绝空人工摘要，提交保留真实有效档案。
+    memoryRuntimeFactory: options => createV3MemoryRuntime({ ...options, store: { ...options.store, readRoot: undefined,
+      async readReachable(...args) {
+        const current = await options.store.readReachable(...args);
+        if (returned || current.status !== 'ready') return current;
+        return { ...current, floorMemories: current.floorMemories.map(memory => memory.floorId !== current.floors[0].id ? memory
+          : { ...memory, summary: { ...memory.summary, effectiveSource: 'user', userText: '' } }) };
+      } } }),
+    todoReview: request => {
+      requestSeen = request; returned = true;
+      assert.equal(request.timeline[0].summary, '');
+      assert.ok(request.timeline[0].userRefs.length);
+      assert.ok(request.users.some(row => row.content === 'USER材料0'));
+      assert.ok(request.timeline[1].summary.includes('第一项已完成'));
+      return { jsonData: { decisions: request.matters.map(matter => ({ key: matter.key,
+        status: matter.records.some(row => row.floorKey === 'floor-1') ? 'completed' : matter.status,
+        following: !matter.records.some(row => row.floorKey === 'floor-1'), reason: '后楼明确完成证据。', evidenceFloorKeys: ['floor-2'] })) } };
+    } });
+  await h.runtime.start();
+  const plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(plan.status, 'ready'); assert.equal(plan.followup.apiCalls, 1);
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.ok(requestSeen); assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(result.followup.completed, 1); assert.equal(result.followup.appended, 1);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(after.floorMemories[0].summary, source.floorMemories[0].summary);
+  assert.equal(after.floorMemories.at(-1).qianshiDelta.events.at(-1).status, 'completed');
+  assert.deepEqual(after.floorMemories[0].qianshiDelta.events, source.floorMemories[0].qianshiDelta.events);
+});
+
+test('274共享池旧阶段同事项键重绑本楼有效端点，早期context不因相关度子表丢状态，未来仍拒绝', async t => {
+  for (const future of [false, true]) await t.test(future ? '真实未来仍partial' : '旧阶段及早期context有效', async () => {
+    let rejudging = false;
+    const fixtureOptions = { initialChat: [user('开始'), assistant('旧书约定与车票。'), user('继续'), assistant('待续旧书和车票。'),
+      user('继续'), assistant('旧书有了新进展。'), user('继续'), assistant('待续旧书。'), user('稳定')], utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (!rejudging) {
+        const candidate = request.payload.qianshiCandidates.find(row => row.candidateType === 'matter');
+        return { jsonData: { summary: request.payload.canonicalContent, qianshi: { events: [{ key: 'old', title: '旧书约定',
+          description: '按原约定继续归还旧书。', status: 'planned', following: true, matter: true,
+          ...(candidate ? { links: [{ candidateKey: candidate.key, kind: 'progress' }] } : {}) },
+          ...(!candidate ? [{ key: 'ticket', title: '车票提示', description: '收到车票信息。', status: 'occurred', matter: false }] : []),
+          ...(request.payload.canonicalContent.includes('待续') ? [{ key: 'bad', title: '坏项', description: '原返回坏值。', status: 'invalid' }] : [])], order: [] } } };
+      }
+      const early = request.qianshiCandidates.find(row => row.candidateType === 'matter' && row.latestProgress.sourceAssistantSeq === 1);
+      const later = request.qianshiCandidates.find(row => row.candidateType === 'matter' && row.latestProgress.sourceAssistantSeq === 3);
+      const context = request.qianshiCandidates.find(row => row.candidateType === 'event');
+      assert.ok(early && later && context);
+      assert.equal(request.floors[1].qianshiCandidateKeys.includes(early.key), false);
+      assert.equal(request.floors[1].qianshiCandidateKeys.includes(context.key), false);
+      return rejudgeBatchResponse(request, row => ({ recordDecisions: row.records.map(record => ({ key: record.key, status: 'inProgress',
+        actionStatus: 'inProgress', matter: true, following: true, links: [
+          { candidateKey: row.floorKey === 'floor-2' && future ? later.key : early.key, kind: 'progress' },
+          ...(row.floorKey === 'floor-4' ? [{ candidateKey: context.key, kind: 'context' }] : []),
+        ] })) }));
+    } };
+    let h = harness(fixtureOptions);
+    await h.runtime.start();
+    for (const row of h.runtime.getState().floors) await h.runtime.extractFloor(row.floorId, { analyzeState: false });
+    const before = await h.store.readReachable({ mode: 'runtime' });
+    for (const memory of before.floorMemories.filter(memory => memory.qianshiDelta.status === 'partial')) {
+      const row = h.backend.records.get(`chat-${CHAT}/v3-floor-memory-${memory.id}`);
+      row.data = { ...memory, qianshiDelta: { ...memory.qianshiDelta, status: 'pending', reason: '原请求尚未完成，待继续。' } };
+    }
+    const seed = h; h = harness({ ...fixtureOptions, sharedBackend: seed.backend, sharedContext: seed.context }); await h.runtime.start();
+    const plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true }); rejudging = true;
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.commitStatus, 'saved', JSON.stringify(result));
+    assert.equal(result.status, 'completed', JSON.stringify(result));
+    const after = await h.store.readReachable({ mode: 'runtime' });
+    const last = after.floorMemories[3].qianshiDelta.events[0];
+    assert.equal(last.status, 'inProgress');
+    assert.deepEqual(last.continuesFromEventIds, [before.floorMemories[2].qianshiDelta.events[0].id], '旧阶段编号只指同一稳定事项，采用本楼前有效最新端点');
+    if (future) {
+      assert.equal(after.floorMemories[1].qianshiDelta.events[0].status, 'planned', '真正未来绑定保持按条拒绝');
+      assert.equal(after.floorMemories[1].qianshiDelta.status, 'partial', '质量保旧仍记录partial，运行终态不重复付费');
+    }
+  });
+});
+
+test('274全档再审保已存复核与原progress，records及末阶段完整线只给剧情事实', async () => {
+  let round = 0, reviewId, reviewedRecords = [];
+  const h = await prepareFollowingFixture({ historyResult: row => {
+    reviewedRecords.push(...row.records);
+    assert.ok(row.records.every(record => !record.description.includes('跟进复核')));
+    return { recordDecisions: row.records.map(record => ({ key: record.key, keepLine: record.preserveLine === true,
+      status: 'planned', actionStatus: 'planned', following: true, matter: true, links: [] })) };
+  }, review: request => {
+    assert.ok(request.matters.every(matter => matter.records.every(record => !record.description.includes('跟进复核'))));
+    return { jsonData: { decisions: request.matters.map((matter, index) => ({ key: matter.key, status: matter.status,
+      following: round === 0 && index === 0 ? false : matter.following, reason: '临时场景无后续价值。', evidenceFloorKeys: ['floor-2'] })) } };
+  } });
+  let plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal((await h.runtime.startQianshiRejudge(plan.planId)).status, 'completed');
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(before.followingReviewEventIds.length, 1); reviewId = before.followingReviewEventIds[0];
+  const rawReview = before.floorMemories.at(-1).qianshiDelta.events.find(event => event.id === reviewId);
+  round = 1; reviewedRecords = [];
+  plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: 0 });
+  assert.equal(plan.floors.reduce((sum, row) => sum + row.recordCount, 0), 2);
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(result.followup.appended, 0); assert.equal(reviewedRecords.length, 2);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(after.followingReviewEventIds, [reviewId]);
+  assert.deepEqual(after.floorMemories.at(-1).qianshiDelta.events.find(event => event.id === reviewId), rawReview);
+  assert.equal(h.runtime.getQianshiSnapshot().timeline.undatedEventIds.includes(reviewId), false);
+});
+
+test('274已删273复核后再全档，删除原记录只保留一次且不复活', async () => {
+  let round = 0;
+  const h = await prepareFollowingFixture({ review: request => ({ jsonData: { decisions: request.matters.map((matter, index) => ({
+    key: matter.key, status: matter.status, following: round === 0 && index === 0 ? false : matter.following,
+    reason: '临时跟进已无后续意义。', evidenceFloorKeys: ['floor-2'] })) } }) });
+  let plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal((await h.runtime.startQianshiRejudge(plan.planId)).status, 'completed');
+  let before = await h.store.readReachable({ mode: 'runtime' });
+  const reviewId = before.followingReviewEventIds[0]; assert.ok(reviewId);
+  await h.runtime.deleteQianshiEvent({ eventId: reviewId });
+  before = await h.store.readReachable({ mode: 'runtime' });
+  round = 1; plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: 0 });
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.commitStatus, 'saved', JSON.stringify(result));
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  const delta = after.floorMemories.at(-1).qianshiDelta;
+  assert.equal(delta.events.filter(event => event.id === reviewId).length, 1);
+  assert.ok(delta.deletedEventIds.includes(reviewId));
+  assert.equal(projectQianshiGraph(after).events.some(event => event.id === reviewId), false);
+  assert.equal(after.followingReviewEventIds.includes(reviewId), false);
+  assert.deepEqual(delta.events.find(event => event.id === reviewId), before.floorMemories.at(-1).qianshiDelta.events.find(event => event.id === reviewId));
+});
+
+test('含非空复核的CAS返回与独立full读取等价，热投影保同一复核身份', async () => {
+  const commits = [];
+  const captureStore = store => ({ ...store,
+    async commitRoot(...args) { const result = await store.commitRoot(...args); commits.push(result); return result; },
+    forIdentity(identity) { return captureStore(store.forIdentity(identity)); },
+  });
+  const h = harness({ initialChat: [user('约好核对清单'), assistant('约好核对清单。'), user('稳定')],
+    memoryRuntimeFactory: options => createV3MemoryRuntime({ ...options, store: captureStore(options.store) }),
+    utility: () => ({ jsonData: { summary: '约好核对清单。', qianshi: { events: [{ key: 'original', title: '核对清单', description: '核对清单的原约定。', matter: true, status: 'planned', following: true }], order: [] } } }),
+    todoReview: request => ({ jsonData: { decisions: request.matters.map(matter => ({ key: matter.key, status: matter.status, following: false, reason: '当前场景已结束，无独立未决后果。', evidenceFloorKeys: ['floor-1'] })) } }),
+  });
+  await h.runtime.start(); await h.runtime.extractNext({ analyzeState: false });
+  const plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed'); assert.equal(result.followup.appended, 1);
+  const committed = commits.at(-1).reachable, fresh = await h.store.readReachable();
+  assert.equal(fresh.followingReviewEventIds.length, 1);
+  assert.deepEqual(committed.followingReviewEventIds, fresh.followingReviewEventIds);
+  assert.deepEqual(committed, fresh, 'CAS快照与fresh完整图使用同一派生规则');
+  const readsBefore = h.backend.calls.length;
+  const snapshot = h.runtime.getQianshiSnapshot();
+  assert.equal(h.backend.calls.length, readsBefore, 'CAS返回的热投影不再整图回读');
+  assert.equal(snapshot.events.filter(event => event.followingReviewOfEventId).length, 1);
+  assert.equal(snapshot.events.find(event => event.followingReviewOfEventId).id, fresh.followingReviewEventIds[0]);
+});
+
+
+test('整理读取原档即失败时记录启动阶段与安全原因，零模型零写且新计划清除旧失败', async () => {
+  let fail = false;
+  const h = harness({ initialChat: [user('开始'), assistant('一条原事实。'), user('稳定')],
+    identityProjectionProvider: async () => {
+      if (fail === 'technical') throw new TypeError("Cannot read properties of undefined (reading 'matters')");
+      if (fail === 'unknown') throw new TypeError('读取失败 https://private.test sk-private-token');
+      if (fail) throw Object.assign(new Error('读取失败 https://private.test sk-private-token'), { code: 'BACKEND_TIMEOUT' });
+      return {};
+    },
+    utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      return request.task === 'rejudgeStoredQianshiV1'
+        ? rejudgeBatchResponse(request, row => ({ events: row.records.map(record => ({ key: record.key, status: 'occurred', matter: false })), order: [] }))
+        : { jsonData: { summary: '原摘要。', qianshi: { events: [{ key: 'e', title: '原事实', description: '事实。', status: 'occurred', matter: false }], order: [] } } };
+    } });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const plan = await h.runtime.prepareQianshiRejudge(), before = h.calls.length;
+  const writes = h.backend.calls.filter(call => call[0] === 'put').length;
+  fail = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'failed'); assert.equal(result.commitStatus, 'notAttempted');
+  assert.equal(result.request, null); assert.deepEqual(result.outcomes, []);
+  assert.equal(result.failure.stage, 'preparing'); assert.equal(result.failure.code, 'BACKEND_TIMEOUT');
+  assert.match(result.failure.message, /记忆存储请求超时/u); assert.doesNotMatch(JSON.stringify(result), /private/u);
+  assert.equal(h.calls.length, before); assert.equal(h.backend.calls.filter(call => call[0] === 'put').length, writes);
+  assert.equal(h.runtime.getQianshiStatus().history.failure.code, 'BACKEND_TIMEOUT');
+  fail = false;
+  const next = await h.runtime.prepareQianshiRejudge();
+  const completed = await h.runtime.startQianshiRejudge(next.planId);
+  assert.equal(completed.status, 'completed', JSON.stringify(completed)); assert.equal(completed.failure, undefined);
+  const unknownPlan = await h.runtime.prepareQianshiRejudge(); fail = 'unknown';
+  const unknown = await h.runtime.startQianshiRejudge(unknownPlan.planId);
+  assert.equal(unknown.failure.name, 'TypeError'); assert.match(unknown.failure.message, /程序异常/u);
+  assert.equal(unknown.failure.detail, '[REDACTED]');
+  assert.doesNotMatch(JSON.stringify(unknown), /private/u);
+  fail = false; const technicalPlan = await h.runtime.prepareQianshiRejudge(); fail = 'technical';
+  const technical = await h.runtime.startQianshiRejudge(technicalPlan.planId);
+  assert.equal(technical.failure.detail, "Cannot read properties of undefined (reading 'matters')");
+  assert.match(technical.failure.message, /程序异常/u);
+});
+
+async function manualSourceRejudgeHarness(onRejudge = () => {}) {
+  let h, rejudging = false;
+  h = harness({ modernAnchors: true, initialChat: [user('开始'), assistant('第一楼归档正文。'), user('继续'), assistant('第二楼归档正文。'), user('稳定')],
+    captureBusinessIdentity: () => h ? ({ hostChatId: h.context.chatId, chatId: h.context.chatMetadata.qianqianjie.chatId,
+      characterLocator: 'character.png', personaLocator: 'persona.png' }) : null,
+    utility: async options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (!rejudging) return { jsonData: { summary: '归档摘要。', qianshi: { events: [{ key: 'e', title: '归档事项', description: '原事实。', status: 'occurred', matter: false }], order: [] } } };
+      await onRejudge(request, h);
+      return rejudgeBatchResponse(request, row => ({ events: row.records.map(record => ({ key: record.key,
+        status: 'completed', actionStatus: 'completed', matter: false })), order: [] }));
+    } });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) {
+    await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    h.context.chat[floor.messageIndex].extra = { qianqianjie_floor: { schemaVersion: 1, chatId: CHAT, floorId: floor.floorId } };
+  }
+  rejudging = true;
+  return h;
+}
+
+const setRejudgeSource = (h, index, raw) => { h.context.chat[index].mes = raw; h.context.chat[index].swipes[0] = raw; };
+
+test('重判双基线允许预览前已确认正文修订，新正文与人工校准进入请求并保留', async () => {
+  const requests = [];
+  const h = await manualSourceRejudgeHarness(request => requests.push(request));
+  const first = h.runtime.getState().floors[0], before = await h.store.readReachable({ mode: 'runtime' });
+  await h.runtime.editSummary(first.floorId, '人工确认摘要。');
+  const event = h.runtime.getQianshiSnapshot().events[0];
+  await h.runtime.editQianshiEventText({ eventId: event.id, expected: { memoryId: event.sourceFloorMemoryId,
+    title: event.title, description: event.description, object: event.object }, title: '人工确认事项', description: event.description,
+    object: event.object, status: 'inProgress' });
+  const calibrated = await h.store.readReachable({ mode: 'runtime' });
+  setRejudgeSource(h, 1, '第一楼人工确认的新正文。'); setRejudgeSource(h, 3, '第二楼人工确认的新正文。');
+  const calls = h.calls.length;
+  const previousPlan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: 1, toMessageIndex: 1 });
+  setRejudgeSource(h, 3, '第二楼再次确认的新正文。');
+  const cutoffPlan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: 1, toMessageIndex: 1 });
+  assert.notEqual(previousPlan.planId, cutoffPlan.planId, '跟进落点的新见证也使旧预览失效');
+  setRejudgeSource(h, 1, '第一楼再次确认的新正文。');
+  const plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: 1, toMessageIndex: 1 });
+  assert.notEqual(cutoffPlan.planId, plan.planId, '新预览绑定新的正文见证');
+  await assert.rejects(h.runtime.startQianshiRejudge(previousPlan.planId), { code: 'QIANSHI_REJUDGE_PLAN_STALE' });
+  assert.equal(h.calls.length, calls, '重新预览不调用模型');
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(requests[0].floors[0].source, '第一楼再次确认的新正文。');
+  assert.equal(requests[0].floors[0].summary, '人工确认摘要。');
+  assert.equal(requests[0].floors[0].records[0].title, '人工确认事项');
+  assert.equal(requests[0].floors[0].records[0].status, 'inProgress');
+  const after = await h.store.readReachable({ mode: 'runtime' }), memory = after.floorMemories.find(item => item.floorId === first.floorId);
+  assert.deepEqual(after.floors, before.floors, '归档正文指纹保持');
+  assert.equal(memory.sourceCanonicalContent, '第一楼归档正文。');
+  assert.deepEqual(memory.summary, calibrated.floorMemories.find(item => item.floorId === first.floorId).summary);
+  assert.deepEqual(memory.qianshiDelta.manualEventOverrides, calibrated.floorMemories.find(item => item.floorId === first.floorId).qianshiDelta.manualEventOverrides);
+  assert.equal(h.runtime.getQianshiSnapshot().events.find(item => item.id === event.id).status, 'inProgress');
+  assert.deepEqual(after.stateDeltas, before.stateDeltas);
+});
+
+test('重判所选楼正文真变只保旧并待续，无关后楼变化不反撤健康结果', async () => {
+  for (const duringRequest of [false, true]) for (const index of [1, 3]) {
+    const h = await manualSourceRejudgeHarness((request, current) => {
+      if (duringRequest) setRejudgeSource(current, index, '请求期间再次变化。');
+    });
+    setRejudgeSource(h, 1, '预览前已确认的正文。');
+    const plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: 1, toMessageIndex: 1 });
+    const before = await h.store.readReachable({ mode: 'runtime' });
+    if (!duringRequest) setRejudgeSource(h, index, '确认后再次变化。');
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.commitStatus, 'saved');
+    const after = await h.store.readReachable({ mode: 'runtime' });
+    assert.deepEqual(after.floorMemories.map(memory => memory.summary), before.floorMemories.map(memory => memory.summary), '人工及原摘要不改');
+    assert.deepEqual(after.stateDeltas, before.stateDeltas);
+    if (index === 1) {
+      assert.equal(result.status, 'partial'); assert.equal(result.savedFloors, 0);
+      assert.equal(result.outcomes[0].reasonCode, 'QIANSHI_REJUDGE_SOURCE_CHANGED');
+      assert.equal(result.calls, duringRequest ? 1 : 0);
+      assert.equal(result.followup.status, 'deferred');
+      assert.deepEqual(after.floorMemories[0].qianshiDelta.events, before.floorMemories[0].qianshiDelta.events, '变动楼保当前旧判断');
+      assert.equal(after.floorMemories[0].qianshiDelta.status, 'pending', '真实来源缺口持久待续');
+    } else {
+      assert.equal(result.status, 'completed'); assert.equal(result.savedFloors, 1); assert.equal(result.calls, 1);
+      assert.deepEqual(after.floorMemories[1], before.floorMemories[1], '无关后楼原稿保留');
+    }
+  }
+});
+
+test('重判双基线拒绝错楼标、重复楼标、换swipe及明确清空，不借旧正文继续', async () => {
+  for (const mutation of ['wrongFloor', 'foreignFloor', 'duplicateFloor', 'swipe', 'blank', 'unmarkedChange']) {
+    const h = await manualSourceRejudgeHarness();
+    if (mutation === 'wrongFloor') h.context.chat[1].extra.qianqianjie_floor.floorId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+    if (mutation === 'foreignFloor') h.context.chat[1].extra.qianqianjie_floor.chatId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+    if (mutation === 'duplicateFloor') h.context.chat[3].extra.qianqianjie_floor = { ...h.context.chat[1].extra.qianqianjie_floor };
+    if (mutation === 'swipe') { h.context.chat[1].swipes.push(h.context.chat[1].mes); h.context.chat[1].swipe_id = 1; }
+    if (mutation === 'blank') setRejudgeSource(h, 1, '   ');
+    if (mutation === 'unmarkedChange') { delete h.context.chat[1].extra.qianqianjie_floor; setRejudgeSource(h, 1, '没有身份依据的新正文。'); }
+    const calls = h.calls.length, puts = h.backend.calls.filter(call => call[0] === 'put').length;
+    await assert.rejects(h.runtime.prepareQianshiRejudge({ fromMessageIndex: 1, toMessageIndex: 1 }),
+      error => ['QIANSHI_REJUDGE_SOURCE_CHANGED', 'QIANSHI_REJUDGE_SOURCE_EMPTY'].includes(error.code), mutation);
+    assert.equal(h.calls.length, calls); assert.equal(h.backend.calls.filter(call => call[0] === 'put').length, puts);
+  }
+});
+
+test('重判双基线切聊后保存原目标，离页准备沿原目标归档取材', async () => {
+  for (const switchBeforePreview of [false, true]) {
+    const requests = [], h = await manualSourceRejudgeHarness(request => requests.push(request));
+    const targetIdentity = h.runtime.captureBusinessIdentity(), originalStore = h.store.forIdentity(targetIdentity);
+    setRejudgeSource(h, 1, 'A预览时人工确认的正文。');
+    const switchChat = () => { h.context.chat = [user('B输入'), assistant('B正文'), user('B稳定')];
+      h.context.chatId = 'host-b'; h.context.chatMetadata = { qianqianjie: { schemaVersion: 1, chatId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } }; };
+    try {
+      if (switchBeforePreview) switchChat();
+      const plan = await h.runtime.prepareQianshiRejudge({ targetIdentity, fromMessageIndex: 1, toMessageIndex: 1 });
+      if (!switchBeforePreview) switchChat();
+      const result = await h.runtime.startQianshiRejudge(plan.planId);
+      assert.equal(result.status, 'completed', JSON.stringify(result));
+      assert.equal(requests[0].floors[0].source, switchBeforePreview ? '第一楼归档正文。' : 'A预览时人工确认的正文。');
+      const saved = await originalStore.readReachable({ mode: 'runtime' }); assert.equal(saved.root.chatId, CHAT);
+      assert.equal(h.context.chat[1].mes, 'B正文');
+    } finally { originalStore.release(); }
+  }
+});
+
+test('局部坏楼不阻健康摘要与新尾自动维护，不读取坏前文也不覆盖其人工记忆', async () => {
+  const requests = [];
+  const h = harness({ modernAnchors: true, initialChat: [assistant('不能借用的坏楼原文。'), user('确认坏楼'), assistant('健康楼原文。'), user('确认健康楼')], utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content); requests.push(request);
+    return { jsonData: { summary: '健康结果。', qianshi: { events: [] } } };
+  } });
+  await h.runtime.start(); const initial = await h.store.readReachable({ mode: 'runtime' });
+  for (const floor of initial.floors) h.context.chat[floor.hostLocator.messageIndex].extra = { qianqianjie_floor: { schemaVersion: 1, chatId: CHAT, floorId: floor.id } };
+  await h.runtime.extractFloor(initial.floors[0].id, { analyzeState: false });
+  await h.runtime.editSummary(initial.floors[0].id, '坏楼的人工确认摘要。');
+  const preserved = (await h.store.readReachable({ mode: 'runtime' })).floorMemories.find(memory => memory.floorId === initial.floors[0].id);
+  h.context.chat[0].extra.qianqianjie_floor.chatId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  await h.runtime.refreshStatus({ reconcileFoundation: true }); requests.length = 0;
+  const result = await h.runtime.extractFloor(initial.floors[1].id);
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.floorMemories.find(memory => memory.floorId === initial.floors[1].id)?.summary.aiText, '健康结果。', JSON.stringify(result));
+  assert.deepEqual(saved.floorMemories.find(memory => memory.floorId === initial.floors[0].id), preserved);
+  assert.equal(h.runtime.getState().lastCseError, null);
+  assert.equal(requests.length, 1); assert.doesNotMatch(JSON.stringify(requests[0]), /不能借用的坏楼原文|坏楼的人工确认摘要/u);
+  assert.equal(h.runtime.getState().status, 'needsReview'); assert.equal(h.runtime.getState().memoryWorkBusy, false);
+  h.context.chat.push(assistant('自动维护的健康新尾。'), user('确认新尾'));
+  h.setAutomation({ enabled: true, batchSize: 1 });
+  await h.runtime.retryAutomation();
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(after.floorMemories.some(memory => memory.sourceCanonicalContent === '自动维护的健康新尾。'), true, JSON.stringify({ last: h.runtime.getState().lastAutoMemory, foundation: h.foundationRuntime.getState(), floors: after.floors.map(floor => [floor.id, floor.hostLocator]) }));
+  assert.deepEqual(after.floorMemories.find(memory => memory.floorId === initial.floors[0].id), preserved);
+  assert.equal(h.runtime.getState().lastAutoMemory.status, 'partial');
+  assert.equal(h.runtime.getState().memoryWorkBusy, false);
+  h.context.chat.push(assistant('局部隔离后的连续甲'), assistant('局部隔离后的连续乙'), user('确认连续段'));
+  await h.runtime.refreshStatus({ reconcileFoundation: true });
+  const scope = h.runtime.getState().consecutiveAssistantConfirmation;
+  assert.ok(scope);
+  await h.runtime.confirmConsecutiveAssistants(scope);
+  await waitFor(() => !h.runtime.getState().memoryWorkBusy && !h.runtime.getState().activeRun);
+  const confirmed = h.runtime.getState();
+  assert.equal(confirmed.status, 'needsReview');
+  assert.equal(confirmed.memoryWorkBusy, false);
+  assert.equal(confirmed.lastAutoMemory.status, 'partial');
+});
+
+test('局部隔离仍拒绝目标在模型请求中失去身份，旧人工稿保留且不写另一聊天', async () => {
+  let mutate = false;
+  const h = harness({ modernAnchors: true, initialChat: [assistant('健康目标。'), user('确认目标'), assistant('待核末楼。'), user('确认末楼')],
+    utility: () => { if (mutate) h.context.chat[0].extra.qianqianjie_floor.chatId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+      return { jsonData: { summary: mutate ? '不应保存的新结果。' : '原结果。' } }; } });
+  await h.runtime.start(); const initial = await h.store.readReachable({ mode: 'runtime' });
+  for (const floor of initial.floors) h.context.chat[floor.hostLocator.messageIndex].extra = { qianqianjie_floor: { schemaVersion: 1, chatId: CHAT, floorId: floor.id } };
+  await h.runtime.extractFloor(initial.floors[0].id, { analyzeState: false });
+  await h.runtime.editSummary(initial.floors[0].id, '人工确认原稿。');
+  const original = (await h.store.readReachable({ mode: 'runtime' })).floorMemories.find(memory => memory.floorId === initial.floors[0].id);
+  h.context.chat[2].extra.qianqianjie_floor.chatId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  await h.runtime.refreshStatus({ reconcileFoundation: true }); mutate = true;
+  await h.runtime.extractFloor(initial.floors[0].id, { analyzeState: false });
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(saved.floorMemories.find(memory => memory.floorId === initial.floors[0].id), original);
+  assert.equal(h.runtime.getState().lastExtractorError.code, 'V3_MEMORY_PREFIX_CHANGED');
+  assert.equal(h.runtime.getState().memoryWorkBusy, false);
+});
+
+test('历史保旧partial完成后直接尾审，留空仅复核跟进无需重判历史', async () => {
+  let complete = false, reviews = 0;
+  const h = await prepareFollowingFixture({ historyResult: row => ({ recordDecisions: row.records.map(record => ({
+    key: record.key, status: 'planned', actionStatus: 'planned', following: true, matter: true,
+    links: !complete && row.floorKey === 'floor-2' ? [{ candidateKey: 'floor-99:record-1', kind: 'progress' }] : [] })) }),
+    review: request => {
+      reviews += 1;
+      assert.deepEqual(request.timeline.map(row => row.floorKey), ['floor-1', 'floor-2']);
+      return { jsonData: { decisions: request.matters.map(matter => ({ key: matter.key, status: matter.status,
+        following: true, reason: '约定仍有效。', evidenceFloorKeys: ['floor-2'] })) } };
+    } });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  let plan = await h.runtime.prepareQianshiRejudge();
+  let result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.commitStatus, 'saved'); assert.equal(result.savedCompleteFloors, 1); assert.equal(result.savedPartialFloors, 1);
+  assert.equal(reviews, 1); assert.equal(result.followup.status, 'completed'); assert.equal(result.followup.calls, 1);
+  assert.equal(result.status, 'completed');
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context }); await cold.runtime.start();
+  const coldPlan = await cold.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(coldPlan.totalFloors, 0); assert.equal(coldPlan.historyApiCalls, 0);
+  assert.equal(cold.calls.length, 0, '冷读保旧质量结果不重判历史');
+  const partial = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(partial.rootRevision, before.rootRevision + 1);
+  complete = true;
+  plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(plan.totalFloors, 0); assert.equal(plan.historyApiCalls, 0);
+  result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(reviews, 2);
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(after.floorMemories[0], partial.floorMemories[0], '已经完成楼不重复付费或改写');
+});
+
+
+test('存量可用partial与候选质量诊断零历史调用，旧档原值保留', async () => {
+  const h = await prepareFollowingFixture();
+  const initial = await h.store.readReachable({ mode: 'runtime' });
+  const reason = '1 条旧记录仍被范围外引用，归线结构沿用原值；有效状态和跟进判断已接收。';
+  const protectedMemories = initial.floorMemories.map((memory, index) => validateFloorMemory({ ...memory, qianshiDelta: {
+    ...memory.qianshiDelta, status: 'partial', reason,
+    ...(index ? { historyReview: { rawFingerprint: memory.sourceRawFingerprint, priorStatus: 'partial', priorReason: null,
+      reconciliationStatus: 'pending', reconciliationReason: null, candidates: [{ candidateId: memory.qianshiDelta.events[0].id,
+        decision: 'duplicate', event: memory.qianshiDelta.events[0], relations: [], recommendedEventId: memory.qianshiDelta.events[0].id, matchBasis: ['同一事件'] }] } } : {}),
+  } }, { expectedChatId: CHAT }));
+  for (const memory of protectedMemories) {
+    const key = `chat-${CHAT}/v3-floor-memory-${memory.id}`;
+    h.backend.records.set(key, { ...h.backend.records.get(key), data: memory });
+  }
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => assert.fail('预览不调模型') });
+  await cold.runtime.start();
+  const before = await cold.store.readReachable({ mode: 'runtime' });
+  let plan = await cold.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(plan.totalFloors, 0); assert.equal(plan.historyApiCalls, 0);
+  assert.deepEqual((await cold.store.readReachable({ mode: 'runtime' })).floorMemories, before.floorMemories);
+  const mixed = { ...protectedMemories[1], qianshiDelta: { ...protectedMemories[1].qianshiDelta, reason: reason + '；1 条旧记录没有得到有效重判。' } };
+  const key = `chat-${CHAT}/v3-floor-memory-${mixed.id}`;
+  h.backend.records.set(key, { ...h.backend.records.get(key), data: mixed });
+  const mixedCold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => assert.fail('预览不调模型') });
+  await mixedCold.runtime.start();
+  plan = await mixedCold.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(plan.totalFloors, 0); assert.equal(plan.historyApiCalls, 0);
+});
+
+test('本轮完整重判只吸收已正式存在的重复pending，真实待决及人工new候选保留', async () => {
+  for (const kind of ['redundant', 'pending', 'manualNew']) {
+    const h = await prepareFollowingFixture({ count: 1, review: request => ({ jsonData: { decisions: request.matters.map(matter => ({
+      key: matter.key, status: matter.status, following: true, reason: '约定仍有效。', evidenceFloorKeys: ['floor-1'] })) } }) });
+    const initial = await h.store.readReachable({ mode: 'runtime' }), memory = initial.floorMemories[0], event = memory.qianshiDelta.events[0];
+    const candidate = { candidateId: kind === 'manualNew' ? '99999999-9999-4999-8999-999999999999' : event.id,
+      decision: kind === 'manualNew' ? 'new' : 'pending', event: kind === 'manualNew' ? { ...event,
+        id: '99999999-9999-4999-8999-999999999999', matterId: null, updatesMatter: false, status: 'occurred', title: '人工确认的新事件' } : event,
+      relations: [], recommendedEventId: kind === 'pending' ? event.id : null, matchBasis: kind === 'pending' ? ['仍需核对'] : [] };
+    const modified = validateFloorMemory({ ...memory, qianshiDelta: { ...memory.qianshiDelta,
+      historyReview: { rawFingerprint: memory.sourceRawFingerprint, priorStatus: 'partial', priorReason: null, candidates: [candidate] } } }, { expectedChatId: CHAT });
+    const key = `chat-${CHAT}/v3-floor-memory-${memory.id}`;
+    h.backend.records.set(key, { ...h.backend.records.get(key), data: modified });
+    const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      return rejudgeBatchResponse(request, row => ({ recordDecisions: row.records.map(record => ({ key: record.key,
+        status: 'planned', actionStatus: 'planned', following: true, matter: true, links: [] })) }));
+    }, todoReview: request => ({ jsonData: { decisions: request.matters.map(matter => ({ key: matter.key, status: matter.status,
+      following: true, reason: '约定仍有效。', evidenceFloorKeys: ['floor-1'] })) } }) });
+    await cold.runtime.start();
+    const plan = await cold.runtime.prepareQianshiRejudge();
+    const result = await cold.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.commitStatus, 'saved', kind);
+    const saved = (await cold.store.readReachable({ mode: 'runtime' })).floorMemories[0].qianshiDelta;
+    assert.deepEqual(saved.historyReview.candidates, kind === 'redundant' ? [] : [candidate], kind);
+    assert.equal(saved.status, kind === 'pending' ? 'partial' : 'ready', kind);
+    assert.ok(result.followup.calls > 0, '有可用正式结果的旧待决质量不阻尾审');
+  }
+});
+
+test('离线长USER分窗仅携带引用材料，完整时间线与累计判断保留并量化输入节省', async () => {
+  const requests = [], count = 8;
+  let currentTokens = 0, oldTokens = 0;
+  const h = await prepareFollowingFixture({ count, userLength: 800, summaryLength: 900, review: (request, options) => {
+    requests.push({ request, systemPrompt: options.systemPrompt });
+    assert.deepEqual(new Set(request.users.map(row => row.key)), new Set(request.timeline.flatMap(row => row.userRefs)));
+    const tokens = estimateRecallTokens(`${BASE_PROCESSING_PROMPT}\n\n${options.systemPrompt}\n${JSON.stringify(request)}`);
+    assert.ok(tokens <= 10000); currentTokens += tokens;
+    return { jsonData: { decisions: request.matters.map(matter => ({ key: matter.key, status: matter.status, following: true,
+      reason: '本窗材料已核对，继续结合后文。', evidenceFloorKeys: request.timeline.length ? [request.timeline.at(-1).floorKey] : [] })) } };
+  } });
+  const plan = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true, maxInputTokens: 10000 });
+  assert.ok(plan.followup.apiCalls > 1);
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(requests.length, plan.followup.apiCalls);
+  const allUsers = [...new Map(requests.flatMap(({ request }) => request.users).map(row => [row.key, row])).values()];
+  assert.equal(allUsers.length, count);
+  const covered = new Set(requests.flatMap(({ request }) => request.timeline.map(row => row.floorKey)));
+  assert.equal(covered.size, count);
+  assert.ok(requests.some(({ request }) => request.previousDecisions.length));
+  for (const { request, systemPrompt } of requests) oldTokens += estimateRecallTokens(`${BASE_PROCESSING_PROMPT}\n\n${systemPrompt}\n${JSON.stringify({ ...request, users: allUsers })}`);
+  assert.ok(currentTokens < oldTokens);
+  process.stdout.write('FOLLOWUP_WINDOW_SAVINGS ' + JSON.stringify({ floors: count, users: allUsers.length, calls: requests.length,
+    currentTokens, repeatedAllUsersTokens: oldTokens, savedTokens: oldTokens - currentTokens, userAppearances: requests.reduce((sum, row) => sum + row.request.users.length, 0), oldUserAppearances: requests.length * allUsers.length }) + '\n');
+});
+
+
+test('预览已延后尾审时不取无关清空截止楼，健康范围保存且尾审始终零调用', async () => {
+  let reviews = 0;
+  const h = await prepareFollowingFixture({ review: () => { reviews += 1; return { jsonData: { decisions: [] } }; } });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  const last = before.floors.at(-1), old = before.floorMemories.at(-1);
+  const recordKey = `chat-${CHAT}/v3-floor-memory-${old.id}`;
+  h.backend.records.set(recordKey, { ...h.backend.records.get(recordKey), data: { ...old, qianshiDelta: { ...old.qianshiDelta, status: 'pending', reason: '本次请求尚未完成，旧记录保留。' } } });
+  const current = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: options => rejudgeBatchResponse(JSON.parse(options.taskMessages[0].content), row => ({ recordDecisions: row.records.map(record => ({ key: record.key, status: 'planned', actionStatus: 'planned', following: true, matter: true, links: [] })) })),
+    todoReview: () => { reviews += 1; return { jsonData: { decisions: [] } }; } });
+  await current.runtime.start();
+  h.context.chat[last.hostLocator.messageIndex].mes = '';
+  h.context.chat[last.hostLocator.messageIndex].swipes[0] = '';
+  const plan = await current.runtime.prepareQianshiRejudge({ fromMessageIndex: before.floors[0].hostLocator.messageIndex,
+    toMessageIndex: before.floors[0].hostLocator.messageIndex });
+  assert.equal(plan.followup.status, 'deferred'); assert.equal(plan.followup.apiCalls, 0);
+  assert.equal(plan.apiCalls, plan.historyApiCalls);
+  const result = await current.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.commitStatus, 'saved', JSON.stringify(result)); assert.equal(result.savedCompleteFloors, 1);
+  assert.equal(result.followup.status, 'deferred'); assert.equal(reviews, 0);
+  assert.equal(result.status, 'partial');
+  assert.equal(result.request.outcome, 'completed'); assert.equal(result.request.error, null);
+  assert.equal(result.calls, plan.historyApiCalls);
+  const saved = await current.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.floorMemories.find(memory => memory.floorId === last.id).qianshiDelta.status, 'pending');
+  assert.deepEqual(saved.floorMemories.find(memory => memory.floorId === last.id).qianshiDelta.events, old.qianshiDelta.events);
+  h.setEnabled(false); h.runtime.invalidate(); current.setEnabled(false); current.runtime.invalidate();
+});
+
+test('摘要链修复：编辑窗忙态明确未保存并保留人工草稿', async () => {
+  let hold = false, started, release;
+  const ready = new Promise(resolve => { started = resolve; });
+  const h = harness({ utility: async () => {
+    if (hold) { started(); await new Promise(resolve => { release = resolve; }); }
+    return { jsonData: { summary: '模型摘要。' } };
+  } });
+  await h.runtime.start(); const floor = h.runtime.getState().floors[0];
+  await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const ui = viewHarness(h.runtime); await ui.view.activate();
+  const card = ui.flatten(ui.container).find(node => node.attributes['data-qqj-floor-id'] === floor.floorId);
+  card.open = true; card.fire('toggle'); ui.flatten(card).find(node => node.textContent === '编辑').click();
+  const field = ui.flatten(ui.editorContent()).find(node => node.placeholder === '输入用户修订摘要');
+  field.value = '必须保留的人工草稿'; field.fire('input');
+  hold = true; const pending = h.runtime.extractFloor(floor.floorId, { analyzeState: false }); await ready;
+  const saved = await ui.submitEditor(); release(); await pending;
+  assert.equal(saved, false); assert.ok(ui.editorContent());
+  assert.equal(field.value, '必须保留的人工草稿'); assert.ok(ui.editorError()); ui.view.deactivate();
+});
+
+test('摘要链修复：明确目标人工保存不依赖live正文或swipe', async t => {
+  for (const change of ['empty', 'body', 'swipe']) await t.test(change, async () => {
+    let h; h = harness({ captureBusinessIdentity: () => h ? ({ hostChatId: h.context.chatId,
+      chatId: h.context.chatMetadata.qianqianjie.chatId, characterLocator: 'character.png', personaLocator: 'persona.png' }) : null });
+    await h.runtime.start(); const floor = h.runtime.getState().floors[0];
+    await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    const message = h.context.chat[floor.messageIndex];
+    const mutate = () => {
+      if (change === 'empty') { message.mes = ''; message.swipes = []; }
+      else if (change === 'body') { message.mes = '保存期间修过的正文'; message.swipes[0] = message.mes; }
+      else { message.swipes.push('另一个回复'); message.swipe_id = 1; message.mes = message.swipes[1]; }
+    };
+    if (change === 'empty') mutate();
+    else { let changed = false; h.backend.setBeforeGet(({ key }) => { if (!changed && key === 'v3-root') { changed = true; mutate(); } }); }
+    await h.runtime.editSummary(floor.floorId, '独立人工校准');
+    const graph = await h.store.readReachable({ mode: 'runtime' });
+    assert.equal(graph.floorMemories.find(memory => memory.floorId === floor.floorId).summary.userText, '独立人工校准');
+  });
+});
+
+test('摘要链修复：同楼自动版本更新不阻人工字段并保自动新字段', async () => {
+  const identity = h => ({ hostChatId: h.context.chatId, chatId: h.context.chatMetadata.qianqianjie.chatId,
+    characterLocator: 'character.png', personaLocator: 'persona.png' });
+  let h; h = harness({ captureBusinessIdentity: () => h ? identity(h) : null });
+  await h.runtime.start(); const floor = h.runtime.getState().floors[0]; await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const gate = h.backend.holdNextRootPut();
+  const pending = h.runtime.editSummary(floor.floorId, '人工最终稿'); await gate.started;
+  let other; other = harness({ sharedBackend: h.backend, sharedContext: h.context,
+    captureBusinessIdentity: () => other ? identity(other) : null, utility: () => ({ jsonData: { summary: '最新模型稿', people: [{ name: '后来的人' }] } }) });
+  await other.runtime.start(); await other.runtime.extractFloor(floor.floorId, { analyzeState: false }); gate.release(); await pending;
+  const graph = await h.store.readReachable({ mode: 'runtime' }); const saved = graph.floorMemories.find(memory => memory.floorId === floor.floorId);
+  assert.equal(saved.summary.userText, '人工最终稿'); assert.equal(saved.summary.aiText, '最新模型稿');
+  assert.ok(saved.participants.some(person => graph.entities.find(entity => entity.id === person.entityId)?.displayName === '后来的人'));
+});
+
+test('摘要链修复：人工时间地点人物含清空经冷读重提仍保留', async () => {
+  const h = harness(); await h.runtime.start(); const floor = h.runtime.getState().floors[0];
+  await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  await h.runtime.editMemory(floor.floorId, { summary: '人工摘要', timeText: '人工时间', originalTimeText: '时间未明确', timeChanged: true,
+    locations: [{ name: '人工地点' }], participantNames: ['人工人物'] });
+  let cold = harness({ sharedBackend: h.backend, sharedContext: h.context }); await cold.runtime.start();
+  await cold.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  let graph = await cold.store.readReachable({ mode: 'runtime' }), saved = graph.floorMemories.find(memory => memory.floorId === floor.floorId);
+  assert.equal(saved.summary.userText, '人工摘要'); assert.equal(saved.chronology[0].time.sourceText, '人工时间');
+  assert.deepEqual(saved.locations.map(item => item.name), ['人工地点']);
+  assert.deepEqual(saved.participants.map(item => graph.entities.find(entity => entity.id === item.entityId)?.displayName), ['人工人物']);
+  await cold.runtime.editMemory(floor.floorId, { summary: '人工摘要', timeText: '', originalTimeText: '人工时间', timeChanged: true,
+    locations: [], participantNames: [] });
+  cold = harness({ sharedBackend: h.backend, sharedContext: h.context }); await cold.runtime.start();
+  await cold.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  graph = await cold.store.readReachable({ mode: 'runtime' }); saved = graph.floorMemories.find(memory => memory.floorId === floor.floorId);
+  assert.equal(saved.chronology[0].time.sourceText, '时间未明确'); assert.deepEqual(saved.locations, []); assert.deepEqual(saved.participants, []);
+});
+
+test('摘要链修复：别楼楼标待核不阻健康千事人工文字与整线状态', async () => {
+  const h = harness({ modernAnchors: true, initialChat: [user('开始'), assistant('归还旧书'), user('稳定'), assistant('另一楼'), user('继续')],
+    utility: () => ({ jsonData: { summary: '归还旧书', qianshi: { events: [{ key: 'matter', title: '归还旧书', description: '准备归还旧书', status: 'inProgress', matter: true }], order: [] } } }) });
+  await h.runtime.start(); const [first, other] = h.runtime.getState().floors;
+  await h.runtime.extractFloor(first.floorId, { analyzeState: false });
+  for (const floor of [first, other]) h.context.chat[floor.messageIndex].extra = { qianqianjie_floor: { schemaVersion: 1,
+    chatId: floor === first ? CHAT : 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', floorId: floor.floorId } };
+  assert.equal((await h.foundationRuntime.refreshStatus()).status, 'needsReview');
+  let event = h.runtime.getQianshiSnapshot().events[0];
+  await h.runtime.editQianshiEventText({ eventId: event.id, expected: { memoryId: event.sourceFloorMemoryId, title: event.title,
+    description: event.description, object: event.object }, title: '人工归还事项', description: event.description, object: event.object });
+  const matter = h.runtime.getQianshiSnapshot().matters[0];
+  await h.runtime.setQianshiMatterStatus({ matterId: matter.matterId, status: 'completed', expectedStatus: matter.status, expectedManualStatus: matter.manualStatusOverride });
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context }); await cold.runtime.start();
+  assert.equal(cold.runtime.getQianshiSnapshot().events[0].title, '人工归还事项');
+  assert.equal(cold.runtime.getQianshiSnapshot().matters[0].status, 'completed');
+});
+
+test('摘要链修复：本楼候选异常降为千事pending保摘要，历史同CSE输入本批仅派一次', async t => {
+  for (const failCandidate of [true, false]) await t.test(failCandidate ? 'candidate' : 'cse', async () => {
+    const seed = await seedContinuousSummaryTail(4);
+    const h = harness({ sharedBackend: seed.backend, sharedContext: seed.context, automation: { enabled: true, batchSize: 1 },
+      qianshiCandidatePreparer: (graph, options) => {
+        if (failCandidate && options.canonicalContent.includes('尾部欠账 2')) throw new TypeError('本楼准备故障');
+        return prepareQianshiCandidates(graph, options);
+      }, utility: options => {
+        if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { summary: JSON.parse(options.taskMessages[0].content).payload.canonicalContent, qianshi: { events: [], order: [] } } };
+        if (!failCandidate) throw new Error('同输入CSE失败');
+        return { jsonData: { noMaterialChange: true } };
+      } });
+    await h.runtime.start(); await h.runtime.startHistoricalRebuild();
+    await waitFor(() => h.runtime.getState().lastAutoMemory?.reason === 'manualHistoricalRebuild' && !h.runtime.getState().memoryWorkBusy);
+    const state = h.runtime.getState();
+    assert.equal(state.summaryCompletedCount, 5);
+    if (failCandidate) {
+      assert.equal(state.lastAutoMemory.status, 'completed');
+      assert.equal(state.lastAutoMemory.failedItems?.length ?? 0, 0);
+      const prepared = state.floors.find(floor => floor.memory?.summary.aiText === '尾部欠账 2');
+      assert.equal(prepared.memory.qianshiDelta.status, 'pending');
+      assert.equal(state.floors.filter(floor => floor.assistantSeq > 1 && floor.memory?.qianshiDelta.status === 'pending').length, 1);
+      assert.equal(h.calls.filter(options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, 4, '四个新楼摘要各派一次');
+    } else assert.equal(h.calls.filter(options => options.systemPrompt === CSE_SYSTEM_PROMPT).length, 4, '四楼独立CSE各派一次');
+    h.setEnabled(false); h.runtime.invalidate();
+  });
+});
+
+test('摘要链修复：人工原文逐项合并保留并发删除及不同字段', async t => {
+  for (const change of ['deleteOther', 'deleteTarget', 'editOther', 'editOtherField']) await t.test(change, async () => {
+    const h = harness({ utility: () => ({ jsonData: { summary: '模型摘要' } }) });
+    await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+    await h.runtime.extractFloor(floorId, { analyzeState: false });
+    const readMemory = async () => (await h.store.readReachable({ mode: 'runtime' })).floorMemories.find(item => item.floorId === floorId);
+    const metadata = anchors => ({ summary: '模型摘要', locations: [], participantNames: [], exactAnchors: anchors });
+    await h.runtime.editMemory(floorId, metadata([
+      { carrier: '载体甲', exactText: '人工甲', knownEntityIds: [] },
+      { carrier: '载体乙', exactText: '人工乙', knownEntityIds: [] },
+    ]));
+    const old = await readMemory();
+    const other = harness({ sharedBackend: h.backend, sharedContext: h.context }); await other.runtime.start();
+    const gate = h.backend.holdNextRootPut();
+    const pending = h.runtime.editMemory(floorId, metadata(old.exactAnchors.map((item, index) => index === 0 ? { ...item, exactText: '人工甲修改' } : item)))
+      .then(() => ({ saved: true }), error => ({ saved: false, code: error.code }));
+    await gate.started;
+    const anchors = change === 'deleteOther' ? [old.exactAnchors[0]] : change === 'deleteTarget' ? [old.exactAnchors[1]]
+      : old.exactAnchors.map((item, index) => change === 'editOther' && index === 1 ? { ...item, exactText: '人工乙修改' }
+        : change === 'editOtherField' && index === 0 ? { ...item, carrier: '甲新载体' } : item);
+    await other.runtime.editMemory(floorId, metadata(anchors));
+    gate.release(); const result = await pending; const saved = await readMemory();
+    if (change === 'deleteTarget') {
+      assert.deepEqual(result, { saved: false, code: 'V3_MEMORY_STALE' });
+      assert.deepEqual(saved.exactAnchors.map(item => item.exactText), ['人工乙']);
+    } else {
+      assert.equal(result.saved, true);
+      assert.deepEqual(saved.exactAnchors.map(item => item.exactText), change === 'deleteOther' ? ['人工甲修改']
+        : ['人工甲修改', change === 'editOther' ? '人工乙修改' : '人工乙']);
+      if (change === 'editOtherField') assert.equal(saved.exactAnchors[0].carrier, '甲新载体');
+    }
+  });
+});
+
+test('摘要链修复：自动原文换代仍接受人工校准，明确人工删除仍保留', async t => {
+  for (const removedByHuman of [false, true]) await t.test(removedByHuman ? 'humanDelete' : 'modelReplace', async () => {
+    const h = harness({ initialChat: [assistant('原句。'), user('确认'), assistant('尾楼。')],
+      utility: () => ({ jsonData: { summary: '原摘要', exactQuotes: [{ exactText: '原句。', whyPreserve: '载体原文' }] } }) });
+    await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+    await h.runtime.extractFloor(floorId, { analyzeState: false });
+    const old = (await h.store.readReachable({ mode: 'runtime' })).floorMemories.find(item => item.floorId === floorId);
+    assert.equal(old.exactAnchors.length, 1); assert.notEqual(old.exactAnchors[0].manual, true);
+    const other = harness({ sharedBackend: h.backend, sharedContext: h.context,
+      utility: () => ({ jsonData: { summary: '新模型稿' } }) }); await other.runtime.start();
+    const gate = h.backend.holdNextRootPut();
+    const pending = h.runtime.editMemory(floorId, { summary: '原摘要', locations: [], participantNames: [],
+      exactAnchors: [{ ...old.exactAnchors[0], carrier: '手动载体', exactText: '人工原句', knownEntityIds: [] }] })
+      .then(() => ({ saved: true }), error => ({ saved: false, code: error.code }));
+    await Promise.race([gate.started, pending.then(result => assert.fail(JSON.stringify(result)))]);
+    if (removedByHuman) await other.runtime.editMemory(floorId, { summary: '原摘要', locations: [], participantNames: [], exactAnchors: [] });
+    else await other.runtime.extractFloor(floorId, { analyzeState: false });
+    gate.release(); const result = await pending;
+    const saved = (await h.store.readReachable({ mode: 'runtime' })).floorMemories.find(item => item.floorId === floorId);
+    if (removedByHuman) {
+      assert.deepEqual(result, { saved: false, code: 'V3_MEMORY_STALE' }); assert.deepEqual(saved.exactAnchors, []);
+      assert.ok(saved.suppressedExactAnchorIds.includes(old.exactAnchors[0].anchorId));
+    } else {
+      assert.equal(result.saved, true); assert.equal(saved.summary.aiText, '新模型稿');
+      assert.equal(saved.exactAnchors[0].manual, true); assert.equal(saved.exactAnchors[0].exactText, '人工原句');
+    }
+  });
+});
+
+test('摘要链修复：编辑窗只提交实际改动字段，保留打开后自动更新', async () => {
+  const h = harness({ initialChat: [assistant('旧原句。新原句。'), user('确认'), assistant('尾楼。')],
+    utility: () => ({ jsonData: { summary: '原摘要', locations: [{ name: '原地点' }], exactQuotes: [{ exactText: '旧原句。', whyPreserve: '旧载体' }] } }) });
+  await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  const ui = viewHarness(h.runtime); await ui.view.activate();
+  const card = ui.flatten(ui.container).find(node => node.attributes['data-qqj-floor-id'] === floorId);
+  card.open = true; card.fire('toggle'); ui.flatten(card).find(node => node.textContent === '编辑').click();
+  const field = ui.flatten(ui.editorContent()).find(node => node.placeholder === '输入用户修订摘要');
+  field.value = '只改人工摘要'; field.fire('input');
+  const other = harness({ sharedBackend: h.backend, sharedContext: h.context,
+    utility: () => ({ jsonData: { summary: '新模型摘要', locations: [{ name: '新地点' }], people: [{ name: '新人物' }],
+      exactQuotes: [{ exactText: '新原句。', whyPreserve: '新载体' }] } }) });
+  await other.runtime.start(); await other.runtime.extractFloor(floorId, { analyzeState: false });
+  assert.equal(await ui.submitEditor(), true);
+  const graph = await h.store.readReachable({ mode: 'runtime' }), saved = graph.floorMemories.find(item => item.floorId === floorId);
+  assert.equal(saved.summary.userText, '只改人工摘要'); assert.equal(saved.summary.aiText, '新模型摘要');
+  assert.deepEqual(saved.locations.map(item => item.name), ['新地点']);
+  assert.deepEqual(saved.exactAnchors.map(item => item.exactText), ['新原句。']);
+  assert.ok(saved.participants.some(person => graph.entities.find(entity => entity.id === person.entityId)?.displayName === '新人物'));
+  ui.view.deactivate();
+});
+
+test('摘要链修复：不同人工字段可并发保存，同摘要冲突保当前', async t => {
+  for (const change of ['location', 'summary', 'restoreAi']) await t.test(change, async () => {
+    const h = harness(); await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+    await h.runtime.extractFloor(floorId, { analyzeState: false });
+    if (change === 'restoreAi') await h.runtime.editSummary(floorId, '旧人工摘要');
+    const other = harness({ sharedBackend: h.backend, sharedContext: h.context }); await other.runtime.start();
+    const gate = h.backend.holdNextRootPut();
+    const pending = h.runtime.editSummary(floorId, '本次人工摘要').then(() => ({ saved: true }), error => ({ saved: false, code: error.code }));
+    await gate.started;
+    if (change === 'summary') await other.runtime.editSummary(floorId, '另一份已保存人工摘要');
+    else if (change === 'restoreAi') await other.runtime.restoreAi(floorId);
+    else await other.runtime.editMemory(floorId, { locations: [{ name: '另一份人工地点' }] });
+    gate.release(); const result = await pending;
+    const cold = harness({ sharedBackend: h.backend, sharedContext: h.context }); await cold.runtime.start();
+    await cold.runtime.extractFloor(floorId, { analyzeState: false });
+    const saved = (await cold.store.readReachable({ mode: 'runtime' })).floorMemories.find(item => item.floorId === floorId);
+    if (change !== 'location') {
+      assert.deepEqual(result, { saved: false, code: 'V3_MEMORY_STALE' }); if (change === 'summary') assert.equal(saved.summary.userText, '另一份已保存人工摘要');
+      else assert.equal(saved.summary.effectiveSource, 'ai');
+    } else {
+      assert.equal(result.saved, true); assert.equal(saved.summary.userText, '本次人工摘要');
+      assert.deepEqual(saved.locations.map(item => item.name), ['另一份人工地点']);
+    }
+  });
+});
+
+test('CSE局部隔离：历史中间楼失败仍保存后楼人物状态，本批不重复失败楼', async () => {
+  const seed = await seedContinuousSummaryTail(4), requests = [];
+  const h = harness({ automation: { enabled: true, batchSize: 1 }, sharedBackend: seed.backend, sharedContext: seed.context,
+    utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content), content = request.payload?.canonicalContent ?? '';
+      if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { summary: '摘要-' + content } };
+      requests.push(content);
+      if (/尾部欠账\s*2/.test(content)) throw new Error('单楼CSE失败');
+      return { jsonData: { noMaterialChange: true } };
+    } });
+  await h.runtime.start(); await h.runtime.startHistoricalRebuild();
+  await waitFor(() => h.runtime.getState().lastAutoMemory?.reason === 'manualHistoricalRebuild' && !h.runtime.getState().memoryWorkBusy, 'history settles');
+  const state = h.runtime.getState();
+  assert.equal(state.summaryCompletedCount, 5);
+  assert.equal(state.cseFloors.filter(item => ['ready', 'noChange'].includes(item.status)).length, 4);
+  assert.equal(requests.filter(content => /尾部欠账\s*2/.test(content)).length, 1);
+  assert.equal(requests.length, 4, '已完成前缀不重复分析，仅处理四楼欠账');
+  h.setEnabled(false); h.runtime.invalidate();
+});
+
+test('CSE局部隔离：重构中间缺口持久记录，冷开继续只补失败楼', async () => {
+  const seed = await seedContinuousSummaryTail(4, { includeCse: true }); let mode = 'seed'; const requests = [];
+  const options = { automation: { enabled: true, batchSize: 20 }, sharedBackend: seed.backend, sharedContext: seed.context,
+    utility: call => {
+      const content = JSON.parse(call.taskMessages[0].content).payload?.canonicalContent ?? '';
+      if (call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) { assert.equal(mode, 'seed'); return { jsonData: { summary: '摘要-' + content } }; }
+      if (mode !== 'seed') requests.push(content);
+      if (mode === 'fail' && /尾部欠账\s*2/.test(content)) throw new Error('中间缺口');
+      return { jsonData: content === '已完成前缀' ? { subjects: [{ subject: '裴晚生', situational: [{ text: '保留前缀状态', visibility: 'observable', reason: '依据' }] }] } : { noMaterialChange: true } };
+    } };
+  const h = harness(options); await h.runtime.start(); await h.runtime.startHistoricalRebuild();
+  await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()), 'seed caught up');
+  mode = 'fail'; await h.runtime.rebuildCse(CHAT);
+  assert.equal(requests.length, 5);
+  assert.equal(h.runtime.getState().cseRebuildStatus, 'failed');
+  assert.equal(h.runtime.getState().cseRebuildCompletedCount, 4);
+  const graph = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(graph.run.diagnostics.cseRebuild.completedFloorIds.length, 4);
+  const healthy = h.runtime.getState().floors.find(item => item.assistantSeq === 4);
+  await h.runtime.retryStateAnalysis(healthy.floorId);
+  const person = h.runtime.getState().cseSubjects[0]; assert.ok(person);
+  await h.runtime.correctSubjectState(person.subjectEntityId, { situational: [{ text: '重构间隙人工状态', visibility: 'private' }] });
+  const afterOtherCse = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(afterOtherCse.run.diagnostics.cseRebuild.completedFloorIds.length, 4, '普通重分析及人工编辑继承仍有效的原job进度');
+  h.setEnabled(false); h.runtime.invalidate();
+  const cold = harness(options); await cold.runtime.start();
+  assert.equal(cold.runtime.getState().cseRebuildCompletedCount, 4);
+  mode = 'resume'; requests.length = 0; await cold.runtime.resumeCseRebuild(CHAT);
+  assert.equal(cold.runtime.getState().cseRebuildStatus, 'completed');
+  assert.equal(cold.runtime.getState().summaryCompletedCount, 5);
+  assert.equal(requests.length, 1); assert.match(requests[0], /尾部欠账\s*2/);
+  cold.setEnabled(false); cold.runtime.invalidate();
+});
+
+test('第一批辅助隔离：普通准备及千事沿局部不可用合同继续健康存档', async () => {
+  let unavailable = false, rejudging = false;
+  const h = harness({ withPlaces: true, identityProjectionProvider: async (_identity, options = {}) => {
+    if (unavailable) {
+      assert.equal(options.allowUnavailable, true);
+      return { unavailableSources: ['people', 'places'] };
+    }
+    return {};
+  }, utility: options => {
+    const request = JSON.parse(options.taskMessages[0].content);
+    if (rejudging) return rejudgeBatchResponse(request, row => ({ recordDecisions: row.records.map(record => ({
+      key: record.key, status: 'occurred', actionStatus: 'occurred', matter: false, links: [], following: false,
+    })) }));
+    return { jsonData: { summary: '健康摘要', qianshi: { events: [{ key: 'old', title: '既有事实', description: '已发生', status: 'occurred', matter: false }], order: [] } } };
+  } });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  unavailable = true;
+  await h.runtime.refreshStatus({ allowCached: false });
+  assert.equal((await h.runtime.prepareCurrent()).status, 'ready');
+  const plan = await h.runtime.prepareQianshiRejudge();
+  rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.commitStatus, 'saved', JSON.stringify(result)); assert.equal(result.savedFloors, 1);
+  assert.equal((await h.store.readReachable({ mode: 'runtime' })).floorMemories[0].summary.aiText, '健康摘要');
+  h.setEnabled(false); h.runtime.invalidate();
+});
+
+test('CSE辅助目录：冷开不可用与提交期间不可用继续已知人物，沿allowUnavailable', async t => {
+  for (const failAt of [1, 2]) await t.test(String(failAt), async () => {
+    let count = 0;
+    const h = harness({ identityProjectionProvider: async (identity, options = {}) => {
+      if (options.includePlaces !== false) return {};
+      count += 1;
+      if (count >= failAt) {
+        assert.equal(options.allowUnavailable, true);
+        return { unavailableSources: ['people'] };
+      }
+      return {};
+    } });
+    await h.runtime.start(); await h.runtime.extractNext();
+    assert.equal(h.runtime.getState().lastCseError, null);
+    assert.equal(h.runtime.getState().cseFloors.filter(item => ['ready', 'noChange'].includes(item.status)).length, 1);
+    assert.equal(count, 2);
+  });
+});
+
+test('CSE人工合并：正常编辑窗仅提交实际条目，后台新增同类与其他分类保留', async () => {
+  let addNew = false;
+  const h = harness({ utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT
+    ? { jsonData: { summary: '角色停留', people: [{ name: '你', role: 'user' }] } }
+    : { jsonData: { subjects: [{ subject: '林岚', situational: [
+      { text: '原状态A', visibility: 'observable', reason: '依据' },
+      ...(addNew ? [{ text: '新状态B', visibility: 'observable', reason: '依据' }] : []),
+    ], ...(addNew ? { adaptive: [{ text: '新增长期倾向', visibility: 'private', reason: '依据' }] } : {}) }] } } });
+  await h.runtime.start(); await h.runtime.extractNext();
+  const state = h.runtime.getState(), subject = state.cseSubjects.find(item => item.situational.some(value => value.text === '原状态A'));
+  const ui = viewHarness(h.runtime, { page: 'people' }); await ui.view.activate();
+  const card = ui.flatten(ui.container).find(node => node.attributes?.['data-qqj-cse-entity-id'] === subject.subjectEntityId);
+  ui.flatten(card).find(node => ['编辑状态', '编辑我的状态', '编辑人物状态'].includes(node.textContent)).click();
+  const field = ui.flatten(ui.editorContent()).find(node => node.placeholder === '当前情境内容');
+  field.value = '人工状态A'; field.fire('input');
+  addNew = true; await h.runtime.retryStateAnalysis(state.floors[0].floorId);
+  const submitted = await ui.submitEditor();
+  assert.equal(submitted, true, ui.editorError()?.stack);
+  const target = h.runtime.getState().cseSubjects.find(item => item.subjectEntityId === subject.subjectEntityId);
+  assert.deepEqual(target.situational.map(item => item.text).sort(), ['人工状态A', '新状态B'].sort());
+  assert.deepEqual(target.adaptive.map(item => item.text), ['新增长期倾向']);
+  ui.view.deactivate();
+});
+
+test('CSE人工合并：无关摘要CAS竞争有界重基，忙态明确未保存', async () => {
+  let blocking = false, entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const utility = async options => {
+    if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { summary: '角色状态', people: [{ name: '裴晚生' }] } };
+    if (blocking) { entered(); await new Promise(resolve => { release = resolve; }); }
+    return { jsonData: { subjects: [{ subject: '裴晚生', situational: [{ text: '原状态', visibility: 'observable', reason: '依据' }] }] } };
+  };
+  const h = harness({ utility }); await h.runtime.start(); await h.runtime.extractNext();
+  const state = h.runtime.getState(), subject = state.cseSubjects.find(item => item.situational.length);
+  const copy = values => values.map(item => ({ itemId: item.id, text: item.text, visibility: item.visibility, towardEntityId: item.towardEntityId ?? null, origin: item.origin }));
+  const edits = { expectedChatId: state.chatId, anchorFloorId: state.replayedCurrentState.headFloorId,
+    original: { core: copy(subject.core), adaptive: copy(subject.adaptive), situational: copy(subject.situational) },
+    situational: copy(subject.situational).map(item => ({ ...item, text: 'CAS人工状态' })) };
+  const other = harness({ sharedBackend: h.backend, sharedContext: h.context, utility }); await other.runtime.start();
+  const gate = h.backend.holdNextRootPut();
+  const pending = h.runtime.correctSubjectState(subject.subjectEntityId, edits); await gate.started;
+  await other.runtime.editSummary(state.floors[0].floorId, '并发摘要'); gate.release(); await pending;
+  const graph = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(graph.floorMemories[0].summary.userText, '并发摘要');
+  assert.ok(h.runtime.getState().cseSubjects.some(item => item.situational.some(value => value.text === 'CAS人工状态')));
+  blocking = true; const running = h.runtime.retryStateAnalysis(state.floors[0].floorId); await started;
+  await assert.rejects(h.runtime.correctSubjectState(subject.subjectEntityId, edits), error => error.code === 'V3_MEMORY_BUSY');
+  release(); await running;
+});
+
+test('CSE局部隔离：核心存储提交失败停止本批，保存摘要和旧人物链保留', async () => {
+  const seed = await seedContinuousSummaryTail(3); let inject = false; let models = 0;
+  const h = harness({ sharedBackend: seed.backend, sharedContext: seed.context, automation: { enabled: true, batchSize: 20 },
+    utility: options => {
+      if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { summary: '健康摘要' } };
+      if (inject) { models += 1; h.backend.setBeforePut(({ key }) => { if (key === 'v3-root') throw Object.assign(new Error('核心存储不可用'), { code: 'BACKEND_NETWORK' }); }); }
+      return { jsonData: { noMaterialChange: true } };
+    } });
+  await h.runtime.start(); await h.runtime.startHistoricalRebuild(); await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()));
+  const before = await h.store.readReachable({ mode: 'runtime' }); inject = true; await h.runtime.rebuildCse(CHAT);
+  h.backend.setBeforePut(null);
+  assert.equal(models, 1); assert.equal(h.runtime.getState().cseRebuildStatus, 'failed');
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(after.floorMemories.map(item => item.id), before.floorMemories.map(item => item.id));
+  assert.deepEqual(after.stateDeltas.map(item => item.id), before.stateDeltas.map(item => item.id));
+  h.setEnabled(false); h.runtime.invalidate();
+});
+
+test('CSE人工合并：在途模型遇另一实例明确清空时保人工，目标删除拒绝旧稿', async () => {
+  let block = false, entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const utility = async options => {
+    if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { summary: '状态摘要', people: [{ name: '裴晚生' }] } };
+    if (block) { entered(); await new Promise(resolve => { release = resolve; }); }
+    return { jsonData: { subjects: [{ subject: '裴晚生', situational: [{ text: '自动状态', visibility: 'observable', reason: '依据' }] }] } };
+  };
+  const h = harness({ utility }); await h.runtime.start(); await h.runtime.extractNext();
+  const state = h.runtime.getState(), subject = state.cseSubjects.find(item => item.situational.length);
+  const other = harness({ sharedBackend: h.backend, sharedContext: h.context, utility }); await other.runtime.start();
+  block = true; const running = h.runtime.retryStateAnalysis(state.floors[0].floorId); await started;
+  await other.runtime.correctSubjectState(subject.subjectEntityId, { core: subject.core, adaptive: subject.adaptive, situational: [] });
+  release(); await running;
+  assert.equal(h.runtime.getState().lastCseError, null);
+  assert.deepEqual(h.runtime.getState().cseSubjects.find(item => item.subjectEntityId === subject.subjectEntityId).situational, []);
+  h.runtime.setIdentityProjection({ deletedEntityIds: [subject.subjectEntityId] });
+  await assert.rejects(h.runtime.correctSubjectState(subject.subjectEntityId, { situational: [{ text: '旧稿', visibility: 'private' }] }), error => error.code === 'V3_CSE_MANUAL_TARGET_INVALID');
+});
+
+test('CSE局部隔离：同楼另一自动结果先保存时旧回包仍stale', async () => {
+  let block = false, entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const result = text => ({ jsonData: { subjects: [{ subject: '裴晚生', situational: [{ text, visibility: 'observable', reason: '依据' }] }] } });
+  const h = harness({ utility: async options => {
+    if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) return { jsonData: { summary: '已存摘要', people: [{ name: '裴晚生' }] } };
+    if (block) { entered(); await new Promise(resolve => { release = resolve; }); }
+    return result('较早自动状态');
+  } });
+  await h.runtime.start(); await h.runtime.extractNext();
+  const floorId = h.runtime.getState().floors[0].floorId;
+  const other = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => result('已保存的新自动状态') });
+  await other.runtime.start(); block = true;
+  const running = h.runtime.retryStateAnalysis(floorId); await started;
+  await other.runtime.retryStateAnalysis(floorId); release(); await running;
+  assert.equal(h.runtime.getState().lastCseError?.code, 'V3_CSE_STALE');
+  const graph = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(graph.currentStates[0].subjects.flatMap(subject => subject.situational.map(item => item.text)), ['已保存的新自动状态']);
+});
+
+
+test('第一批千事隔离：第二批失败仍保存前后健康楼，冷开仅继续失败楼', async () => {
+  let rejudging = false, requests = 0, fail = true;
+  const utility = options => {
+    if (!rejudging) return { jsonData: { summary: '稳定摘要', qianshi: { events: [{ key: 'old', title: '原事实', description: '已经发生', status: 'occurred', matter: false }], order: [] } } };
+    requests += 1;
+    if (fail && requests === 2) throw new Error('受控第二批请求失败');
+    return rejudgeBatchResponse(JSON.parse(options.taskMessages[0].content), row => ({ recordDecisions: row.records.map(record => ({ key: record.key, status: 'occurred', actionStatus: 'occurred', matter: false, links: [], following: false })) }));
+  };
+  const h = harness({ initialChat: [user('开始'), assistant('第一段'), user('继续'), assistant('第二段'), user('继续'), assistant('第三段'), user('稳定')], utility });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const firstFloor = h.runtime.getState().floors[0];
+  await h.runtime.editMemory(firstFloor.floorId, { timeText: '2026-08-01 10:00', originalTimeText: '时间未明确', timeChanged: true });
+  const before = await h.store.readReachable({ mode: 'runtime' });
+  const plan = await h.runtime.prepareQianshiRejudge({ maxOutputTokens: 1200 });
+  assert.equal(plan.historyApiCalls, 3); rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(requests, 3); assert.equal(result.savedFloors, 2, JSON.stringify(result));
+  assert.equal(result.failedFloors, 1); assert.equal(result.attemptedFloors, 3); assert.equal(result.processedFloors, 2);
+  assert.equal(result.commitStatus, 'saved'); assert.equal(result.status, 'partial');
+  assert.deepEqual(result.outcomes.map(row => row.status), ['saved-complete', 'failed', 'saved-complete']);
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.rootRevision, before.rootRevision + 1);
+  assert.equal(saved.run.diagnostics.floorProvenance[firstFloor.floorId].timeEdited, true);
+  assert.equal(saved.run.diagnostics.floorProvenance[saved.floors[1].id].timeEdited ?? false, false, '失败楼保本楼人工归属，不继承首楼标记');
+  assert.equal(saved.floorMemories[1].qianshiDelta.status, 'pending');
+  assert.deepEqual(saved.floorMemories[1].qianshiDelta.events, before.floorMemories[1].qianshiDelta.events);
+  assert.equal(h.runtime.getQianshiSnapshot().events.length, 3);
+  fail = false;
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility }); await cold.runtime.start();
+  const remaining = await cold.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(remaining.totalFloors, 1); assert.equal(remaining.floors[0].assistantSeq, 2);
+  const resumed = await cold.runtime.startQianshiRejudge(remaining.planId);
+  assert.equal(resumed.status, 'completed', JSON.stringify(resumed)); assert.equal(requests, 4);
+  assert.equal((await cold.runtime.prepareQianshiRejudge({ onlyIncomplete: true })).totalFloors, 0);
+  h.setEnabled(false); h.runtime.invalidate(); cold.setEnabled(false); cold.runtime.invalidate();
+});
+
+test('第一批千事隔离：同批缺楼重复归属与坏单楼编译隔离，健康同批保存', async t => {
+  for (const mode of ['missing', 'duplicate', 'compile']) await t.test(mode, async () => {
+    let rejudging = false;
+    const h = harness({ initialChat: [user('开始'), assistant('第一段'), user('继续'), assistant('第二段'), user('继续'), assistant('第三段'), user('稳定')], utility: options => {
+      if (!rejudging) return { jsonData: { summary: '稳定摘要', qianshi: { events: [{ key: 'old', title: '原事实', description: '已经发生', status: 'occurred', matter: false }], order: [] } } };
+      const packet = rejudgeBatchResponse(JSON.parse(options.taskMessages[0].content), row => ({ events: row.records.map(record => ({ key: record.key,
+        status: mode === 'compile' && row.floorKey === 'floor-2' ? 'invalid' : 'occurred', actionStatus: 'occurred', matter: false })), order: [] }));
+      if (mode === 'missing') packet.jsonData.floors.splice(1, 1);
+      if (mode === 'duplicate') packet.jsonData.floors.push(structuredClone(packet.jsonData.floors[1]));
+      return packet;
+    } });
+    await h.runtime.start(); for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    const plan = await h.runtime.prepareQianshiRejudge(); assert.equal(plan.historyApiCalls, 1); rejudging = true;
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(result.savedFloors, 2, JSON.stringify(result)); assert.equal(result.failedFloors, 1); assert.equal(result.calls, 1);
+    assert.deepEqual(result.outcomes.map(row => row.status), ['saved-complete', 'failed', 'saved-complete']);
+    assert.equal((await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true })).totalFloors, 1);
+    h.setEnabled(false); h.runtime.invalidate();
+  });
+});
+
+test('第一批千事收口：可靠保旧partial完成本轮并进入尾审，默认历史零重复', async () => {
+  let reviews = 0;
+  const h = await prepareFollowingFixture({ historyResult: row => ({ recordDecisions: row.records.map(record => ({ key: record.key,
+    status: 'planned', actionStatus: 'planned', following: true, matter: true,
+    links: row.floorKey === 'floor-2' ? [{ candidateKey: 'floor-99:record-1', kind: 'progress' }] : [] })) }),
+    review: request => { reviews += 1; return { jsonData: { decisions: request.matters.map(matter => ({ key: matter.key, status: matter.status, following: true, reason: '保留现判断', evidenceFloorKeys: ['floor-2'] })) } }; } });
+  const plan = await h.runtime.prepareQianshiRejudge();
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.commitStatus, 'saved'); assert.equal(result.savedPartialFloors, 1);
+  assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.request.outcome, 'completed');
+  assert.equal(reviews, 1); assert.equal(result.followup.status, 'completed');
+  const next = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(next.totalFloors, 0); assert.equal(next.historyApiCalls, 0);
+  h.setEnabled(false); h.runtime.invalidate();
+});
+
+test('第一批千事并发：独立CSE更新后千事照常提交并保最新CSE', async () => {
+  let rejudging = false, entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const h = harness({ utility: async options => {
+    if (!rejudging) return { jsonData: { summary: '稳定摘要', qianshi: { events: [{ key: 'old', title: '原事实', description: '已经发生', status: 'occurred', matter: false }], order: [] } } };
+    entered(); await new Promise(resolve => { release = resolve; });
+    return rejudgeBatchResponse(JSON.parse(options.taskMessages[0].content), row => ({ recordDecisions: row.records.map(record => ({ key: record.key, status: 'occurred', actionStatus: 'occurred', matter: false, links: [], following: false })) }));
+  } });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const other = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => ({ jsonData: { noMaterialChange: true } }) });
+  await other.runtime.start(); const plan = await h.runtime.prepareQianshiRejudge(); rejudging = true;
+  const pending = h.runtime.startQianshiRejudge(plan.planId); await started;
+  await other.runtime.retryStateAnalysis(other.runtime.getState().floors[0].floorId);
+  const withCse = await other.store.readReachable({ mode: 'runtime' }); assert.equal(withCse.stateDeltas.length, 1);
+  release(); const result = await pending;
+  assert.equal(result.commitStatus, 'saved', JSON.stringify(result)); assert.equal(result.status, 'completed');
+  const after = await h.store.readReachable({ mode: 'runtime' });
+  assert.deepEqual(after.stateDeltas, withCse.stateDeltas);
+  h.setEnabled(false); h.runtime.invalidate(); other.setEnabled(false); other.runtime.invalidate();
+});
+
+
+test('第一批千事引用：后批可引用失败批保留的原合法事项', async () => {
+  let rejudging = false, seeded = 0, requests = 0;
+  const h = harness({ initialChat: [user('开始'), assistant('第一段'), user('继续'), assistant('第二段'), user('继续'), assistant('第三段'), user('稳定')], utility: options => {
+    if (!rejudging) return { jsonData: { summary: '稳定摘要', qianshi: { events: [{ key: 'old', title: `第${++seeded}旧约定`, description: '独立约定', status: 'planned', matter: true }], order: [] } } };
+    requests += 1; if (requests === 2) throw new Error('第二批请求失败');
+    const request = JSON.parse(options.taskMessages[0].content);
+    return rejudgeBatchResponse(request, row => {
+      const prior = request.qianshiCandidates.find(candidate => candidate.origin?.title === '第2旧约定');
+      if (row.floorKey === 'floor-3') assert.ok(prior, '失败批的原合法事项仍可作为候选');
+      return { recordDecisions: row.records.map(record => ({ key: record.key, status: row.floorKey === 'floor-3' ? 'completed' : 'planned',
+        actionStatus: 'occurred', following: row.floorKey !== 'floor-3', matter: true,
+        links: row.floorKey === 'floor-3' ? [{ candidateKey: prior.key, kind: 'progress' }] : [] })) };
+    });
+  } });
+  await h.runtime.start(); for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  const before = await h.store.readReachable({ mode: 'runtime' }), secondId = before.floorMemories[1].qianshiDelta.events[0].matterId;
+  const plan = await h.runtime.prepareQianshiRejudge({ maxOutputTokens: 1200 }); rejudging = true;
+  const result = await h.runtime.startQianshiRejudge(plan.planId);
+  assert.equal(result.savedFloors, 2, JSON.stringify(result)); assert.equal(result.failedFloors, 1); assert.equal(requests, 3);
+  const saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(saved.floorMemories[2].qianshiDelta.events[0].matterId, secondId);
+  assert.equal(h.runtime.getQianshiSnapshot().matters.find(matter => matter.matterId === secondId).status, 'completed');
+  h.setEnabled(false); h.runtime.invalidate();
+});
+
+test('第一批辅助隔离：同聊已知人工姓名保留，恢复读取后明确删除立即生效', async () => {
+  let projection = {}, unavailable = false;
+  const h = harness({ withPlaces: true, identityProjectionProvider: async (_identity, options = {}) => {
+    assert.equal(options.allowUnavailable, true);
+    return unavailable ? { unavailableSources: ['people'], currentNamesByEntityId: {}, manualAliasesByEntityId: {}, reviewedAliasesByEntityId: {} } : projection;
+  } });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const source = await h.store.readReachable({ mode: 'runtime' });
+  const person = source.entities.find(entity => entity.entityType === 'person');
+  assert.ok(person);
+  projection = { currentNamesByEntityId: { [person.id]: '人工姓名' } };
+  await h.runtime.prepareCurrent();
+  assert.ok(h.runtime.getQianshiEditPeople().some(value => value.entityId === person.id && value.name === '人工姓名'));
+  unavailable = true; await h.runtime.prepareCurrent();
+  assert.ok(h.runtime.getQianshiEditPeople().some(value => value.entityId === person.id && value.name === '人工姓名'));
+  unavailable = false; projection = { deletedEntityIds: [person.id] }; await h.runtime.prepareCurrent();
+  assert.equal(h.runtime.getQianshiEditPeople().some(value => value.entityId === person.id), false);
+  h.setEnabled(false); h.runtime.invalidate();
+});
+
+
+test('第一批千事CAS：保存期独立CSE冲突沿原提交层重基，人工源变更拒绝', async t => {
+  for (const change of ['cse', 'summary']) await t.test(change, async () => {
+    let rejudging = false, requests = 0;
+    const h = harness({ utility: options => {
+      if (!rejudging) return { jsonData: { summary: '原摘要', qianshi: { events: [{ key: 'old', title: '原事实', description: '原事实', status: 'occurred', matter: false }], order: [] } } };
+      requests += 1;
+      return rejudgeBatchResponse(JSON.parse(options.taskMessages[0].content), row => ({ recordDecisions: row.records.map(record => ({ key: record.key, status: 'occurred', actionStatus: 'occurred', matter: false, links: [], following: false })) }));
+    } });
+    await h.runtime.start(); const id = h.runtime.getState().floors[0].floorId;
+    await h.runtime.extractFloor(id, { analyzeState: false });
+    const other = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => ({ jsonData: { noMaterialChange: true } }) }); await other.runtime.start();
+    const plan = await h.runtime.prepareQianshiRejudge(); rejudging = true;
+    let fired = false;
+    h.backend.setBeforePut(async ({ key }) => {
+      if (key !== 'v3-root' || fired) return;
+      fired = true;
+      if (change === 'cse') await other.runtime.retryStateAnalysis(id);
+      else await other.runtime.editSummary(id, '并发人工摘要');
+    });
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(fired, true); assert.equal(requests, 1);
+    const after = await h.store.readReachable({ mode: 'runtime' });
+    if (change === 'cse') {
+      assert.equal(result.commitStatus, 'saved', JSON.stringify(result)); assert.equal(result.savedFloors, 1);
+      assert.equal(after.stateDeltas.length, 1);
+    } else {
+      assert.equal(result.savedFloors, 0); assert.equal(result.status, 'partial');
+      assert.ok(result.outcomes.some(outcome => outcome.reasonCode === 'QIANSHI_REJUDGE_SOURCE_CHANGED'));
+      assert.equal(after.floorMemories[0].summary.userText, '并发人工摘要');
+    }
+    h.backend.setBeforePut(null); h.setEnabled(false); h.runtime.invalidate(); other.setEnabled(false); other.runtime.invalidate();
+  });
+});
+
+
+test('第一批千事通道：明确配置认证错误停止后批，已有健康结果照常保存', async t => {
+  for (const failure of [{ code: 'QQJ_CONFIG' }, { code: 'QQJ_PRESET_INVALID' }, { code: 'QQJ_AUTH' }, { httpStatus: 401 }, { status: 403 }]) await t.test(JSON.stringify(failure), async () => {
+    let rejudging = false, requests = 0;
+    const h = harness({ initialChat: [user('开始'), assistant('第一段'), user('继续'), assistant('第二段'), user('继续'), assistant('第三段'), user('稳定')], utility: options => {
+      if (!rejudging) return { jsonData: { summary: '稳定摘要', qianshi: { events: [{ key: 'old', title: '原事实', description: '已经发生', status: 'occurred', matter: false }], order: [] } } };
+      requests += 1; if (requests === 2) throw Object.assign(new Error('模型通道不可用'), failure);
+      return rejudgeBatchResponse(JSON.parse(options.taskMessages[0].content), row => ({ recordDecisions: row.records.map(record => ({ key: record.key, status: 'occurred', actionStatus: 'occurred', matter: false, links: [], following: false })) }));
+    } });
+    await h.runtime.start(); for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+    const plan = await h.runtime.prepareQianshiRejudge({ maxOutputTokens: 1200 }); rejudging = true;
+    const result = await h.runtime.startQianshiRejudge(plan.planId);
+    assert.equal(requests, 2); assert.equal(result.calls, 2); assert.equal(result.attemptedFloors, 2);
+    assert.equal(result.savedFloors, 1, JSON.stringify(result)); assert.equal(result.failedFloors, 2);
+    assert.equal(result.commitStatus, 'saved'); assert.equal(h.runtime.getQianshiSnapshot().events.length, 3);
+    const cold = harness({ sharedBackend: h.backend, sharedContext: h.context }); await cold.runtime.start();
+    assert.equal((await cold.runtime.prepareQianshiRejudge({ onlyIncomplete: true })).totalFloors, 2);
+    h.setEnabled(false); h.runtime.invalidate(); cold.setEnabled(false); cold.runtime.invalidate();
+  });
+});
+
+
+test('第一批千事待续：人工追加保pending，补齐后的尾审预估与实际一致', async () => {
+  let rejudging = false, failing = true, reviews = 0;
+  const h = harness({ initialChat: [user('开始'), assistant('旧约定仍有效。'), user('稳定')],
+    utility: options => {
+      if (!rejudging) return { jsonData: { summary: '原摘要', qianshi: { events: [{ key: 'old', title: '旧约定', description: '已存约定', status: 'planned', matter: true }], order: [] } } };
+      if (failing) throw Object.assign(new Error('单批请求超时'), { code: 'QQJ_TIMEOUT' });
+      return rejudgeBatchResponse(JSON.parse(options.taskMessages[0].content), row => ({ recordDecisions: row.records.map(record => ({ key: record.key,
+        status: 'planned', actionStatus: 'planned', matter: true, links: [], following: true })) }));
+    }, todoReview: request => { reviews += 1; return { jsonData: { decisions: request.matters.map(matter => ({ key: matter.key, status: matter.status,
+      following: true, reason: '维持已存判断', evidenceFloorKeys: ['floor-1'] })) } }; } });
+  await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const first = await h.runtime.prepareQianshiRejudge(); rejudging = true;
+  const failed = await h.runtime.startQianshiRejudge(first.planId);
+  assert.equal(failed.commitStatus, 'saved'); assert.equal(failed.savedFloors, 0); assert.equal(failed.failedFloors, 1);
+  assert.equal((await h.runtime.createQianshiTodo({ title: '人工待办', description: '人工独立新增', people: [] })).status, 'saved');
+  const pending = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(pending.floorMemories[0].qianshiDelta.status, 'pending');
+  const next = await h.runtime.prepareQianshiRejudge({ onlyIncomplete: true });
+  assert.equal(next.totalFloors, 1); assert.equal(next.followup.apiCalls, 1);
+  failing = false;
+  const completed = await h.runtime.startQianshiRejudge(next.planId);
+  assert.equal(completed.status, 'completed', JSON.stringify(completed)); assert.equal(completed.calls, next.apiCalls);
+  assert.equal(reviews, 1); assert.ok(h.runtime.getQianshiSnapshot().events.some(event => event.title === '人工待办'));
+  h.setEnabled(false); h.runtime.invalidate();
+});
+
+
+test('第一批CSE通道：明确配置认证故障停止后楼，健康结果保留且原入口可继续', async t => {
+  for (const mode of ['historical', 'rebuild']) for (const failure of [{ code: 'QQJ_CONFIG' }, { code: 'QQJ_AUTH' }, { httpStatus: 401 }]) {
+    await t.test(`${mode}/${JSON.stringify(failure)}`, async () => {
+      const seed = await seedContinuousSummaryTail(4, { includeCse: true });
+      let failing = mode === 'historical', requests = [], summaries = 0;
+      const h = harness({ automation: { enabled: true, batchSize: 1 }, sharedBackend: seed.backend, sharedContext: seed.context,
+        utility: options => {
+          const content = JSON.parse(options.taskMessages[0].content).payload?.canonicalContent ?? '';
+          if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) { summaries += 1; return { jsonData: { summary: '摘要-' + content } }; }
+          if (failing) {
+            requests.push(content);
+            if (requests.length >= 2) throw Object.assign(new Error('受控模型通道故障'), failure);
+          }
+          return { jsonData: { noMaterialChange: true } };
+        } });
+      await h.runtime.start();
+      let before = await h.store.readReachable({ mode: 'runtime' });
+      await h.runtime.startHistoricalRebuild();
+      await waitFor(() => !h.runtime.getState().memoryWorkBusy && h.runtime.getState().lastAutoMemory?.reason === 'manualHistoricalRebuild', 'history settled');
+      if (mode === 'rebuild') {
+        assert.ok(registeredGraphCaughtUp(h.runtime.getState()));
+        before = await h.store.readReachable({ mode: 'runtime' }); failing = true; requests = [];
+        await h.runtime.rebuildCse(CHAT);
+      }
+      const failed = h.runtime.getState(), after = await h.store.readReachable({ mode: 'runtime' });
+      assert.equal(requests.length, 2, '首楼健康保存，通道故障后停止逐楼派发');
+      assert.equal(failed.summaryCompletedCount, 5);
+      assert.equal(failed.lastCseError.code, failure.code ?? 'V3_CSE_FAILED');
+      if (failure.httpStatus) assert.equal(failed.lastCseError.httpStatus, failure.httpStatus);
+      const untouched = mode === 'rebuild' ? before.stateDeltas.filter(delta => delta.floorId !== before.floors[0].id) : before.stateDeltas;
+      assert.ok(untouched.every(delta => after.stateDeltas.some(value => value.id === delta.id)), '已有健康CSE保留');
+      const completed = mode === 'rebuild' ? failed.cseRebuildCompletedCount : after.stateDeltas.length;
+      assert.equal(completed, mode === 'rebuild' ? 1 : 2);
+      const summaryCount = summaries; failing = false; const resumed = [];
+      const callsBefore = h.calls.length;
+      if (mode === 'rebuild') await h.runtime.resumeCseRebuild(CHAT);
+      else {
+        await h.runtime.startHistoricalRebuild();
+        await waitFor(() => registeredGraphCaughtUp(h.runtime.getState()) && !h.runtime.getState().memoryWorkBusy, 'resume settled');
+      }
+      resumed.push(...h.calls.slice(callsBefore).filter(options => options.systemPrompt !== EXTRACTOR_SYSTEM_PROMPT));
+      assert.equal(resumed.length, mode === 'rebuild' ? 4 : 3, '原继续入口只补本轮尚未完成目标');
+      assert.equal(summaries, summaryCount, '已保存摘要不重跑');
+      assert.ok(registeredGraphCaughtUp(h.runtime.getState()));
+      if (mode === 'rebuild') assert.equal(h.runtime.getState().cseRebuildStatus, 'completed');
+      h.setEnabled(false); h.runtime.invalidate(); seed.setEnabled(false); seed.runtime.invalidate();
+    });
+  }
+});
+
+
+test('第二批人工待办按稳定存档保存，正文和回复变化仍零模型，冷读保pending', async () => {
+  const h = harness({ modernAnchors: true, readOnlyLifecycle: true,
+    initialChat: [user('开始'), assistant('原正文。'), user('稳定')], utility: () => ({ jsonData: { summary: '原摘要' } }) });
+  await h.foundationRuntime.reconcile('batch2-todo'); await h.runtime.start();
+  const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  const calls = h.calls.length;
+  h.context.chat[1].mes = '已改正文。'; h.context.chat[1].swipes = ['另一回复。']; h.context.chat[1].swipe_id = 0;
+  const result = await h.runtime.createQianshiTodo({ title: '人工待办', description: '以人工登记为准', people: [] });
+  assert.equal(result.status, 'saved'); assert.equal(h.calls.length, calls);
+  const source = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(source.floorMemories[0].qianshiDelta.status, 'pending');
+  assert.ok(source.floorMemories[0].qianshiDelta.manualEventIds.includes(result.eventId));
+  const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => assert.fail('冷读不调用模型') });
+  await cold.runtime.start(); assert.ok(cold.runtime.getQianshiSnapshot().events.some(event => event.id === result.eventId));
+});
+
+test('第二批已删地点的旧编辑窗明确未保存，删除和冷读保持一致', async () => {
+  const h = harness({ withPlaces: true, modernAnchors: true, readOnlyLifecycle: true,
+    initialChat: [user('开始'), assistant('原正文。'), user('稳定')], utility: () => ({ jsonData: { summary: '原摘要' } }) });
+  await h.foundationRuntime.reconcile('batch2-place'); await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  const made = await h.runtime.createPlace({ name: '人工地点' }, h.runtime.getPlaceEditContext(null));
+  const context = h.runtime.getPlaceEditContext(made.entityId);
+  await h.runtime.deletePlace(made.entityId, context);
+  await assert.rejects(h.runtime.savePlace(made.entityId, { description: '旧窗迟到修改' }, context), error => error.code === 'QQJ_PLACE_UNAVAILABLE');
+  assert.equal(h.runtime.getQianchuangSnapshot().places.some(place => place.entityId === made.entityId), false);
+});
+
+
+test('第二批地点保存期间删除准确拒绝，读工作区期间切聊仍保存原目标', async t => {
+  for (const mode of ['deleteDuringPut', 'switchDuringRead']) await t.test(mode, async () => {
+    const h = harness({ withPlaces: true, modernAnchors: true, readOnlyLifecycle: true,
+      initialChat: [user('开始'), assistant('原正文。'), user('稳定')], utility: () => ({ jsonData: { summary: '原摘要' } }) });
+    await h.foundationRuntime.reconcile('batch2-place-race'); await h.runtime.start();
+    await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+    const made = await h.runtime.createPlace({ name: '人工地点' }, h.runtime.getPlaceEditContext(null));
+    const context = h.runtime.getPlaceEditContext(made.entityId);
+    if (mode === 'deleteDuringPut') {
+      let race = true;
+      h.backend.setBeforePut(async ({ key }) => {
+        if (key === 'v3-place-workspace' && race) { race = false; await h.runtime.deletePlace(made.entityId, context); }
+      });
+      await assert.rejects(h.runtime.savePlace(made.entityId, { description: '迟到内容' }, context), error => error.status === 409 || error.httpStatus === 409);
+      assert.equal(h.runtime.getQianchuangSnapshot().places.some(place => place.entityId === made.entityId), false);
+    } else {
+      const read = h.placeWorkspaceStore.read;
+      let race = true;
+      h.backend.setBeforeGet(async ({ key }) => {
+        if (key !== 'v3-place-workspace' || !race) return;
+        race = false; h.runtime.invalidate();
+        h.context.chatMetadata.qianqianjie.chatId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+      });
+      await h.runtime.savePlace(made.entityId, { description: '原目标人工内容' }, context);
+      const saved = await read({ chatId: CHAT }, { fresh: true });
+      assert.equal(saved.data.placesByEntityId[made.entityId].description, '原目标人工内容');
+      const other = await read({ chatId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }, { fresh: true });
+      assert.equal(other.data?.placesByEntityId?.[made.entityId], undefined);
+    }
+  });
+});
+
+test('运行保存解耦：中楼摘要失败仍分析后楼有效摘要，用户继续只补缺口', async () => {
+  let failSecond = true;
+  const calls = [];
+  const h = harness({ initialChat: [user('开始'), assistant('健康一'), user('继续二'), assistant('失败二'), user('继续三'), assistant('健康三'), user('确认')],
+    utility: options => {
+      const request = JSON.parse(options.taskMessages[0].content), body = request.payload.canonicalContent;
+      calls.push({ task: request.task, body });
+      if (request.task === 'understandCharacterStateAfterFloor') return { jsonData: { subjects: [] } };
+      if (body === '失败二' && failSecond) throw Object.assign(new Error('本楼摘要失败'), { code: 'TEST_LOCAL_SUMMARY' });
+      return { jsonData: { summary: body, people: [{ name: '你', role: 'user' }, { name: '裴晚生' }] } };
+    } });
+  await h.runtime.start(); await h.runtime.startHistoricalRebuild();
+  let graph = await h.store.readReachable({ mode: 'runtime' });
+  const sequence = new Map(graph.floors.map(floor => [floor.id, floor.assistantSeq]));
+  assert.deepEqual(graph.floorMemories.map(memory => sequence.get(memory.floorId)).sort(), [1, 3]);
+  assert.deepEqual(graph.stateDeltas.map(delta => sequence.get(delta.floorId)).sort(), [1, 3]);
+  assert.equal(h.runtime.getState().memoryWorkBusy, false);
+  assert.equal(h.runtime.getState().lastAutoMemory.status, 'partial');
+  const firstCalls = calls.length;
+  failSecond = false; await h.runtime.startHistoricalRebuild();
+  assert.deepEqual(calls.slice(firstCalls).map(call => call.body), ['失败二', '失败二']);
+  graph = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(graph.floorMemories.length, 3); assert.equal(graph.stateDeltas.length, 3);
+});
+
+test('运行保存解耦：人工摘要及待办忽略无关root元数据版本，原目标CAS保存', async t => {
+  for (const action of ['summary', 'todo']) await t.test(action, async () => {
+    let armed = false, reads = 0, injected = false;
+    const h = harness({ utility: () => ({ jsonData: { summary: '原摘要' } }), memoryRuntimeFactory: options => {
+      const original = options.store;
+      return createV3MemoryRuntime({ ...options, store: { ...original, async readRoot(...args) {
+        if (armed && ++reads === 2) {
+          const previous = await original.readRoot(...args);
+          assert.equal((await original.commitRoot({ ...previous.data, updatedAt: new Date(Date.parse(previous.data.updatedAt) + 1).toISOString() }, previous.revision)).status, 'saved');
+          injected = true;
+        }
+        return original.readRoot(...args);
+      } } });
+    } });
+    await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+    await h.runtime.extractFloor(floorId, { analyzeState: false }); armed = true;
+    if (action === 'summary') await h.runtime.editSummary(floorId, '人工最高摘要');
+    else assert.equal((await h.runtime.createQianshiTodo({ title: '人工待办', description: '明确登记' })).status, 'saved');
+    armed = false; assert.equal(injected, true);
+    const graph = await h.store.readReachable({ mode: 'runtime' });
+    const saved = graph.floorMemories.find(memory => memory.floorId === floorId);
+    if (action === 'summary') assert.equal(saved.summary.userText, '人工最高摘要');
+    else assert.ok(saved.qianshiDelta.events.some(event => event.title === '人工待办'));
+  });
+});
+
+test('运行保存解耦：已提交人工摘要的覆盖同步失败准确保存，刷新恢复且零模型重跑', async () => {
+  let armed = false, afterCommit = false;
+  const h = harness({ utility: () => ({ jsonData: { summary: '自动摘要' } }), memoryRuntimeFactory: options => {
+    const original = options.store, originalSanitizer = options.sanitizerOptions;
+    return createV3MemoryRuntime({ ...options, store: { ...original, async commitRoot(...args) {
+      const result = await original.commitRoot(...args); if (armed && result.status === 'saved') afterCommit = true; return result;
+    } }, sanitizerOptions: () => {
+      if (afterCommit) throw Object.assign(new Error('覆盖读取失败'), { code: 'TEST_COVERAGE' });
+      return originalSanitizer();
+    } });
+  } });
+  await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId, { analyzeState: false }); const calls = h.calls.length;
+  armed = true; await h.runtime.editSummary(floorId, '已提交的人工内容');
+  assert.equal(h.runtime.getState().floors[0].summary, '已提交的人工内容');
+  assert.equal(h.runtime.getState().memorySyncStatus, 'error');
+  assert.equal(h.runtime.getState().memorySyncError.code, 'TEST_COVERAGE');
+  assert.equal(h.runtime.getState().activeExtraction, null);
+  const graph = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(graph.floorMemories[0].summary.userText, '已提交的人工内容');
+  armed = false; afterCommit = false; await h.runtime.refreshStatus();
+  await waitFor(() => h.runtime.getState().memorySyncStatus === 'idle');
+  assert.equal(h.calls.length, calls);
+});
+
+test('运行保存解耦：自动摘要已提交后的覆盖同步失败保完成计数，刷新零重跑', async () => {
+  let armed = false, afterCommit = false;
+  const h = harness({ utility: () => ({ jsonData: { summary: '独立已存摘要' } }), memoryRuntimeFactory: options => {
+    const original = options.store, originalSanitizer = options.sanitizerOptions;
+    return createV3MemoryRuntime({ ...options, store: { ...original, async commitRoot(...args) {
+      const result = await original.commitRoot(...args);
+      if (armed && result.status === 'saved') afterCommit = true;
+      return result;
+    } }, sanitizerOptions: () => {
+      if (afterCommit) throw Object.assign(new Error('覆盖读取失败'), { code: 'TEST_COVERAGE' });
+      return originalSanitizer();
+    } });
+  } });
+  await h.runtime.start();
+  const floorId = h.runtime.getState().floors[0].floorId;
+  armed = true;
+  await h.runtime.extractFloor(floorId, { analyzeState: false });
+  assert.equal(h.runtime.getState().summaryCompletedCount, 1);
+  assert.equal(h.runtime.getState().floors[0].summary, '独立已存摘要');
+  assert.equal(h.runtime.getState().memorySyncError.code, 'TEST_COVERAGE');
+  assert.equal(h.runtime.getState().lastExtractorError?.floorId ?? null, null);
+  assert.equal(h.runtime.getState().activeExtraction, null);
+  const calls = h.calls.length;
+  afterCommit = false; await h.runtime.refreshStatus();
+  await waitFor(() => h.runtime.getState().memorySyncStatus === 'idle');
+  assert.equal(h.calls.length, calls);
+  assert.equal(h.runtime.getState().summaryCompletedCount, 1);
+});
+
+test('局部时间戳沿真实摘要入口保存健康字段，日期冲突不借模型或前楼补齐', async () => {
+  const stamp = (ns, date, weekday, time) => `<!-- ${ns}-start | date=${date} | weekday=${weekday} | time=${time} -->正文<!-- ${ns}-end | date=${date} | weekday=${weekday} | time=${time} -->`;
+  for (const [raw, expected, precision] of [
+    [stamp('QQJ', '2026年5月10日', '周一', '09:00') + stamp('SDC', '2026年5月10日', '周二', '09:00'), '2026年5月10日 09:00', 'exact'],
+    [stamp('QQJ', '2026年5月10日', '未知', '99:99'), '2026年5月10日', 'unresolved'],
+    [stamp('QQJ', '2026年5月10日', '未知', '09:00') + stamp('SDC', '2026年5月11日', '未知', '09:00'), '日期未知 09:00', 'unresolved'],
+  ]) {
+    const h = harness({ initialChat: [user('继续'), assistant(raw), assistant('确认稳定。')],
+      utility: () => ({ jsonData: { summary: '摘要。', time: [{ sourceText: '模型另造时间', description: '不得补齐' }] } }) });
+    await h.runtime.start();
+    await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+    const calls = h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT);
+    assert.equal(calls.length, 1);
+    const saved = h.runtime.getState().floors[0].memory.chronology;
+    assert.equal(saved[0].time.sourceText, `${expected} → ${expected}`);
+    assert.equal(saved[0].time.precision, precision);
+  }
+});
+
+test('新档身份首次保存失败后，原空档事实随同目标正常准备成功接回首楼自动摘要', async () => {
+  let session, continuation = null, captureCount = 0, failIdentity = true;
+  const h = harness({ initialChat: [assistant('无时间戳开场。')], modernAnchors: true, readOnlyLifecycle: true,
+    automation: { enabled: true, batchSize: 1 }, captureBusinessIdentity: options => options?.allowUnprepared ? { hostChatId: h.context.chatId, characterLocator: h.context.characters[0].avatar, personaLocator: h.context.userAvatar } : session.identity(),
+    utility: options => options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT ? { jsonData: { summary: '正常接回首楼。' } } : { jsonData: { noMaterialChange: true } } });
+  h.context.chatMetadata = {};
+  session = createChatSession({ contextProvider: () => h.context, identityCoordinator: {
+    async prepare(raw, _host, options) {
+      if (failIdentity) throw Object.assign(new Error('首次保存发生真实版本冲突'), { code: 'V3_TARGET_CHAT_CHANGED' });
+      options.getTaskInputs(); raw.chatMetadata.qianqianjie = { schemaVersion: 2, chatId: CHAT }; return CHAT;
+    },
+  }, captureTaskInputs: ({ raw, host, observeOnly = false }) => {
+    if (observeOnly) {
+      captureCount++;
+      void h.runtime.start({ preparationSnapshot: { chat: raw.chat, identity: { hostChatId: host.hostChatId, characterLocator: host.characterAvatar, personaLocator: host.personaAvatar } } });
+      return null;
+    }
+    return { chat: structuredClone(raw.chat), chatMetadata: structuredClone(raw.chatMetadata) };
+  }, onPrepared: ({ result }) => { continuation = h.runtime.start({ preparedIdentity: result.identity }); } });
+  await assert.rejects(session.prepare({ entryPoint: 'chatChanged' }), error => error.code === 'V3_TARGET_CHAT_CHANGED');
+  assert.equal(captureCount, 1, '身份I/O失败前即观察唯一零稳定楼，不要求复制整档');
+  assert.equal(h.calls.length, 0);
+  h.context.chat.push(user('确认开场。')); h.emit('MESSAGE_SENT', 1);
+  h.context.chat.push(assistant('下一条正常回复。')); h.emit('MESSAGE_RECEIVED', 2);
+  await waitFor(() => h.foundationRuntime.getState().inspectedStableCount === 1);
+  assert.equal(h.calls.length, 0, '未准备好身份不派摘要模型');
+  failIdentity = false;
+  await session.prepare({ entryPoint: 'sourcePrepare' }); await continuation;
+  await waitFor(() => h.runtime.getState().rememberedCount === 1 && h.runtime.getState().cseReady, '正常准备恢复后没有接回真实新楼事件');
+  assert.equal(h.calls.filter(call => call.systemPrompt === EXTRACTOR_SYSTEM_PROMPT).length, 1);
+  assert.equal(h.runtime.getState().floors[0].summary, '正常接回首楼。');
+  const calls = h.calls.length;
+  await session.prepare(); h.emit('MESSAGE_RECEIVED', 2); h.emit('MESSAGE_SENT', 1);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(h.calls.length, calls, '准备完成和相同宿主事件不重复消费');
+});
+
+test('空档身份准备事实不授予冷开稳定旧档、后来聊天或关闭后的调用', async () => {
+  for (const mode of ['history', 'changed', 'character', 'persona', 'disabled']) {
+    let session, continuation = null, failIdentity = true;
+    const h = harness({ initialChat: mode === 'history' ? [assistant('旧首楼'), user('旧确认')] : [assistant('新首楼')], modernAnchors: true, readOnlyLifecycle: true,
+      automation: { enabled: true, batchSize: 1 }, captureBusinessIdentity: options => options?.allowUnprepared ? { hostChatId: h.context.chatId, characterLocator: h.context.characters[0].avatar, personaLocator: h.context.userAvatar } : session.identity(), utility: () => { throw new Error('不应调用'); } });
+    h.context.chatMetadata = {};
+    session = createChatSession({ contextProvider: () => h.context, identityCoordinator: { async prepare(raw, _host, options) {
+      if (failIdentity) throw Object.assign(new Error('identity conflict'), { code: 'V3_TARGET_CHAT_CHANGED' });
+      // 复用已存在文件头，无需复制整份旧档。
+      raw.chatMetadata.qianqianjie = { schemaVersion: 2, chatId: CHAT }; return CHAT;
+    } }, captureTaskInputs: ({ raw, host }) => {
+      assert.notEqual(mode, 'history', '稳定旧历史不为起步观察额外复制整档');
+      const inputs = { chat: structuredClone(raw.chat), chatMetadata: structuredClone(raw.chatMetadata) };
+      void h.runtime.start({ preparationSnapshot: { chat: inputs.chat, identity: { hostChatId: host.hostChatId, characterLocator: host.characterAvatar, personaLocator: host.personaAvatar } } }); return inputs;
+    }, onPrepared: ({ result }) => { continuation = h.runtime.start({ preparedIdentity: result.identity }); } });
+    await assert.rejects(session.prepare(), error => error.code === 'V3_TARGET_CHAT_CHANGED');
+    if (mode === 'changed') { h.context.chatId = 'different-host'; h.emit('CHAT_CHANGED'); }
+    if (mode === 'character') h.context.characters = [{ avatar: 'different-character.png' }];
+    if (mode === 'persona') h.context.userAvatar = 'different-persona.png';
+    if (mode === 'disabled') { h.setEnabled(false); await h.runtime.setEnabled(false); }
+    failIdentity = false; await session.prepare(); if (continuation) await continuation;
+    if (mode === 'history') await h.runtime.start();
+    h.context.chat.push(assistant('正常后楼'), user('后楼确认')); h.emit('MESSAGE_RECEIVED', h.context.chat.length - 2); h.emit('MESSAGE_SENT', h.context.chat.length - 1);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(h.calls.length, 0, mode); assert.equal([...h.backend.records.keys()].some(key => key.endsWith('/v3-root')), false, mode);
+  }
+});
+
+test('身份完成后的接续读取期间切聊，不给后来聊天写新根或调用模型', async () => {
+  const owner = () => ({ chatId: h.context.chatMetadata.qianqianjie?.chatId ?? null, hostChatId: h.context.chatId, characterLocator: h.context.characters[0].avatar, personaLocator: h.context.userAvatar });
+  const h = harness({ initialChat: [assistant('A开场')], modernAnchors: true, readOnlyLifecycle: true, automation: { enabled: true, batchSize: 1 }, captureBusinessIdentity: owner,
+    utility: () => { throw new Error('不可派给B'); } });
+  h.context.chatMetadata = {};
+  await h.runtime.start({ preparationSnapshot: { chat: structuredClone(h.context.chat), identity: owner() } });
+  h.context.chat.push(user('A的确认')); h.emit('MESSAGE_SENT', 1);
+  await waitFor(() => h.foundationRuntime.getState().inspectedStableCount === 1);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  h.context.chatMetadata.qianqianjie = { schemaVersion: 2, chatId: CHAT };
+  const preparedIdentity = owner(); let entered, release;
+  const gateEntered = new Promise(resolve => { entered = resolve; }); const gate = new Promise(resolve => { release = resolve; }); let held = false;
+  h.setReadReachableGate(async () => { if (!held) { held = true; entered(); await gate; } });
+  const reconnect = h.runtime.start({ preparedIdentity }); await gateEntered;
+  h.context.chatId = 'host-B'; h.context.chatMetadata = { qianqianjie: { schemaVersion: 2, chatId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } };
+  h.context.chat = [assistant('B旧楼'), user('B旧确认')]; h.emit('CHAT_CHANGED'); release();
+  await reconnect; await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(h.calls.length, 0);
+  assert.equal([...h.backend.records.keys()].some(key => key.endsWith('/v3-root')), false);
+});
+
+test('地点初始化补独立世界书地点，整理只读库内来源，交替不回滚剧情人工与删除', async () => {
+  const roomQuote='青石城有青石馆，青石馆内有书房，书房有旧书桌。';
+  const remoteQuote='青石城内有远山馆。', newQuote='青石城内有新岚阁。'; let addNew=false, libraryReads=0;
+  const book={kind:'worldbook',world:'地点测试',locator:'book:dual',fingerprint:'sha256:dual',hostEnabled:true,content:roomQuote+'\n\n'+remoteQuote+'\n\n禁区有荒废遗迹。'};
+  const requests=[];let storyChange=false,deleted=false;
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[assistant('本楼尚未到访地图地点。'),user('确认')],
+    placeWorldInfoProvider:async()=>{libraryReads++;return {chatId:CHAT,candidates:[{...book,content:book.content+(addNew?'\n\n'+newQuote:'')}],macros:{}};},
+    utility:options=>{
+      const request=JSON.parse(options.taskMessages[0].content),p=request.payload;
+      if(request.task!=='organizePlaces'){if(deleted)assert.equal(p.knownPlaces.some(row=>row.displayName==='远山馆'),false,'普通摘要目录不暴露删除种子');return {jsonData:storyChange?{summary:'书房换了书架。',placePaths:[{path:[{name:'书房',sameAsPlaceKey:p.knownPlaces.find(row=>row.displayName==='书房').entityKey,description:'书房已换成新书架。'}],source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent}]}:{summary:'尚未到访地图地点。'}};}
+      requests.push(p);assert.ok(['initialize','organize'].includes(p.mode));
+      const known=new Map(p.knownPlaces.map(row=>[row.displayName,row]));
+      if(p.mode==='organize'){
+        assert.ok(p.placeWorldbookSources.length);assert.ok(!p.placeWorldbookSources.some(source=>source.content.includes('荒废遗迹')),'整理不重新送整份世界书');
+        return {jsonData:{placePaths:[]}};
+      }
+      assert.match(options.systemPrompt,/世界书.*不执行/,'全量世界书只作地点资料');
+      assert.ok(p.placeWorldbookSources[0].content.includes('荒废遗迹'),'初始化读取完整允许世界书');
+      const node=(name,extra={})=>({name,...(known.get(name)?{sameAsPlaceKey:known.get(name).entityKey}:{}),...extra});
+      const path=(names,quote)=>({path:names,evidence:[{source:'worldbook',sourceKey:p.placeWorldbookSources[0].sourceKey,exactQuote:quote}]});
+      return {jsonData:{placePaths:[path([node('青石城',{mapLevel:'city',mapStyle:'modern'}),node('青石馆'),node('书房',{description:'书房有旧书桌。',facilities:[{icon:'Table2',label:'书桌'}]})],roomQuote),path([node('青石城'),node('远山馆',{description:'旧世界书馆舍'})],remoteQuote),...(addNew?[path([node('青石城'),node('新岚阁')],newQuote)]:[])]}};
+    }});
+  await h.foundationRuntime.reconcile('dual-place-fixture');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+  const before=h.calls.length;await h.runtime.organizePlaces({mode:'initialize'});assert.equal(h.calls.length,before+1);
+  let snapshot=h.runtime.getQianchuangSnapshot();const ids=new Map(snapshot.places.map(place=>[place.displayName,place.entityId]));assert.equal(ids.size,4);assert.equal(snapshot.places.find(place=>place.displayName==='远山馆').parentEntityId,ids.get('青石城'));
+  const readsAfterInitialization=libraryReads;await h.runtime.organizePlaces({mode:'organize'});assert.equal(libraryReads,readsAfterInitialization,'整理不调用完整世界书provider');
+  storyChange=true;h.context.chat.push(assistant('你在书房把旧书桌换成新书架。'),user('确认改造'));h.emit('MESSAGE_SENT',3);
+  await h.foundationRuntime.reconcile('dual-story-change');await h.runtime.refreshStatus({preferCached:false});
+  await h.runtime.extractFloor(h.runtime.getState().floors.find(floor=>floor.messageIndex===2).floorId,{analyzeState:false});
+  await h.runtime.savePlace(ids.get('青石馆'),{description:'',parentEntityId:null},h.runtime.getPlaceEditContext(ids.get('青石馆')));
+  const beforeDelete=await h.placeWorkspaceStore.read({chatId:CHAT});beforeDelete.data.foundation.entities.find(entity=>entity.id===ids.get('远山馆')).identityBrief='将被删除的旧简介';await h.placeWorkspaceStore.put({chatId:CHAT},beforeDelete.data,beforeDelete.revision);await h.runtime.refreshStatus({preferCached:false});
+  await h.runtime.deletePlace(ids.get('远山馆'),h.runtime.getPlaceEditContext(ids.get('远山馆')));
+  deleted=true;await h.runtime.extractFloor(h.runtime.getState().floors.find(floor=>floor.messageIndex===2).floorId,{analyzeState:false});
+  addNew=true;await h.runtime.organizePlaces({mode:'initialize'});await h.runtime.organizePlaces({mode:'organize'});
+  snapshot=h.runtime.getQianchuangSnapshot();assert.equal(snapshot.places.find(place=>place.displayName==='书房').entityId,ids.get('书房'));
+  assert.ok(snapshot.places.find(place=>place.displayName==='书房').features.some(row=>row.text==='书房已换成新书架。'));
+  assert.ok(!snapshot.places.find(place=>place.displayName==='书房').features.some(row=>row.text.includes('旧书桌')));
+  assert.equal(snapshot.places.find(place=>place.displayName==='青石馆').parentEntityId,null);assert.equal(snapshot.places.find(place=>place.displayName==='青石馆').features.length,0);
+  assert.equal(snapshot.places.some(place=>place.displayName==='远山馆'),false);assert.ok(snapshot.places.some(place=>place.displayName==='新岚阁'),'删除path隔离仍保健康新地点');
+  assert.throws(()=>h.runtime.getPlaceEditContext(ids.get('远山馆')),error=>error.code==='QQJ_PLACE_UNAVAILABLE');
+  assert.equal(requests.at(-1).knownPlaces.some(row=>row.displayName==='远山馆'),false,'整理库不含已删种子');
+  const stored=(await h.placeWorkspaceStore.read({chatId:CHAT})).data;assert.ok(stored.placesByEntityId[ids.get('远山馆')].createdEntity);assert.deepEqual(Object.keys(stored.placesByEntityId[ids.get('远山馆')]).sort(),['createdEntity','scopes']);assert.equal(Object.hasOwn(stored.placesByEntityId[ids.get('远山馆')].createdEntity,'identityBrief'),false,'删除种子不保已删简介');
+});
+
+test('空聊天初始化与无世界书零调用，并保初始化后的正常实时起步', async()=>{
+  let available=false;const book={kind:'worldbook',world:'空聊地图',locator:'book:empty-init',fingerprint:'sha256:empty-init',hostEnabled:true,content:'青石馆内有书房。'};
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[],automation:{enabled:true,batchSize:1},placeWorldInfoProvider:async()=>({candidates:available?[book]:[],macros:{}}),utility:options=>{
+    const r=JSON.parse(options.taskMessages[0].content);if(r.task==='organizePlaces'){assert.ok(r.payload.placeWorldbookSources.length,'无世界书不得进入模型');return {jsonData:{placePaths:[{path:[{name:'青石馆'},{name:'书房'}],source:'worldbook',sourceKey:r.payload.placeWorldbookSources[0].sourceKey,exactQuote:book.content}]}};}
+    return options.systemPrompt===EXTRACTOR_SYSTEM_PROMPT?{jsonData:{summary:'后续开场摘要。'}}:{jsonData:{noMaterialChange:true}};
+  }});
+  await h.runtime.start();assert.equal((await h.runtime.organizePlaces({mode:'initialize'})).status,'skipped');assert.equal(h.calls.length,0);
+  available=true;await h.runtime.organizePlaces({mode:'initialize'});assert.equal(h.calls.length,1);assert.equal(h.runtime.getState().rememberedCount,0);
+  const cold=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,modernAnchors:true,readOnlyLifecycle:true,automation:{enabled:true,batchSize:1},utility:options=>options.systemPrompt===EXTRACTOR_SYSTEM_PROMPT?{jsonData:{summary:'后续开场摘要。'}}:{jsonData:{noMaterialChange:true}}});
+  await cold.runtime.start();assert.equal(cold.runtime.allowsRealtimeTailFromEmpty(),true,'空root冷开仍保实时起点');
+  cold.context.chat.push(assistant('新开场'),user('确认'));cold.emit('MESSAGE_SENT',1);cold.context.chat.push(assistant('新回复'));cold.emit('MESSAGE_RECEIVED',2);
+  await waitFor(()=>cold.runtime.getState().rememberedCount===1,'初始化后的真实新楼未自动摘要');
+  assert.equal(cold.calls.filter(call=>call.systemPrompt===EXTRACTOR_SYSTEM_PROMPT).length,1);
+});
+
+
+test('千事候选局部不可用保摘要，空或独立Q不二次准备', async t => {
+ for(const phase of ['before','after','healthy','independent','abort'])await t.test(phase,async()=>{
+  let calls=0,preparations=0,broken=phase==='before'||phase==='abort';
+  const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant('甲递来信。'),user('稳定')],qianshiCandidateIndexFactory:(...args)=>{
+   const index=createQianshiCandidateIndex(...args);return{...index,prepare(...args){preparations++;if(broken)throw Object.assign(new Error('候选不可用'),phase==='abort'?{name:'AbortError'}:{code:'Q_CANDIDATE_UNAVAILABLE'});return index.prepare(...args);}};
+  },utility:()=>{calls++;if(phase==='after')broken=true;return{jsonData:{summary:'合法摘要',qianshi:{events:phase==='independent'?[{key:'new',title:'收到信',description:'甲递来信。',status:'occurred',matter:false}]:[],order:[]}}};}});
+  await h.foundationRuntime.reconcile('candidate-isolation');await h.runtime.start();
+  const run=h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+  if(phase==='abort'){await assert.rejects(run,error=>error.name==='AbortError');assert.equal(calls,0);return;}
+  await run;const graph=await h.store.readReachable({mode:'runtime'});
+  assert.equal(calls,1);assert.equal(graph.floorMemories[0]?.summary.aiText,'合法摘要');assert.equal(preparations,1);
+  assert.equal(graph.floorMemories[0].qianshiDelta.status,phase==='before'?'pending':phase==='independent'?'ready':'empty');
+ });
+});
+
+test('千事仅核实际progress/context/order旧端点，候选故障变化局部待补',async t=>{
+ for(const kind of ['progress','context','order'])for(const change of ['healthy','throw','changed','reorder','unrelated'])await t.test(`${kind}/${change}`,async()=>{
+  let calls=0,preparations=0,after=false,usedKey;
+  const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant('甲准备还书。'),user('继续'),assistant('甲归还旧书。'),user('稳定')],qianshiCandidateIndexFactory:(...args)=>{
+   const index=createQianshiCandidateIndex(...args);return{...index,prepare(...args){preparations++;if(after&&change==='throw')throw new Error('提交候选故障');const value=index.prepare(...args);if(!after)return value;return {...value,request:value.request.map(item=>({...item,...(change==='changed'||change==='unrelated'&&item.key!==usedKey?{title:'人工改过的事项'}:{}),...(change==='reorder'?{key:'candidate-99'}:{})})),bindings:value.bindings.map(item=>({...item,...(change==='reorder'?{key:'candidate-99'}:{})}))};}};
+  },utility:options=>{
+   calls++;if(calls===1)return{jsonData:{summary:'甲准备还书。',qianshi:{events:[{key:'old',title:'还书',description:'甲准备还书。',status:'planned',matter:true},{key:'other',title:'整理卡片',description:'甲另有整理卡片计划。',status:'planned',matter:true}],order:[]}}};
+   const key=JSON.parse(options.taskMessages[0].content).payload.qianshiCandidates[0].key;usedKey=key;after=true;
+   return{jsonData:{summary:'甲归还旧书。',qianshi:{events:[{key:'new',title:'归还旧书',description:'甲归还旧书。',status:'completed',matter:kind!=='order',...(kind==='order'?{}:{links:[{candidateKey:key,kind}]})}],order:kind==='order'?[{before:key,after:'new',certainty:'explicit'}]:[]}}};
+  }});
+  await h.foundationRuntime.reconcile('used-candidate');await h.runtime.start();const floors=h.runtime.getState().floors;
+  await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});
+  const graph=await h.store.readReachable({mode:'runtime'}),saved=graph.floorMemories.find(item=>item.floorId===floors[1].floorId);
+  assert.equal(calls,2);assert.equal(saved?.summary.aiText,'甲归还旧书。');assert.equal(saved.qianshiDelta.status,['throw','changed'].includes(change)?'pending':'ready');
+  assert.equal(preparations,3,'两次初备及仅第二楼真实旧引用的一次复核');
+ });
+});
+
+test('摘要模型返回后持久化故障回执保本次安全metadata与指纹，pending不增调用',async()=>{
+ let calls=0;
+ const h=harness({utility:()=>{calls++;return{jsonData:calls===1?{invalidPacket:true}:{summary:'有效摘要'},taskMetadata:{source:'shared-utility',sourceLabel:'安全测试',model:'returned-model',finishReason:'stop',transportAttempts:2}};}});
+ await h.runtime.start();const floor=h.runtime.getState().floors[0];let failed=false;
+ h.backend.setBeforePut(({key})=>{if(!failed&&key.startsWith('v3-index-')){failed=true;throw Object.assign(new Error('safe storage failure'),{code:'TEST_COMMIT_STORAGE'});}});
+ await h.runtime.extractFloor(floor.floorId,{analyzeState:false});const failure=h.runtime.getState().lastExtractorError;
+ assert.equal(failure.code,'TEST_COMMIT_STORAGE');assert.equal(failure.api.model,'returned-model');assert.equal(failure.api.finishReason,'stop');assert.equal(failure.attempts,2);assert.equal(failure.transportAttempts,2);
+ const audit=[...h.backend.records.values()].map(row=>row.data).find(row=>row.recordType==='run'&&row.diagnostics?.code==='TEST_COMMIT_STORAGE');
+ assert.equal(audit.diagnostics.stage,'committing');assert.match(audit.diagnostics.responseFingerprint,/^sha256:[a-f0-9]{64}$/);
+ assert.doesNotMatch(JSON.stringify(audit.diagnostics),/有效摘要/);
+ h.backend.setBeforePut(null);await h.runtime.extractFloor(floor.floorId,{analyzeState:false});assert.equal(calls,2);assert.equal(h.runtime.getState().lastExtractorError,null);
+});
+
+
+test('千事初备失败后同楼摘要与CSE仍各自一次运行',async()=>{
+ let summaries=0,analyses=0;
+ const h=harness({qianshiCandidateIndexFactory:()=>({prepare(){throw new Error('Q unavailable');},invalidate(){}}),utility:options=>{
+  if(options.systemPrompt===EXTRACTOR_SYSTEM_PROMPT){summaries++;return{jsonData:{summary:'顾砚读完信。',people:[{name:'顾砚'}]}};}
+  analyses++;return{jsonData:{noMaterialChange:true}};
+ }});
+ await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId);
+ const graph=await h.store.readReachable({mode:'runtime'});assert.equal(graph.floorMemories[0].qianshiDelta.status,'pending');assert.equal(graph.stateDeltas.length,1);assert.equal(summaries,1);assert.equal(analyses,1);
+});
+
+test('人物绑定歧义的局部隔离保schema空间兄弟项与健康承诺的可空锚关联',async t=>{
+ for(const kind of ['space','anchor'])await t.test(kind,async()=>{
+  let projection={},stage=0;
+  const body='顾砚与周宁在东屋，周宁转述顾砚的话：“明天还书”，并答应归还书。';
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant('顾砚与周宁在场。'),user('继续'),assistant(body),user('稳定')],identityProjectionProvider:()=>projection,utility:options=>{
+   if(stage++===0)return{jsonData:{summary:'顾砚与周宁在场。',people:[{name:'顾砚'},{name:'周宁'}]}};
+   const payload=JSON.parse(options.taskMessages[0].content).payload;
+   projection={reviewedAliasesByEntityId:{[other.id]:['顾砚']}};
+   return{jsonData:{summary:'周宁在东屋答应归还书。',people:[{name:'顾砚'},{name:'周宁'}],actions:[{actor:'周宁',action:'答应归还书',completion:'completed'}],
+    ...(kind==='space'?{spatialFacts:{places:[{key:'place-mention-1',name:'东屋',identity:'new',exactQuote:body,source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey}],containments:[],positions:[{subject:'周宁',placeKey:'place-mention-1',status:'confirmed',exactQuote:body,source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey}]}}:
+      {exactQuotes:[{exactText:'明天还书',speaker:'顾砚',whyPreserve:'转述原句'}],commitments:[{issuer:'周宁',content:'答应归还书',exactQuote:'明天还书'}]}),
+    qianshi:{events:[{key:'bad',title:'原说话',description:'顾砚的话。',status:'occurred',matter:false,people:['顾砚']},{key:'healthy',title:'还书',description:'周宁答应还书。',status:'planned',matter:true,people:['周宁']}],order:[{before:'bad',after:'healthy',certainty:'explicit'}]}}};
+  }});
+  await h.foundationRuntime.reconcile('mixed-binding');await h.runtime.start();const floors=h.runtime.getState().floors;
+  await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});const entities=(await h.store.readReachable({mode:'runtime'})).entities,other=entities.find(item=>item.displayName==='周宁');
+  await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});const graph=await h.store.readReachable({mode:'full'}),saved=graph.floorMemories.find(item=>item.floorId===floors[1].floorId);
+  assert.equal(h.runtime.getState().lastExtractorError,null);assert.equal(saved?.summary.aiText,'周宁在东屋答应归还书。');assert.equal(saved.actions.length,1);
+  if(kind==='space'){assert.equal(saved.spatialFacts.schemaVersion,1);assert.equal(saved.spatialFacts.positions.length,1);}
+  else{assert.equal(saved.exactAnchors.length,0);assert.equal(saved.commitments[0].content,'答应归还书');assert.equal(saved.commitments[0].exactAnchorId,null);}
+  assert.deepEqual(saved.qianshiDelta.events.map(event=>event.title),['还书']);assert.deepEqual(saved.qianshiDelta.relations,[]);
+  const projected=projectQianshiGraph(graph);assert.ok(projected.matters.some(matter=>matter.title==='还书'));assert.deepEqual(projected.diagnostics.danglingRelationIds,[]);
+ });
+});
+
+test('已付费pending按原绑定基线隔离后来撤销的别名，保摘要健康动作且不重发',async()=>{
+ let projection={},calls=0;
+ const h=harness({modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant('顾砚与周宁在场。'),user('继续'),assistant('顾先生接信，周宁还书。'),user('稳定')],identityProjectionProvider:()=>projection,utility:()=>({jsonData:++calls===1?
+  {summary:'顾砚与周宁在场。',people:[{name:'顾砚',aliases:['顾先生']},{name:'周宁'}]}:
+  {summary:'顾先生接信，周宁还书。',people:[{name:'顾先生'},{name:'周宁'}],actions:[{actor:'顾先生',action:'接信',completion:'completed'},{actor:'周宁',action:'还书',completion:'completed'}]}})});
+ await h.foundationRuntime.reconcile('paid-binding');await h.runtime.start();const floors=h.runtime.getState().floors;
+ await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});const person=(await h.store.readReachable({mode:'runtime'})).entities.find(item=>item.displayName==='顾砚');
+ let failed=false;h.backend.setBeforePut(({key})=>{if(!failed&&key.startsWith('v3-index-')){failed=true;throw new Error('temporary save failure');}});
+ await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});assert.ok(h.runtime.getState().lastExtractorError);assert.equal(calls,2);
+ projection={manualAliasesByEntityId:{[person.id]:[]}};h.backend.setBeforePut(null);
+ await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});const graph=await h.store.readReachable({mode:'full'}),saved=graph.floorMemories.find(item=>item.floorId===floors[1].floorId);
+ assert.equal(calls,2);assert.equal(h.runtime.getState().lastExtractorError,null);assert.equal(saved?.summary.aiText,'顾先生接信，周宁还书。');assert.deepEqual(saved.actions.map(item=>item.action),['还书']);
+});
+
+test('同名人物与地点沿实体类型独立，投影无关更新不隔离健康绑定',async()=>{
+ let projection={},stage=0,otherId;
+ const body='顾砚与周宁在名为“顾砚”的书斋。';
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('开始'),assistant(body),user('继续'),assistant(body+'顾砚接过信。'),user('稳定')],identityProjectionProvider:()=>projection,utility:options=>{
+  const payload=JSON.parse(options.taskMessages[0].content).payload,first=stage++===0,place=payload.knownPlaces.find(item=>item.displayName==='顾砚');
+  if(!first)projection={currentNamesByEntityId:{[otherId]:'周远'}};
+  return{jsonData:{summary:first?body:'顾砚在书斋接信。',people:[{name:'顾砚'},{name:'周宁'}],...(first?{}:{actions:[{actor:'顾砚',action:'接信',completion:'completed'}]}),spatialFacts:{places:[{key:'place-mention-1',name:'顾砚',identity:first?'new':'existing',...(place?{sameAsPlaceKey:place.entityKey}:{}),exactQuote:body,source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey}],containments:[],positions:[{subject:'周宁',placeKey:'place-mention-1',status:'confirmed',exactQuote:body,source:'canonicalContent',sourceFloorKey:payload.sourceFloorKey}]}}};
+ }});
+ await h.foundationRuntime.reconcile('typed-bindings');await h.runtime.start();const floors=h.runtime.getState().floors;
+ await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});const source=await h.store.readReachable({mode:'runtime'});otherId=source.entities.find(item=>item.displayName==='周宁').id;
+ assert.equal(source.entities.filter(item=>item.displayName==='顾砚').length,2);
+ await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});const graph=await h.store.readReachable({mode:'full'}),saved=graph.floorMemories.find(item=>item.floorId===floors[1].floorId);
+ assert.equal(h.runtime.getState().lastExtractorError,null);assert.equal(saved.summary.aiText,'顾砚在书斋接信。');assert.deepEqual(saved.actions.map(item=>item.action),['接信']);assert.equal(saved.spatialFacts.positions.length,1);
+});
+
+test('聚合摘要共享候选失败边界，保整批来源和pending千事而不增加摘要请求',async()=>{
+ let summaries=0,preparations=0;
+ const h=harness({modernAnchors:true,initialChat:[assistant('甲收到信。'),user('继续'),assistant('甲收起信。'),user('确认')],qianshiCandidatePreparer:()=>{preparations++;throw new Error('aggregate candidates unavailable');},utility:options=>{
+  if(JSON.parse(options.taskMessages[0].content).task==='extractFloorSemantics'){summaries++;return{jsonData:{summary:'甲收到并收起信。'}};}
+  return{jsonData:{noMaterialChange:true}};
+ }});
+ h.context.chatMetadata.integrity='complete';await h.runtime.start();await h.runtime.startHistoricalRebuild({aggregate:true});
+ await waitFor(()=>h.runtime.getState().rememberedCount===2&&!h.runtime.getState().memoryWorkBusy);
+ const graph=await h.store.readReachable({mode:'full'});assert.equal(summaries,1);assert.equal(preparations,1);assert.equal(graph.floorMemories.length,1);assert.equal(graph.floorMemories[0].sourceFloorIds.length,2);assert.equal(graph.floorMemories[0].qianshiDelta.status,'pending');
+});
+
+async function localQianshiRejudgeSeed({ matter = false, external = () => [], decide = null, review = null, linkEarlier = false } = {}) {
+  let reviewing = false, wait = false, entered, release, calls = 0, referenceReads = 0;
+  const started = new Promise(resolve => { entered = resolve; });
+  const h = harness({ initialChat: [user('开始'), assistant('第一件独立事情。'), user('继续'), assistant('第二件独立事情。'), user('继续'), assistant('第三件独立事情。'), user('稳定')],
+    qianshiExternalReferenceProvider: (...args) => { referenceReads++; return external(...args); },
+    todoReview: request => review ? review(request) : ({ jsonData: { decisions: request.matters.map(row => ({ key: row.key, status: row.status, following: false, reason: '本次复核已完成', evidenceFloorKeys: [] })) } }),
+    utility: async options => {
+      const request = JSON.parse(options.taskMessages[0].content);
+      if (!reviewing) return { jsonData: { summary: request.payload.canonicalContent, qianshi: { events: [{ key: 'old', title: request.payload.canonicalContent,
+        description: '本楼独立原事实', status: matter ? 'planned' : 'occurred', matter, following: matter,
+        ...(linkEarlier && request.payload.qianshiCandidates.find(row => row.candidateType === 'matter') ? { links: [{ candidateKey: request.payload.qianshiCandidates.find(row => row.candidateType === 'matter').key, kind: 'progress' }] } : {}) }], order: [] } } };
+      calls++; if (wait) { entered(); await new Promise(resolve => { release = resolve; }); }
+      return decide ? decide(request) : rejudgeBatchResponse(request, row => ({ recordDecisions: row.records.map(record => ({ key: record.key, status: 'completed', actionStatus: 'occurred', matter: false, following: false, links: [] })), order: [] }));
+    } });
+  await h.runtime.start();
+  for (const floor of h.runtime.getState().floors) await h.runtime.extractFloor(floor.floorId, { analyzeState: false });
+  return { h, started, begin(pending = false) { reviewing = true; wait = pending; referenceReads = 0; }, release() { release(); }, calls: () => calls, reads: () => referenceReads };
+}
+
+test('千事整理实际依赖局部重基，范围外变更与单楼真变不连带健康楼', async t => {
+  for (const change of ['none', 'outside-summary', 'outside-title', 'outside-todo', 'selected-summary']) await t.test(change, async () => {
+    const s = await localQianshiRejudgeSeed(), { h } = s, floors = h.runtime.getState().floors;
+    const editor = harness({ sharedBackend: h.backend, sharedContext: h.context }); await editor.runtime.start();
+    s.begin(true); const plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: floors[0].messageIndex,
+      toMessageIndex: floors[change === 'selected-summary' ? 1 : 0].messageIndex });
+    const task = h.runtime.startQianshiRejudge(plan.planId); await s.started;
+    if (change.endsWith('summary')) await editor.runtime.editSummary(floors[change === 'selected-summary' ? 0 : 1].floorId, '人工最新摘要');
+    if (change === 'outside-title') {
+      const event = editor.runtime.getQianshiSnapshot().events.find(event => event.sourceFloorId === floors[1].floorId);
+      await editor.runtime.editQianshiEventText({ eventId: event.id, expected: { memoryId: event.sourceFloorMemoryId, title: event.title, description: event.description, object: event.object }, title: '人工最新标题', description: event.description, object: event.object });
+    }
+    if (change === 'outside-todo') await editor.runtime.createQianshiTodo({ title: '范围外新人工待办', description: '本次请求未使用的新待办', people: [] });
+    const current = await h.store.readReachable({ mode: 'runtime' }), roots = h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length;
+    s.release(); const result = await task, saved = await h.store.readReachable({ mode: 'runtime' });
+    assert.equal(result.savedFloors, 1, JSON.stringify(result)); assert.equal(s.calls(), 1); assert.equal(result.calls, 1, '范围外新增事项不扩大本轮付费复核范围');
+    assert.equal(h.backend.calls.filter(call => call[0] === 'put' && call[2] === 'v3-root').length - roots, 1);
+    const healthy = saved.floorMemories.find(memory => memory.floorId === floors[change === 'selected-summary' ? 1 : 0].floorId);
+    assert.equal(healthy.qianshiDelta.events[0].status, 'completed');
+    if (change === 'selected-summary') {
+      const changed = saved.floorMemories.find(memory => memory.floorId === floors[0].floorId);
+      assert.equal(changed.summary.userText, '人工最新摘要'); assert.equal(changed.summary.effectiveSource, 'user');
+      assert.equal(changed.qianshiDelta.status, 'pending'); assert.equal(changed.qianshiDelta.events[0].status, 'occurred');
+      assert.equal(result.failedFloors, 1);
+    } else assert.deepEqual(saved.floorMemories.find(memory => memory.floorId === floors[1].floorId), current.floorMemories.find(memory => memory.floorId === floors[1].floorId));
+    assert.deepEqual(saved.stateDeltas, current.stateDeltas);
+  });
+});
+
+test('千事整理人工原线优先且恢复自动不复活暂存旧覆盖', async t => {
+  for (const scenario of ['manual', 'restore', 'linked']) await t.test(scenario, async () => {
+    const restore = scenario === 'restore';
+    const s = await localQianshiRejudgeSeed({ matter: true, linkEarlier: scenario === 'linked' }), { h } = s;
+    let matter = h.runtime.getQianshiSnapshot().matters[0];
+    await h.runtime.setQianshiMatterStatus({ matterId: matter.matterId, status: 'completed', expectedStatus: matter.status, expectedManualStatus: matter.manualStatusOverride });
+    const editor = harness({ sharedBackend: h.backend, sharedContext: h.context }); await editor.runtime.start();
+    s.begin(restore); const plan = await h.runtime.prepareQianshiRejudge(), task = h.runtime.startQianshiRejudge(plan.planId);
+    if (restore) { await s.started; matter = editor.runtime.getQianshiSnapshot().matters.find(row => row.matterId === matter.matterId);
+      await editor.runtime.setQianshiMatterStatus({ matterId: matter.matterId, status: null, expectedStatus: matter.status, expectedManualStatus: matter.manualStatusOverride }); s.release(); }
+    const result = await task; assert.equal(result.savedFloors, 3, JSON.stringify(result)); assert.equal(s.calls(), 1);
+    const saved = await h.store.readReachable({ mode: 'runtime' }), graph = projectQianshiGraph(saved);
+    assert.equal(saved.floorMemories.flatMap(memory => memory.qianshiDelta.manualMatterStatusOverrides ?? []).some(override => override.matterId === matter.matterId), !restore);
+    if (!restore) { const actual = graph.matters.find(row => row.matterId === matter.matterId); assert.ok(actual); assert.equal(actual.status, 'completed'); assert.equal(actual.origin.eventId, matter.origin.eventId);
+      if (scenario === 'linked') assert.deepEqual(actual.recordIds, matter.recordIds, '整线人工状态保每个进展的原归线'); }
+    const cold = harness({ sharedBackend: h.backend, sharedContext: h.context, utility: () => assert.fail('冷读不调用模型') }); await cold.runtime.start();
+    assert.equal(cold.runtime.getQianshiSnapshot().matters.find(row => row.matterId === matter.matterId)?.manualStatusOverride ?? null, restore ? null : 'completed');
+  });
+});
+
+test('千事整理辅助时间引用未知保线，范围外变化不挡保存且健康仅两次读取', async t => {
+  for (const kind of ['healthy', 'unavailable', 'auxiliary-abort', 'outside-removed', 'related-added']) await t.test(kind, async () => {
+    let unavailable = false, references = [];
+    const s = await localQianshiRejudgeSeed({ matter: true, external: () => { if (unavailable) throw kind === 'auxiliary-abort' ? new DOMException('auxiliary read aborted', 'AbortError') : Object.assign(new Error('optional time source unavailable'), { code: 'BACKEND_NETWORK' }); return references; } }), { h } = s;
+    const floors = h.runtime.getState().floors, matters = h.runtime.getQianshiSnapshot().matters;
+    const first = matters.find(row => row.origin.sourceFloorId === floors[0].floorId), outside = matters.find(row => row.origin.sourceFloorId === floors[1].floorId);
+    if (kind === 'outside-removed') references = [{ id: 'outside-time', qianshiRef: { matterId: outside.matterId, originEventId: outside.origin.eventId } }];
+    unavailable = ['unavailable', 'auxiliary-abort'].includes(kind); s.begin(kind.endsWith('removed') || kind.endsWith('added'));
+    const plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: floors[0].messageIndex, toMessageIndex: floors[0].messageIndex });
+    const task = h.runtime.startQianshiRejudge(plan.planId);
+    if (kind.endsWith('removed') || kind.endsWith('added')) { await s.started; references = kind === 'related-added' ? [{ id: 'new-time', qianshiRef: { matterId: first.matterId, originEventId: first.origin.eventId } }] : []; s.release(); }
+    const result = await task; assert.equal(result.savedFloors, 1, JSON.stringify(result)); assert.equal(s.calls(), 1); assert.equal(s.reads(), 2);
+    const saved = await h.store.readReachable({ mode: 'runtime' }), graph = projectQianshiGraph(saved), event = graph.events.find(event => event.id === first.origin.eventId);
+    assert.equal(event.status, 'completed');
+    if (['unavailable', 'auxiliary-abort', 'related-added'].includes(kind)) assert.equal(event.matterId, first.matterId);
+  });
+});
+
+
+test('千事整理实际旧候选变动只保使用楼，独立楼同次保存', async t => {
+ for (const kind of ['progress', 'order']) await t.test(kind, async () => {
+  const s = await localQianshiRejudgeSeed({ matter: true, decide: request => rejudgeBatchResponse(request, row => ({ recordDecisions: row.records.map(record => ({
+    key: record.key, status: 'completed', actionStatus: 'occurred', matter: kind === 'progress' && row.floorKey === 'floor-2', following: false,
+    links: kind === 'progress' && row.floorKey === 'floor-2' ? [{ candidateKey: row.qianshiCandidates.find(candidate => candidate.latestProgress?.sourceAssistantSeq === 1).key, kind: 'progress' }] : [],
+  })), order: kind === 'order' && row.floorKey === 'floor-2' ? [row.qianshiCandidates.find(candidate => candidate.latestProgress?.sourceAssistantSeq === 1).key, 'record-1'] : [] })) }), { h } = s, floors = h.runtime.getState().floors;
+  const editor = harness({ sharedBackend: h.backend, sharedContext: h.context }); await editor.runtime.start();
+  s.begin(true); const plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: floors[1].messageIndex, toMessageIndex: floors[2].messageIndex });
+  const task = h.runtime.startQianshiRejudge(plan.planId); await s.started;
+  const event = editor.runtime.getQianshiSnapshot().events.find(row => row.sourceFloorId === floors[0].floorId);
+  await editor.runtime.editQianshiEventText({ eventId: event.id, expected: { memoryId: event.sourceFloorMemoryId, title: event.title, description: event.description, object: event.object }, title: '人工更新旧候选事实', description: event.description, object: event.object });
+  s.release(); const result = await task, saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(result.savedFloors, 1, JSON.stringify(result)); assert.equal(result.failedFloors, 1); assert.equal(s.calls(), 1);
+  assert.equal(saved.floorMemories.find(memory => memory.floorId === floors[1].floorId).qianshiDelta.status, 'pending');
+  assert.equal(saved.floorMemories.find(memory => memory.floorId === floors[2].floorId).qianshiDelta.events[0].status, 'completed');
+  assert.equal(projectQianshiGraph(saved).events.find(row => row.id === event.id).title, '人工更新旧候选事实');
+ });
+});
+
+test('千事整理尾审真实用到的摘要变化仅撤尾审，健康历史同次保存', async t => {
+ for (const timing of ['current-window', 'later-window']) await t.test(timing, async () => {
+  let entered, release, editor, floors, reviewCalls = 0;
+  const started = new Promise(resolve => { entered = resolve; });
+  const response = request => ({ jsonData: { decisions: request.matters.map(row => ({ key: row.key, status: 'completed', following: false, reason: '本次完整复核', evidenceFloorKeys: [request.timeline[0].floorKey] })) } });
+  const s = await localQianshiRejudgeSeed({ matter: true,
+    decide: request => rejudgeBatchResponse(request, row => ({ recordDecisions: row.records.map(record => ({ key: record.key, status: 'planned', actionStatus: 'occurred', matter: true, following: true, links: [] })), order: [] })),
+    review: async request => {
+      reviewCalls++;
+      if (timing === 'later-window') {
+        if (reviewCalls === 1) { assert.equal(request.finalWindow, false); assert.equal(request.timeline.some(row => row.floorKey === 'floor-3'), false);
+          await editor.runtime.editSummary(floors[2].floorId, '尾审实际用到的人工最新摘要'); }
+        return response(request);
+      }
+      entered(); return new Promise(resolve => { release = () => resolve(response(request)); });
+    },
+  }), { h } = s; floors = h.runtime.getState().floors;
+  editor = harness({ sharedBackend: h.backend, sharedContext: h.context }); await editor.runtime.start();
+  if (timing === 'later-window') {
+    for (const floor of floors.slice(1)) { await editor.runtime.editSummary(floor.floorId, '后续复核窗口材料。'.repeat(380));
+      const matter = editor.runtime.getQianshiSnapshot().matters.find(row => row.origin.sourceFloorId === floor.floorId);
+      await editor.runtime.setQianshiMatterFollowing({ matterId: matter.matterId, following: false, expectedFollowing: matter.following }); }
+  }
+  s.begin(); const plan = await h.runtime.prepareQianshiRejudge({ fromMessageIndex: floors[0].messageIndex, toMessageIndex: floors[0].messageIndex,
+    ...(timing === 'later-window' ? { maxInputTokens: 4000 } : {}) });
+  if (timing === 'later-window') assert.ok(plan.followup.apiCalls > 1);
+  const task = h.runtime.startQianshiRejudge(plan.planId);
+  if (timing === 'current-window') { await started; await editor.runtime.editSummary(floors[1].floorId, '尾审实际用到的人工最新摘要'); release(); }
+  const result = await task, saved = await h.store.readReachable({ mode: 'runtime' });
+  assert.equal(result.savedFloors, 1, JSON.stringify(result)); assert.equal(result.followup.status, 'failed', JSON.stringify(result));
+  assert.equal(result.followup.reasonCode, 'QIANSHI_REJUDGE_SOURCE_CHANGED');
+  if (timing === 'later-window') assert.ok(reviewCalls < plan.followup.apiCalls, '旧后窗材料在发请求前停止，不多付该窗调用');
+  assert.equal(saved.floorMemories.find(memory => memory.floorId === floors[timing === 'later-window' ? 2 : 1].floorId).summary.userText, '尾审实际用到的人工最新摘要');
+  assert.equal(saved.followingReviewEventIds.length, 0);
+ });
+});
+
+test('千事删除只读核心标记，暖态和冷态不依赖人物地点目录', async t => {
+  for (const kind of ['warm', 'warm-broken', 'cold-broken', 'warm-foundation-advanced']) await t.test(kind, async () => {
+    let projectionReads = 0, broken = false;
+    const provider = () => { projectionReads++; if (broken) throw Object.assign(new Error('目录辅助故障'), { code: 'BACKEND_TIMEOUT' }); return {}; };
+    let h = harness({ withPlaces: true, identityProjectionProvider: provider, initialChat: [user('开始'), assistant('归还旧书。'), user('稳定')],
+      utility: () => ({ jsonData: { summary: '归还旧书。', qianshi: { events: [{ key: 'old', title: '旧书', description: '归还旧书', status: 'planned', matter: true }], order: [] } } }) });
+    await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+    const event = h.runtime.getQianshiSnapshot().events[0];
+    if (kind === 'warm-foundation-advanced') {
+      const editor = harness({ sharedBackend: h.backend, sharedContext: h.context, withPlaces: true, identityProjectionProvider: provider }); await editor.runtime.start();
+      await editor.runtime.deleteQianshiEvent({ eventId: event.id });
+      h.foundationRuntime.adoptReachable(await editor.store.readReachable({ mode: 'runtime' }));
+    } else await h.runtime.deleteQianshiEvent({ eventId: event.id });
+    if (kind === 'cold-broken') h = harness({ sharedBackend: h.backend, sharedContext: h.context, withPlaces: true, identityProjectionProvider: provider });
+    projectionReads = 0; broken = kind !== 'warm'; const callsBefore = h.backend.calls.length;
+    const result = await h.runtime.getQianshiDeletions();
+    assert.equal(projectionReads, 0); assert.equal(result.chatId, CHAT); assert.deepEqual(result.events, [{ eventId: event.id, matterId: event.matterId }]);
+    if (kind.startsWith('warm')) assert.equal(h.backend.calls.length, callsBefore);
+  });
+});
+
+
+test('Batch17 地点补充合并最新工作区，保人工且不因无关revision吞新地点', async () => {
+  let h, changed=false;
+  h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('青石馆有灶房。'),user('稳定')],utility:async options=>{
+    const p=JSON.parse(options.taskMessages[0].content).payload;
+    if(!changed){changed=true;const current=await h.placeWorkspaceStore.read({chatId:CHAT});
+      await createPlaceWorkspaceStore({client:h.backend.client}).put({chatId:CHAT},{schemaVersion:1,kind:'qqj-v3-place-workspace',chatId:CHAT,placesByEntityId:{},deletionsByEntityId:{},mapStyle:'modern'},current.revision);}
+    return {jsonData:{summary:'你查看青石馆。',placePaths:[{path:[{name:'青石馆',mapRole:'site'},{name:'灶房',description:'灶房内有石灶。'}],source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent}]}};
+  }});
+  await h.foundationRuntime.reconcile('batch17-workspace');await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+  const saved=await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true});
+  assert.equal((await h.store.readReachable({mode:'runtime'})).floorMemories.length,1);
+  assert.equal(saved.data.mapStyle,'modern');
+  assert.ok(saved.data.foundation?.facts.some(f=>f.kind==='feature'&&f.text==='灶房内有石灶。'),'健康地点补充应合入最新工作区');
+  assert.equal(h.calls.length,1);
+});
+
+test('Batch17 Core提交后切聊仍保存原目标地点补充', async () => {
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('青石馆有灶房。'),user('稳定')],utility:options=>{
+    const p=JSON.parse(options.taskMessages[0].content).payload;
+    return {jsonData:{summary:'你查看青石馆。',placePaths:[{path:[{name:'青石馆'},{name:'灶房',description:'灶房内有石灶。'}],source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent}]}};
+  }});
+  await h.foundationRuntime.reconcile('batch17-target');await h.runtime.start();
+  h.backend.setAfterPut(({key})=>{if(key==='v3-root')h.context.chatMetadata.qianqianjie.chatId='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';});
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+  const saved=await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true});
+  assert.ok(saved.data?.foundation?.facts.some(f=>f.kind==='feature'&&f.text==='灶房内有石灶。'),'原目标Core成功后地点补充仍应保存');
+  assert.equal(h.backend.records.has('chat-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/v3-place-workspace'),false);
+  assert.equal(h.calls.length,1);
+});
+
+
+test('Batch17 双输出父链经runtime冷读与后楼目录承接，原整理可补旧散点', async t => {
+ for(const mode of ['ordinary','organize','leaf','top-leaf']) await t.test(mode,async()=>{
+  const scattered=mode==='organize',requests=[];
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('青石馆灶房内有石灶。'),assistant('青石馆灶房内有石灶。'),user('继续'),assistant('你留在灶房。'),user('稳定')],utility:options=>{
+   const r=JSON.parse(options.taskMessages[0].content),p=r.payload;requests.push(r);
+   if(r.task==='organizePlaces'){
+    const row=storedEvidenceRows(p).find(row=>row.content.includes('青石馆'));
+    return {jsonData:{placePaths:[{path:[{name:'青石馆',sameAsPlaceKey:p.knownPlaces.find(x=>x.displayName==='青石馆').entityKey},{name:'灶房',sameAsPlaceKey:p.knownPlaces.find(x=>x.displayName==='灶房').entityKey}],source:'storedPlaceEvidence',sourceKey:row.sourceKey,exactQuote:row.content}]}};
+   }
+   if(requests.filter(r=>r.task==='extractFloorSemantics').length>1){
+    const room=p.knownPlaces.find(x=>x.displayName==='灶房');assert.match(room.pathLabel,/青石馆/);return {jsonData:{summary:'你留在灶房。'}};
+   }
+   const ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent};
+   return {jsonData:{summary:'你查看灶房。',spatialFacts:{places:['青石馆','灶房'].map((name,i)=>({key:`place-mention-${i+1}`,name,identity:'new',...ev})),containments:[],positions:[]},...(scattered?{}:{placePaths:[{...(mode==='top-leaf'?{placeKey:'place-mention-2'}:{}),path:[{name:'青石馆'},{name:'灶房',...(mode==='leaf'?{placeKey:'place-mention-2'}:{}),description:'灶房内有石灶。'}],...ev}]})}};
+  }});
+  await h.foundationRuntime.reconcile('batch17-consumer');await h.runtime.start();const floors=h.runtime.getState().floors;
+  await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});
+  if(scattered)await h.runtime.organizePlaces();
+  const before=h.runtime.getQianchuangSnapshot(),parent=before.places.find(p=>p.displayName==='青石馆'),room=before.places.find(p=>p.displayName==='灶房');
+  assert.equal(before.places.length,2);assert.equal(room.parentEntityId,parent.entityId);
+  const cold=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,modernAnchors:true,readOnlyLifecycle:true});await cold.runtime.start();
+  assert.equal(cold.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===room.entityId).parentEntityId,parent.entityId);assert.equal(cold.calls.length,0);
+  await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});assert.equal(h.calls.length,scattered?3:2);
+ });
+});
+
+test('Batch17 另一runtime人工名称简介方位父级及删除优先，健康补充同次保存',async t=>{
+ for(const action of ['manual','delete'])await t.test(action,async()=>{
+  let h,editor;
+  h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant('青石馆有灶房。'),user('继续'),assistant('青石馆有灶房和廊房。'),user('稳定')],utility:async(options,count)=>{
+   const p=JSON.parse(options.taskMessages[0].content).payload,ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent};
+   const known=name=>p.knownPlaces.find(p=>p.displayName===name)?.entityKey;
+   if(count===2){
+    editor=harness({withPlaces:true,sharedBackend:h.backend,sharedContext:h.context,modernAnchors:true,readOnlyLifecycle:true});await editor.runtime.start();
+    const room=editor.runtime.getQianchuangSnapshot().places.find(p=>p.displayName==='灶房'),context=editor.runtime.getPlaceEditContext(room.entityId);
+    if(action==='delete')await editor.runtime.deletePlace(room.entityId,context);
+    else await editor.runtime.savePlace(room.entityId,{name:'手订灶房',description:'',relations:'人工方位',parentEntityId:null},context);
+   }
+   return{jsonData:{summary:p.canonicalContent,placePaths:[{path:[{name:'青石馆',...(known('青石馆')?{sameAsPlaceKey:known('青石馆')}:{})},{name:'灶房',...(known('灶房')?{sameAsPlaceKey:known('灶房')}:{}) ,description:'自动旧灶简介。',relations:['自动旧方位']}],...ev},...(count===2?[{path:[{name:'青石馆',sameAsPlaceKey:known('青石馆')},{name:'廊房',description:'廊房有木窗。'}],...ev}]:[])]}};
+  }});
+  await h.foundationRuntime.reconcile('batch17-manual');await h.runtime.start();const floors=h.runtime.getState().floors;
+  await h.runtime.extractFloor(floors[0].floorId,{analyzeState:false});const roomId=h.runtime.getQianchuangSnapshot().places.find(p=>p.displayName==='灶房').entityId;
+  await h.runtime.extractFloor(floors[1].floorId,{analyzeState:false});
+  const saved=await h.placeWorkspaceStore.read({chatId:CHAT},{fresh:true}),snapshot=h.runtime.getQianchuangSnapshot();
+  assert.ok(saved.data.foundation.facts.some(f=>f.text==='廊房有木窗。'));assert.equal((await h.store.readReachable({mode:'runtime'})).floorMemories.length,2);assert.equal(h.calls.length,2);
+  if(action==='delete'){assert.ok(saved.data.deletionsByEntityId[roomId]);assert.equal(snapshot.places.some(p=>p.entityId===roomId),false);}
+  else {const room=snapshot.places.find(p=>p.entityId===roomId);assert.equal(room.displayName,'手订灶房');assert.equal(room.parentEntityId,null);assert.deepEqual(room.features,[]);assert.deepEqual(room.relations.map(f=>f.text),['人工方位']);}
+ });
+});
+
+test('Batch17 地点真实read put CAS失败局部提示，摘要已存且模型不重调',async t=>{
+ for(const failure of ['read','put','cas'])await t.test(failure,async()=>{
+  const warnings=[];
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,notifyUser:value=>warnings.push(value),initialChat:[user('继续'),assistant('青石馆有灶房。'),user('稳定')],utility:options=>{
+   const p=JSON.parse(options.taskMessages[0].content).payload;return{jsonData:{summary:'健康摘要。',placePaths:[{path:[{name:'青石馆'},{name:'灶房',description:'灶房内有石灶。'}],source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent}]}};
+  }});
+  await h.foundationRuntime.reconcile('batch17-io');await h.runtime.start();
+  const fail=()=>{throw Object.assign(Error('place storage failure'),{status:failure==='cas'?409:500});};
+  h.backend.setAfterPut(({key})=>{if(key==='v3-root'){
+   if(failure==='read')h.backend.setBeforeGet(({key})=>{if(key==='v3-place-workspace')fail();});
+   else h.backend.setBeforePut(({key})=>{if(key==='v3-place-workspace')fail();});
+  }});
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+  h.backend.setBeforeGet(null);h.backend.setBeforePut(null);
+  assert.equal((await h.store.readReachable({mode:'runtime'})).floorMemories[0].summary.aiText,'健康摘要。');
+  assert.ok(warnings.some(value=>value.text==='摘要已保存，地点补充未保存。'));assert.equal(h.calls.length,1);
+  assert.equal(h.backend.calls.filter(row=>row[0]==='put'&&row[2]==='v3-place-workspace').length,failure==='read'?0:1);
+ });
+});
+
+
+test('Batch17 省略选填key的已知父短链与USER简介共用原编译，坏源同名歧义局部隔离',async t=>{
+ const content='青石馆内有灶房，灶房内有石灶。',ev={source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content};
+ for(const variant of ['known-parent','user','ambiguous','invalid-place-source','invalid-path-source'])await t.test(variant,async()=>{
+  const known=variant==='known-parent',userSource=variant==='user',evidence=userSource?{source:'precedingUserInput',sourceSnapshotIndex:0,exactQuote:content}:ev;
+  const packet={summary:'健康摘要。',spatialFacts:{places:[{key:'place-mention-1',name:'灶房',identity:'new',...evidence}],containments:[],positions:[]},placePaths:[{path:[{name:'青石馆',...(known?{sameAsPlaceKey:'place-1'}:{})},{name:'灶房',description:'灶房内有石灶。'}],...evidence}]};
+  if(variant==='ambiguous')packet.spatialFacts.places.push({...packet.spatialFacts.places[0],key:'place-mention-2'});
+  if(variant==='invalid-place-source')packet.spatialFacts.places[0].sourceFloorKey='floor-999';
+  if(variant==='invalid-path-source')packet.placePaths[0].sourceFloorKey='floor-999';
+  const result=await direct(packet,{content,entities:known?[precisionPlace(900,'青石馆')]:[],...(userSource?{sourceUserInputSnapshot:{messages:[{content,messageIndex:0,swipeId:null,selectedSwipeIndex:null}]}}:{})});
+  assert.equal(result.memory.summary.aiText,'健康摘要。');
+  if(variant.startsWith('invalid')||variant==='ambiguous'){assert.ok(result.isolated.some(row=>row.field==='placePaths'));assert.equal(result.foundationPatch.facts.some(f=>f.text==='灶房内有石灶。'),false);}
+  else {assert.deepEqual(result.isolated,[]);assert.equal(result.memory.spatialFacts.containments.length,1);assert.ok(result.foundationPatch.facts.some(f=>f.text==='灶房内有石灶。'));assert.equal(result.newEntities.filter(e=>e.displayName==='灶房').length,1);if(known)assert.equal(result.memory.spatialFacts.containments[0].parentEntityId,precisionPlace(900,'青石馆').id);}
+ });
+});
+
+test('Batch17 顶层显式叶key消歧同名声明，省略key父节点仍唯一承接',async()=>{
+ const content='青石馆有灶房，另有一处同名灶房。',ev={source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:content};
+ const result=await direct({summary:'健康摘要。',spatialFacts:{places:['青石馆','灶房','灶房'].map((name,index)=>({key:`place-mention-${index+1}`,name,identity:'new',...ev})),containments:[],positions:[]},placePaths:[{placeKey:'place-mention-2',path:[{name:'青石馆'},{name:'灶房',description:'选定灶房简介。'}],...ev}]},{content});
+ assert.deepEqual(result.isolated,[]);assert.equal(result.newEntities.length,3);assert.equal(result.newEntities.filter(row=>row.displayName==='青石馆').length,1);
+ const feature=result.foundationPatch.facts.find(f=>f.text==='选定灶房简介。'),edge=result.memory.spatialFacts.containments[0];
+ assert.equal(result.memory.spatialFacts.containments.length,1);assert.equal(edge.placeEntityId,feature.placeEntityId);assert.equal(edge.parentEntityId,result.newEntities.find(row=>row.displayName==='青石馆').id);
+});
+
+test('328继续CSE重构保待重构楼后来人工修改和清空，冷开只补缺楼', async t => {
+  for (const clear of [false,true]) await t.test(clear?'人工清空':'人工修改', async()=>{
+    let mode='seed';
+    const h=harness({initialChat:[user('开始'),assistant('第一楼'),assistant('第二楼'),assistant('尾楼')],automation:{enabled:true,batchSize:20},utility:options=>{
+      const p=JSON.parse(options.taskMessages[0].content).payload;
+      if(options.systemPrompt===EXTRACTOR_SYSTEM_PROMPT)return{jsonData:{summary:p.canonicalContent,people:[{name:'裴晚生'}]}};
+      if(mode==='fail'&&p.canonicalContent==='第二楼')throw Error('独立尾楼失败');
+      return{jsonData:{subjects:[{subject:'裴晚生',situational:[{text:'模型状态',visibility:'observable',reason:'现场'}]}]}};
+    }});
+    await h.runtime.start();await h.runtime.startHistoricalRebuild();await waitFor(()=>registeredGraphCaughtUp(h.runtime.getState()));
+    mode='fail';await h.runtime.rebuildCse(CHAT);assert.equal(h.runtime.getState().cseRebuildCompletedCount,1);
+    const s=h.runtime.getState(),subject=s.cseSubjects.find(x=>x.displayName==='裴晚生');assert.ok(subject);
+    await h.runtime.correctSubjectState(subject.subjectEntityId,{expectedCurrentStateId:s.currentStateId,expectedCurrentStateFingerprint:s.currentStateFingerprint,core:subject.core,adaptive:subject.adaptive,situational:clear?[]:[{text:'暂停后人工状态',visibility:'private',reason:'人工',towardEntityId:null}]});
+    const before=await h.store.readReachable({mode:'runtime'});
+    const cold=harness({sharedBackend:h.backend,sharedContext:h.context,utility:options=>{assert.equal(options.systemPrompt,CSE_SYSTEM_PROMPT);return{jsonData:{subjects:[{subject:'裴晚生',situational:[{text:'继续模型状态',visibility:'observable',reason:'现场'}]}]}};}});
+    await cold.runtime.start();await cold.runtime.resumeCseRebuild(CHAT);
+    assert.equal(cold.runtime.getState().cseRebuildStatus,'completed');assert.equal(cold.calls.length,1);
+    const kept=cold.runtime.getState().cseSubjects.find(x=>x.displayName==='裴晚生').situational;
+    if(clear)assert.deepEqual(kept,[]);else assert.ok(kept.some(x=>x.text==='暂停后人工状态'&&x.origin==='manual'));
+    const after=await cold.store.readReachable({mode:'runtime'});assert.deepEqual(after.floorMemories.map(x=>x.id),before.floorMemories.map(x=>x.id));
+    assert.equal(cold.runtime.getState().memoryWorkBusy,false);
+  });
+});
+
+test('328地点整理保存前GET等待时取消，释放后不派发PUT',async()=>{
+  const h=harness({withPlaces:true,utility:options=>JSON.parse(options.taskMessages[0].content).task==='organizePlaces'?{jsonData:{placePaths:[],mapStyle:'sci-fi'}}:{jsonData:{summary:'查看房间。'}}});
+  await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});await h.runtime.createPlace({name:'房间'},h.runtime.getPlaceEditContext(null));
+  let release;const controller=new AbortController();
+  h.backend.setBeforeGet(({key})=>key==='v3-place-workspace'?new Promise(resolve=>{release=resolve;}):undefined);h.backend.calls.length=0;
+  const pending=h.runtime.organizePlaces({signal:controller.signal});await waitFor(()=>release);controller.abort();release();
+  await assert.rejects(pending,{name:'AbortError'});h.backend.setBeforeGet(null);
+  assert.equal(h.backend.calls.filter(x=>x[0]==='put'&&x[2]==='v3-place-workspace').length,0);
+  assert.equal(h.runtime.getState().memoryWorkBusy,false);
+});
+
+test('328地点已存丢回执沿原保存确认，人工名称空描述进入真实召回且新增不重复',async()=>{
+ const h=harness({withPlaces:true,readOnlyLifecycle:true,initialChat:[assistant('查看灶房。'),user('稳定')],utility:options=>{const p=JSON.parse(options.taskMessages[0].content).payload;return{jsonData:{summary:'查看灶房。',locations:[{name:'灶房',change:'present',people:[]}],placePaths:[{path:[{name:'灶房',description:'灶房内有石灶'}],evidence:[{source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:p.canonicalContent}]}]}};}});
+ await h.foundationRuntime.reconcile('test');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ const first={entityId:h.runtime.getQianchuangSnapshot().places.find(x=>x.displayName==='灶房').entityId};
+ let lose=true;h.backend.setAfterPut(({key})=>{if(lose&&key==='v3-place-workspace'){lose=false;throw Object.assign(Error('lost'),{code:'BACKEND_NETWORK'});}});
+ await h.runtime.savePlace(first.entityId,{name:'人工灶房',description:''},h.runtime.getPlaceEditContext(first.entityId));
+ await h.runtime.prepareCurrent();await h.runtime.refreshStatus({preferCached:false});
+ const value=await h.placeWorkspaceStore.read({chatId:CHAT});const source=await readRecallSource({store:h.store,identityProjection:{placeWorkspace:value.data,placeWorkspaceRevision:value.revision}});
+ const selected=JSON.stringify(historySelectionContext(source,{text:'灶房 石灶',latestUserText:'灶房 石灶'}));assert.equal(source.entities.find(x=>x.entityId===first.entityId).displayName,'人工灶房');assert.ok(!selected.includes('灶房内有石灶'));
+ assert.equal(h.runtime.getQianchuangSnapshot().places.find(x=>x.entityId===first.entityId).displayName,'人工灶房');
+ lose=true;const added=await h.runtime.createPlace({name:'原稿新地点'},h.runtime.getPlaceEditContext(null));assert.ok(added.entityId);
+ assert.equal(h.runtime.getQianchuangSnapshot().places.filter(x=>x.displayName==='原稿新地点').length,1);assert.equal(h.calls.length,1);
+});
+
+test('328千事补齐按通道认证停止后批，独立Abort只隔离本批并沿原入口续缺楼',async t=>{
+ for(const mode of ['auth','abort'])await t.test(mode,async()=>{
+  let phase='seed',historyCalls=0;const h=harness({readOnlyLifecycle:true,initialChat:[1,2,3].flatMap(i=>[assistant(`第${i}楼`+'甲'.repeat(10000)),user(`确认${i}`)]),utility:options=>{
+   const r=JSON.parse(options.taskMessages[0].content);if(r.task==='extractFloorSemantics')return{jsonData:{summary:r.payload.canonicalContent.slice(0,3)}};if(r.task!=='extractQianshiHistoryV1')return{jsonData:{noMaterialChange:true}};
+   historyCalls++;if(phase==='fail'&&historyCalls===2){assert.equal(options.signal.aborted,false);throw mode==='auth'?Object.assign(Error('auth'),{code:'QQJ_AUTH',httpStatus:401}):new DOMException('独立请求中止','AbortError');}
+   return{jsonData:{floors:r.floors.map(f=>({floorKey:f.floorKey,qianshi:{events:[{key:'fact',title:'独立事实',description:'此楼记录独立事实。',status:'occurred',matter:false}],order:[]}}))}};
+  }});
+  await h.foundationRuntime.reconcile('test');await h.runtime.start();for(const floor of h.runtime.getState().floors)await h.runtime.extractFloor(floor.floorId,{analyzeState:false});
+  phase='fail';const plan=await h.runtime.prepareQianshiHistory({maxInputTokens:38000});assert.equal(plan.batchCount,3,JSON.stringify({batchCount:plan.batchCount,batches:plan.batches.map(x=>({seq:x.assistantSeqs,tokens:x.estimatedInputTokens})),maxInputTokens:plan.maxInputTokens,budgetSkipped:plan.budgetSkippedFloors}));const result=await h.runtime.startQianshiHistory(plan.planId);
+  assert.equal(historyCalls,mode==='auth'?2:3);assert.equal(result.status,'partial');assert.equal(result.processedFloors,mode==='auth'?1:2);assert.equal(h.runtime.getState().qianshiHistoryActive,false);
+  phase='resume';historyCalls=0;const next=await h.runtime.prepareQianshiHistory({maxInputTokens:38000});assert.deepEqual(next.batches.flatMap(x=>x.assistantSeqs),mode==='auth'?[2,3]:[2]);assert.equal((await h.runtime.startQianshiHistory(next.planId)).status,'completed');assert.equal((await h.runtime.prepareQianshiHistory()).apiCalls,0);
+ });
+});
+
+test('328千事混合档整理补完旧记录后，延后尾审总结指向剩余无记录楼的补齐入口',async()=>{
+ const h=harness({readOnlyLifecycle:true,initialChat:[assistant('第一楼留下旧记录。'),user('确认1'),assistant('第二楼尚无记录。'),user('确认2')],utility:options=>{const p=JSON.parse(options.taskMessages[0].content).payload;return{jsonData:{summary:p.canonicalContent,...(p.canonicalContent.includes('第一楼')?{qianshi:{events:[{key:'old',title:'旧事实',description:'已存第一楼事实',status:'occurred',matter:false}],order:[]}}:{})}};}});
+ await h.foundationRuntime.reconcile('test');await h.runtime.start();for(const f of h.runtime.getState().floors)await h.runtime.extractFloor(f.floorId,{analyzeState:false});
+ const original=await h.store.readReachable({mode:'runtime'}),first=original.floorMemories.find(x=>x.floorId===original.floors[0].id);h.backend.records.get(`chat-${CHAT}/v3-floor-memory-${first.id}`).data.qianshiDelta.status='pending';
+ const cold=harness({sharedBackend:h.backend,sharedContext:h.context,readOnlyLifecycle:true,utility:options=>{const r=JSON.parse(options.taskMessages[0].content);assert.equal(r.task,'rejudgeStoredQianshiV1');return rejudgeBatchResponse(r,f=>({recordDecisions:f.records.map(record=>({key:record.key,status:'occurred',actionStatus:'occurred',matter:false,following:false,links:[]})),order:[]}));}});
+ await cold.runtime.start();const plan=await cold.runtime.prepareQianshiRejudge({onlyIncomplete:true});assert.equal(plan.totalFloors,1);const result=await cold.runtime.startQianshiRejudge(plan.planId);assert.equal(result.followup.status,'deferred');assert.equal(result.savedFloors,1);assert.match(result.message,/无旧记录.*补齐旧楼/);assert.doesNotMatch(result.message,/点“整理”留空继续历史缺口/);
+ const next=await cold.runtime.prepareQianshiHistory();assert.deepEqual(next.batches.flatMap(x=>x.assistantSeqs),[2]);assert.equal(cold.calls.length,1);
+});
+
+
+test('地点标签贯通原摘要保存冷读、旧档整理与地图，篇末位置仅取正文',async t=>{
+ for(const mode of ['ordinary','organize','manual-clear'])await t.test(mode,async()=>{
+  const tag='河湾镇·临江客栈·东厢房',body='你离开房里，来到码头。',requests=[];
+  const utility=options=>{
+   const r=JSON.parse(options.taskMessages[0].content),p=r.payload;requests.push(r);
+   const path=(room,key)=>[{name:'河湾镇',mapRole:'area',mapLevel:'scope'},{name:'临江客栈',mapRole:'site'},{name:room,...key,mapRole:'interior'}];
+   if(r.task==='organizePlaces'){
+    const room=p.knownPlaces.find(x=>x.displayName===(mode==='manual-clear'?'人工房':'房里'));
+    const row=storedEvidenceRows(p).find(x=>x.sourceType==='locationReference');assert.ok(row,'旧档整理必须提供独立标签来源');assert.equal(row.content,tag);assert.ok(row.placeKeys.includes(room.entityKey));
+    return{jsonData:{placePaths:[{path:path(room.displayName,{sameAsPlaceKey:room.entityKey,...(mode==='manual-clear'?{mapLevel:'scope',description:'不应回填的描述'}:{})}),evidence:[{source:'storedPlaceEvidence',sourceKey:row.sourceKey,exactQuote:row.content}]}]}};
+   }
+   assert.deepEqual(p.locationReference,[tag]);assert.equal(p.canonicalContent,body);
+   const ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:body};
+   return{jsonData:{summary:body,people:[{name:'林岚',role:'user',presence:'present'}],spatialFacts:{places:[{key:'place-mention-1',name:'房里',identity:'new',...ev},{key:'place-mention-2',name:'码头',identity:'new',...ev}],containments:[],positions:[{subject:'林岚',placeKey:'place-mention-2',status:'confirmed',...ev}]},...(mode==='ordinary'?{placePaths:[{path:path('东厢房',{placeKey:'place-mention-1'}),source:'locationReference',sourceFloorKey:p.sourceFloorKey,sourceSnapshotIndex:0,exactQuote:tag}]}:{})}};
+  };
+  const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(`<location>${tag}</location>${body}`),user('稳定')],utility});
+  await h.foundationRuntime.reconcile('location-source');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+  let snapshot=h.runtime.getQianchuangSnapshot(),room=snapshot.places.find(p=>p.displayName===(mode==='ordinary'?'东厢房':'房里'));assert.ok(room);assert.equal(snapshot.places.filter(p=>['房里','东厢房'].includes(p.displayName)).length,1,'泛称与具体路径复用一个叶ID');
+  if(mode==='manual-clear')await h.runtime.savePlace(room.entityId,{name:'人工房',parentEntityId:null,mapLevel:null,description:'',relations:''},h.runtime.getPlaceEditContext(room.entityId));
+  const cold=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,sharedBackend:h.backend,sharedContext:h.context,utility});await cold.runtime.start();assert.equal(cold.calls.length,0);
+  const saved=await cold.store.readReachable({mode:'runtime'});assert.deepEqual(saved.floorMemories[0].sourceLocationReference,[tag]);assert.equal(saved.floorMemories[0].sourceCanonicalContent,body);assert.doesNotThrow(()=>validateFloorMemory(saved.floorMemories[0],{expectedChatId:CHAT}));
+  if(mode!=='ordinary')await cold.runtime.organizePlaces();
+  snapshot=cold.runtime.getQianchuangSnapshot();room=snapshot.places.find(p=>p.entityId===room.entityId);
+  if(mode==='manual-clear'){assert.equal(room.displayName,'人工房');assert.equal(room.parentEntityId,null);assert.equal(room.mapLevel,null);assert.deepEqual(room.features,[]);assert.deepEqual(room.relations,[]);}
+  else{const inn=snapshot.places.find(p=>p.displayName==='临江客栈'),town=snapshot.places.find(p=>p.displayName==='河湾镇');assert.equal(room.parentEntityId,inn.entityId);assert.equal(inn.parentEntityId,town.entityId);assert.equal(town.mapLevel,'scope');assert.ok(snapshot.mapRootIds.includes(town.entityId));}
+  assert.equal(snapshot.places.find(p=>p.entityId===snapshot.userPosition.placeEntityId)?.displayName,'码头','标签不可覆盖正文末位');
+  assert.equal(requests.length,mode==='ordinary'?1:2);
+  const reload=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,sharedBackend:h.backend,sharedContext:h.context,utility:()=>assert.fail('保存冷读不调用模型')});await reload.runtime.start();assert.equal(reload.runtime.getQianchuangSnapshot().places.find(p=>p.entityId===room.entityId).parentEntityId,room.parentEntityId);
+ });
+});
+
+test('聚合标签编译只保各成员来源，移动船舱不沿停靠镇归属，坏标签不连坐摘要',async()=>{
+ const first={id:'11111111-1111-4111-8111-111111111111',chatId:CHAT,narrativeGeneration:GENERATION,assistantSeq:1,content:{canonicalContent:'驳船临时停靠河湾镇，舱底有一张短榻。',rawFingerprint:'sha256:'+'a'.repeat(64)}};
+ const second={...first,id:'11111111-1111-4111-8111-111111111112',assistantSeq:2,content:{canonicalContent:'驳船离镇驶向江心，你还在舱底。',rawFingerprint:'sha256:'+'b'.repeat(64)}};
+ const envelope=await createExtractorEnvelope({batchId:'33333333-3333-4333-8333-333333333333',chatId:CHAT,narrativeGeneration:GENERATION,floor:second,sourceFloors:[{floor:first,locationReference:['河湾镇·临江客栈']},{floor:second,locationReference:['驳船·舱底']}],userIdentity:null});
+ const response={summary:'驳船离镇，你留在舱底。',placePaths:[{path:[{name:'河湾镇',mapLevel:'scope'},{name:'临江客栈'}],source:'locationReference',sourceFloorKey:'floor-1',sourceSnapshotIndex:0,exactQuote:'河湾镇·临江客栈'},{path:[{name:'驳船',mapRole:'site'},{name:'舱底',mapRole:'interior'}],source:'locationReference',sourceFloorKey:'floor-2',sourceSnapshotIndex:0,exactQuote:'驳船·舱底'},{path:[{name:'错误楼源'}],source:'locationReference',sourceFloorKey:'floor-1',exactQuote:'驳船·舱底'}]};
+ const result=await normalizeExtractorResponse({response,envelope,floor:second,now:NOW,expectedScope:envelope.scope});assert.equal(result.memory.summary.aiText,response.summary);assert.equal(result.isolated.filter(x=>x.field==='placePaths').length,1);assert.equal(result.foundationPatch.entities.some(e=>e.displayName==='错误楼源'),false);
+ const ship=result.foundationPatch.entities.find(e=>e.displayName==='驳船'),cabin=result.foundationPatch.entities.find(e=>e.displayName==='舱底');const edges=result.foundationPatch.facts.filter(f=>f.kind==='containment');assert.ok(edges.some(f=>f.placeEntityId===cabin.id&&f.parentEntityId===ship.id&&f.source.floorId===second.id));assert.equal(edges.some(f=>f.placeEntityId===ship.id),false);assert.equal(result.memory.spatialFacts?.positions?.length??0,0);
+ assert.deepEqual(result.memory.sourceFloorSnapshots.map(s=>s.locationReference),[['河湾镇·临江客栈'],['驳船·舱底']]);assert.doesNotThrow(()=>validateFloorMemory(JSON.parse(JSON.stringify(result.memory)),{expectedChatId:CHAT}));
+});
+
+test('地点标签source不能冒充正文证据，即使同句正文存在也不生成标签在场',async()=>{
+ const body='你在码头。',floor={id:'11111111-1111-4111-8111-111111111111',chatId:CHAT,narrativeGeneration:GENERATION,assistantSeq:1,content:{canonicalContent:body}};
+ const envelope=await createExtractorEnvelope({batchId:'33333333-3333-4333-8333-333333333333',chatId:CHAT,narrativeGeneration:GENERATION,floor,locationReference:[body],userIdentity:{displayName:'林岚',aliases:['你','林岚']}});
+ const result=await normalizeExtractorResponse({response:{summary:'健康摘要。',people:[{name:'林岚',role:'user',presence:'present'}],spatialFacts:{places:[{key:'place-mention-1',name:'码头',identity:'new',source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:body}],containments:[],positions:[{subject:'林岚',placeKey:'place-mention-1',status:'confirmed',source:'locationReference',sourceFloorKey:'floor-1',exactQuote:body}]}},envelope,floor,now:NOW,expectedScope:envelope.scope});
+ assert.equal(result.memory.summary.aiText,'健康摘要。');assert.equal(result.memory.spatialFacts?.positions?.length??0,0);
+});
+
+
+test('单地点标签基础来源也沿原整理取材，不要求先有父边或正文位置',async()=>{
+ const tag='河湾镇',body='你眺望远处。';
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(`<location>${tag}</location>${body}`),user('稳定')],utility:options=>{
+  const r=JSON.parse(options.taskMessages[0].content),p=r.payload;
+  if(r.task==='organizePlaces'){const row=storedEvidenceRows(p).find(x=>x.sourceType==='locationReference');assert.ok(row);assert.equal(row.content,tag);return{jsonData:{placePaths:[]}};}
+  return{jsonData:{summary:body,placePaths:[{path:[{name:tag,mapLevel:'scope'}],source:'locationReference',sourceFloorKey:p.sourceFloorKey,exactQuote:tag}]}};
+ }});
+ await h.foundationRuntime.reconcile('single-tag');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});assert.equal(h.runtime.getQianchuangSnapshot().places.length,1);await h.runtime.organizePlaces();assert.equal(h.calls.length,2);
+});
+
+test('地点提取协议同次开放标签路径来源与独立区域职责',()=>{
+ const schema=EXTRACTOR_RESPONSE_SCHEMA.properties.placePaths.items.properties;
+ assert.ok(schema.evidence.items.properties.source.enum.includes('locationReference'));assert.ok(schema.source.enum.includes('locationReference'));
+ assert.match(buildExtractorSystemPrompt(),/source:locationReference/);assert.match(buildExtractorSystemPrompt(),/临时停靠/);assert.match(buildExtractorSystemPrompt(),/镇.*scope/);
+});
+
+test('同批标签父链与正文明确归属相冲突时保正文链，坏标签路径不抹健康地点',async t=>{
+ for(const revision of [false,true])await t.test(revision?'标签显式修订':'普通标签',async()=>{
+ const body='客房实际属于乙馆。',floor={id:'11111111-1111-4111-8111-111111111111',chatId:CHAT,narrativeGeneration:GENERATION,assistantSeq:1,content:{canonicalContent:body}};
+ const envelope=await createExtractorEnvelope({batchId:'33333333-3333-4333-8333-333333333333',chatId:CHAT,narrativeGeneration:GENERATION,floor,locationReference:['甲馆·客房'],userIdentity:null});
+ const ev={source:'canonicalContent',sourceFloorKey:'floor-1',exactQuote:body};
+ const response={summary:'健康摘要。',spatialFacts:{places:[{key:'place-mention-1',name:'客房',identity:'new',...ev}],containments:[],positions:[]},placePaths:[{path:[{name:'甲馆'},{name:'客房',placeKey:'place-mention-1'}],source:'locationReference',sourceFloorKey:'floor-1',exactQuote:'甲馆·客房',...(revision?{identityChange:'ownershipChanged'}:{})},{path:[{name:'乙馆'},{name:'客房',placeKey:'place-mention-1'}],...ev}]};
+ const result=await normalizeExtractorResponse({response,envelope,floor,now:NOW,expectedScope:envelope.scope});assert.equal(result.memory.summary.aiText,'健康摘要。');const room=result.newEntities.find(e=>e.displayName==='客房'),hall=result.newEntities.find(e=>e.displayName==='乙馆');assert.ok(hall);assert.ok(result.memory.spatialFacts.containments.some(f=>f.placeEntityId===room.id&&f.parentEntityId===hall.id));assert.equal(result.foundationPatch.facts.some(f=>f.kind==='containment'&&f.source.kind==='locationReference'),false);assert.ok(result.isolated.some(f=>f.field==='placePaths'&&f.index===0));
+ });
+});
+
+test('泛称房里与标签具体厢房用同一叶ID，正文位置沿父链落在独立镇分区',async()=>{
+ const tag='河湾镇·临江客栈·东厢房',body='你在房里歇下。';
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(`<location>${tag}</location>${body}`),user('稳定')],utility:options=>{
+  const p=JSON.parse(options.taskMessages[0].content).payload,ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:body};
+  return{jsonData:{summary:body,people:[{name:'林岚',role:'user',presence:'present'}],spatialFacts:{places:[{key:'place-mention-1',name:'房里',identity:'new',...ev}],containments:[],positions:[{subject:'林岚',placeKey:'place-mention-1',status:'confirmed',...ev}]},placePaths:[{path:[{name:'河湾镇',mapLevel:'scope',mapRole:'area'},{name:'临江客栈',mapRole:'site'},{name:'东厢房',placeKey:'place-mention-1',mapRole:'interior'}],source:'locationReference',sourceFloorKey:p.sourceFloorKey,exactQuote:tag}]}};
+ }});
+ await h.foundationRuntime.reconcile('tag-room-position');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId,{analyzeState:false});
+ const snapshot=h.runtime.getQianchuangSnapshot(),room=snapshot.places.find(p=>p.displayName==='东厢房'),town=snapshot.places.find(p=>p.displayName==='河湾镇');assert.equal(snapshot.places.length,3);assert.equal(snapshot.places.some(p=>p.displayName==='房里'),false);assert.equal(snapshot.userPosition.placeEntityId,room.entityId);assert.equal(snapshot.userPosition.mapRootEntityId,town.entityId);assert.equal(snapshot.userPosition.isCurrent,true);assert.equal(town.mapLevel,'scope');
+});
+
+test('坏地点标签局部隔离后健康摘要、CSE与召回继续沿原入口保存',async()=>{
+ const body='裴晚生在书房提醒你带伞。',tag='河湾镇·客栈';
+ const h=harness({withPlaces:true,modernAnchors:true,readOnlyLifecycle:true,initialChat:[user('继续'),assistant(`<location>${tag}</location>${body}`),user('稳定')],utility:options=>{
+  if(options.systemPrompt===CSE_SYSTEM_PROMPT)return{jsonData:{subjects:[{subject:'裴晚生',situational:[{text:'提醒林岚带伞。',visibility:'observable',reason:'本楼明确提醒'}]}]}};
+  const p=JSON.parse(options.taskMessages[0].content).payload,ev={source:'canonicalContent',sourceFloorKey:p.sourceFloorKey,exactQuote:body};
+  return{jsonData:{summary:body,people:[{name:'裴晚生',presence:'present'},{name:'林岚',role:'user',presence:'present'}],spatialFacts:{places:[{key:'place-mention-1',name:'书房',identity:'new',...ev}],containments:[],positions:[]},placePaths:[{path:[{name:'错误客栈'}],source:'locationReference',sourceFloorKey:p.sourceFloorKey,exactQuote:'不存在的标签'}]}};
+ }});
+ await h.foundationRuntime.reconcile('bad-tag-cse');await h.runtime.start();await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId);
+ const saved=await h.store.readReachable({mode:'runtime'});assert.equal(saved.floorMemories[0].summary.aiText,body);assert.equal(saved.stateDeltas.length,1);assert.equal(h.calls.length,2);assert.equal(h.runtime.getState().lastExtractorError,null);assert.ok(h.runtime.getQianchuangSnapshot().places.some(p=>p.displayName==='书房'));assert.equal(h.runtime.getQianchuangSnapshot().places.some(p=>p.displayName==='错误客栈'),false);assert.ok(h.runtime.getState().cseSubjects.some(p=>p.displayName==='裴晚生'&&p.situational.some(x=>x.text==='提醒林岚带伞。')));
+ const recall=await readRecallSource({store:h.store,now:()=>new Date(NOW)});assert.equal(recall.status,'ready');assert.equal(recall.floorMemories[0].summary,body);assert.equal(recall.coverage.cseCurrent,true);
 });

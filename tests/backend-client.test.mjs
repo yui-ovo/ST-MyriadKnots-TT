@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { gunzipSync } from 'node:zlib';
 import { API_BASE } from '../src/constants.js';
 import { createBackendClient } from '../src/backend-client.js';
+import * as backendModule from '../src/backend-client.js';
+import { publicErrorMessage } from '../src/public-error.js';
 
 function withGlobals(values, callback) {
   const previous = new Map();
@@ -20,6 +22,89 @@ function withGlobals(values, callback) {
 
 const asBytes = body => typeof body === 'string' ? Buffer.from(body) : Buffer.from(body);
 
+test('TT默认客户端识别原生批读写能力，复用现有批协议且不走HTTP', async () => {
+  const slots = new Map(); let healthReads = 0, nativeReads = 0;
+  const key = options => `${options.namespace}/${options.table}/${options.key}`;
+  const store = {
+    async tryGetJson(options) { nativeReads++; return slots.has(key(options)) ? { found: true, value: structuredClone(slots.get(key(options))) } : { found: false }; },
+    async setJson(options) { slots.set(key(options), structuredClone(options.value)); },
+    async deleteJson(options) { slots.delete(key(options)); },
+    async listKeys() { assert.fail('批读不得扫描整份集合'); },
+    async listTables() { healthReads++; return []; },
+  };
+  await withGlobals({ __TAURITAVERN__: { ready: Promise.resolve(), api: { extension: { store } } }, fetch: () => assert.fail('TT不得访问HTTP后端') }, async () => {
+    const client = createBackendClient({ headers: () => assert.fail('原生接口不读取HTTP请求头') });
+    await client.put('chat', 'first', { summary: '人工摘要🙂' }, 0);
+    await client.put('chat', 'second', { state: '手动状态' }, 0);
+    nativeReads = 0;
+    const records = await client.getMany('chat', ['second', 'missing', 'first']);
+    assert.deepEqual(records.map(record => [record.recordId, record.status]), [['second', 200], ['missing', 404], ['first', 200]]);
+    assert.deepEqual(records[0].envelope.data, { state: '手动状态' });
+    assert.deepEqual(records[2].envelope.data, { summary: '人工摘要🙂' });
+    assert.equal(client.getDiagnosticSnapshot().sinceClientCreatedRequestCounts.post, 1, '使用已实现的record-batch接口');
+    assert.equal(client.getDiagnosticSnapshot().sinceClientCreatedRequestCounts.get, 0, '不再拆成独立GET');
+    assert.equal(nativeReads, 3); assert.equal(healthReads, 1);
+    await client.getMany('chat', ['first']);
+    assert.equal(healthReads, 1, '后续批次复用能力结果');
+    const saved = await client.putMany('chat', [{ recordId: 'third', data: { batch: true }, expectedRevision: 0 }]);
+    assert.equal(saved[0].status, 200); assert.equal(saved[0].envelope.revision, 1);
+    assert.deepEqual((await client.get('chat', 'third')).data, { batch: true });
+    assert.equal(healthReads, 1, '已有能力时批写不额外协商');
+    const fresh = await createBackendClient().putMany('chat', [{ recordId: 'a', data: {}, expectedRevision: 0 }, { recordId: 'b', data: {}, expectedRevision: 0 }], { negotiate: true });
+    assert.deepEqual(fresh.map(item => item.status), [200, 200]);
+    assert.equal(healthReads, 2, '新客户端多记录只协商一次原生能力');
+  });
+});
+
+test('batch PUT sends one acknowledged package and uses only cached capability', async () => {
+  const calls = []; let active = 0, maxActive = 0;
+  const client = createBackendClient({ fetchImpl: async (url, options) => {
+    calls.push([url, options]); active++; maxActive = Math.max(maxActive, active);
+    try {
+      if (url.endsWith('/health')) return Response.json({ ok: true, api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true, recordBatchWrite: true } });
+      const { records } = JSON.parse(options.body); assert.ok(Buffer.byteLength(options.body) <= 1048576);
+      return Response.json(records.map(item => ({ recordId: item.recordId, status: 200, envelope: { revision: 1, data: item.data } })));
+    } finally { active--; }
+  } });
+  const records = Array.from({ length: 64 }, (_, index) => ({ recordId: `r-${index}`, data: { text: `完整材料${index}` }, expectedRevision: 0 }));
+  assert.equal(await client.putMany('chat', records), null); assert.equal(calls.length, 0, '不为批写新增健康探测');
+  await client.health();
+  const result = await client.putMany('chat', records);
+  assert.deepEqual(result.map(item => item.envelope.data), records.map(item => item.data));
+  assert.equal(calls.length, 2); assert.equal(calls[1][1].method, 'PUT'); assert.match(calls[1][0], /record-batch/); assert.equal(maxActive, 1);
+  await assert.rejects(client.putMany('chat', [...records, records[0]])); assert.equal(calls.length, 2);
+});
+
+test('batch package iterator is UTF8-bounded, keeps order and sends oversized records singly', () => {
+  assert.equal(typeof backendModule.recordWriteBatches, 'function');
+  const entries = Array.from({ length: 129 }, (_, index) => ({ recordId: `r-${index}`, data: '字'.repeat(index === 64 ? 360000 : 6000), expectedRevision: 0 }));
+  const seen = []; let single = 0, packets = 0;
+  for (const group of backendModule.recordWriteBatches(entries)) {
+    assert.ok(group.records.length <= 64);
+    if (group.single) { single++; assert.equal(group.records.length, 1); assert.equal(group.records[0], entries[64]); }
+    else { packets++; assert.ok(Buffer.byteLength(JSON.stringify({ records: group.records })) <= 1048576); }
+    seen.push(...group.records);
+  }
+  assert.equal(single, 1); assert.ok(packets >= 4); assert.deepEqual(seen, entries);
+  let consumed = 0;
+  const lazy = backendModule.recordWriteBatches((function* () { for (let index = 0; index < 6400; index++) { consumed++; yield { recordId: `lazy-${index}`, data: {}, expectedRevision: 0 }; } })());
+  assert.equal(lazy.next().value.records.length, 64); assert.equal(consumed, 65, '只生成当前包和下一条，不预制全部包字符串');
+});
+
+test('batch PUT HTTP or result errors never trigger a resend or single-write fallback', async () => {
+  for (const mode of ['http', 'order', 'json']) {
+    let writes = 0;
+    const client = createBackendClient({ fetchImpl: async (url, options) => {
+      if (url.endsWith('/health')) return Response.json({ ok: true, api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true, recordBatchWrite: true } });
+      writes++; assert.equal(options.method, 'PUT');
+      if (mode === 'http') return Response.json({}, { status: 500 });
+      if (mode === 'json') return new Response('{');
+      return Response.json([{ recordId: 'wrong', status: 200, envelope: { revision: 1, data: {} } }]);
+    } });
+    await client.health(); await assert.rejects(client.putMany('chat', [{ recordId: 'one', data: {}, expectedRevision: 0 }])); assert.equal(writes, 1);
+  }
+});
+
 test('backend GET 超时会退出且不自动重试', async () => {
   let calls = 0;
   const fetchImpl = (_url, { signal }) => {
@@ -27,7 +112,10 @@ test('backend GET 超时会退出且不自动重试', async () => {
     return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true }));
   };
   const client = createBackendClient({ fetchImpl, timeoutMs: 5 });
-  await assert.rejects(client.get('chat-x', 'meta'), error => error.name === 'TimeoutError' && error.code === 'BACKEND_TIMEOUT');
+  await assert.rejects(client.get('chat-x', 'meta'), error => error.name === 'TimeoutError'
+    && error.code === 'BACKEND_TIMEOUT'
+    && error.message.includes('读取记忆超时')
+    && publicErrorMessage(error) === '记忆存储请求超时，请稍后重试。');
   assert.equal(calls, 1);
 });
 
@@ -122,7 +210,7 @@ test('backend HTTP 400 仅将短 error/message 写入诊断，解析失败仍保
     { ok: false, status: 400, json: async () => '<html>PRIVATE_HTML</html>' },
   ];
   const client = createBackendClient({ fetchImpl: async () => responses.shift() });
-  await assert.rejects(client.put('private-chat', 'v3-floor-memory-private', { private: 'PRIVATE_REQUEST' }, 0), error => error.status === 400 && error.message === '后端请求失败（HTTP 400），请查看详细诊断。');
+  await assert.rejects(client.put('private-chat', 'v3-floor-memory-private', { private: 'PRIVATE_REQUEST' }, 0), error => error.status === 400 && error.message === '保存记忆失败（HTTP 400）。');
   const valid = client.getDiagnosticSnapshot();
   assert.equal(valid.latestWrite.backendError, 'VALIDATION_ERROR');
   assert.equal(valid.lastFailure.backendMessage, '字段格式无效');
@@ -131,13 +219,13 @@ test('backend HTTP 400 仅将短 error/message 写入诊断，解析失败仍保
   assert.equal(client.getDiagnosticSnapshot().latestRead.outcome, 'success');
   assert.deepEqual(client.getDiagnosticSnapshot().lastFailure, valid.lastFailure);
 
-  await assert.rejects(client.put('private-chat', 'v3-floor-memory-private', {}, 0), error => error.status === 400 && error.message === '后端请求失败（HTTP 400），请查看详细诊断。');
+  await assert.rejects(client.put('private-chat', 'v3-floor-memory-private', {}, 0), error => error.status === 400 && error.message === '保存记忆失败（HTTP 400）。');
   const malformed = client.getDiagnosticSnapshot();
   assert.equal(malformed.latestWrite.httpStatus, 400);
   assert.equal(malformed.latestWrite.backendError, undefined);
   assert.equal(malformed.latestWrite.backendMessage, undefined);
 
-  await assert.rejects(client.put('private-chat', 'v3-floor-memory-private', {}, 0), error => error.status === 400 && error.message === '后端请求失败（HTTP 400），请查看详细诊断。');
+  await assert.rejects(client.put('private-chat', 'v3-floor-memory-private', {}, 0), error => error.status === 400 && error.message === '保存记忆失败（HTTP 400）。');
   const nonJson = client.getDiagnosticSnapshot();
   assert.equal(nonJson.lastFailure.httpStatus, 400);
   assert.equal(nonJson.lastFailure.backendError, undefined);
@@ -221,7 +309,8 @@ test('backend 诊断按 client 生命周期统计 records 请求并只暴露固�
     ['v3-run-private', 'run'], ['v3-checkpoint-private', 'checkpoint'], ['v3-entity-private', 'entity'],
     ['v3-baseline-private', 'baseline'], ['v3-state-delta-private', 'stateDelta'],
     ['v3-current-state-private', 'currentState'], ['v3-index-private', 'index'],
-    ['binding-private', 'binding'], ['v3-people-workspace', 'peopleWorkspace'], ['private-record-id', 'unknown'],
+    ['binding-private', 'binding'], ['v3-people-workspace', 'peopleWorkspace'],
+    ['self-use-memory-transfer-rollback-v1', 'memoryTransferRollback'], ['private-record-id', 'unknown'],
   ];
   for (const [recordId, recordType] of cases) {
     await client.get(privateCollection, recordId);
@@ -276,12 +365,36 @@ test('backend 诊断保留最近失败，后续成功不清除 timeout 与 HTTP 
       ? { ok: false, status: 409, json: async () => ({ private: 'PRIVATE_HTTP_BODY' }) }
       : { ok: true, status: 200, json: async () => ({ ok: true }) };
   } });
-  await assert.rejects(httpClient.put('private', 'v3-entity-private', { private: 'PRIVATE_INPUT' }, 0), error => error.status === 409 && error.message === '后端请求失败（HTTP 409），请查看详细诊断。');
+  await assert.rejects(httpClient.put('private', 'v3-entity-private', { private: 'PRIVATE_INPUT' }, 0), error => error.status === 409 && error.message === '保存记忆失败（HTTP 409）。');
   const httpFailure = httpClient.getDiagnosticSnapshot().lastFailure;
   assert.equal(httpFailure.outcome, 'httpError'); assert.equal(httpFailure.httpStatus, 409);
   await httpClient.remove('private', 'v3-entity-private', 1);
   assert.deepEqual(httpClient.getDiagnosticSnapshot().lastFailure, httpFailure);
   assert.doesNotMatch(JSON.stringify(httpClient.getDiagnosticSnapshot()), /PRIVATE_HTTP_BODY|PRIVATE_INPUT|v3-entity-private/);
+});
+
+test('记忆存储连接失败用记忆操作说明，不沿用模型 API 地址指引', async () => {
+  const cause = new TypeError('Failed to fetch');
+  const client = createBackendClient({ fetchImpl: async () => { throw cause; } });
+  await assert.rejects(client.get('chat-x', 'v3-root'), error => {
+    assert.equal(error.cause, cause);
+    assert.match(error.message, /^读取记忆失败，无法连接记忆存储服务/u);
+    const visible = publicErrorMessage(error);
+    assert.equal(error.code, 'BACKEND_NETWORK'); assert.match(visible, /记忆存储连接失败/u);
+    assert.doesNotMatch(visible, /记忆管理|复制状态诊断/u);
+    assert.doesNotMatch(visible, /API 地址|API Key/u);
+    return true;
+  });
+  const snapshot = client.getDiagnosticSnapshot();
+  assert.equal(snapshot.lastFailure.outcome, 'failure');
+  assert.equal(snapshot.latestRead.recordType, 'root');
+});
+
+test('请求准备阶段失败保留真实原因，不误报为记忆存储连接失败', async () => {
+  const cause = new Error('本地请求头配置失败');
+  const client = createBackendClient({ headers: () => { throw cause; }, fetchImpl: async () => { throw new Error('不应调用'); } });
+  await assert.rejects(client.get('chat-x', 'v3-root'), error => error === cause);
+  assert.equal(client.getDiagnosticSnapshot().latestRead.outcome, 'failure');
 });
 
 test('backend 外部取消保留原错误对象且诊断不复制错误内容', async () => {
@@ -490,4 +603,245 @@ test('默认 HTTP 压缩 PUT 对 409/400 保持原状态诊断且不明文重发
     assert.equal(bodyReads, 1, '409保持不读取body，400仅读取一次原有短诊断');
     assert.deepEqual(client.getDiagnosticSnapshot().sinceClientCreatedRequestCounts, { get: 0, put: 2, delete: 0 });
   });
+});
+
+const batchHealth = capabilities => ({ ok: true, api: { current: 1, supported: [1] },
+  capabilities: { records: true, optimisticRevision: true, ...capabilities } });
+
+test('后端批量读取先协商能力并保留请求顺序与状态', async () => {
+  const calls = [];
+  const client = createBackendClient({ fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    if (url.endsWith('/v1/health')) return { ok: true, status: 200, json: async () => batchHealth({ recordBatchRead: true }) };
+    return { ok: true, status: 200, json: async () => [
+      { recordId: 'a', status: 200, envelope: { revision: 2, data: { value: 'A' } } },
+      { recordId: 'b', status: 404, error: 'not_found', message: 'Record not found' },
+    ] };
+  } });
+  assert.deepEqual(await client.getMany('chat-x', ['a', 'b']), [
+    { recordId: 'a', status: 200, envelope: { revision: 2, data: { value: 'A' } } },
+    { recordId: 'b', status: 404, error: 'not_found', message: 'Record not found' },
+  ]);
+  assert.match(calls[1].url, /\/v1\/record-batch\/qianqianjie\/chat-x$/);
+  assert.deepEqual(JSON.parse(calls[1].options.body), { recordIds: ['a', 'b'] });
+  assert.equal(client.getDiagnosticSnapshot().latestRead.method, 'POST');
+  assert.equal(client.getDiagnosticSnapshot().sinceClientCreatedRequestCounts.post, 1);
+});
+
+test('旧后端无批量能力时按最多16路并发回落到单记录读取', async () => {
+  let active = 0, maximum = 0;
+  const calls = [];
+  const client = createBackendClient({ fetchImpl: async (url, options) => {
+    calls.push(url);
+    if (url.endsWith('/v1/health')) return { ok: true, status: 200, json: async () => batchHealth({}) };
+    active += 1; maximum = Math.max(maximum, active);
+    await new Promise(resolve => setTimeout(resolve, 1));
+    active -= 1;
+    const recordId = decodeURIComponent(url.split('/').at(-1));
+    return { ok: true, status: 200, json: async () => ({ revision: 1, data: { recordId } }) };
+  } });
+  const ids = Array.from({ length: 20 }, (_, index) => `id-${index}`);
+  const result = await client.getMany('chat-x', ids);
+  assert.deepEqual(result.map(item => item.recordId), ids);
+  assert.equal(result.every(item => item.status === 200), true);
+  assert.ok(maximum > 1 && maximum <= 16);
+  assert.equal(calls.length, 21);
+});
+
+test('批量读取拒绝与请求顺序或记录数不符的后端响应', async () => {
+  const client = createBackendClient({ fetchImpl: async url => url.endsWith('/v1/health')
+    ? { ok: true, status: 200, json: async () => batchHealth({ recordBatchRead: true }) }
+    : { ok: true, status: 200, json: async () => [{ recordId: 'wrong', status: 200, envelope: { revision: 1, data: {} } }] } });
+  await assert.rejects(client.getMany('chat-x', ['expected']), /后端批量读取结果无效/);
+});
+
+test('后端记录迭代使用轻量ID清单并按64条分批读取', async () => {
+  const calls = [];
+  const ids = Array.from({ length: 65 }, (_, index) => `id-${index}`);
+  const client = createBackendClient({ fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    if (url.endsWith('/v1/health')) return { ok: true, status: 200, json: async () => batchHealth({ recordBatchRead: true, recordIdList: true }) };
+    if (url.includes('/v1/record-ids/')) return { ok: true, status: 200, json: async () => ids };
+    const recordIds = JSON.parse(options.body).recordIds;
+    return { ok: true, status: 200, json: async () => recordIds.map(recordId => ({ recordId, status: 200, envelope: { revision: 1, data: { recordId } } })) };
+  } });
+  const records = [];
+  for await (const record of client.iterRecords('chat-x')) records.push(record);
+  assert.equal(records.length, 65);
+  assert.deepEqual(records.map(record => record.recordId), ids);
+  assert.equal(calls.filter(call => call.url.includes('/v1/record-batch/')).length, 2);
+  assert.deepEqual(JSON.parse(calls.find(call => call.url.includes('/v1/record-batch/')).options.body).recordIds, ids.slice(0, 64));
+});
+
+test('记录迭代在旧后端能力缺失时保留 collection list 回落', async () => {
+  const calls = [];
+  const records = [{ recordId: 'a', revision: 1, data: { value: 1 } }];
+  const client = createBackendClient({ fetchImpl: async (url, options) => {
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => url.endsWith('/v1/health') ? batchHealth({}) : records };
+  } });
+  const result = [];
+  for await (const record of client.iterRecords('chat-x')) result.push(record);
+  assert.deepEqual(result, records);
+  assert.equal(calls.some(url => url.endsWith('/v1/records/qianqianjie/chat-x')), true);
+  assert.equal(calls.some(url => url.includes('/v1/record-ids/')), false);
+});
+
+test('轻量ID清单不要求批读能力，流式枚举按已有单记录GET分批读取', async () => {
+  const calls = [], ids = Array.from({ length: 65 }, (_, index) => `id-${index}`);
+  const client = createBackendClient({ fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    if (url.endsWith('/v1/health')) return Response.json(batchHealth({ recordIdList: true }));
+    if (url.includes('/v1/record-ids/')) return Response.json(ids);
+    const recordId = decodeURIComponent(url.split('/').at(-1));
+    return Response.json({ revision: 1, data: { recordId } });
+  } });
+  const iterator = client.iterRecords('chat-x', { requireStreaming: true });
+  assert.equal((await iterator.next()).value.recordId, 'id-0');
+  assert.equal(calls.filter(call => call.url.includes('/v1/records/')).length, 64);
+  assert.equal(calls.some(call => call.url.endsWith('/v1/records/qianqianjie/chat-x')), false);
+  const remaining = [];
+  for await (const item of iterator) remaining.push(item.recordId);
+  assert.deepEqual(remaining, ids.slice(1));
+  assert.equal(calls.filter(call => call.url.includes('/v1/records/')).length, 65);
+});
+
+test('请求流式枚举时老HTTP后端在读取完整集合前提示更新白鸟', async () => {
+  const calls = [];
+  const client = createBackendClient({ fetchImpl: async url => {
+    calls.push(url);
+    return Response.json(batchHealth({}));
+  } });
+  await assert.rejects(client.iterRecords('chat-x', { requireStreaming: true }).next(), /更新.*白鸟|白鸟.*更新/);
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].endsWith('/v1/health'));
+});
+
+test('冷启动共享能力探测不被旧聊天取消，新聊天仍可接力批读', async () => {
+  for (const kind of ['getMany', 'iterRecords']) {
+    const calls = [], controller = new AbortController();
+    const reason = new DOMException('oldChatClosed', 'AbortError');
+    let releaseHealth, startedResolve;
+    const started = new Promise(resolve => { startedResolve = resolve; });
+    const client = createBackendClient({ fetchImpl: async (url, options) => {
+      calls.push(url);
+      if (url.endsWith('/v1/health')) return new Promise((resolve, reject) => {
+        releaseHealth = () => resolve(Response.json(batchHealth({ recordBatchRead: true, recordIdList: true })));
+        options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        startedResolve();
+      });
+      assert.match(url, /record-batch\/qianqianjie\/chat-new$/);
+      return Response.json(JSON.parse(options.body).recordIds.map(recordId => ({ recordId, status: 200, envelope: { revision: 1, data: { recordId } } })));
+    } });
+    const previous = kind === 'getMany'
+      ? client.getMany('chat-old', ['old-record'], { signal: controller.signal })
+      : client.iterRecords('chat-old', { signal: controller.signal }).next();
+    await started;
+    const current = client.getMany('chat-new', ['new-record']);
+    const outcomes = Promise.allSettled([previous, current]);
+    controller.abort(reason); releaseHealth();
+    const [oldOutcome, newOutcome] = await outcomes;
+    assert.equal(oldOutcome.status, 'rejected', kind);
+    assert.equal(oldOutcome.reason, reason, '旧聊天保留自身取消结果');
+    assert.equal(newOutcome.status, 'fulfilled', `${kind}共享探测后新聊天不受旧signal连带取消`);
+    assert.deepEqual(newOutcome.value.map(record => record.recordId), ['new-record']);
+    assert.equal(calls.filter(url => url.endsWith('/v1/health')).length, 1, '不重试能力探测');
+    assert.equal(calls.some(url => url.includes('chat-old')), false, '旧聊天取消后不再请求记录');
+  }
+});
+
+test('275批量POST复用完整读取长预算，响应头及body均受该预算且单条仍短预算', async t => {
+  const ids = Array.from({ length: 64 }, (_, index) => `v3-floor-memory-${index}`);
+  const records = ids.map(recordId => ({ recordId, status: 200, envelope: { revision: 1, data: { text: '中性夹具' } } }));
+  const delayed = (signal, value, milliseconds) => new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); reject(signal.reason ?? new DOMException('Aborted', 'AbortError')); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(value); }, milliseconds);
+    signal.addEventListener('abort', abort, { once: true });
+  });
+  const untilAborted = signal => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason ?? new DOMException('Aborted', 'AbortError')), { once: true }));
+  for (const mode of ['headers', 'body', 'single', 'batchTimeout', 'cancel', 'legacy']) await t.test(mode, async () => {
+    const calls = [], controller = new AbortController();
+    const client = createBackendClient({ timeoutMs: 10, listTimeoutMs: mode === 'batchTimeout' ? 30 : 100,
+      fetchImpl: async (url, options) => {
+        if (url.endsWith('/health')) return { ok: true, status: 200, json: async () => ({ ok: true,
+          api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true, recordBatchRead: mode !== 'legacy' } }) };
+        calls.push(options.method ?? 'GET');
+        const response = { ok: true, status: 200, json: () => {
+          if (mode === 'batchTimeout') return untilAborted(options.signal);
+          if (mode === 'cancel') { setTimeout(() => controller.abort(new DOMException('用户取消', 'AbortError')), 5); return untilAborted(options.signal); }
+          return mode === 'headers' ? Promise.resolve(records) : delayed(options.signal, options.method === 'POST' ? records : { revision: 1, data: {} }, 40);
+        } };
+        return mode === 'headers' ? delayed(options.signal, response, 40) : response;
+      } });
+    if (mode === 'single') {
+      await assert.rejects(client.get('chat', 'v3-root'), error => error.code === 'BACKEND_TIMEOUT');
+      assert.deepEqual(calls, ['GET']);
+    } else if (mode === 'legacy') {
+      await assert.rejects(client.getMany('chat', ids.slice(0, 2)), error => error.code === 'BACKEND_TIMEOUT');
+      assert.deepEqual(calls, ['GET', 'GET'], '旧服务逐条兼容保原短预算且不重发');
+    } else if (mode === 'batchTimeout' || mode === 'cancel') {
+      await assert.rejects(client.getMany('chat', ids, { signal: controller.signal }), error => mode === 'cancel'
+        ? error.name === 'AbortError' && error.code !== 'BACKEND_TIMEOUT' : error.code === 'BACKEND_TIMEOUT');
+      assert.deepEqual(calls, ['POST'], '真正超时和外部取消均不增加请求');
+      assert.equal(client.getDiagnosticSnapshot().latestRead.outcome, mode === 'cancel' ? 'aborted' : 'timeout');
+    } else {
+      assert.deepEqual(await client.getMany('chat', ids), records);
+      assert.deepEqual(calls, ['POST'], '慢头或慢正文只发一次批量请求');
+      assert.equal(client.getDiagnosticSnapshot().latestRead.outcome, 'success');
+    }
+  });
+});
+
+test('275默认批读120秒，普通health及单请求默认15秒', async () => {
+  const delays = [], originalSetTimeout = globalThis.setTimeout;
+  await withGlobals({ setTimeout(callback, delay, ...args) { delays.push(delay); return originalSetTimeout(callback, delay, ...args); } }, async () => {
+    const client = createBackendClient({ fetchImpl: async url => ({ ok: true, status: 200, json: async () => url.endsWith('/health')
+      ? { ok: true, api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true, recordBatchRead: true } }
+      : [{ recordId: 'v3-floor-memory-neutral', status: 200, envelope: { revision: 1, data: {} } }] }) });
+    await client.getMany('chat', ['v3-floor-memory-neutral']);
+    assert.deepEqual(delays, [15000, 120000]);
+  });
+});
+
+
+test('显式多条批写在暖读零回源的新client协商一次，旧后端与失败不逐包重探', async t => {
+  const records = [{ recordId: 'a', data: {}, expectedRevision: 0 }, { recordId: 'b', data: {}, expectedRevision: 0 }];
+  for (const mode of ['supported', 'legacy', 'failed']) await t.test(mode, async () => {
+    let health = 0, writes = 0, recovered = false;
+    const client = createBackendClient({ fetchImpl: async (url, options) => {
+      if (url.endsWith('/health')) {
+        health++;
+        if (mode === 'failed' && !recovered) throw new TypeError('offline health failure');
+        return Response.json({ ok: true, api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true, recordBatchWrite: mode === 'supported' || recovered } });
+      }
+      writes++; assert.equal(options.method, 'PUT');
+      return Response.json(JSON.parse(options.body).records.map(item => ({ recordId: item.recordId, status: 200, envelope: { revision: 1, data: item.data } })));
+    } });
+    assert.equal(await client.putMany('chat', records.slice(0, 1), { negotiate: true }), null, '单条不增加探测');
+    const results = await Promise.all([client.putMany('chat', records, { negotiate: true }), client.putMany('chat', records, { negotiate: true })]);
+    await client.putMany('chat', records, { negotiate: true });
+    assert.equal(health, 1, '并行和后续批次共享一次有界能力协商');
+    assert.equal(writes, mode === 'supported' ? 3 : 0);
+    if (mode === 'supported') assert.deepEqual(results[0].map(item => item.envelope.data), records.map(item => item.data));
+    else assert.deepEqual(results, [null, null], '保存仍由store原单写回落承担');
+    if (mode === 'failed') {
+      recovered = true; await client.health();
+      assert.equal((await client.putMany('chat', records, { negotiate: true })).length, 2);
+      assert.equal(health, 2); assert.equal(writes, 1, '后来正常协商得到能力后恢复批写');
+    }
+  });
+});
+
+
+test('显式批写等待能力期间取消后不再发送保存请求', async () => {
+  let release, health = 0, writes = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const client = createBackendClient({ fetchImpl: async url => {
+    if (url.endsWith('/health')) { health++; await gate; return Response.json({ ok: true, api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true, recordBatchWrite: true } }); }
+    writes++; assert.fail('取消后不得发送PUT');
+  } });
+  const controller = new AbortController();
+  const saving = client.putMany('chat', [{ recordId: 'a', data: {}, expectedRevision: 0 }, { recordId: 'b', data: {}, expectedRevision: 0 }], { negotiate: true, signal: controller.signal });
+  await new Promise(resolve => setImmediate(resolve)); controller.abort(); release();
+  await assert.rejects(saving, error => error.name === 'AbortError'); assert.equal(health, 1); assert.equal(writes, 0);
 });

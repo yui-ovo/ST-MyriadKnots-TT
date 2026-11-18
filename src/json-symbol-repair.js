@@ -3,8 +3,11 @@ const BARE_KEY_PART = /[A-Za-z0-9_-]/u;
 const NUMBER = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/uy;
 const MAX_REPAIRS = 64;
 
-function normalizeFinishReason(value) {
-  return String(value ?? '').trim().toLowerCase();
+export function normalizeFinishReason(value) {
+  const reason = String(value ?? '').trim().toLowerCase();
+  if (reason === 'end_turn') return 'stop';
+  if (!reason) return '';
+  return ['stop', 'length', 'max_tokens', 'content_filter', 'tool_calls', 'function_call'].includes(reason) ? reason : 'other';
 }
 
 function scanner(source, { trailingCommasOnly = false, requireOperations = true } = {}) {
@@ -26,19 +29,36 @@ function scanner(source, { trailingCommasOnly = false, requireOperations = true 
   };
   const valueStart = char => char === '{' || char === '[' || char === '"' || char === '-' || /[0-9]/u.test(char ?? '') || char === 't' || char === 'f' || char === 'n';
 
-  const stringToken = ({ value = false } = {}) => {
+  const stringToken = ({ value = false, containerClose = null } = {}) => {
     if (source[index] !== '"') return null;
     let raw = '"';
+    let pairedQuote = -1;
     index += 1;
     while (index < source.length) {
       const char = source[index];
       if (char === '"') {
         if (value) {
+          // Keep a real outer close; only the remaining pair candidate stays literal.
+          if (index === pairedQuote) {
+            pairedQuote = -1;
+            if (!isOuterStringEnd(index, containerClose)) {
+              addOperation('escape-string-quote', index, '\\');
+              raw += '\\"';
+              index += 1;
+              continue;
+            }
+          }
           let boundary = index + 1;
           while (/\s/u.test(source[boundary] ?? '')) boundary += 1;
           const separatedNextToken = boundary > index + 1 && (valueStart(source[boundary]) || BARE_KEY_START.test(source[boundary] ?? ''));
           const closesValue = boundary === source.length || [',', '}', ']'].includes(source[boundary]) || separatedNextToken;
           if (!closesValue) {
+            const nextKey = inspectKey(index + 1);
+            if (nextKey?.kind === 'bare' && nextKey.colon) {
+              let valueAt = nextKey.valueAt + 1;
+              while (/\s/u.test(source[valueAt] ?? '')) valueAt += 1;
+              if (valueStart(source[valueAt])) return null;
+            }
             let paired = index + 1;
             while (paired < source.length) {
               if (source[paired] === '\\') { paired += 2; continue; }
@@ -49,6 +69,7 @@ function scanner(source, { trailingCommasOnly = false, requireOperations = true 
             let afterPair = paired + 1;
             while (/\s/u.test(source[afterPair] ?? '')) afterPair += 1;
             if (source[afterPair] === ':') return null;
+            pairedQuote = paired;
             addOperation('escape-string-quote', index, '\\');
             raw += '\\"';
             index += 1;
@@ -93,14 +114,13 @@ function scanner(source, { trailingCommasOnly = false, requireOperations = true 
     if (source[index] === '"') {
       addOperation('insert-key-opening-quote', start, '"');
       output += `"${raw}`;
-      const closingAt = index;
       index += 1;
       output += '"';
-      return { key: raw, repaired: true, end: index, closingAt };
+      return { key: raw };
     }
     addOperation('quote-bare-key', start, '""');
     output += `"${raw}"`;
-    return { key: raw, repaired: true, end: index };
+    return { key: raw };
   };
 
   const inspectKey = at => {
@@ -142,19 +162,45 @@ function scanner(source, { trailingCommasOnly = false, requireOperations = true 
     return { kind: 'bare', key, colon: source[cursor] === ':', valueAt: cursor };
   };
 
+  // A lookahead quote can be the real value end after a single literal quote.
+  const isOuterStringEnd = (at, containerClose) => {
+    let next = at + 1;
+    while (/\s/u.test(source[next] ?? '')) next += 1;
+    if (containerClose ? source[next] === containerClose : next === source.length) return true;
+    if (source[next] !== ',') return false;
+    next += 1;
+    while (/\s/u.test(source[next] ?? '')) next += 1;
+    if (source[next] === containerClose) return true;
+    const token = inspectKey(next);
+    if (containerClose === '}') return token?.colon === true;
+    if (containerClose !== ']') return false;
+    if (token?.kind === 'quoted') return [',', ']'].includes(source[token.valueAt]);
+    if (source[next] === '{' || source[next] === '[') return true;
+    const literal = ['true', 'false', 'null'].find(value => source.startsWith(value, next));
+    let end;
+    if (literal) end = next + literal.length;
+    else {
+      NUMBER.lastIndex = next;
+      if (!NUMBER.exec(source)) return false;
+      end = NUMBER.lastIndex;
+    }
+    while (/\s/u.test(source[end] ?? '')) end += 1;
+    return [',', ']'].includes(source[end]);
+  };
+
   const parseKey = () => {
     if (source[index] === '"') {
       const token = stringToken();
-      return token ? { key: token.decoded, repaired: false } : null;
+      return token ? { key: token.decoded } : null;
     }
     return bareKeyToken();
   };
 
-  const parseValue = () => {
+  const parseValue = containerClose => {
     const char = source[index];
     if (char === '{') return parseObject();
     if (char === '[') return parseArray();
-    if (char === '"') return stringToken({ value: true });
+    if (char === '"') return stringToken({ value: true, containerClose });
     for (const literal of ['true', 'false', 'null']) {
       if (source.startsWith(literal, index)) {
         output += literal;
@@ -188,7 +234,7 @@ function scanner(source, { trailingCommasOnly = false, requireOperations = true 
       else if (valueStart(source[index]) && (source[index] !== '"' || colonGap > 0)) { addOperation('insert-colon', index, ':'); output += ':'; }
       else return null;
       whitespace();
-      const value = parseValue();
+      const value = parseValue('}');
       if (!value) return null;
       const gap = whitespace();
       if (source[index] === '}') { output += '}'; index += 1; return { kind: 'object' }; }
@@ -224,7 +270,7 @@ function scanner(source, { trailingCommasOnly = false, requireOperations = true 
     whitespace();
     if (source[index] === ']') { output += ']'; index += 1; return { kind: 'array' }; }
     while (index < source.length) {
-      const value = parseValue();
+      const value = parseValue(']');
       if (!value) return null;
       whitespace();
       if (source[index] === ']') { output += ']'; index += 1; return { kind: 'array' }; }
@@ -270,7 +316,25 @@ export function parseJsonWithSymbolRepair(value, { finishReason } = {}) {
     return Object.freeze({ value: JSON.parse(text), text, repaired: false, operations: Object.freeze([]) });
   } catch { /* only a true stop may enter the symbol-only repair */ }
   if (normalizeFinishReason(finishReason) !== 'stop') return null;
-  return scanner(text);
+  const scanned = scanner(text);
+  if (scanned) return scanned;
+  // A quoted source excerpt may end with \" while its outer string quote is
+  // missing. Insert only that quote, leaving the excerpt and all other bytes.
+  let repaired = null;
+  for (const match of text.matchAll(/\\"(?=[,}\]])/gu)) {
+    const at = match.index + 2;
+    let slashes = 1;
+    while (text[match.index - slashes] === '\\') slashes += 1;
+    if (slashes % 2 === 0) continue;
+    const candidate = text.slice(0, at) + '"' + text.slice(at);
+    try { JSON.parse(candidate); } catch { continue; }
+    const inspected = scanner(candidate, { requireOperations: false });
+    if (!inspected) continue;
+    if (repaired) return null;
+    repaired = Object.freeze({ value: inspected.value, text: candidate, repaired: true,
+      operations: Object.freeze([Object.freeze({ type: 'insert-string-closing-quote', index: at, value: '"' })]) });
+  }
+  return repaired;
 }
 
 export function parseJsonWithSafeTrailingCommas(value) {

@@ -10,13 +10,14 @@ const input = { scope: { fromIndex: 4, toIndex: 6 }, sources: [
 const batch = [{ uid: '1', segments: [{ id: 'body', text: '旧家' }] }];
 const change = () => ({ uid: '1', segmentId: 'body', replacements: [{ before: '旧家', after: '新家' }], reason: '完成搬迁', evidenceRefs: ['memory:4', 'dialogue:5'] });
 
-test('guidance uses existing front matter and always preserves the fixed output contract', () => {
+test('guidance preserves the fixed output contract while transport supplies shared front matter', () => {
   const custom = buildWorldbookUpdatePrompt('CUSTOM_GUIDANCE', 'CUSTOM_PREFIX');
-  assert.ok(custom.startsWith('CUSTOM_PREFIX\n\nCUSTOM_GUIDANCE'));
+  assert.ok(custom.startsWith('CUSTOM_GUIDANCE'));
+  assert.equal(custom.includes('CUSTOM_PREFIX'), false);
   assert.match(custom, /固定输出与权限要求/);
   const defaults = buildWorldbookUpdatePrompt();
   assert.ok(defaults.includes(DEFAULT_WORLDBOOK_GUIDANCE));
-  assert.ok(defaults.indexOf('fictional_content_processing_protocol') < defaults.indexOf(DEFAULT_WORLDBOOK_GUIDANCE));
+  assert.ok(defaults.startsWith(DEFAULT_WORLDBOOK_GUIDANCE));
 });
 
 test('decision evidence is checked and floor references are derived from supplied sources only', () => {

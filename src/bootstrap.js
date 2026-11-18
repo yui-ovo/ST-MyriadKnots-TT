@@ -1,3 +1,4 @@
+import { createQianchuangView } from './ui/qianchuang-view.js';
 import { createPanel } from './ui/panel.js';
 import { createFab } from './ui/fab.js';
 import { installWandEntry } from './ui/wand-entry.js';
@@ -6,17 +7,21 @@ import { createV3FoundationView } from './ui/v3-foundation-view.js';
 import { createPeopleProfilesView } from './ui/people-profiles-view.js';
 import { createQianshiTimelineView } from './ui/qianshi-timeline-view.js';
 import { createStorageManagementView } from './ui/storage-management-view.js';
+import { createMemoryTransferView } from './ui/memory-transfer-view.js';
 import { createDialogManager } from './ui/dialog.js';
 
 export function bootstrap({
-  memoryTransfer,
   dynamicWorldbook,
   settings,
+  activity,
   apiTools,
   vectorApi,
   vectorIndex,
+  pluginUpdates,
+  renderUpdateMarkdown,
   onPluginEnabledChange,
   onStoryClockChange,
+  subscribeSettingsChange,
   onAutoHideChange,
   onTimeEvolutionChange,
   calendarContextProvider,
@@ -29,20 +34,27 @@ export function bootstrap({
   v3FoundationRuntime,
   v3RecallRuntime,
   peopleWorkspaceRuntime,
+  qianchuangWorldInfoProvider,
+  userAvatarProvider,
   chatMemoryManagement,
   storageManagement,
+  memoryTransfer,
+  hostDownload,
   sessionStateProvider,
   prepareSession,
   backendDiagnosticProvider,
   pluginDiagnosticProvider,
   onPluginEnableFailure,
   pluginVersion,
+  moduleUrl,
   inlineRenderer,
   sourcePermissionViewFactory = createSourcePermissionView,
   v3FoundationViewFactory = createV3FoundationView,
   peopleProfilesViewFactory = createPeopleProfilesView,
   qianshiTimelineViewFactory = createQianshiTimelineView,
+  qianchuangViewFactory = createQianchuangView,
   storageManagementViewFactory = createStorageManagementView,
+  memoryTransferViewFactory = createMemoryTransferView,
   documentRef = globalThis.document,
   panelFactory = createPanel,
   fabFactory = createFab,
@@ -59,9 +71,10 @@ export function bootstrap({
   let panel, fab;
   const dialog = dialogFactory({ documentRef, $: globalThis.jQuery ?? globalThis.$, subscribeContextChange: subscribeDialogContextChange });
   if (dialog?.host) (documentRef.documentElement ?? documentRef.body).append(dialog.host);
-  const foundationView = v3FoundationViewFactory({ runtime: v3FoundationRuntime, recallRuntime: v3RecallRuntime, vectorRuntime: vectorIndex, peopleRuntime: peopleWorkspaceRuntime, timeRuntime, memoryManagement: chatMemoryManagement, sessionStateProvider, backendDiagnosticProvider, pluginDiagnosticProvider, pluginVersion, uiDiagnosticProvider: () => panel?.getUiDiagnostic?.() ?? '{}', documentRef, confirmImpl: options => dialog.confirm(options), chooseImpl: options => dialog.choose?.(options) ?? null, infoImpl: options => dialog.info(options), customImpl: options => dialog.custom(options) });
+  const foundationView = v3FoundationViewFactory({ runtime: v3FoundationRuntime, recallRuntime: v3RecallRuntime, vectorRuntime: vectorIndex, onOpenVectorSettings: () => panel?.openVectorSettings?.(), peopleRuntime: peopleWorkspaceRuntime, timeRuntime, memoryManagement: chatMemoryManagement, sessionStateProvider, prepareSession, backendDiagnosticProvider, pluginDiagnosticProvider, pluginVersion, documentRef, confirmImpl: options => dialog.confirm(options), chooseImpl: options => dialog.choose?.(options) ?? null, infoImpl: options => dialog.info(options), customImpl: options => dialog.custom(options), cancelDialogImpl: () => dialog.cancelTop?.() });
   const peopleProfilesView = peopleProfilesViewFactory({ runtime: peopleWorkspaceRuntime, sessionStateProvider, prepareSession, documentRef, dialog });
   const qianshiTimelineView = qianshiTimelineViewFactory({ runtime: v3FoundationRuntime, documentRef, dialog });
+  const qianchuangView = qianchuangViewFactory({ runtime: v3FoundationRuntime, settings, sessionStateProvider, prepareSession, dialog, moduleUrl, userAvatarProvider, documentRef });
   const storageManagementView = storageManagementViewFactory({ manager: storageManagement, documentRef, confirmImpl: options => dialog.confirm(options) });
   const syncAppearance = value => {
     fab?.setAppearance?.(value); inlineRenderer?.setAppearance?.(value);
@@ -83,20 +96,24 @@ export function bootstrap({
     }
   };
   panel = panelFactory({
-    memoryTransfer,
     dynamicWorldbook,
     settings,
     apiTools,
     vectorApi,
     vectorIndex,
+    pluginUpdates,
+    renderUpdateMarkdown,
     v3FoundationView: foundationView,
     peopleProfilesView,
     qianshiTimelineView,
+    qianchuangView,
     storageManagementView,
+    memoryTransferViewFactory: memoryTransfer ? options => memoryTransferViewFactory({ ...options, runtime: memoryTransfer, documentRef, hostDownload, confirmImpl: options => dialog.confirm(options) }) : null,
     sourcePermissionView,
     onPluginEnabledChange,
     onPluginEnableFailure,
     onStoryClockChange,
+    subscribeSettingsChange,
     onAutoHideChange,
     onTimeEvolutionChange,
     calendarContextProvider,
@@ -121,10 +138,14 @@ export function bootstrap({
     syncFabVisibility();
     documentRef.body.append(fab.host);
   }
+  const applyActivity = value => { fab?.setBusy?.(value.busy); panel.setActivity?.(value); foundationView.setActivity?.(value); };
+  applyActivity(activity?.getState?.() ?? { busy: false, copy: '' });
+  const releaseActivity = activity?.subscribe?.(applyActivity);
   syncAppearance(panel.syncAppearance?.());
   wandInstaller(open);
   const instance = {
     ...panel,
+    disposeActivity: () => releaseActivity?.(),
     fab,
     dialog,
     show: open,

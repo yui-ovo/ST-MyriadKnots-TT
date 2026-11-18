@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { createTauriBackendFetch, isTauriTavern } from '../src/tauri-backend.js';
 import { createBackendClient } from '../src/backend-client.js';
+import { createStorageManagement } from '../src/storage-management.js';
 import { API_BASE } from '../src/constants.js';
+import { validateFoundationGraph } from '../src/v3/foundation-schema.js';
 import { createFoundationStore } from '../src/v3/foundation-store.js';
 import { createFoundationRuntime } from '../src/v3/foundation-runtime.js';
 import { createHostAdapter } from '../src/v3/host-adapter.js';
@@ -20,7 +22,7 @@ const nativeJson = value => Array.isArray(value) ? value.map(nativeJson) : value
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'qqj-tt-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  let failWrite = false, failRead = false, writeCount = 0;
+  let failWrite = false, failRead = false, failReadAt = null, failWriteAt = null, writeAttempts = 0, writeCount = 0, readCount = 0;
   const location = ({ namespace, table = 'main', key }) => {
     for (const value of [namespace, table, ...(key === undefined ? [] : [key])]) {
       assert.match(value, /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/);
@@ -31,11 +33,15 @@ async function fixture(t) {
   const names = async path => { try { return await readdir(path); } catch (e) { if (e.code === 'ENOENT') return []; throw e; } };
   const store = {
     async tryGetJson(opts) {
+      readCount += 1;
+      if (failReadAt === readCount) throw new Error('injected read failure');
       if (failRead) throw new Error('read failure');
       try { return { found: true, value: JSON.parse(await readFile(location(opts), 'utf8')) }; }
       catch (e) { if (e.code === 'ENOENT') return { found: false }; throw e; }
     },
     async setJson(opts) {
+      writeAttempts += 1;
+      if (failWriteAt === writeAttempts) throw new Error('injected write failure');
       if (failWrite) throw new Error('write failure');
       const path = location(opts);
       await mkdir(location({ ...opts, key: undefined }), { recursive: true });
@@ -44,6 +50,8 @@ async function fixture(t) {
       writeCount++;
     },
     async deleteJson(opts) {
+      writeAttempts += 1;
+      if (failWriteAt === writeAttempts) throw new Error('injected delete failure');
       if (failWrite) throw new Error('write failure');
       await rm(location(opts));
       writeCount++;
@@ -55,7 +63,9 @@ async function fixture(t) {
   const fetchImpl = createTauriBackendFetch({ globalRef });
   const client = createBackendClient({ fetchImpl });
   const request = (path, method = 'GET', body) => fetchImpl(`${API_BASE}/v1/${path}`, { method, ...(body ? { body: JSON.stringify(body) } : {}) });
-  return { client, request, store, globalRef, root, fetchImpl, writes: () => writeCount,
+  return { client, request, store, globalRef, root, fetchImpl, writes: () => writeCount, reads: () => readCount,
+    resetReads: () => { readCount = 0; }, failReadAt: value => { failReadAt = value; },
+    failWriteAt: value => { failWriteAt = value; }, resetWriteAttempts: () => { writeAttempts = 0; },
     failWrite: value => { failWrite = value; }, failRead: value => { failRead = value; } };
 }
 
@@ -67,9 +77,455 @@ test('TT health checks native IO; read/put/list survive a new client/runtime', a
   const restarted = createBackendClient({ fetchImpl: createTauriBackendFetch({ globalRef: { ...f.globalRef } }) });
   assert.deepEqual(await restarted.get('聊天🙂', '记录'.repeat(64)), created);
   assert.deepEqual(await restarted.list('聊天🙂'), [{ recordId: '记录'.repeat(64), ...created }]);
+  const batch = await restarted.getMany('聊天🙂', ['记录'.repeat(64), '缺失记录']);
+  assert.deepEqual(batch.map(item => [item.recordId, item.status]), [['记录'.repeat(64), 200], ['缺失记录', 404]], 'TT批量读取保留逐项结果');
+  const iterated = [];
+  for await (const item of restarted.iterRecords('聊天🙂')) iterated.push(item.recordId);
+  assert.deepEqual(iterated, ['记录'.repeat(64)], 'TT记录遍历使用原生逐条迭代');
   assert.deepEqual(await restarted.list('other'), []);
   f.failRead(true);
   await assert.rejects(f.client.health(), /read failure/);
+});
+
+test('TT批写四路独立记录保输入序及版本，原生最终提交仍可串行', async t => {
+  const f = await fixture(t); await f.client.health();
+  const original = f.store.setJson;
+  let active = 0, maximum = 0, tail = Promise.resolve();
+  f.store.setJson = async options => {
+    active++; maximum = Math.max(maximum, active);
+    try { await new Promise(resolve => setImmediate(resolve)); const saved = tail.then(() => original(options)); tail = saved.catch(() => {}); return await saved; }
+    finally { active--; }
+  };
+  const records = Array.from({ length: 64 }, (_, index) => ({ recordId: `batch-${index}`, expectedRevision: 0, data: { index, nested: { z: '先', a: [null, 3] } } }));
+  const saved = await f.client.putMany('c', records);
+  assert.deepEqual(saved.map(item => [item.recordId, item.status, item.envelope.revision]), records.map(item => [item.recordId, 200, 1]));
+  assert.equal(maximum, 4); assert.equal(f.writes(), 64);
+  for (const item of records) assert.deepEqual((await f.client.get('c', item.recordId)).data, item.data);
+  const old = saved[0].envelope;
+  const updated = (await f.client.putMany('c', [{ ...records[0], expectedRevision: 1, data: { updated: true } }]))[0].envelope;
+  assert.equal(updated.revision, 2); assert.equal(updated.createdAt, old.createdAt); assert.equal(updated.generationId, old.generationId);
+  await f.client.remove('c', records[0].recordId, 2);
+  const trash = await (await f.request('trash/qianqianjie')).json();
+  const recreated = (await f.client.putMany('c', [records[0]]))[0].envelope;
+  assert.notEqual(recreated.generationId, old.generationId); assert.equal(recreated.revision, 1);
+  assert.deepEqual(await (await f.request('trash/qianqianjie')).json(), trash);
+});
+
+test('TT批写逐项冲突/坏slot/读写失败不覆盖旧值，其余条仍成功', async t => {
+  const f = await fixture(t); await f.client.health();
+  const winner = await f.client.put('c', 'conflict', { winner: true }, 0);
+  const readWinner = await f.client.put('c', 'read-error', { winner: 'read' }, 0);
+  const table = nativeKey(JSON.stringify(['qianqianjie', 'c']));
+  const badOptions = { namespace: 'qqj-bainiao-v1', table, key: nativeKey('bad') };
+  const bad = { format: 'qqj-tt-json-v2', serialized: '{invalid' }; await f.store.setJson({ ...badOptions, value: bad });
+  const read = f.store.tryGetJson, write = f.store.setJson;
+  f.store.tryGetJson = options => options.key === nativeKey('read-error') ? Promise.reject(new Error('read failed')) : read(options);
+  f.store.setJson = options => options.key === nativeKey('write-error') ? Promise.reject(new Error('write failed')) : write(options);
+  const ids = ['conflict', 'bad', 'read-error', 'write-error', 'healthy'];
+  const result = await f.client.putMany('c', ids.map(recordId => ({ recordId, data: { attempted: true }, expectedRevision: recordId === 'read-error' ? 1 : 0 })));
+  assert.deepEqual(result.map(item => item.status), [409, 500, 500, 500, 200]);
+  f.store.tryGetJson = read; f.store.setJson = write;
+  assert.deepEqual(await f.client.get('c', 'conflict'), winner); assert.deepEqual(await f.client.get('c', 'read-error'), readWinner);
+  assert.deepEqual((await read(badOptions)).value, bad);
+  assert.deepEqual((await f.client.get('c', 'healthy')).data, { attempted: true });
+  await assert.rejects(f.client.get('c', 'write-error'), error => error.status === 404);
+});
+
+test('TT批写重复ID、超量、超字节和非法项全部前置拒绝，零native读写', async t => {
+  const f = await fixture(t);
+  const item = { recordId: 'a', data: {}, expectedRevision: 0 };
+  for (const records of [[item, item], Array.from({ length: 65 }, (_, index) => ({ ...item, recordId: `r-${index}` })),
+    [{ ...item, data: 'x'.repeat(1048576) }], [{ ...item, expectedRevision: -1 }], [item, { ...item, recordId: '../bad' }]]) {
+    assert.equal((await f.request('record-batch/qianqianjie/c', 'PUT', { records })).status, 400);
+  }
+  assert.equal(f.reads(), 0); assert.equal(f.writes(), 0);
+});
+
+for (const stage of ['read', 'write']) test(`TT批写取消${stage}阶段后收拢全部已发操作才释放namespace`, { timeout: 5000 }, async t => {
+  const f = await fixture(t); await f.client.health();
+  const records = Array.from({ length: 16 }, (_, index) => ({ recordId: `cancel-${index}`, data: { index }, expectedRevision: 0 }));
+  let announce, releaseFirst, releaseRest, finishFirst, submitted = 0, active = 0, laterRead = false;
+  const entered = new Promise(resolve => { announce = resolve; }), first = new Promise(resolve => { releaseFirst = resolve; });
+  const rest = new Promise(resolve => { releaseRest = resolve; }), firstDone = new Promise(resolve => { finishFirst = resolve; });
+  const original = f.store[stage === 'read' ? 'tryGetJson' : 'setJson'];
+  f.store[stage === 'read' ? 'tryGetJson' : 'setJson'] = async options => {
+    const index = submitted++; active++; if (submitted === 4) announce();
+    try { await (index === 0 ? first : rest); return await original(options); }
+    finally { active--; if (index === 0) finishFirst(); }
+  };
+  const controller = new AbortController();
+  const saving = f.client.putMany('c', records, { signal: controller.signal }).then(value => ({ value }), error => ({ error }));
+  let reading;
+  try {
+    assert.equal(await Promise.race([entered.then(() => 'entered'), saving.then(() => 'returned')]), 'entered');
+    controller.abort(); assert.equal((await saving).error.name, 'AbortError');
+    if (stage === 'read') f.store.tryGetJson = async options => { laterRead = true; assert.equal(active, 0); return original(options); };
+    else { const read = f.store.tryGetJson; f.store.tryGetJson = async options => { laterRead = true; assert.equal(active, 0); return read(options); }; }
+    reading = f.client.get('c', records[0].recordId).then(value => ({ value }), error => ({ error }));
+    releaseFirst(); await firstDone; await new Promise(resolve => setImmediate(resolve));
+    assert.equal(laterRead, false); assert.equal(submitted, 4); assert.equal(active, 3);
+    releaseRest(); const result = await reading;
+    if (stage === 'read') { assert.equal(result.error.status, 404); assert.equal(f.writes(), 0); }
+    else { assert.deepEqual(result.value.data, { index: 0 }); assert.equal(f.writes(), 4); }
+  } finally { releaseFirst(); releaseRest(); await Promise.allSettled([saving, reading].filter(Boolean)); }
+});
+
+test('TT native responses retain nested JSON isolation without copying complete records again', async t => {
+  const f = await fixture(t);
+  const input = { z: { text: '手改摘要', rows: [1, { value: '原值' }] }, a: '保留字段顺序' };
+  const expected = structuredClone(input);
+  const pending = f.client.put('c', 'r', input, 0);
+  input.z.text = '调用者后续草稿';
+  const saved = await pending;
+  assert.deepEqual(saved.data, expected, '请求已经序列化，不借用调用者的可变对象');
+  saved.data.z.rows[1].value = '修改写入响应';
+  assert.deepEqual((await f.client.get('c', 'r')).data, expected);
+
+  const direct = await f.client.get('c', 'r');
+  direct.data.z.text = '修改单条响应';
+  const batch = await f.client.getMany('c', ['r', 'r']);
+  assert.deepEqual(batch[0].envelope.data, expected);
+  batch[0].envelope.data.z.rows[1].value = '修改批读响应';
+  assert.deepEqual(batch[1].envelope.data, expected, '重复ID的两次原生读取互不共享数据');
+
+  const listed = await f.client.list('c');
+  assert.deepEqual(listed[0].data, expected);
+  listed[0].data.z.text = '修改集合响应';
+  const iterator = f.client.iterRecords('c', { requireStreaming: true });
+  const first = await iterator.next();
+  assert.deepEqual(first.value.data, expected);
+  first.value.data.z.rows.push('修改流式响应');
+  await iterator.return();
+  assert.deepEqual((await f.client.get('c', 'r')).data, expected);
+  assert.deepEqual(Object.keys((await f.client.get('c', 'r')).data), ['z', 'a']);
+
+  const deleted = await f.client.remove('c', 'r', 1);
+  const restoredResponse = await f.request(`trash/qianqianjie/${deleted.trashId}/restore`, 'POST');
+  const restored = await restoredResponse.json();
+  restored.data.z.text = '修改还原响应';
+  assert.deepEqual((await f.client.get('c', 'r')).data, expected, '响应修改不影响已还原的记录');
+});
+
+test('TT批量读取固定最多8条native并发，保持顺序、重复ID与逐项200/404/500', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.client.health()).capabilities.recordBatchRead, true);
+  const ids = Array.from({ length: 57 }, (_, index) => `record-${index}`);
+  for (const [index, id] of ids.entries()) await f.client.put('c', id, { index }, 0);
+  await f.client.put('c', 'deleted', '旧记录', 0); await f.client.remove('c', 'deleted', 1);
+  const table = nativeKey(JSON.stringify(['qianqianjie', 'c']));
+  await f.store.setJson({ namespace: 'qqj-bainiao-v1', table, key: nativeKey('bad'), value: { format: 'qqj-tt-json-v2', serialized: '{bad' } });
+  const originalRead = f.store.tryGetJson;
+  let active = 0, maximum = 0;
+  f.store.tryGetJson = async options => {
+    active++; maximum = Math.max(maximum, active);
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      if (options.key === nativeKey('io-failure')) throw new Error('private native read failure');
+      return await originalRead(options);
+    } finally { active--; }
+  };
+  const requested = [ids[23], 'missing', 'bad', 'deleted', 'io-failure', ...ids.slice().reverse(), ids[0], 'bad'];
+  const writesBefore = f.writes();
+  const response = await f.request('record-batch/qianqianjie/c', 'POST', { recordIds: requested });
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.deepEqual(result.map(item => item.recordId), requested);
+  assert.deepEqual(result.map(item => item.status), requested.map(id => ['missing', 'deleted'].includes(id) ? 404 : ['bad', 'io-failure'].includes(id) ? 500 : 200));
+  assert.ok(maximum > 1, '原生读取实际并行，不再排成逐条namespace任务');
+  assert.ok(maximum <= 8, '单批原生读取保持固定上限');
+  for (const item of result) {
+    if (item.status === 200) assert.equal(item.envelope.data.index, Number(item.recordId.slice('record-'.length)));
+    else assert.equal(item.error, item.status === 404 ? 'not_found' : 'storage_error');
+  }
+  assert.doesNotMatch(JSON.stringify(result), /private native read failure/);
+  assert.equal(f.writes(), writesBefore, '批量读取不写入');
+});
+
+test('TT批量读取拒绝坏JSON、空批次、超过64条及非法ID，且不读取或写入', async t => {
+  const f = await fixture(t); f.resetReads();
+  for (const body of [{}, { recordIds: [] }, { recordIds: Array(65).fill('r') }, { recordIds: 'r' },
+    { recordIds: ['valid', 1] }, { recordIds: ['valid', ''] }, { recordIds: ['valid', '../bad'] }]) {
+    assert.equal((await f.request('record-batch/qianqianjie/c', 'POST', body)).status, 400);
+  }
+  const malformed = await f.fetchImpl(`${API_BASE}/v1/record-batch/qianqianjie/c`, { method: 'POST', body: '{bad' });
+  assert.equal(malformed.status, 400);
+  assert.equal((await f.request('record-batch/qianqianjie/c', 'GET')).status, 405);
+  assert.equal(f.reads(), 0, '整批参数先验证，不能读到前面的合法ID');
+  assert.equal(f.writes(), 0);
+});
+
+test('TT64条批读每8条让出共享队列，另一个client的root短预算不等待整批', { timeout: 5000 }, async t => {
+  for (const currentCollection of ['large-chat', 'other-chat']) await t.test(currentCollection, async t => {
+    const f = await fixture(t), ids = Array.from({ length: 64 }, (_, index) => `floor-${index}`);
+    for (const [index, id] of ids.entries()) await f.client.put('large-chat', id, { index }, 0);
+    await f.client.put(currentCollection, 'v3-root', { headCheckpointId: 'current-head' }, 0);
+    const originalRead = f.store.tryGetJson;
+    let announce, release, batchFinished = false, floorsRead = 0, floorsBeforeRoot = null;
+    const entered = new Promise(resolve => { announce = resolve; }), gate = new Promise(resolve => { release = resolve; });
+    f.store.tryGetJson = async options => {
+      if (options.key === nativeKey('v3-root')) floorsBeforeRoot = floorsRead;
+      else { floorsRead++; if (floorsRead === 1) announce(); await gate; }
+      await new Promise(resolve => setTimeout(resolve, 35));
+      return originalRead(options);
+    };
+    const batch = f.client.getMany('large-chat', ids).then(value => { batchFinished = true; return value; });
+    try {
+      await entered;
+      const foreground = createBackendClient({ fetchImpl: createTauriBackendFetch({ globalRef: f.globalRef }), timeoutMs: 180 });
+      const reading = foreground.get(currentCollection, 'v3-root'); release();
+      assert.equal((await reading).data.headCheckpointId, 'current-head');
+      assert.equal(floorsBeforeRoot, 8, '同namespace另一client在首个8条组之后获得原队列');
+      assert.equal(batchFinished, false, 'root不等待64条全部扫描');
+      const rows = await batch; assert.deepEqual(rows.map(row => row.envelope.data.index), ids.map((_, index) => index));
+    } finally { release(); await Promise.allSettled([batch]); f.store.tryGetJson = originalRead; }
+  });
+});
+
+test('TT批读组间CAS更新root，复制写入期间不开始下一组且查询看到完整新root', { timeout: 5000 }, async t => {
+  const f = await fixture(t), ids = Array.from({ length: 24 }, (_, index) => `floor-${index}`);
+  for (const [index, id] of ids.entries()) await f.client.put('chat', id, { index }, 0);
+  await f.client.put('chat', 'v3-root', { version: 'old' }, 0);
+  const originalRead = f.store.tryGetJson, originalWrite = f.store.setJson;
+  let announceFirst, announceSecond, announceWrite, releaseFirst, releaseSecond, releaseWrite;
+  const first = new Promise(resolve => { announceFirst = resolve; }), second = new Promise(resolve => { announceSecond = resolve; }), writeEntered = new Promise(resolve => { announceWrite = resolve; });
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; }), secondGate = new Promise(resolve => { releaseSecond = resolve; }), writeGate = new Promise(resolve => { releaseWrite = resolve; });
+  let floorsRead = 0, active = 0, writing = false;
+  f.store.tryGetJson = async options => {
+    assert.equal(writing, false, '不能在TT2.2 fallback复制替换期间读取半文件');
+    if (options.key === nativeKey('v3-root')) return originalRead(options);
+    const index = floorsRead++; active++;
+    if (floorsRead === 8) announceFirst(); if (floorsRead === 9) announceSecond();
+    try { if (index < 8) await firstGate; else if (index < 16) await secondGate; return await originalRead(options); }
+    finally { active--; }
+  };
+  f.store.setJson = async options => {
+    assert.equal(active, 0, '写入前当前8个native读取必须全部settle');
+    writing = true; announceWrite();
+    try { await writeGate; return await originalWrite(options); } finally { writing = false; }
+  };
+  const batch = f.client.getMany('chat', ids);
+  let outcomes, reading;
+  try {
+    await first;
+    const other = createBackendClient({ fetchImpl: createTauriBackendFetch({ globalRef: f.globalRef }) });
+    outcomes = Promise.allSettled([f.client.put('chat', 'v3-root', { version: 'new', rows: [1, 2] }, 1), other.put('chat', 'v3-root', { version: 'loser' }, 1)]);
+    reading = other.get('chat', 'v3-root'); releaseFirst();
+    assert.equal(await Promise.race([writeEntered.then(() => 'write'), second.then(() => 'nextGroup')]), 'write', '排队写入先于下一8条组');
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(floorsRead, 8);
+    releaseWrite();
+    const root = await reading; assert.equal(root.revision, 2); assert.deepEqual(root.data, { version: 'new', rows: [1, 2] });
+    const results = await outcomes; assert.equal(results[0].status, 'fulfilled'); assert.equal(results[1].reason.status, 409);
+    releaseSecond(); assert.equal((await batch).length, ids.length);
+  } finally {
+    releaseFirst(); releaseSecond(); releaseWrite(); await Promise.allSettled([batch, outcomes, reading]);
+    f.store.tryGetJson = originalRead; f.store.setJson = originalWrite;
+  }
+});
+
+test('TT批量读取取消后不再派发，全部已发native读结束后才允许复制写入并释放后续读取', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  assert.equal((await f.client.health()).capabilities.recordBatchRead, true);
+  const ids = Array.from({ length: 24 }, (_, index) => `record-${index}`);
+  for (const [index, id] of ids.entries()) await f.client.put('c', id, { index }, 0);
+  const originalRead = f.store.tryGetJson, originalWrite = f.store.setJson;
+  let announce, releaseFirst, releaseRest, firstFinished;
+  const entered = new Promise(resolve => { announce = resolve; });
+  const gateFirst = new Promise(resolve => { releaseFirst = resolve; });
+  const gateRest = new Promise(resolve => { releaseRest = resolve; });
+  const firstDone = new Promise(resolve => { firstFinished = resolve; });
+  let submitted = 0, active = 0, followingReadStarted = false, writeStarted = false;
+  f.store.tryGetJson = async options => {
+    const index = submitted++;
+    if (index >= 8) { followingReadStarted = true; assert.equal(active, 0, '后续读取不与已取消批次残留native读重叠'); return originalRead(options); }
+    active++; if (submitted === 8) announce();
+    try { await (index === 0 ? gateFirst : gateRest); return await originalRead(options); }
+    finally { active--; if (index === 0) firstFinished(); }
+  };
+  f.store.setJson = async options => { writeStarted = true; assert.equal(active, 0, 'fallback copy开始前整批已发读必须全部结束'); return originalWrite(options); };
+  const controller = new AbortController(), reason = new DOMException('chat changed', 'AbortError');
+  const reading = f.fetchImpl(`${API_BASE}/v1/record-batch/qianqianjie/c`, { method: 'POST', body: JSON.stringify({ recordIds: ids }), signal: controller.signal });
+  const cancelled = reading.then(value => ({ value }), error => ({ error }));
+  let writing;
+  try {
+    const earlyResponse = await Promise.race([entered.then(() => null), reading]);
+    assert.equal(earlyResponse, null, '批量请求应先提交8个native读取');
+    writing = f.client.put('c', ids[0], { index: 'updated' }, 1);
+    const written = writing.then(value => ({ value }), error => ({ error }));
+    controller.abort(reason);
+    assert.equal((await cancelled).error, reason);
+    releaseFirst(); await firstDone; await new Promise(resolve => setImmediate(resolve));
+    assert.equal(submitted, 8, '取消后不读取剩余16条，也不提前启动下一任务');
+    assert.equal(followingReadStarted, false);
+    assert.equal(writeStarted, false, '首个worker结束不能释放仍有7个native读的namespace锁');
+    releaseRest();
+    const saved = await written;
+    assert.equal(saved.error, undefined);
+    assert.equal(saved.value.revision, 2);
+    assert.equal(writeStarted, true);
+    assert.equal((await f.client.get('c', ids[0])).data.index, 'updated');
+    assert.equal(submitted, 10, '仅8个已发批读、写入前读和最终读取');
+  } finally {
+    releaseFirst(); releaseRest();
+    await Promise.allSettled([reading, writing]);
+    f.store.tryGetJson = originalRead; f.store.setJson = originalWrite;
+  }
+});
+
+test('TT流式枚举逐条读取，yield后释放namespace锁，提前结束不读取其余正文', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  for (const id of ['a', 'b', 'c']) await f.client.put('c', id, { text: `正文-${id}` }, 0);
+  f.resetReads();
+  const iterator = f.client.iterRecords('c', { requireStreaming: true });
+  const first = await iterator.next();
+  assert.equal(first.done, false);
+  assert.equal(f.reads(), 1, '首条产出前只读取一条记录');
+  assert.deepEqual((await f.client.get('c', first.value.recordId)).data, first.value.data, '消费者能在同namespace读取，不等待整个迭代结束');
+  assert.equal(f.reads(), 2);
+  await iterator.return();
+  assert.equal(f.reads(), 2, '提前结束不扫描后续正文');
+  assert.equal((await iterator.next()).done, true);
+});
+
+test('TT流式枚举跳过已删除记录并在取消后停止后续native读取', async t => {
+  const f = await fixture(t);
+  for (const id of ['a', 'b', 'c']) await f.client.put('c', id, id, 0);
+  await f.client.remove('c', 'b', 1);
+  const ids = [];
+  for await (const item of f.client.iterRecords('c', { requireStreaming: true })) ids.push(item.recordId);
+  assert.deepEqual(ids.sort(), ['a', 'c']);
+  const controller = new AbortController(); f.resetReads();
+  const iterator = f.client.iterRecords('c', { signal: controller.signal, requireStreaming: true });
+  await iterator.next();
+  const reads = f.reads(); controller.abort();
+  await assert.rejects(iterator.next(), error => error.name === 'AbortError');
+  assert.equal(f.reads(), reads);
+});
+
+test('TT流式枚举沿用单次请求超时与诊断，并在迟到native读取结束后释放锁', { timeout: 5000 }, async t => {
+  const f = await fixture(t); await f.client.put('c', 'r', '内容', 0);
+  const originalRead = f.store.tryGetJson;
+  let release;
+  const pendingRead = new Promise(resolve => { release = resolve; });
+  f.store.tryGetJson = async options => { await pendingRead; return originalRead(options); };
+  const client = createBackendClient({ fetchImpl: f.fetchImpl, timeoutMs: 20 });
+  const iterator = client.iterRecords('c', { requireStreaming: true });
+  await assert.rejects(iterator.next(), error => error.code === 'BACKEND_TIMEOUT');
+  assert.equal(client.getDiagnosticSnapshot().lastFailure.outcome, 'timeout');
+  release(); f.store.tryGetJson = originalRead;
+  assert.equal((await client.get('c', 'r')).data, '内容');
+});
+
+test('TT流式枚举等待native就绪时也按单次请求截止，不在就绪后补扫正文', { timeout: 1000 }, async t => {
+  const f = await fixture(t); await f.client.put('c', 'r', '内容', 0); f.resetReads();
+  let release;
+  f.globalRef.__TAURITAVERN__.ready = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  const client = createBackendClient({ fetchImpl: f.fetchImpl, timeoutMs: 20 });
+  await assert.rejects(client.iterRecords('c', { requireStreaming: true }).next(), error => error.code === 'BACKEND_TIMEOUT');
+  release();
+  assert.equal((await client.get('c', 'r')).data, '内容');
+  assert.equal(f.reads(), 1, '只有消费者随后主动读取，不补扫已经超时的迭代');
+});
+
+test('TT后台慢集合扫描逐条让出队列，当前聊天root在扫描结束前完成', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  await f.client.put('large-chat', 'v3-root', { headCheckpointId: 'current-head' }, 0);
+  const slowId = 'v3-floor-memory-slow';
+  await f.client.put('large-chat', slowId, { summary: '较大的已保存摘要' }, 0);
+  for (let i = 0; i < 50; i++) await f.client.put('large-chat', `floor-${i}`, { summary: '已保存摘要' }, 0);
+  const slowKey = `r-${createHash('sha256').update(slowId).digest('hex')}`;
+  const originalRead = f.store.tryGetJson;
+  let release, announce, gated = false, scanFinished = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  const scanEntered = new Promise(resolve => { announce = resolve; });
+  f.store.tryGetJson = async options => {
+    if (options.key === slowKey && !gated) { gated = true; announce(); await gate; }
+    await new Promise(resolve => setTimeout(resolve, 10));
+    return originalRead(options);
+  };
+  const scanning = f.client.list('large-chat').then(value => { scanFinished = true; return value; });
+  await scanEntered;
+  try {
+    const foreground = createBackendClient({ fetchImpl: f.fetchImpl, timeoutMs: 250 });
+    const reading = foreground.get('large-chat', 'v3-root');
+    release();
+    const root = await reading;
+    assert.equal(root.data.headCheckpointId, 'current-head');
+    assert.equal(scanFinished, false, 'root读取与慢扫描交替执行，不等待整份集合');
+  } finally {
+    release();
+    await scanning;
+    f.store.tryGetJson = originalRead;
+  }
+});
+
+test('TT慢集合扫描不阻塞其他聊天的root、向量和人物资料单条读取', { timeout: 5000 }, async t => {
+  const f = await fixture(t), slowId = 'v3-floor-memory-slow';
+  await f.client.put('large-chat', slowId, { summary: '后台扫描的较大摘要' }, 0);
+  for (let i = 0; i < 50; i++) await f.client.put('large-chat', `floor-${i}`, { summary: '已保存摘要' }, 0);
+  const targets = [
+    ['v3-root', { headCheckpointId: 'other-head' }],
+    ['qqj-vector-index', { shardIds: ['existing-shard'] }],
+    ['v3-people-workspace', { profilesByEntityId: { keeper: { name: '手填人物' } } }],
+  ];
+  for (const [id, data] of targets) await f.client.put('other-chat', id, data, 0);
+  const slowKey = `r-${createHash('sha256').update(slowId).digest('hex')}`;
+  const originalRead = f.store.tryGetJson;
+  let release, announce, gated = false, scanFinished = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  const scanEntered = new Promise(resolve => { announce = resolve; });
+  f.store.tryGetJson = async options => {
+    if (options.key === slowKey && !gated) { gated = true; announce(); await gate; }
+    await new Promise(resolve => setTimeout(resolve, 10));
+    return originalRead(options);
+  };
+  const scanning = f.client.list('large-chat').then(value => { scanFinished = true; return value; });
+  await scanEntered;
+  try {
+    const foreground = createBackendClient({ fetchImpl: f.fetchImpl, timeoutMs: 250 });
+    const reading = Promise.all(targets.map(([id]) => foreground.get('other-chat', id)));
+    release();
+    const found = await reading;
+    assert.deepEqual(found.map(item => item.data), targets.map(([, data]) => data));
+    assert.equal(scanFinished, false);
+  } finally {
+    release(); await scanning; f.store.tryGetJson = originalRead;
+  }
+});
+
+test('TT写入期间保持读写互斥，发布后读完整新值且并发CAS仍只有一个成功', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  const before = { version: 'old', nested: { ready: true }, rows: [1, 2, 3] };
+  const after = { version: 'new', nested: { ready: false, added: '完整字段' }, rows: [7, 8] };
+  await f.client.put('chat', 'v3-root', before, 0);
+  const originalWrite = f.store.setJson;
+  let release, announce;
+  const gate = new Promise(resolve => { release = resolve; });
+  const writeEntered = new Promise(resolve => { announce = resolve; });
+  let writing = false;
+  const originalRead = f.store.tryGetJson;
+  f.store.tryGetJson = async options => { assert.equal(writing, false, '不在native复制替换期间读取半文件'); return originalRead(options); };
+  f.store.setJson = async options => { writing = true; announce(); await gate; try { return await originalWrite(options); } finally { writing = false; } };
+  const first = f.client.put('chat', 'v3-root', after, 1);
+  await writeEntered;
+  const otherClient = createBackendClient({ fetchImpl: createTauriBackendFetch({ globalRef: f.globalRef }), timeoutMs: 250 });
+  const writes = Promise.allSettled([first, otherClient.put('chat', 'v3-root', { version: 'losing writer' }, 1)]);
+  let outcomes;
+  try {
+    const reading = otherClient.get('chat', 'v3-root');
+    release();
+    const pending = await reading;
+    assert.equal(pending.revision, 2);
+    assert.deepEqual(pending.data, after, '读取等待native写入完整发布');
+  } finally {
+    release(); outcomes = await writes; f.store.setJson = originalWrite; f.store.tryGetJson = originalRead;
+  }
+  assert.equal(outcomes[0].status, 'fulfilled');
+  assert.equal(outcomes[1].status, 'rejected');
+  assert.equal(outcomes[1].reason.status, 409);
+  const committed = await otherClient.get('chat', 'v3-root');
+  assert.equal(committed.revision, 2);
+  assert.deepEqual(committed.data, after, '提交后读取完整新代，没有部分字段或旧值覆盖');
 });
 
 test('TT preserves JSON field order through native save, cold read, list and trash restore', async t => {
@@ -99,6 +555,14 @@ async function seedLegacy(f, slot) {
     key: nativeKey(slot.recordId), value: slot });
 }
 
+async function validateLegacyGraph(client, slots) {
+  const records = await Promise.all(slots.map(async slot => (await client.get(slot.collection, slot.recordId)).data));
+  const checkpoint = records.find(record => record.recordType === 'checkpoint');
+  return validateFoundationGraph({ root: null, checkpoint, run: records.find(record => record.recordType === 'run'),
+    floors: records.filter(record => record.recordType === 'floor'), indexes: records.filter(record => record.recordType === 'index'),
+    indexKeys: checkpoint.producedRefs.indexes });
+}
+
 test('TT first foundation initialization and cold graph read survive actual native key ordering', async t => {
   const f = await fixture(t);
   const { context } = await failedInitFixture();
@@ -124,23 +588,203 @@ test('TT retries the genuine tt.2 failed initialization without deleting records
   assert.equal(state.stableCount, 1);
   const read = await foundationFor(f.client, context).store.readReachable();
   assert.equal(read.status, 'ready');
-  assert.equal(read.indexes[0].id, oldIndex.id);
-  assert.equal(read.indexes[0].contentFingerprint, oldIndex.contentFingerprint);
+  const indexSlot = slots.find(slot => slot.current?.data?.recordType === 'index');
+  const restoredOld = (await f.client.get(indexSlot.collection, indexSlot.recordId)).data;
+  assert.equal(restoredOld.id, oldIndex.id);
+  assert.equal(restoredOld.contentFingerprint, oldIndex.contentFingerprint);
+  assert.deepEqual(restoredOld, oldIndex);
+  await validateLegacyGraph(f.client, slots);
   const records = await f.client.list(slots[0].collection);
   for (const slot of slots) assert.ok(records.some(record => record.recordId === slot.recordId));
   assert.deepEqual(await (await f.request('trash/qianqianjie')).json(), []);
 });
 
 test('TT legacy index recovery cannot hide modified data or checksum mismatches', async t => {
+  for (const tamper of ['reference', 'checksum']) {
+    const f = await fixture(t);
+    const { slots } = await failedInitFixture();
+    const indexSlot = slots.find(slot => slot.current?.data?.recordType === 'index');
+    if (tamper === 'reference') indexSlot.current.data.entries[0].refs[0].itemId = 'tampered';
+    else indexSlot.current.data.contentFingerprint = `sha256:${'0'.repeat(64)}`;
+    for (const slot of slots) await seedLegacy(f, slot);
+    assert.deepEqual((await f.client.get(indexSlot.collection, indexSlot.recordId)).data, indexSlot.current.data);
+    await assert.rejects(validateLegacyGraph(f.client, slots), error => ['V3_GRAPH_INDEX_ROUTE_INVALID', 'V3_GRAPH_INDEX_FINGERPRINT_INVALID'].includes(error.code));
+  }
+});
+
+test('TT 到期回收分批最多读取32个原生slot并保留当前记录', async t => {
+  const f = await fixture(t);
+  for (let index = 0; index < 40; index += 1) {
+    const id = `record-${String(index).padStart(2, '0')}`;
+    await f.client.put('large-chat', id, { index, state: index === 0 ? 'current' : 'old' }, 0);
+    await f.client.remove('large-chat', id, 1);
+    if (index === 0) await f.client.put('large-chat', id, { index, state: 'current' }, 0);
+  }
+  const namespace = 'qqj-bainiao-v1';
+  const tables = await f.store.listTables({ namespace });
+  for (const table of tables) {
+    for (const key of await f.store.listKeys({ namespace, table })) {
+      const found = await f.store.tryGetJson({ namespace, table, key });
+      if (found.found !== true || found.value?.format !== 'qqj-tt-json-v2') continue;
+      const slot = JSON.parse(found.value.serialized);
+      if (slot.namespace !== 'qianqianjie' || !slot.trash.length) continue;
+      for (const item of slot.trash) item.expiresAt = '2026-01-01T00:00:00.000Z';
+      await f.store.setJson({ namespace, table, key, value: { ...found.value, serialized: JSON.stringify(slot) } });
+    }
+  }
+  f.resetReads();
+  const first = await f.client.collectExpiredTrash('qianqianjie', { limit: 32 });
+  assert.equal(first.scanned, 32);
+  assert.equal(first.deleted, 32);
+  assert.equal(first.complete, false);
+  assert.ok(f.reads() <= 32);
+  const second = await f.client.collectExpiredTrash('qianqianjie', { limit: 32, cursor: first.nextCursor });
+  assert.equal(second.scanned, 8);
+  assert.equal(second.deleted, 8);
+  assert.equal(second.complete, true);
+  assert.equal((await f.client.get('large-chat', 'record-00')).data.state, 'current');
+});
+
+test('TT 回收legacy index前先恢复字段顺序，过期删除后冷读指纹仍有效', async t => {
   const f = await fixture(t);
   const { context, slots } = await failedInitFixture();
-  const indexSlot = slots.find(slot => slot.current?.data?.recordType === 'index');
-  indexSlot.current.data.entries[0].refs[0].itemId = 'tampered';
   for (const slot of slots) await seedLegacy(f, slot);
-  const state = await foundationFor(f.client, context).runtime.start();
-  assert.equal(state.status, 'error');
-  await assert.rejects(f.client.get(indexSlot.collection, 'v3-root'), e => e.status === 404);
-  assert.deepEqual((await f.client.get(indexSlot.collection, indexSlot.recordId)).data, indexSlot.current.data);
+  const oldIndexSlot = slots.find(slot => slot.current?.data?.recordType === 'index');
+  const { runtime } = foundationFor(f.client, context);
+  assert.equal((await runtime.start()).status, 'ready');
+  let indexSlot = null;
+  for (const table of await f.store.listTables({ namespace: 'qqj-bainiao-v1' })) {
+    for (const key of await f.store.listKeys({ namespace: 'qqj-bainiao-v1', table })) {
+      const found = await f.store.tryGetJson({ namespace: 'qqj-bainiao-v1', table, key });
+      if (found.found !== true) continue;
+      const candidate = found.value?.format === 'qqj-tt-json-v2' ? JSON.parse(found.value.serialized) : found.value;
+      if (candidate.namespace === 'qianqianjie' && candidate.recordId === oldIndexSlot.recordId) {
+        indexSlot = { table, key, value: candidate };
+      }
+    }
+  }
+  assert.ok(indexSlot);
+  const expectedFingerprint = indexSlot.value.current.data.contentFingerprint;
+  indexSlot.value.trash.push({ trashId: `${indexSlot.value.current.generationId}-99`, namespace: 'qianqianjie',
+    collection: indexSlot.value.collection, recordId: indexSlot.value.recordId, expiresAt: '2026-01-01T00:00:00.000Z',
+    envelope: { ...indexSlot.value.current, revision: 99 } });
+  await f.store.setJson({ namespace: 'qqj-bainiao-v1', table: indexSlot.table, key: indexSlot.key, value: indexSlot.value });
+  const result = await f.client.collectExpiredTrash('qianqianjie', { limit: 32 });
+  assert.equal(result.deleted, 1);
+  const stored = await f.store.tryGetJson({ namespace: 'qqj-bainiao-v1', table: indexSlot.table, key: indexSlot.key });
+  assert.equal(stored.value.format, 'qqj-tt-json-v2');
+  const current = JSON.parse(stored.value.serialized).current;
+  assert.equal(current.data.contentFingerprint, expectedFingerprint);
+  const coldClient = createBackendClient({ fetchImpl: createTauriBackendFetch({ globalRef: { ...f.globalRef } }) });
+  const restoredOld = (await coldClient.get(oldIndexSlot.collection, oldIndexSlot.recordId)).data;
+  assert.equal(restoredOld.id, oldIndexSlot.current.data.id);
+  assert.equal(restoredOld.contentFingerprint, expectedFingerprint);
+  await validateLegacyGraph(coldClient, slots);
+  const reachable = await foundationFor(coldClient, context).store.readReachable();
+  assert.equal(reachable.status, 'ready');
+});
+
+test('TT 单个slot读取失败保留前项清理计数并继续返回部分结果', async t => {
+  const f = await fixture(t);
+  for (const id of ['a', 'b']) {
+    await f.client.put('chat', id, { id }, 0);
+    await f.client.remove('chat', id, 1);
+  }
+  const namespace = 'qqj-bainiao-v1';
+  for (const table of await f.store.listTables({ namespace })) {
+    for (const key of await f.store.listKeys({ namespace, table })) {
+      const found = await f.store.tryGetJson({ namespace, table, key });
+      if (found.found !== true || found.value?.format !== 'qqj-tt-json-v2') continue;
+      const slot = JSON.parse(found.value.serialized);
+      if (slot.namespace !== 'qianqianjie' || !slot.trash.length) continue;
+      for (const item of slot.trash) item.expiresAt = '2026-01-01T00:00:00.000Z';
+      await f.store.setJson({ namespace, table, key, value: { ...found.value, serialized: JSON.stringify(slot) } });
+    }
+  }
+  f.resetReads();
+  f.failReadAt(2);
+  const result = await f.client.collectExpiredTrash('qianqianjie', { limit: 32 });
+  assert.equal(result.scanned, 2);
+  assert.equal(result.deleted, 1);
+  assert.equal(result.failed, 1);
+  assert.equal(result.complete, true);
+});
+
+test('TT 保留未到期和畸形期限slot，单个写失败不丢弃部分结果或异namespace记录', async t => {
+  const f = await fixture(t);
+  for (const id of ['expired-a', 'expired-b', 'future', 'invalid']) {
+    await f.client.put('chat', id, { id }, 0);
+    await f.client.remove('chat', id, 1);
+  }
+  const namespace = 'qqj-bainiao-v1';
+  const expiryByRecord = new Map([['expired-a', '2026-01-01T00:00:00.000Z'], ['expired-b', '2026-01-01T00:00:00.000Z'],
+    ['future', '2099-01-01T00:00:00.000Z'], ['invalid', 'not-a-date']]);
+  for (const table of await f.store.listTables({ namespace })) {
+    for (const key of await f.store.listKeys({ namespace, table })) {
+      const found = await f.store.tryGetJson({ namespace, table, key });
+      if (found.found !== true || found.value?.format !== 'qqj-tt-json-v2') continue;
+      const slot = JSON.parse(found.value.serialized);
+      const expiry = expiryByRecord.get(slot.recordId);
+      if (slot.namespace !== 'qianqianjie' || !expiry) continue;
+      for (const item of slot.trash) item.expiresAt = expiry;
+      await f.store.setJson({ namespace, table, key, value: { ...found.value, serialized: JSON.stringify(slot) } });
+    }
+  }
+  const foreignSlot = { format: 'qqj-tt-record-v1', namespace: 'other', collection: 'c', recordId: 'foreign', current: null, trash: [] };
+  await seedLegacy(f, foreignSlot);
+  f.resetWriteAttempts();
+  f.failWriteAt(1);
+  const result = await f.client.collectExpiredTrash('qianqianjie', { limit: 32 });
+  assert.equal(result.scanned, 5);
+  assert.equal(result.deleted, 1);
+  assert.equal(result.failed, 2);
+  assert.equal(result.complete, true);
+  const retained = await (await f.request('trash/qianqianjie')).json();
+  assert.equal(retained.length, 3);
+  assert.ok(retained.some(item => item.expiresAt === '2099-01-01T00:00:00.000Z'));
+  assert.ok(retained.some(item => item.expiresAt === 'not-a-date'));
+  assert.ok(retained.some(item => item.expiresAt === '2026-01-01T00:00:00.000Z'));
+  const foreignTable = nativeKey(JSON.stringify(['other', 'c']));
+  const foreignKey = nativeKey('foreign');
+  assert.equal((await f.store.tryGetJson({ namespace, table: foreignTable, key: foreignKey })).found, true);
+});
+
+test('storage activity maintenance reaches the real TT client and removes expired trash', async t => {
+  const f = await fixture(t);
+  await f.client.put('maintenance-chat', 'expired-record', { value: 'old' }, 0);
+  await f.client.remove('maintenance-chat', 'expired-record', 1);
+  for (const table of await f.store.listTables({ namespace: 'qqj-bainiao-v1' })) {
+    for (const key of await f.store.listKeys({ namespace: 'qqj-bainiao-v1', table })) {
+      const found = await f.store.tryGetJson({ namespace: 'qqj-bainiao-v1', table, key });
+      if (!found.found || found.value?.format !== 'qqj-tt-json-v2') continue;
+      const slot = JSON.parse(found.value.serialized);
+      if (slot.recordId !== 'expired-record') continue;
+      slot.trash[0].expiresAt = '2026-01-01T00:00:00.000Z';
+      await f.store.setJson({ namespace: 'qqj-bainiao-v1', table, key, value: { ...found.value, serialized: JSON.stringify(slot) } });
+    }
+  }
+  const identity = { chatId: 'maintenance-chat', hostChatId: 'host-chat', characterLocator: 'char.png', personaLocator: 'me.png' };
+  const settingsValue = { storageAutoCleanupEnabled: false, storageAutoCleanupProgress: {}, storageTrashGcLastCompletedAt: '' };
+  const settings = { get: () => settingsValue, update: patch => Object.assign(settingsValue, patch) };
+  const manager = createStorageManagement({
+    client: f.client,
+    store: { async readReachable() { throw new Error('unexpected ordinary cleanup scan'); } },
+    session: { identity: () => identity, getState: () => ({ status: 'ready', identity }), suspend() {}, resume() {}, async prepare() {} },
+    hostAdapter: { snapshot: () => ({ chatId: identity.hostChatId, context: { chatMetadata: { qianqianjie: { chatId: identity.chatId } } } }) },
+    settings,
+    memoryRuntime: { getState: () => ({ chatId: identity.chatId, stableCount: 0 }), getActivityState: () => ({ chatId: identity.chatId, stableCount: 0 }), subscribe: () => () => {} },
+    foundationRuntime: { getReachable: () => null },
+    isBusy: () => false,
+    logger: { warn() {} },
+  });
+  for (let attempt = 0; attempt < 30 && manager.getState().trashGc.status !== 'completed'; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.equal(manager.getState().trashGc.status, 'completed');
+  assert.equal(manager.getState().trashGc.deleted, 1);
+  assert.ok(settingsValue.storageTrashGcLastCompletedAt);
+  assert.deepEqual(await (await f.request('trash/qianqianjie')).json(), []);
+  manager.dispose();
 });
 
 test('TT malformed serialized slots fail closed instead of becoming empty data', async t => {
@@ -372,6 +1016,20 @@ test('TT large collection scan stops issuing native reads after cancellation', a
   assert.ok(readsAtCancellation < 128);
   assert.equal(reads, readsAtCancellation, '取消后不得继续逐条读取剩余记录');
   assert.equal(f.writes(), 128);
+});
+
+test('TT默认本地读写不依赖HTTP headers，注入与自定义HTTP仍读取provider', async t => {
+  const f = await fixture(t), previous = globalThis.__TAURITAVERN__;
+  globalThis.__TAURITAVERN__ = f.globalRef.__TAURITAVERN__;
+  t.after(() => { if (previous === undefined) delete globalThis.__TAURITAVERN__; else globalThis.__TAURITAVERN__ = previous; });
+  const failure = new Error('HTTP headers unavailable');
+  const headers = () => { throw failure; };
+  const local = createBackendClient({ headers });
+  await local.put('header-free', 'record', { own: true }, 0);
+  assert.deepEqual((await local.get('header-free', 'record')).data, { own: true });
+  for (const options of [{ fetchImpl: async () => { assert.fail('provider应先被调用'); } }, { baseUrl: '/custom-http' }]) {
+    await assert.rejects(createBackendClient({ ...options, headers }).get('c', 'r'), error => error === failure);
+  }
 });
 
 test('TT default routing selects local storage while explicit fetch injection is preserved', async t => {

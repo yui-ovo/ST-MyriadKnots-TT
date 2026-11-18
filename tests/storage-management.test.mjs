@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { classifyStorageRecords, createStorageManagement, STORAGE_AUTO_BYTE_THRESHOLD, STORAGE_AUTO_RECORD_THRESHOLD } from '../src/storage-management.js';
 import { createFoundationStore } from '../src/v3/foundation-store.js';
+import { buildFoundationIndexes } from '../src/v3/foundation-runtime.js';
+import { createSettingsStore } from '../src/settings.js';
+import { createV3MemoryRuntime } from '../src/v3/memory-runtime.js';
+import { scanAssistantCandidates } from '../src/v3/foundation-domain.js';
 
 const CHAT = '123e4567-e89b-42d3-a456-426614174000';
 const HOST = 'host-chat';
@@ -82,10 +86,13 @@ function recordsWithOld(oldCount = 3) {
 }
 
 function fixture({ oldCount = 3, busy = false, rootChanged = false, rootChatId = CHAT, removeHook = null, warmCache = false,
-  cacheRootChanged = false, scanFailure = null, stableCount = 10, autoEnabled = false, vectorRuntime = null } = {}) {
-  let items = recordsWithOld(oldCount), memoryState = { chatId: CHAT, stableCount }, isBusy = busy;
+  cacheRootChanged = false, scanFailure = null, stableCount = 10, autoEnabled = false, vectorRuntime = null,
+  trashGcSupport = undefined, pluginEnabled = true, trashGcCompletedAt = '', trashGcPages = null, streamRecords = false,
+  extraRecords = [], reachableOverride = null, rootHeadCheckpointId = null, settingsStore = null, memoryRuntimeOverride = null } = {}) {
+  let items = [...recordsWithOld(oldCount), ...extraRecords], memoryState = { chatId: CHAT, stableCount, memorySnapshotStatus: 'ready', memorySyncStatus: 'idle' }, isBusy = busy;
   const removes = [], ordinaryRemoves = [], listeners = new Set(), sessionCalls = [];
   let listCalls = 0, rootReads = 0, fullReads = 0, listFailure = null, rootReadFailure = null, maintenanceRootFailure = null;
+  let streamedRecords = 0;
   let cacheRootMismatch = cacheRootChanged;
   let rootVersion = 9;
   let pendingScanFailure = scanFailure;
@@ -101,14 +108,16 @@ function fixture({ oldCount = 3, busy = false, rootChanged = false, rootChatId =
     async prepare() { sessionCalls.push('prepare'); sessionState = { status: 'ready', identity }; return sessionState; },
     getState: () => sessionState,
   };
-  const settingsValue = { storageAutoCleanupEnabled: autoEnabled, storageAutoCleanupProgress: autoEnabled ? { [CHAT]: stableCount - 10 } : {} };
-  const settings = { get: () => settingsValue, update(patch) { Object.assign(settingsValue, structuredClone(patch)); } };
+  const settingsValue = settingsStore?.get() ?? { storageAutoCleanupEnabled: autoEnabled, storageAutoCleanupProgress: autoEnabled ? { [CHAT]: stableCount - 10 } : {}, storageTrashGcLastCompletedAt: trashGcCompletedAt };
+  const settings = settingsStore ?? { get: () => settingsValue, update(patch) { Object.assign(settingsValue, structuredClone(patch)); } };
+  let trashHealthCalls = 0, trashCollectCalls = 0, trashPageIndex = 0, trashGcOnCall = null;
   const client = {
     async list() { listCalls += 1; if (listFailure) { const failure = listFailure; listFailure = null; throw failure; } return structuredClone(items); },
+    ...(streamRecords ? { async *iterRecords() { for (const item of items) { streamedRecords += 1; yield structuredClone(item); } } } : {}),
     async get(_collection, recordId) {
       assert.equal(recordId, 'v3-root');
       if (maintenanceRootFailure) { const failure = maintenanceRootFailure; maintenanceRootFailure = null; throw failure; }
-      return { revision: rootChanged ? 10 : 9, data: rootData(CHAT, rootChanged ? RUN : HEAD) };
+      return { revision: rootChanged ? 10 : 9, data: rootData(CHAT, rootChanged ? RUN : (rootHeadCheckpointId ?? HEAD)) };
     },
     async remove(_collection, recordId, revision) {
       ordinaryRemoves.push([recordId, revision]);
@@ -123,15 +132,29 @@ function fixture({ oldCount = 3, busy = false, rootChanged = false, rootChatId =
       items.splice(index, 1);
       return { trashId: recordId };
     },
+    ...(trashGcSupport === undefined ? {} : {
+      async health() {
+        trashHealthCalls += 1;
+        if (trashGcSupport === '404') throw Object.assign(new Error('health route missing'), { status: 404 });
+        if (trashGcSupport === '500') throw Object.assign(new Error('temporary health failure'), { status: 500 });
+        return { capabilities: { trashGc: trashGcSupport } };
+      },
+      async collectExpiredTrash() {
+        trashCollectCalls += 1;
+        trashGcOnCall?.(trashCollectCalls);
+        if (trashGcPages) return structuredClone(trashGcPages[Math.min(trashPageIndex++, trashGcPages.length - 1)]);
+        return { scanned: 0, deleted: 0, failed: 0, complete: true };
+      },
+    }),
   };
   const store = {
     async readRoot() { rootReads += 1; if (rootReadFailure) { const failure = rootReadFailure; rootReadFailure = null; throw failure; }
-      const root = cacheRootMismatch ? reachable('other-chat').root : rootData(CHAT, rootVersion === 9 ? HEAD : RUN);
+      const root = cacheRootMismatch ? reachable('other-chat').root : rootData(CHAT, rootVersion === 9 ? (rootHeadCheckpointId ?? HEAD) : RUN);
       return { status: 'ready', revision: cacheRootMismatch ? 10 : rootVersion, data: root }; },
     async readReachable() {
       fullReads += 1;
       if (pendingScanFailure) { const failure = pendingScanFailure; pendingScanFailure = null; throw failure; }
-      const value = reachable(rootChatId);
+      const value = reachableOverride ? structuredClone(reachableOverride) : reachable(rootChatId);
       if (!cacheRootMismatch && rootVersion !== 9) {
         value.rootRevision = rootVersion;
         value.root.headCheckpointId = RUN;
@@ -142,19 +165,24 @@ function fixture({ oldCount = 3, busy = false, rootChanged = false, rootChatId =
   };
   const memoryRuntime = {
     getState: () => memoryState,
+    getActivityState: () => memoryState,
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
   };
+  let enabled = pluginEnabled;
+  const hostAdapter = { snapshot: () => ({ chatId: HOST, context: { chatMetadata: { qianqianjie: { chatId: CHAT } } } }) };
   const manager = createStorageManagement({
-    client, store, settings, memoryRuntime, foundationRuntime: { getReachable: () => warmCache ? reachable() : null },
+    client, store, settings, memoryRuntime: memoryRuntimeOverride ?? memoryRuntime, foundationRuntime: { getReachable: () => warmCache ? reachable() : null },
     vectorRuntime,
     session,
-    hostAdapter: { snapshot: () => ({ chatId: HOST, context: { chatMetadata: { qianqianjie: { chatId: CHAT } } } }) },
+    hostAdapter,
     isBusy: () => isBusy,
+    isEnabled: () => enabled,
     logger: { warn() {} },
   });
   return {
-    manager, removes, ordinaryRemoves, settingsValue, session, sessionCalls,
-    counts: () => ({ listCalls, rootReads, fullReads }),
+    manager, removes, ordinaryRemoves, settingsValue, session, sessionCalls, store, client, hostAdapter,
+    counts: () => ({ listCalls, rootReads, fullReads, streamedRecords }),
+    trashGcCalls: () => ({ health: trashHealthCalls, collect: trashCollectCalls }),
     failNextScan(error) { pendingScanFailure = error; },
     failNextList(error) { listFailure = error; },
     failNextRootRead(error) { rootReadFailure = error; },
@@ -162,11 +190,214 @@ function fixture({ oldCount = 3, busy = false, rootChanged = false, rootChatId =
     changeCacheRoot() { cacheRootMismatch = true; },
     setRootVersion(value) { rootVersion = value; },
     setBusy(value) { isBusy = value; for (const listener of listeners) listener(memoryState); },
+    setPluginEnabled(value) { enabled = value; },
+    setTrashGcOnCall(callback) { trashGcOnCall = callback; },
     setStableCount(value) { memoryState = { ...memoryState, stableCount: value }; for (const listener of listeners) listener(memoryState); },
+    setMemoryActivity(patch) { memoryState = { ...memoryState, ...patch }; for (const listener of listeners) listener(memoryState); },
     records: () => items,
 };
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test('切聊天时即使没有请求新统计，activity也取消旧手动扫描', async () => {
+  const f = fixture(), otherId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  let selected = { ...f.session.identity() }, announce, release;
+  const entered = new Promise(resolve => { announce = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  let produced = 0, aborted = 0;
+  f.session.identity = () => selected;
+  f.hostAdapter.snapshot = () => ({ chatId: selected.hostChatId, context: { chatMetadata: { qianqianjie: { chatId: selected.chatId } } } });
+  f.client.iterRecords = async function* (_collection, { signal } = {}) {
+    produced++; yield structuredClone(f.records()[0]);
+    announce();
+    await new Promise((resolve, reject) => {
+      const abort = () => { aborted++; reject(signal.reason); };
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener('abort', abort, { once: true });
+      gate.then(() => { signal?.removeEventListener('abort', abort); resolve(); });
+    });
+    for (const item of f.records().slice(1)) { produced++; yield structuredClone(item); }
+  };
+  const pending = f.manager.scan(), result = pending.then(value => ({ value }), error => ({ error }));
+  try {
+    await entered;
+    selected = { ...selected, chatId: otherId, hostChatId: 'other-host' };
+    f.setBusy(false);
+    await tick();
+    assert.equal(aborted, 1, '不依赖新聊天再次调用scan');
+    assert.equal((await result).error?.code, 'QQJ_STORAGE_CHAT_CHANGED');
+    assert.equal(produced, 1, '取消后不再读取旧聊天的后续记录');
+    assert.equal(f.manager.getActivityState().busy, false);
+    assert.equal(f.manager.getState().chatId, otherId);
+    assert.equal(f.manager.getState().status, 'idle');
+    f.setBusy(false);
+    await tick();
+    assert.equal(aborted, 1, '后续通知不会重复取消已结束的扫描');
+  } finally {
+    release(); await Promise.allSettled([pending]); f.manager.dispose();
+  }
+});
+
+test('切聊天后新的手动统计取消旧只读扫描，旧finally不清掉新扫描', async t => {
+  for (const streaming of [true, false]) await t.test(streaming ? 'iterRecords' : 'legacy list', async () => {
+    const f = fixture(), otherId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    let selected = { ...f.session.identity() }, announceA, releaseA, releaseB;
+    const enteredA = new Promise(resolve => { announceA = resolve; });
+    const gateA = new Promise(resolve => { releaseA = resolve; });
+    const gateB = new Promise(resolve => { releaseB = resolve; });
+    const calls = { startedA: 0, startedB: 0, abortedA: 0, producedA: 0 };
+    const wait = (gate, signal, onAbort = () => {}) => new Promise((resolve, reject) => {
+      const abort = () => { onAbort(); reject(signal.reason); };
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener('abort', abort, { once: true });
+      gate.then(() => { signal?.removeEventListener('abort', abort); resolve(); });
+    });
+    const recordsFor = chatId => f.records().map(item => {
+      const value = structuredClone(item);
+      if (value.data.chatId === CHAT) value.data.chatId = chatId;
+      return value;
+    });
+    f.session.identity = () => selected;
+    f.hostAdapter.snapshot = () => ({ chatId: selected.hostChatId, context: { chatMetadata: { qianqianjie: { chatId: selected.chatId } } } });
+    f.store.readReachable = async () => reachable(selected.chatId);
+    if (streaming) f.client.iterRecords = async function* (collection, { signal } = {}) {
+      if (collection === `chat-${CHAT}`) {
+        calls.startedA++;
+        const records = recordsFor(CHAT); calls.producedA++; yield records[0];
+        announceA(); await wait(gateA, signal, () => { calls.abortedA++; });
+        for (const item of records.slice(1)) { calls.producedA++; yield item; }
+      } else {
+        calls.startedB++; await gateB;
+        yield* recordsFor(otherId);
+      }
+    };
+    else f.client.list = async (collection, { signal } = {}) => {
+      if (collection === `chat-${CHAT}`) {
+        calls.startedA++; announceA(); await wait(gateA, signal, () => { calls.abortedA++; });
+        calls.producedA += f.records().length;
+        return recordsFor(CHAT);
+      }
+      calls.startedB++; await gateB; return recordsFor(otherId);
+    };
+    const first = f.manager.scan(), firstResult = first.then(value => ({ value }), error => ({ error }));
+    let second;
+    try {
+      await enteredA;
+      const producedBeforeSwitch = calls.producedA;
+      selected = { ...selected, chatId: otherId, hostChatId: 'other-host' };
+      second = f.manager.scan();
+      await tick();
+      assert.equal(calls.startedB, 1, 'B不能继续等待A的operation.promise');
+      const stale = await firstResult;
+      assert.equal(stale.error?.code, 'QQJ_STORAGE_CHAT_CHANGED');
+      assert.equal(calls.abortedA, 1);
+      assert.equal(calls.producedA, producedBeforeSwitch, '取消后不读取A的后续记录');
+      assert.equal(f.manager.getActivityState().busy, true, 'A的finally不清除正在等待的B扫描');
+      assert.equal(f.manager.getState().status, 'scanning');
+      assert.equal(f.manager.getState().chatId, otherId);
+      releaseB();
+      const result = await second;
+      assert.equal(result.identity.chatId, otherId);
+      assert.equal(f.manager.getState().status, 'ready');
+      assert.equal(f.manager.getState().stats.total.count, f.records().length);
+      assert.equal(f.manager.getActivityState().busy, false);
+    } finally {
+      releaseA(); releaseB();
+      await Promise.allSettled([first, second]);
+      f.manager.dispose();
+    }
+  });
+});
+
+test('旧后端确认不支持回收站清理后，多次 activity 不会重复调度且事件循环可继续', async () => {
+  const f = fixture({ trashGcSupport: false });
+  let checkingTransitions = 0;
+  const unsubscribe = f.manager.subscribe(state => {
+    if (state.trashGc.status === 'checking') checkingTransitions += 1;
+  });
+  await tick();
+  f.setStableCount(11);
+  f.setStableCount(12);
+  f.setStableCount(13);
+  await tick();
+  assert.deepEqual(f.trashGcCalls(), { health: 1, collect: 0 });
+  assert.equal(checkingTransitions, 1);
+  assert.equal(f.manager.getState().trashGc.status, 'unsupported');
+  assert.equal((await f.manager.collectExpiredTrash()).status, 'unsupported');
+  assert.deepEqual(f.trashGcCalls(), { health: 2, collect: 0 }, '手动操作可显式重新核查后端能力');
+  unsubscribe();
+  f.manager.dispose();
+
+  const missingRoute = fixture({ trashGcSupport: '404' });
+  await tick();
+  assert.equal(missingRoute.manager.getState().trashGc.status, 'unsupported');
+  missingRoute.setStableCount(11);
+  await tick();
+  assert.deepEqual(missingRoute.trashGcCalls(), { health: 1, collect: 0 });
+  missingRoute.manager.dispose();
+});
+
+test('到期维护服从插件启用状态和24小时完整检查间隔', async () => {
+  const disabled = fixture({ pluginEnabled: false, trashGcSupport: true });
+  await tick();
+  assert.deepEqual(disabled.trashGcCalls(), { health: 0, collect: 0 });
+  disabled.setPluginEnabled(true);
+  disabled.setStableCount(11);
+  for (let attempt = 0; attempt < 30 && disabled.manager.getState().trashGc.status !== 'completed'; attempt += 1) await tick();
+  assert.equal(disabled.manager.getState().trashGc.status, 'completed');
+  assert.deepEqual(disabled.trashGcCalls(), { health: 1, collect: 1 });
+  disabled.setStableCount(12);
+  disabled.setStableCount(13);
+  await tick();
+  assert.deepEqual(disabled.trashGcCalls(), { health: 1, collect: 1 });
+  disabled.manager.dispose();
+
+  const recent = fixture({ trashGcSupport: true, trashGcCompletedAt: disabled.settingsValue.storageTrashGcLastCompletedAt });
+  await tick();
+  assert.deepEqual(recent.trashGcCalls(), { health: 0, collect: 0 });
+  recent.manager.dispose();
+});
+
+test('健康检查临时失败后仅在24小时重试间隔到期再检查', async () => {
+  const originalNow = Date.now;
+  let now = 1_800_000_000_000;
+  Date.now = () => now;
+  try {
+    const f = fixture({ trashGcSupport: '500' });
+    await tick();
+    assert.deepEqual(f.trashGcCalls(), { health: 1, collect: 0 });
+    now += 24 * 60 * 60 * 1000 - 1;
+    f.setStableCount(11);
+    await tick();
+    assert.deepEqual(f.trashGcCalls(), { health: 1, collect: 0 });
+    now += 2;
+    f.setStableCount(12);
+    await tick();
+    assert.deepEqual(f.trashGcCalls(), { health: 2, collect: 0 });
+    f.manager.dispose();
+  } finally { Date.now = originalNow; }
+});
+
+test('存储忙碌时到期维护让出，既有activity恢复后继续', async () => {
+  const f = fixture({ trashGcSupport: true, trashGcPages: [
+    { scanned: 32, deleted: 1, failed: 0, complete: false, nextCursor: { trashId: 'after-32' } },
+    { scanned: 8, deleted: 2, failed: 0, complete: true, nextCursor: null },
+  ] });
+  f.setTrashGcOnCall(call => {
+    if (call === 1) { f.setBusy(true); f.setPluginEnabled(false); }
+  });
+  await tick();
+  assert.deepEqual(f.trashGcCalls(), { health: 1, collect: 1 });
+  assert.equal(f.manager.getState().trashGc.status, 'pending');
+  f.setPluginEnabled(true);
+  f.setBusy(false);
+  for (let attempt = 0; attempt < 30 && f.manager.getState().trashGc.status !== 'completed'; attempt += 1) await tick();
+  assert.equal(f.manager.getState().trashGc.status, 'completed');
+  assert.deepEqual(f.trashGcCalls(), { health: 1, collect: 2 });
+  assert.equal(f.manager.getState().trashGc.scanned, 40);
+  assert.equal(f.manager.getState().trashGc.deleted, 3);
+  f.manager.dispose();
+});
 function waitForOperationSettled(manager, timeoutMs = 5000) {
   return new Promise(resolve => {
     let sawOperation = false, idleNotifications = 0, timer = null;
@@ -199,6 +430,56 @@ test('统计只把通过生产完整 schema 校验且不可达的九类 foundati
   assert.equal(classified.stats.retained.count, 8);
   assert.equal(classified.candidates.length, 9);
   assert.deepEqual(new Set(classified.candidates.map(item => item.recordId)), new Set(oldRecords.map(item => item.recordId)));
+});
+
+test('复用的旧floorOrder key由新checkpoint/root闭包保护，旧checkpoint索引仍可清理', async () => {
+  const oldIndex = validEnvelope('index', INDEX);
+  const oldCheckpointKey = `v3-checkpoint-${HEAD}`;
+  const newCheckpointId = 'e23e4567-e89b-42d3-a456-426614174000';
+  const reused = structuredClone(oldIndex);
+  const orphan = structuredClone(oldIndex);
+  orphan.recordId = `v3-index-floorOrder-0-f23e4567-e89b-42d3-a456-999999999999`;
+  orphan.data.id = 'f23e4567-e89b-42d3-a456-999999999999';
+  const next = reachable();
+  next.root = { ...next.root, headCheckpointId: newCheckpointId,
+    indexManifest: { ...next.root.indexManifest, floor: [reused.recordId] } };
+  next.checkpoint = { ...next.checkpoint, id: newCheckpointId,
+    producedRefs: { ...next.checkpoint.producedRefs, indexes: [reused.recordId] } };
+  const classified = await classifyStorageRecords([
+    { recordId: 'v3-root', revision: 1, data: next.root },
+    { recordId: oldCheckpointKey, revision: 1, data: validData('checkpoint', HEAD) },
+    { recordId: `v3-checkpoint-${newCheckpointId}`, revision: 1, data: { ...validData('checkpoint', HEAD), id: newCheckpointId } },
+    reused, orphan,
+  ], next, CHAT);
+  assert.equal(classified.candidates.some(item => item.recordId === reused.recordId), false,
+    'new checkpoint producedRefs and root manifest keep the reused immutable index active');
+  assert.ok(classified.candidates.some(item => item.recordId === orphan.recordId),
+    'an old index key outside the current graph remains a cleanup candidate');
+});
+
+test('存储管理真实扫描与清理保护复用key并删除合法孤立floorOrder', async () => {
+  const nextCheckpointId = 'e23e4567-e89b-42d3-a456-426614174000';
+  const currentIndexKey = validEnvelope('index', INDEX).recordId;
+  const [orphanIndex] = await buildFoundationIndexes({
+    chatId: CHAT, narrativeGeneration: GENERATION, checkpointId: oldId(99),
+    floors: [{ id: FLOOR, hostLocator: { messageIndex: 1, swipeId: null, selectedSwipeIndex: null } }],
+    candidates: [{ hostLocator: { messageIndex: 1, swipeId: null, selectedSwipeIndex: null } }], now: NOW,
+  });
+  const orphan = { recordId: `v3-index-${orphanIndex.kind}-${orphanIndex.shard}-${orphanIndex.id}`, revision: 41, data: orphanIndex };
+  const next = reachable();
+  next.root = { ...next.root, headCheckpointId: nextCheckpointId, indexManifest: { ...next.root.indexManifest, floor: [currentIndexKey] } };
+  next.checkpoint = { ...next.checkpoint, id: nextCheckpointId,
+    producedRefs: { ...next.checkpoint.producedRefs, indexes: [currentIndexKey] } };
+  const nextCheckpoint = validEnvelope('checkpoint', nextCheckpointId);
+  const f = fixture({ extraRecords: [orphan, nextCheckpoint], reachableOverride: next, rootHeadCheckpointId: nextCheckpointId });
+  const preview = await f.manager.scan();
+  assert.equal(preview.status, 'ready');
+  assert.equal(preview.candidates.some(item => item.recordId === currentIndexKey), false);
+  assert.ok(preview.candidates.some(item => item.recordId === orphan.recordId));
+  const result = await f.manager.cleanup();
+  assert.equal(result.status, 'completed');
+  assert.ok(f.removes.some(([recordId]) => recordId === orphan.recordId), 'cleanup deletes the orphan index through removePermanent');
+  assert.equal(f.removes.some(([recordId]) => recordId === currentIndexKey), false, 'cleanup preserves the reused index key');
 });
 
 test('存储管理扫描向量续建见证并保留精确有效的未发布shard', async () => {
@@ -238,6 +519,60 @@ test('大清单分类分批让出事件循环且分类结果与小清单规则�
   assert.deepEqual(classified.candidates.map(item => item.recordId), records.map(item => item.recordId));
 });
 
+test('3901条生产存储扫描使用逐条流并保持候选原始顺序', async () => {
+  const f = fixture({ oldCount: 3885, streamRecords: true });
+  assert.equal(f.records().length, 3901);
+  const snapshot = await f.manager.scan();
+  assert.equal(snapshot.status, 'ready');
+  assert.equal(f.counts().streamedRecords, 3901);
+  assert.equal(f.counts().listCalls, 0, '流式客户端不创建全量list副本');
+  assert.equal(snapshot.stats.total.count, 3901);
+  assert.equal(snapshot.stats.cleanup.count, 3885);
+  assert.equal(snapshot.candidates.length, 3885);
+  assert.equal(snapshot.candidates[0].recordId, `v3-run-${oldId(0)}`);
+  assert.equal(snapshot.candidates.at(-1).recordId, `v3-run-${oldId(3884)}`);
+  f.manager.dispose();
+});
+
+test('固定store扫描不读后来UI的store，结果归原目标且释放视图', async () => {
+  const f = fixture();
+  const read = f.store.readReachable;
+  let leases = 0, releases = 0;
+  f.store.forIdentity = captured => {
+    assert.equal(captured.chatId, CHAT); leases++;
+    return { readReachable: async options => {
+      f.session.identity = () => ({ chatId: 'other-chat', hostChatId: 'other-host' });
+      f.hostAdapter.snapshot = () => ({ chatId: 'other-host', context: { chatMetadata: { qianqianjie: { chatId: 'other-chat' } } } });
+      return read(options);
+    }, release: () => { releases++; } };
+  };
+  f.store.readReachable = async () => { assert.fail('不得读取当前UI动态store'); };
+  const snapshot = await f.manager.scan();
+  assert.equal(snapshot.identity.chatId, CHAT); assert.equal(snapshot.candidates.length, 3);
+  assert.equal(leases, 1); assert.equal(releases, 1);
+  assert.equal(f.manager.getState().chatId, 'other-chat'); assert.equal(f.manager.getState().stats, null);
+  f.manager.dispose();
+});
+
+test('固定候选与root验证完成原目标清理，不因当前UI provider变化否决成功', async () => {
+  let f;
+  f = fixture({ removeHook: async () => {
+    f.session.identity = () => ({ chatId: 'other-chat', hostChatId: 'other-host' });
+    f.hostAdapter.snapshot = () => ({ chatId: 'other-host', context: { chatMetadata: { qianqianjie: { chatId: 'other-chat' } } } });
+  } });
+  const read = f.store.readReachable, root = f.store.readRoot;
+  let releases = 0;
+  f.store.forIdentity = captured => { assert.equal(captured.chatId, CHAT); return { readReachable: read, readRoot: root, release: () => { releases++; } }; };
+  const remove = f.client.removePermanent, get = f.client.get;
+  f.client.removePermanent = (collection, ...args) => { assert.equal(collection, `chat-${CHAT}`); return remove(collection, ...args); };
+  f.client.get = (collection, ...args) => { assert.equal(collection, `chat-${CHAT}`); return get(collection, ...args); };
+  const result = await f.manager.cleanup();
+  assert.equal(result.status, 'completed'); assert.equal(result.deletedCount, 3);
+  assert.ok(releases >= 2); assert.deepEqual(f.sessionCalls, ['suspend', 'resume']);
+  assert.equal(f.manager.getState().chatId, 'other-chat'); assert.equal(f.manager.getState().lastResult, null);
+  f.manager.dispose();
+});
+
 test('root 在扫描后变化时零删除，busy 时同样拒绝且不访问 remove', async () => {
   const changed = fixture({ rootChanged: true });
   await assert.rejects(changed.manager.cleanup(), error => error.code === 'QQJ_STORAGE_ROOT_CHANGED');
@@ -256,15 +591,15 @@ test('仅复用完整暖地基且root一致；仍list，冷图或root变化回�
   const warm = fixture({ warmCache: true });
   const snapshot = await warm.manager.scan();
   assert.equal(snapshot.status, 'ready');
-  assert.deepEqual(warm.counts(), { listCalls: 1, rootReads: 1, fullReads: 0 });
+  assert.deepEqual(warm.counts(), { listCalls: 1, rootReads: 1, fullReads: 0, streamedRecords: 0 });
 
   const cold = fixture();
   await cold.manager.scan();
-  assert.deepEqual(cold.counts(), { listCalls: 1, rootReads: 0, fullReads: 1 });
+  assert.deepEqual(cold.counts(), { listCalls: 1, rootReads: 0, fullReads: 1, streamedRecords: 0 });
 
   const stale = fixture({ warmCache: true, cacheRootChanged: true });
   await stale.manager.scan();
-  assert.deepEqual(stale.counts(), { listCalls: 1, rootReads: 1, fullReads: 1 });
+  assert.deepEqual(stale.counts(), { listCalls: 1, rootReads: 1, fullReads: 1, streamedRecords: 0 });
 });
 
 test('root 二次核验后到删除结束之间 session 保持暂停，新 foundation 写入无法取得身份', async () => {
@@ -329,7 +664,96 @@ test('旧后端对永久路径全量 404 时零删除并明确要求更新白鳥
   assert.deepEqual(legacy.ordinaryRemoves, []);
 });
 
-test('自动清理默认关闭；显式开启后每新增10个稳定楼检查，忙碌顺延且达到100条才删', async () => {
+test('真实memory启动0→513不覆盖已确认基线，也不额外整档扫描', async () => {
+  const chat = [];
+  for (let seq = 1; seq <= 513; seq += 1) chat.push(
+    { is_user: false, is_system: false, mes: `记录第${seq}楼。` },
+    { is_user: true, is_system: false, mes: `继续第${seq}楼。` });
+  const candidates = await scanAssistantCandidates(chat, { chatId: CHAT });
+  const source = { ...reachable(), baseline: null, run: null, entities: [], floorMemories: [], stateDeltas: [], currentStates: [], indexes: [],
+    floors: candidates.map((candidate, index) => ({ ...validData('floor', oldId(index + 1)), assistantSeq: index + 1,
+      hostLocator: candidate.hostLocator, content: { ...validData('floor', FLOOR).content,
+        rawFingerprint: candidate.rawFingerprint, canonicalFingerprint: candidate.canonicalFingerprint,
+        canonicalContent: candidate.canonicalContent, sanitizerFingerprint: candidate.sanitizerFingerprint } })) };
+  const context = { chatId: HOST, chatMetadata: { qianqianjie: { chatId: CHAT } }, chat };
+  const foundationState = { status: 'ready', foundationStatus: 'ready', chatId: CHAT, inspectedStableCount: 513 };
+  const foundation = { getState: () => foundationState, getReachable: () => source, bind() {},
+    async start() { return foundationState; }, async inspect() { return foundationState; },
+    async refreshStatus() { return foundationState; }, async confirmLatest() { return foundationState; }, async setEnabled() { return foundationState; } };
+  const runtime = createV3MemoryRuntime({ foundationRuntime: foundation,
+    store: { async readReachable() { return source; }, async readRecord() { return { status: 'missing' }; },
+      async putRecord() { throw new Error('unexpected memory write'); }, async commitRoot() { throw new Error('unexpected root write'); },
+      recordKey: (_type, id) => id, invalidate() {} },
+    hostAdapter: { snapshot: () => ({ chatId: HOST, context, chat }) },
+    generateAnalysisTask: async () => { throw new Error('unexpected analysis'); },
+    generateUtilityTask: async () => { throw new Error('unexpected extraction'); },
+    isEnabled: () => true, automationSettings: () => ({ enabled: false, batchSize: 1 }), persistAnchors: null, failureStorage: null,
+    logger: { warn() {} },
+  });
+  assert.deepEqual([runtime.getActivityState().memorySnapshotStatus, runtime.getActivityState().memorySyncStatus, runtime.getActivityState().stableCount], ['unavailable', 'idle', 0]);
+  const settingsValue = { storageAutoCleanupEnabled: true, storageAutoCleanupProgress: { [CHAT]: 513 } }, writes = [];
+  const settings = { get: () => settingsValue, update(patch) { writes.push(structuredClone(patch)); Object.assign(settingsValue, structuredClone(patch)); } };
+  const f = fixture({ stableCount: 513, settingsStore: settings, memoryRuntimeOverride: { ...runtime,
+    getState() { throw new Error('automatic checks must use lightweight activity state'); } } });
+  try {
+    await tick();
+    const baselineBeforeLoad = settingsValue.storageAutoCleanupProgress[CHAT];
+    await runtime.start();
+    for (let index = 0; index < 200 && runtime.getActivityState().memorySyncStatus === 'syncing'; index += 1) await tick();
+    await tick();
+    assert.deepEqual([runtime.getActivityState().memorySnapshotStatus, runtime.getActivityState().memorySyncStatus, runtime.getActivityState().stableCount], ['ready', 'idle', 513]);
+    assert.equal(baselineBeforeLoad, 513, '未读记忆的临时0不能覆盖已确认基线');
+    assert.equal(settingsValue.storageAutoCleanupProgress[CHAT], 513);
+    assert.deepEqual(writes, [], '0→513期间不重写基线');
+    assert.deepEqual(f.counts(), { listCalls: 0, rootReads: 0, fullReads: 0, streamedRecords: 0 });
+  } finally { f.manager.dispose(); }
+});
+
+test('自动清理只按已同步楼数记基线；正常十楼、确认减楼及待核健康链保持', async () => {
+  const f = fixture({ stableCount: 513, autoEnabled: true, oldCount: 0 });
+  f.settingsValue.storageAutoCleanupProgress[CHAT] = 513;
+  try {
+    await tick();
+    assert.equal(f.counts().listCalls, 0, '513→513不扫描');
+    for (const state of [
+      { stableCount: 0, memorySnapshotStatus: 'unavailable', memorySyncStatus: 'idle' },
+      { stableCount: 0, memorySnapshotStatus: 'syncing', memorySyncStatus: 'syncing' },
+      { stableCount: 0, memorySnapshotStatus: 'ready', memorySyncStatus: 'syncing' },
+      { stableCount: 523, memorySnapshotStatus: 'ready', memorySyncStatus: 'syncing' },
+    ]) {
+      f.setMemoryActivity(state); await tick();
+      assert.equal(f.settingsValue.storageAutoCleanupProgress[CHAT], 513);
+      assert.equal(f.counts().listCalls, 0);
+    }
+    f.setMemoryActivity({ stableCount: 513, memorySnapshotStatus: 'ready', memorySyncStatus: 'idle' }); await tick();
+    assert.equal(f.counts().listCalls, 0);
+    // A readable review state or a single-floor analysis failure does not invalidate the loaded floor count.
+    f.setMemoryActivity({ stableCount: 523, status: 'needsReview', memorySyncStatus: 'needsReview', lastCseError: { floorId: FLOOR, code: 'SINGLE_FLOOR_FAILED' } });
+    for (let index = 0; index < 200 && f.settingsValue.storageAutoCleanupProgress[CHAT] !== 523; index += 1) await tick();
+    assert.equal(f.settingsValue.storageAutoCleanupProgress[CHAT], 523);
+    assert.equal(f.counts().listCalls, 1, '513→523仅扫描一次');
+    f.setMemoryActivity({ stableCount: 523 }); await tick();
+    assert.equal(f.counts().listCalls, 1, '同节点通知不重复扫描');
+    f.setMemoryActivity({ stableCount: 503, memorySyncStatus: 'idle' }); await tick();
+    assert.equal(f.settingsValue.storageAutoCleanupProgress[CHAT], 503, '同步确认后的真实减楼仍重置基线');
+    assert.equal(f.counts().listCalls, 1);
+  } finally { f.manager.dispose(); }
+});
+
+test('记忆未读时手动存储统计仍运行，不将临时楼数写为自动基线', async () => {
+  const f = fixture({ stableCount: 513, autoEnabled: true });
+  f.settingsValue.storageAutoCleanupProgress[CHAT] = 513;
+  f.setMemoryActivity({ stableCount: 0, memorySnapshotStatus: 'unavailable', memorySyncStatus: 'idle' });
+  try {
+    await f.manager.scan();
+    assert.equal(f.manager.getState().status, 'ready');
+    assert.equal(f.counts().listCalls, 1);
+    assert.equal(f.counts().fullReads, 1);
+    assert.equal(f.settingsValue.storageAutoCleanupProgress[CHAT], 513);
+  } finally { f.manager.dispose(); }
+});
+
+test('已显式关闭的自动清理可开启，每新增10个稳定楼检查，忙碌顺延且达到100条才删', async () => {
   const f = fixture({ oldCount: STORAGE_AUTO_RECORD_THRESHOLD });
   assert.equal(f.manager.getState().autoEnabled, false);
   await f.manager.scan();
@@ -342,6 +766,33 @@ test('自动清理默认关闭；显式开启后每新增10个稳定楼检查，
   assert.equal(f.removes.length, STORAGE_AUTO_RECORD_THRESHOLD);
   assert.equal(f.manager.getState().stats.cleanup.count, 0);
   assert.equal(f.settingsValue.storageAutoCleanupProgress[CHAT], 20);
+});
+
+test('真实设置默认开启后无需手动开关，首见只记基线，新增十楼按原阈值清理；显式关闭不清', async t => {
+  for (const [label, extensionSettings] of [
+    ['新建', {}], ['旧缺字段', { qianqianjie: {} }], ['已关闭', { qianqianjie: { storageAutoCleanupEnabled: false } }],
+  ]) await t.test(label, async () => {
+    const enabled = extensionSettings.qianqianjie?.storageAutoCleanupEnabled !== false;
+    const settings = createSettingsStore({ extensionSettings, save() {} });
+    const f = fixture({ oldCount: STORAGE_AUTO_RECORD_THRESHOLD, stableCount: 50, settingsStore: settings });
+    try {
+      await tick();
+      assert.equal(f.manager.getState().autoEnabled, enabled);
+      assert.equal(f.removes.length, 0, '首见不会立即删除');
+      assert.equal(f.counts().fullReads, 0, '首见不会扫描旧版本');
+      assert.equal(settings.get().storageAutoCleanupProgress[CHAT], enabled ? 50 : undefined);
+      f.setStableCount(59); await tick();
+      assert.equal(f.removes.length, 0);
+      f.setStableCount(60);
+      for (let index = 0; index < 200 && enabled && settings.get().storageAutoCleanupProgress[CHAT] !== 60; index += 1) await tick();
+      if (!enabled) await tick();
+      assert.equal(f.removes.length, enabled ? STORAGE_AUTO_RECORD_THRESHOLD : 0);
+      assert.equal(settings.get().storageAutoCleanupProgress[CHAT], enabled ? 60 : undefined);
+      const oldRecords = new Set(Array.from({ length: STORAGE_AUTO_RECORD_THRESHOLD }, (_, index) => `v3-run-${oldId(index)}`));
+      assert.ok(f.removes.every(([recordId]) => oldRecords.has(recordId)), '仅删除无引用旧版本');
+      if (!enabled) assert.equal(f.counts().fullReads, 0);
+    } finally { f.manager.dispose(); }
+  });
 });
 
 test('手动扫描结果只在同稳定楼节点经root复核后供自动决策复用', async () => {
@@ -497,8 +948,9 @@ test('自动清理的约 8 MiB 阈值与 100 条阈值为“或”关系', async
   f.manager.setAutoEnabled(true);
   const old = f.records().find(item => item.recordId === `v3-run-${oldId(0)}`);
   old.data.diagnostics = { estimatedPayload: 'x'.repeat(STORAGE_AUTO_BYTE_THRESHOLD + 1) };
+  const settled = waitForOperationSettled(f.manager);
   f.setStableCount(20);
-  for (let index = 0; index < 200 && f.manager.getState().stats?.cleanup?.count !== 0; index += 1) await tick();
+  assert.equal(await settled, true);
   assert.equal(f.removes.length, 1);
   assert.equal(f.manager.getState().stats.cleanup.count, 0);
 });

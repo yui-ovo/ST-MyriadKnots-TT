@@ -21,16 +21,21 @@ export async function projectVectorSources(memories, floors, { includeSummaries 
     for (const floorId of sourceFloorIds) {
       const floor = floorById.get(floorId);
       const snapshot = memory.sourceFloorSnapshots?.find(value => value.floorId === floorId);
+      const singleFloor = sourceFloorIds.length === 1 && floorId === memory.floorId;
       // 旧单楼可用同楼已保存原文补缺；聚合楼仍只信各成员的专用快照。
-      const canonicalContent = snapshot?.canonicalContent ?? (floorId === memory.floorId
-        ? memory.sourceCanonicalContent ?? (sourceFloorIds.length === 1 ? floor?.content?.canonicalContent : null)
-        : null);
+      const canonicalContent = snapshot?.canonicalContent ?? (singleFloor ? memory.sourceCanonicalContent ?? floor?.content?.canonicalContent : null);
+      const rawFingerprint = snapshot?.rawFingerprint ?? (singleFloor ? memory.sourceRawFingerprint : null);
+      const sameRaw = /^sha256:[a-f0-9]{64}$/u.test(rawFingerprint ?? '') && rawFingerprint === floor?.content?.rawFingerprint;
       if (!floor || typeof canonicalContent !== 'string' || !canonicalContent.trim()
-        || typeof floor.content?.canonicalContent === 'string' && canonicalContent !== floor.content.canonicalContent) continue;
+        || typeof floor.content?.canonicalContent === 'string' && canonicalContent !== floor.content.canonicalContent && !sameRaw) continue;
+      // Store-validated floor fingerprints may be reused only for the exact canonical text; legacy inputs still hash normally.
+      const knownFingerprint = floor.content?.canonicalContent === canonicalContent
+        && /^sha256:[a-f0-9]{64}$/u.test(floor.content?.canonicalFingerprint ?? '')
+        ? floor.content.canonicalFingerprint : null;
       sources.push(Object.freeze({
         floorId, assistantSeq: floor.assistantSeq, floorMemoryId: memory.id,
         memoryFloorId: anchor.id, memoryAssistantSeq: anchor.assistantSeq, canonicalContent,
-        fingerprint: `sha256:${await sha256(canonicalContent)}`,
+        fingerprint: knownFingerprint ?? `sha256:${await sha256(canonicalContent)}`,
       }));
     }
   }
@@ -64,9 +69,21 @@ export function summaryWitnessShape(value) {
 
 export const vectorWitnessShape = value => rawWitnessShape(value) || summaryWitnessShape(value);
 
-export async function rawWitnessValid(value, source) {
+// 摘要修订可更换 memory ID；原文来源仍由楼、锚点及正文指纹共同确定。
+export const rawSourceKey = value => JSON.stringify([value.floorId, value.assistantSeq, value.memoryFloorId, value.memoryAssistantSeq, value.fingerprint]);
+
+export function createRawSourceLookup(source) {
+  const lookup = new Map();
+  for (const raw of source?.rawSources ?? []) {
+    const key = rawSourceKey(raw);
+    if (!lookup.has(key)) lookup.set(key, raw);
+  }
+  return lookup;
+}
+
+export async function rawWitnessValid(value, source, lookup = null) {
   if (!rawWitnessShape(value)) return false;
-  const raw = (source?.rawSources ?? []).find(raw => raw.floorId === value.floorId && raw.assistantSeq === value.assistantSeq
+  const raw = lookup ? lookup.get(rawSourceKey(value)) : (source?.rawSources ?? []).find(raw => raw.floorId === value.floorId && raw.assistantSeq === value.assistantSeq
     && raw.memoryFloorId === value.memoryFloorId && raw.memoryAssistantSeq === value.memoryAssistantSeq && raw.fingerprint === value.fingerprint);
   // 摘要修订会替换归档记录 ID；同一源楼与原文指纹仍能验证旧冻结回执。
   if (!raw || value.offset + value.length > raw.canonicalContent.length) return false;

@@ -1,6 +1,7 @@
 import { sha256 } from '../identity.js';
 import { sanitizeMemoryContent } from '../memory-content-sanitizer.js';
 import { inspectMessageFloorAnchor } from './message-floor-anchor.js';
+import { isMemoryExcludedMessage } from './memory-exclusion.js';
 
 export const FOUNDATION_CAPABILITIES = Object.freeze({
   foundationReady: true,
@@ -10,7 +11,7 @@ export const FOUNDATION_CAPABILITIES = Object.freeze({
 });
 
 export const FOUNDATION_FORMAT_VERSION = 1;
-const SANITIZER_VERSION = 'memory-content-sanitizer-v1';
+const SANITIZER_VERSION = 'shared-body-wrappers-v1';
 const INPUT_SNAPSHOT_VERSION = 2;
 
 const prefixedHash = async value => `sha256:${await sha256(value)}`;
@@ -40,6 +41,7 @@ export async function foundationInputSnapshot(candidates, stableCount) {
       swipeId: candidate.hostLocator?.swipeId ?? null,
       selectedSwipeIndex: candidate.hostLocator?.selectedSwipeIndex ?? null,
       stabilityFingerprint: candidate.stabilityProof?.fingerprint ?? null,
+      ...(candidate.memoryExcluded === true ? { memoryExcluded: true } : {}),
     })),
   };
   const stablePrefix = {
@@ -53,14 +55,20 @@ export async function foundationInputSnapshot(candidates, stableCount) {
 export function createCheckpointInputFingerprints(floors, { candidates = [], previous = [] } = {}) {
   const priorByFloorId = new Map((Array.isArray(previous) ? previous : []).map(item => [item?.floorId, item]));
   return (Array.isArray(floors) ? floors : []).map((floor, index) => {
-    const stabilityFingerprint = priorByFloorId.get(floor.id)?.stabilityFingerprint
-      ?? candidates[index]?.stabilityProof?.fingerprint
+    const candidate = candidates[index];
+    const prior = priorByFloorId.get(floor.id);
+    const stabilityFingerprint = prior?.stabilityFingerprint
+      ?? candidate?.stabilityProof?.fingerprint
       ?? floor.stability?.proof?.fingerprint
       ?? null;
+    const memoryExcluded = candidate
+      ? candidate.memoryExcluded === true
+      : prior?.memoryExcluded === true;
     return {
       floorId: floor.id,
       canonicalFingerprint: floor.content.canonicalFingerprint,
       ...(stabilityFingerprint ? { stabilityFingerprint } : {}),
+      ...(memoryExcluded ? { memoryExcluded: true } : {}),
     };
   });
 }
@@ -77,8 +85,10 @@ export function selectAssistantMessage(message) {
   if (Array.isArray(message.swipes)) {
     const selectedSwipeIndex = Number.isSafeInteger(message.swipe_id) ? message.swipe_id : 0;
     const selected = message.swipes[selectedSwipeIndex];
-    if (typeof selected !== 'string') return null;
-    return { rawContent: normalizeRaw(selected), swipeId: message.swipe_id ?? selectedSwipeIndex, selectedSwipeIndex };
+    const rawContent = typeof selected === 'string' && selected.trim() ? selected
+      : typeof message.mes === 'string' && message.mes.trim() ? message.mes : selected;
+    if (typeof rawContent !== 'string') return null;
+    return { rawContent: normalizeRaw(rawContent), swipeId: message.swipe_id ?? selectedSwipeIndex, selectedSwipeIndex };
   }
   if (typeof message.mes !== 'string') return null;
   return { rawContent: normalizeRaw(message.mes), swipeId: message.swipe_id ?? null, selectedSwipeIndex: null };
@@ -121,7 +131,8 @@ export async function scanAssistantCandidates(chat, {
     const selected = selectAssistantMessage(source[messageIndex]);
     if (!selected) continue;
     const canonicalContent = sanitizeMemoryContent(selected.rawContent, sanitizerOptions);
-    if (!canonicalContent) continue;
+    const messageAnchor = inspectMessageFloorAnchor(source[messageIndex], chatId);
+    if (!canonicalContent && (!chatId || messageAnchor.status === 'none')) continue;
     assistantSeq += 1;
     const [rawFingerprint, canonicalFingerprint] = await Promise.all([
       prefixedHash(selected.rawContent),
@@ -137,7 +148,7 @@ export async function scanAssistantCandidates(chat, {
     }) : null;
     candidates.push(Object.freeze({
       assistantSeq,
-      messageAnchor: inspectMessageFloorAnchor(source[messageIndex], chatId),
+      messageAnchor,
       hostLocator: Object.freeze({
         messageIndex,
         swipeId: selected.swipeId,
@@ -148,6 +159,7 @@ export async function scanAssistantCandidates(chat, {
       canonicalFingerprint,
       sanitizerFingerprint: sanitizerHash,
       canonicalContent,
+      memoryExcluded: isMemoryExcludedMessage(source[messageIndex]),
       stabilityProof,
     }));
     if (assistantSeq % Math.max(1, yieldEvery) === 0) {
@@ -161,14 +173,6 @@ export async function scanAssistantCandidates(chat, {
   maximumChunkMs = Math.max(maximumChunkMs, finalNow - lastYieldAt);
   if (metrics && typeof metrics === 'object') metrics.maximumChunkMs = maximumChunkMs;
   return Object.freeze(candidates);
-}
-
-export function findEarliestCanonicalDivergence(activeFloors, candidates, compareCount = Math.min(activeFloors.length, candidates.length)) {
-  for (let index = 0; index < compareCount; index += 1) {
-    if (activeFloors[index]?.content?.canonicalFingerprint !== candidates[index]?.canonicalFingerprint) return index + 1;
-  }
-  if (activeFloors.length !== candidates.length) return compareCount + 1;
-  return null;
 }
 
 export function createFloorRecord({
@@ -226,5 +230,6 @@ export function candidateSummary(candidate) {
     messageIndex: candidate.hostLocator.messageIndex,
     canonicalFingerprint: candidate.canonicalFingerprint,
     stabilityProof: candidate.stabilityProof ? Object.freeze({ ...candidate.stabilityProof }) : null,
+    ...(candidate.memoryExcluded === true ? { memoryExcluded: true } : {}),
   });
 }

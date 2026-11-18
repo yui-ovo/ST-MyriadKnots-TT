@@ -1,5 +1,7 @@
 # 千事后端接口合同
 
+适用：1.2.0。本文记录现行存档与接口语义，模型生成、完成状态及后续操作分开说明。其它读取接口见[公开 API](public-api.md)。
+
 千事把每个有效 FloorMemory 上的可选 `qianshiDelta` 作为唯一持久事件增量。Graphology 图只由当前聊天中仍可达、仍有效的 FloorMemory 重放得到，不单独保存第二份事件账本。
 
 ## 摘要同次输出
@@ -61,9 +63,11 @@
 
 ### 人工发生时间
 
-详情编辑提供前缀、年、月、日、时钟五格。复用共用中文数字解析，纪年前缀、具名月份和闰月身份保留，不据此猜测完整历法。时钟按 `HH:mm` 或 `HH:mm~HH:mm` 保存。未修改五格时保留原始时间全文；修改时通过既有 `editQianshiEventText` 接口提交 `storyTime` 与 `expected.storyTime`，沿既有并发与提交检查保存，不调用模型。
+详情编辑提供前缀、年、月、日、时钟五格。复用共用中文数字解析，纪年前缀、具名月份和闰月身份保留，不据此猜测完整历法。时钟可填 `HH:mm`、`HH:mm~HH:mm` 或 `卯时`、`卯初`、`卯正一刻`及起止范围。十二时辰、初正保留时间范围，不补一个精确分钟；刻按十五分钟通行约定细分，须明确初正，支持初刻及一至三刻。未分初正的刻不猜唯一钟点；未细分子时不自动换日。未修改五格时保留原始时间全文；修改时通过既有 `editQianshiEventText` 接口提交 `storyTime` 与 `expected.storyTime`，沿既有并发与提交检查保存，不调用模型。
 
 时间覆盖写入 `manualEventOverrides[{eventId,storyTime}]`，明确清空保存为 `null`。人工时间独立于来源楼时间：清空或仅填写时钟不会从楼层日期补全。图、页面日期分组、候选索引与召回共用此时间投影。刷新、重新提取及重判保留人工时间；约定时间 `scheduledTime`、楼层时间、摘要、CSE 和当前故事时钟不随此编辑改写。
+
+详情编辑的人物可从当前已识别人物目录多选，按稳定实体 ID 保存到 `manualEventOverrides[{eventId,people}]`；没有稳定身份的旧姓名项只保留原记录，不按同名猜配。约定／预计时间使用独立的五格编辑，写入 `manualEventOverrides[{eventId,scheduledTime}]`；明确清空写入 `null`，未修改时不写该字段，保留原相对时间全文。旧调用未提供 `people` 或 `scheduledTime` 时均保持原值。两项人工覆盖随事件在全图、增量候选、重新提取、重判和冷读中沿用。
 
 ## 公开桥
 
@@ -94,7 +98,8 @@ const bridge = globalThis.qqj_qianshi_backend_v1;
     partialFloors,
     pendingFloors,
     degradedFloors,
-    unavailableFloors
+    unavailableFloors,
+    processable: { eligibleFloors, readyFloors, emptyFloors, completeFloors, partialFloors, pendingFloors, degradedFloors, unavailableFloors, frozenFloors }
   },
   events: [],
   matters: [],
@@ -107,11 +112,15 @@ const bridge = globalThis.qqj_qianshi_backend_v1;
 
 `events` 字段为 `id`、`matterId`（独立日常事件为 `null`）、`updatesMatter`、`title`、`description`、`status`、`actionStatus`、`statusManuallyEdited`、`timeManuallyEdited`、`storyTime`、`scheduledTime`、`people[{entityId,name}]`、`object`、`sourceFloorId`、`sourceFloorMemoryId`、`sourceAssistantSeq`、`sourceMessageIndex`。`sourceMessageIndex` 沿用插件现有宿主楼号显示口径，`status` 表示这次进展后的整线状态，`actionStatus` 表示本条动作状态；人工覆盖标记只说明字段来源，旧调用方可忽略新增字段。
 
+`coverage` 顶层计数继续统计当前快照中的全部楼；`coverage.processable` 只统计当前聊天的非冻结楼覆盖。`frozenFloors` 单列导入的只读历史；实际是否进入补齐计划仍由楼层状态、来源和输入预算决定。冻结历史事件仍可查看和召回，但不会因缺少千事字段显示为当前可补齐楼。
+
+历史补齐逐楼结果以 `saved-complete`、`saved-partial` 区分完整与部分保存；部分保存保留编译器给出的中文原因，`savedPartialFloors` 计入最终部分完成状态。提交后回读确认沿用相同分类。
+
 `matters` 字段为 `matterId`、`title`、`description`、`status`、`object`、`people`、`storyTime`、`scheduledTime`、`following`、`trackingOverride`、`origin{eventId,title,description,storyTime,scheduledTime,sourceFloorId,sourceAssistantSeq}`、`latestEventIds`、`eventIds`、`sourceFloorId`、`sourceAssistantSeq`。`following` 是各入口共享的当前关注态；`trackingOverride` 为 `true`、`false` 或 `null`（沿事件状态默认计算）。`relations` 字段为 `id`、`type`（`progress` 或 `before`）、`fromEventId`、`toEventId`、`certainty`。调用方拿不到 Graphology 实例或内部可变对象。
 
 `timeline` 是完整页面使用的展示投影，只保存分段、日期组和事件 ID，不复制或裁短事件正文。可靠的剧情发生日期优先于来源楼和事项推进顺序；同日双方都有明确分钟时按分钟排序，否则保持稳定顺序。不同明确纪年、不可比较日期和时间未明事件不会被强行塞进一条虚假的统一时间轴。该投影按事件各提取一次排序键，不使用召回小集合的两两比较。
 
-`currentProgress` 仍是供公开读取和前端展示的详细进度快照，不直接等于正文注入。正文生成会从同一可达图准备有界千事候选，并让它与既有历史／人物材料共用一次选材：`[相关时间线]` 只保留实际选中的事项起因、关键进展或独立事件，`[当前待接续]` 可包含所有状态仍为 planned / inProgress 的候选，不因话题变化、时间未知或经过数日直接消失；候选进入模型不等于最终必然注入。没有既有历史／人物候选时不为千事单独调用模型，而使用同一有界候选的保守本地投影。scheduledTime 仅作为约定期限，不作为已经发生的时间。最终投影仍受4000字符及召回总预算限制，也不修改事件、事项、关系或公开快照。
+`currentProgress` 仍是供公开读取和前端展示的详细进度快照，不直接等于正文注入。正文生成会从同一可达图准备有界千事候选，并让它与既有历史／人物材料共用一次选材：`[相关时间线]` 只保留实际选中的事项起因、关键进展或独立事件，`[相关跟进事项]` 可包含状态为 planned / inProgress 或已完成但人工继续关注的候选；已完成事项正文仍明确标为已完成，作为背景而非当前行动指令；不因话题变化、时间未知或经过数日直接消失。千事独立块同时标出实际选中事件和事项来源资料的最高 AI 楼序；没有可显示的千事材料时不单独显示范围行。候选进入模型不等于最终必然注入。没有既有历史／人物候选时不为千事单独调用模型，而使用同一有界候选的保守本地投影。scheduledTime 仅作为约定期限，不作为已经发生的时间。最终投影仍受4000字符及召回总预算限制，也不修改事件、事项、关系或公开快照。
 
 ### `read()`
 
@@ -129,9 +138,9 @@ await bridge.prepareHistory({
 });
 ```
 
-`maxInputTokens` 是可调批次容量，当前默认 70000；`maxOutputTokens` 当前默认 30000。结果包含可处理楼、因缺 FloorMemory 而不可处理楼、预计批次、预计 API 调用数和保守的输入 token 上界。规划时每批只预留一次共享候选池容量；执行时同一旧事项候选在批内去重，并用实际请求重新核对容量。完整楼正文不会仅为凑固定楼数而截断；若单楼正文自身已经超过容量，该楼仍作为一个完整批次处理。
+`maxInputTokens` 是可调批次容量，当前默认 70000；`maxOutputTokens` 当前默认 30000。结果包含可处理楼、因缺 FloorMemory 而不可处理楼、预计批次、预计 API 调用数和保守的输入 token 上界。规划时每楼按 24,000 字符的候选上界预留；执行时各楼共享候选池、去重候选，并用实际请求重新核对容量。完整楼正文不会仅为凑固定楼数而截断；若单楼完整请求超过输入预算，该楼完整跳过且不调用模型。
 
-默认只补未处理楼及现有的部分结果。只有用户在“补齐旧楼”中明确选择时，`includeEmptyFloors: true` 才会把真实 `qianshiDelta.status === 'empty'` 且无事件的单楼重新纳入计划；已存在事件、人工删除、审核候选、ready 结果及聚合来源仍跳过。重查仍经过原预览、预算、批次、来源校验与逐楼提交，只替换该楼的千事增量；取消不调用模型，模型再次返回空数组也只保存这次判定，不自动重试。
+默认只补没有可用事件且尚未处理完成的楼；已有可用事件的保旧结果结束本轮历史处理，质量诊断仍保留。只有用户在“补齐旧楼”中明确选择时，`includeEmptyFloors: true` 才会把真实 `qianshiDelta.status === 'empty'` 且无事件的单楼重新纳入计划；已存在事件、人工删除、审核候选、ready 结果及聚合来源仍跳过。重查仍经过原预览、预算、批次、来源校验与逐楼提交，只替换该楼的千事增量；取消不调用模型，模型再次返回空数组也只保存这次判定，不自动重试。
 
 ### `startHistory(planId)`
 
@@ -144,17 +153,27 @@ await bridge.prepareHistory({
 ## 成本与状态边界
 
 - 新楼：千事不增加摘要之外的 API 调用。
-- 旧楼：预计调用数等于规划批次数，不按人物或单楼拆请求。
+- 旧楼：历史处理按规划批次请求；整理流程的末尾跟进复核单独计数。预计量以本次预览为准，不按人物固定拆请求。
 - `getStatus()`、`getSnapshot()`、`read()`、`prepareHistory()` 均不调用模型。
 - 只有显式 `startHistory(planId)` 可以触发旧楼历史模型请求。
 - 读取、打开前端或订阅状态不会自动启动历史任务。
 
 
+### 完成状态与续做
+
+`qianshiDelta.status` 保留编译质量，整理工作流另记本轮是否保存、哪些楼还需要处理。`partial` 且已有可用事件时可以完成历史整理，保留原值和质量诊断，不反复自动请求模型；真正缺结果、未处理或请求／保存失败的楼继续保留待续范围。
+
+“补齐旧楼”负责还没有事件记录的楼；已有记录的历史缺口在“整理”中留空继续。显式填 `0` 才重新检查全部已有记录，也可指定楼层范围。健康结果先保存；历史真实缺口完成后，沿原流程做末尾跟进复核。原值保留或局部错引不要求用户修改内部编号才能继续。
+
+人工编辑通过原事件详情、状态和跟进操作保存。事实完成与停止跟进分别处理；已结束且无后续意义的临时事项可停止跟进，原历史仍可查。跟进复核失败单独保留接续信息，历史成功楼保持有效。
+
 ### 已存千事重判的关联兼容
+
+单个 FloorMemory 最多保存 160 条事件、320 条不同有效关系；每条事件最多保存 40 位人物。超出事件或关系容量时，保留容量内的合法内容并标记部分整理；关系先解析有效端点并按关系 ID 去重，重复项不占容量。单条事件的人物超过 40 位时该事件不保存，其余合法事件继续编译；若没有可保存事件，结果保持待补状态并给出原因。
 
 重判保留原事件 ID 和事实文字，整组暂存后只提交一次；请求前后复用同版本存档并核对 root 与正文，不逐楼重读整档。
 所有千事编译入口共用关联归一化：`kind/type`、`candidateKey/candidate/targetKey/target/to` 转成标准字段后才校验。重判仅保留接续关联，背景关联不改变事件归线。未知关联类型不能默默当作接续，错误候选不能降级为新线。
-精确对应旧记录但引用有误时，原条目及其关系保留并标记部分整理，其他有效条目继续处理；整份返回不可解析、旧编号无法对应或状态无效时拒绝整组提交。模型省略 `matter` 但给出有效接续时，可以由关联确定事项归属。
+精确对应旧记录但引用有误时，原条目及其关系保留，其他有效条目继续处理；旧编号无法对应或状态无效的条目不覆盖已有结果。整份返回无法解析时，该请求没有新千事可提交，已保存结果保留。模型省略 `matter` 但给出有效接续时，可以由关联确定事项归属。
 
 模型的整线状态、动作状态在共用编译器中先统一大小写、下划线、连字符及空格（例如 `in_progress` → `inProgress`），再按现有状态集合校验；存档仍只保存规范值，无法识别的状态不猜测。
 
@@ -164,4 +183,4 @@ await bridge.prepareHistory({
 
 同 user 的冻结召回仍不重选材；只读核对明确删除身份，撤被删事件行、受影响的待接续行及关联刻度提醒，不加入新材料，历史回执不改写。新回执仅签名保存已选事项的删除指纹，旧回执签名保持可读。
 
-“整理”旁仅在存在异常时显示“处理异常”。异常弹窗按当前宿主楼号列出原因，使用与普通千事相同的阅读、编辑、删除及状态入口；只读旧审核候选沿用原权限。断链事件仍进入年表，失效关联单独排除；文字编辑不会自动修复关系，归线需由用户通过“整理”重判指定楼。
+“整理”旁仅在存在异常时显示“处理异常”。异常弹窗按当前宿主楼号列出需操作的原因，使用与普通千事相同的阅读、编辑、删除及状态入口；旧审核候选仅作兼容读取。断链事件仍进入年表，失效关联单独排除。已可靠保存的保旧质量差异按上文完成语义处理；希望再判断时，可主动在“整理”中指定范围。

@@ -9,6 +9,7 @@ const CODE_COPY = Object.freeze({
   QQJ_NOT_FOUND: 'API 404，请检查地址和模型名。',
   QQJ_RATE_LIMIT: 'API 请求过于频繁，请稍后再试。',
   QQJ_SERVER: 'API 服务暂时异常，请稍后再试。',
+  QQJ_UPSTREAM: 'API 请求失败，上游返回了错误。',
   QQJ_NETWORK: '无法连接 API，请检查地址和网络。',
   QQJ_REQUEST_FORMAT: 'API 请求参数或响应格式与当前网关不兼容。',
   QQJ_HTTP_RESPONSE_JSON: 'API 响应不是合法 JSON。',
@@ -16,15 +17,35 @@ const CODE_COPY = Object.freeze({
   QQJ_COMPLETION_JSON: '模型输出中没有完整的 JSON 结果。',
   QQJ_OUTPUT_TRUNCATED: '模型输出疑似被截断。',
   QQJ_TRANSPORT_BUDGET: '本次任务的网络尝试次数已用完，请稍后重试。',
-  BACKEND_TIMEOUT: '后端请求超时，请稍后重试。',
+  BACKEND_TIMEOUT: '记忆存储请求超时，请稍后重试。',
+  BACKEND_NETWORK: '记忆存储连接失败，请稍后重试。',
+  QQJ_EMPTY: '模型没有返回可用结果，请重试。',
   V3_RECALL_MEMORY_PREPARATION_TIMEOUT: '当前聊天记忆准备超时。',
   V3_RECALL_SOURCE_UNAVAILABLE: '当前聊天记忆暂时无法读取。',
   V3_MEMORY_FOUNDATION_NOT_READY: '后端数据尚未就绪，请稍后重试。',
   V3_MEMORY_LOAD_FAILED: '记忆数据读取失败，请稍后重试。',
   V3_MEMORY_PERSIST_FAILED: '记忆保存失败，请稍后重试。',
+  V3_MEMORY_PREFIX_CHANGED: '摘要未保存，请重试该楼。',
   V3_MEMORY_COMMIT_FAILED: '记忆保存失败，请稍后重试。',
+  V3_MEMORY_SUMMARY_TOO_LONG: '摘要超过 4000 字，请缩短后保存。',
+  V3_MEMORY_EXACT_ANCHORS_LIMIT: '每楼关键原文最多保存 60 条，请删除多余条目后再保存。',
+  V3_MEMORY_EXACT_ANCHOR_INVALID: '关键原文需要填写载体名称和完整内容；请检查后再保存。',
+  V3_MEMORY_EXACT_ANCHOR_STALE: '关键原文条目已变化，请刷新后重新编辑。',
+  V3_MEMORY_EXACT_ANCHOR_CARRIER_LIMIT: '载体名称超过 500 字，请缩短后保存。',
+  V3_MEMORY_EXACT_ANCHOR_TEXT_LIMIT: '关键原文内容超过 2000 字，请缩短后保存。',
+  V3_MEMORY_EXACT_ANCHOR_KNOWLEDGE_INVALID: '原文所选知情人物已不存在或已变化，请刷新后重新选择。',
+  V3_MEMORY_EXACT_ANCHOR_KNOWLEDGE_LIMIT: '每条关键原文最多选择 80 位知情人物。',
+  V3_MEMORY_REVISION_NOTE_TOO_LONG: '修订说明超过 1000 字，请缩短后保存。',
   V3_RECALL_FAILED: '记忆召回失败，请稍后重试。',
   V3_CSE_FAILED: '人物状态分析失败，请稍后重试。',
+  V3_EXTRACTOR_SUMMARY_INVALID: '模型没有返回可用摘要，请重新提取本楼。',
+  V3_EXTRACTOR_MULTIPLE_RESULTS: '模型返回了多份不同摘要，无法确认；请重新提取本楼。',
+  V3_EXTRACTOR_LOCAL_SCOPE_INVALID: '当前楼与提取目标不一致，请刷新后重新提取本楼。',
+  V3_EXTRACTOR_LOCAL_CATALOG_INVALID: '人物资料与当前记忆不一致，请刷新后重新提取本楼。',
+  V3_EXTRACTOR_ENTITY_KEY_INVALID: '返回的人物身份无法确认，请重新提取本楼。',
+  V3_EXTRACTOR_ENTITY_TYPE_CONFLICT: '返回的人物类型与现有身份不一致，请重新提取本楼。',
+  V3_EXTRACTOR_ENTITY_AMBIGUOUS: '人物称谓对应多人，无法确认；请重新提取本楼。',
+  V3_EXTRACTOR_USER_ROLE_CONFLICT: '返回的人物身份与用户身份冲突，请检查称谓后重试。',
 });
 
 const clean = value => String(value ?? '')
@@ -36,9 +57,17 @@ const clean = value => String(value ?? '')
 export function publicErrorMessage(error, { fallback = '' } = {}) {
   if (error === null || error === undefined || error === '') return clean(fallback);
   const message = clean(typeof error === 'string' ? error : error?.message);
-  if (message && CHINESE_TEXT.test(message)) return message;
-
   const code = clean(typeof error === 'object' ? error?.code : '');
+  if (code.startsWith('V3_MEMORY_EXACT_ANCHOR_') && CODE_COPY[code] && CHINESE_TEXT.test(message)) return message;
+  // Older browser failure hints have the backend client's operation text but no
+  // transport code. Recognize that producer's formats, without trimming user input.
+  if (code === 'BACKEND_NETWORK' || /^(?:读取|保存|删除)记忆失败，无法连接记忆存储(?:服务)?/u.test(message)) return CODE_COPY.BACKEND_NETWORK;
+  if (code === 'BACKEND_TIMEOUT' || /^(?:读取|保存|删除)记忆超时/u.test(message)) return CODE_COPY.BACKEND_TIMEOUT;
+  if (code === 'BACKEND_HTTP') {
+    const status = Number(error?.httpStatus ?? error?.status);
+    return status === 409 ? '记忆记录已更新，请刷新后重试。'
+      : Number.isSafeInteger(status) && status >= 400 && status <= 599 ? `记忆存储请求失败（HTTP ${status}）。` : '记忆存储请求失败，请稍后重试。';
+  }
   if (CODE_COPY[code]) return CODE_COPY[code];
 
   const name = clean(typeof error === 'object' ? error?.name : '');
@@ -65,5 +94,20 @@ export function publicErrorMessage(error, { fallback = '' } = {}) {
     return '返回数据不是合法 JSON，请稍后重试。';
   }
 
+  if (message && CHINESE_TEXT.test(message)) return message;
   return clean(fallback);
+}
+
+// Compare original details, never two generalized UI sentences. Missing names or
+// codes are common in older state projections; operation identity still has to match.
+export function sameErrorDetails(left, right) {
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const a = typeof left === 'string' ? { message: left } : left;
+  const b = typeof right === 'string' ? { message: right } : right;
+  if (!a.message || a.message !== b.message || a.code && b.code && a.code !== b.code) return false;
+  if (a.runId && a.runId === b.runId && a.floorId && a.floorId === b.floorId) {
+    return !a.lastFailedAt || !b.lastFailedAt || a.lastFailedAt === b.lastFailedAt;
+  }
+  return ['runId', 'floorId', 'lastFailedAt'].every(key => a[key] === b[key]);
 }

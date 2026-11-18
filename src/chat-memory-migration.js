@@ -2,11 +2,12 @@ import { sha256 } from './identity.js';
 import { isUuid } from './host-context.js';
 import { CHAT_IDENTITY_COLLECTION } from './chat-identity.js';
 import { captureTargetChatDescriptor } from './v3/host-adapter.js';
-import { readTargetChat } from './v3/message-floor-anchor.js';
+import { readTargetChat, sameChatQqjData, sameQqjChatMetadata } from './v3/message-floor-anchor.js';
 import { deterministicUuid, selectAssistantMessage } from './v3/foundation-domain.js';
 import { sanitizeMemoryContent } from './memory-content-sanitizer.js';
 import { initializeMigrationGraph, selectCompletedCarriedAliases } from './v3/memory-migration.js';
 import { MIGRATION_ALIAS_KEY, migrationPartition } from './v3/migration-prefix.js';
+import { createPlaceWorkspaceStore } from './v3/place-workspace.js';
 
 const RECEIPT_KEY = 'qqj_v3_recall_receipt';
 const ANCHOR_KEY = 'qianqianjie_floor';
@@ -14,7 +15,6 @@ const AUTO_HIDE_KEY = 'qianqianjieAutoHide';
 const fail = (code, message) => Object.assign(new Error(message), { code });
 const clone = value => structuredClone(value);
 const fingerprint = async value => `sha256:${await sha256(value)}`;
-
 export function cleanOwnedMessage(message, { ai = false, aliasId = null, sourceChatId = null } = {}) {
   const { swipes: _oldSwipes, swipe_info: _oldSwipeInfo, ...payload } = message;
   const result = clone(payload);
@@ -113,6 +113,7 @@ export function createChatMemoryMigration({ client, session, hostAdapter, source
   sanitizerOptions = () => ({}), listHostChats, freshUuid = () => globalThis.crypto?.randomUUID?.(),
   now = () => new Date(), fetchImpl = globalThis.fetch, copyPeople = null, copyTime = null, copyVector = null,
   captureStoryCalendar = () => null, persistStoryCalendar = async () => {},
+  placeWorkspaceStore = createPlaceWorkspaceStore({client}),
 } = {}) {
   if (!client?.get || !client?.put || !session?.identity || !hostAdapter?.snapshot || typeof sourceStoreForIdentity !== 'function'
     || typeof listHostChats !== 'function' || typeof fetchImpl !== 'function') throw new TypeError('记忆搬家依赖无效');
@@ -193,6 +194,7 @@ export function createChatMemoryMigration({ client, session, hostAdapter, source
       const peopleWorkspace = copyPeople
         ? await copyPeople({ sourceIdentity: identity, targetIdentity, entities: sourceReachable.entities, sourceReachable })
         : null;
+      await placeWorkspaceStore.copy(identity,targetIdentity,{floorIds:new Set(sourceReachable.floors.map(floor=>floor.id)),narrativeGeneration:targetNarrativeGeneration});
       // Keep the marker already embedded in the copied message; the descriptor is its stable authority.
       const initialized = await initializeMigrationGraph({ store: sourceStoreForIdentity(targetIdentity), sourceIdentity: identity,
         targetIdentity, sourceReachable, carriedAliases, targetChat,
@@ -206,24 +208,24 @@ export function createChatMemoryMigration({ client, session, hostAdapter, source
         sourceTimeHeadSnapshots,
         sanitizerOptions: sanitizerOptions(), now, newUuid: freshUuid });
 
-      const header = { chat_metadata: { qianqianjie: { schemaVersion: 2, chatId: targetChatId },
+      const header = { chat_metadata: { qianqianjie: { schemaVersion: 2, chatId: targetChatId, file: { characterLocator: identity.characterLocator, hostChatId: targetHostChatId } },
         ...(capturedPrequel === null ? {} : { qianqianjiePrequel: capturedPrequel }) },
         user_name: capturedUserName, character_name: host.characterName };
       const expected = [header, ...targetChat];
+      if (capturedCalendar) await persistStoryCalendar(targetChatId, capturedCalendar);
       const saved = await fetchImpl('/api/chats/save', { method: 'POST', cache: 'no-cache', headers: host.requestHeaders ?? {},
         body: JSON.stringify({ ch_name: host.characterName, file_name: targetHostChatId, avatar_url: host.avatarUrl, chat: expected, force: false }) });
       if (!saved?.ok) throw fail('QQJ_MIGRATION_HOST_SAVE_FAILED', '新聊天没有保存成功。');
       const verifyTarget = Object.freeze({ ...target, chatId: targetChatId });
       const persisted = await readTargetChat(verifyTarget, { fetchImpl });
-      if (JSON.stringify(persisted.chat) !== JSON.stringify(targetChat)
-        || persisted.header.chat_metadata?.qianqianjie?.chatId !== targetChatId
-        || (capturedPrequel !== null && persisted.header.chat_metadata?.qianqianjiePrequel !== capturedPrequel)) throw fail('QQJ_MIGRATION_HOST_VERIFY_FAILED', '新聊天读回核验失败，身份绑定未发布。');
-      if (capturedCalendar) await persistStoryCalendar(targetChatId, capturedCalendar);
+      if (!sameChatQqjData(targetChat, persisted.chat)
+        || !sameQqjChatMetadata(header.chat_metadata, persisted.header.chat_metadata, { includePrequel: true, includeFile: true })) throw fail('QQJ_MIGRATION_HOST_VERIFY_FAILED', '新聊天读回核验失败，身份绑定未发布。');
       const createdAt = now()?.toISOString?.() ?? new Date().toISOString();
       const binding = { schemaVersion: 1, kind: 'qqj-chat-identity-binding', chatId: targetChatId,
         owner: { hostChatId: targetHostChatId, characterLocator: identity.characterLocator, personaLocator: identity.personaLocator },
         state: 'ready', sourceChatId: identity.chatId, createdAt, updatedAt: createdAt };
-      await client.put(CHAT_IDENTITY_COLLECTION, `binding-${targetChatId}`, binding, 0);
+      try { await client.put(CHAT_IDENTITY_COLLECTION, `binding-${targetChatId}`, binding, 0); }
+      catch { /* The saved file and graph publish the migration; the directory is auxiliary. */ }
       let opened = false;
       try {
         const current = hostAdapter.snapshot();

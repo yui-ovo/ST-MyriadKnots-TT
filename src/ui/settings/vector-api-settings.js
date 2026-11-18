@@ -5,7 +5,7 @@ import { publicErrorMessage } from '../../public-error.js';
 // 向量配置独立保存；旧显式预设只用于回填，用户保存后复制配置并解除共享引用。
 export function createVectorApiSettings({ settings, vectorApi, vectorIndex, documentRef = globalThis.document, open = false, onToggle } = {}) {
   const { element, field, button, subDrawer } = createSettingsKit(documentRef);
-  const { drawer: node, body } = subDrawer({ title: '向量召回', id: 'qqj-settings-vector-api', open, onToggle });
+  const { drawer: node, body } = subDrawer({ title: '向量配置', id: 'qqj-settings-vector-api', open, onToggle });
   node.classList.add('qqj-vector-api-settings');
   const savedConfig = () => {
     const value = settings.get();
@@ -43,7 +43,7 @@ export function createVectorApiSettings({ settings, vectorApi, vectorIndex, docu
   const save = button('保存', 'secondary-action', () => {
     saveConfig(); result.textContent = '向量设置已保存'; result.className = 'settings-result success';
   });
-  const test = button('测试连接', 'secondary-action', async () => {
+  const test = button('测试', 'secondary-action', async () => {
     if (test.disabled) return;
     testing = true; sync(); result.textContent = '正在测试…'; result.className = 'settings-result';
     try { await vectorApi.embed(normalizeVectorConfig(draft()), ['连接测试']); result.textContent = '连接成功'; result.className = 'settings-result success'; }

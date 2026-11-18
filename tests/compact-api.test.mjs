@@ -2,11 +2,35 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCompactApiClient, normalizeApiUrl, parseJsonOutput } from '../src/compact-api-client.js';
 import { parseJsonWithSafeTrailingCommas, parseJsonWithSymbolRepair, repairJsonWithUniqueMissingObjectClose } from '../src/json-symbol-repair.js';
-import { createTaskRouter } from '../src/api-routing.js';
+import { createApiTools, createTaskRouter } from '../src/api-routing.js';
 import { buildExtractorSystemPrompt } from '../src/v3/extractor.js';
 import { BASE_PROCESSING_PROMPT, resolveProcessingPrompt, withBaseProcessingPrompt } from '../src/internal-processing-prompt.js';
+import { publicErrorMessage } from '../src/public-error.js';
 
 const config = overrides => ({ url: 'https://api.example.test', key: 'TEST_KEY', model: 'compact-model', excludeParams: [], timeoutSec: 5, stream: false, ...overrides });
+
+test('等待诊断沿原budget记录fetch正文流阶段，取消保留等待处且不采请求材料', async t => {
+  for (const phase of ['fetch', 'responseBody', 'sseBody']) await t.test(phase, async () => {
+    let started;
+    const ready = new Promise(resolve => { started = resolve; });
+    const pending = () => { started(); return new Promise(() => {}); };
+    const budget = { remaining: 3, used: 0, diagnostic: { startedAt: Date.now(), phase: 'preparing', outcome: 'running' } };
+    const controller = new AbortController();
+    const client = createCompactApiClient({ timeoutMs: () => 1000, fetchImpl: () => phase === 'fetch' ? pending()
+      : phase === 'responseBody' ? { ok: true, json: pending }
+        : { ok: true, headers: { get: () => 'text/event-stream' }, body: { getReader: () => ({ read: pending, cancel() {}, releaseLock() {} }) } } });
+    const settled = client.generateTask({ config: config({ stream: phase === 'sseBody' }), taskMessages: [{ role: 'user', content: 'PRIVATE_BODY' }], signal: controller.signal, transportBudget: budget }).catch(error => error);
+    try {
+      await ready;
+      assert.equal(budget.diagnostic.phase, phase);
+      assert.equal(budget.used, 1);
+      assert.equal(budget.diagnostic.timeoutMs, 1000);
+    } finally { controller.abort(); await settled; }
+    assert.equal(budget.diagnostic.phase, phase);
+    assert.equal(budget.diagnostic.outcome, 'cancelled');
+    assert.doesNotMatch(JSON.stringify(budget.diagnostic), /PRIVATE_BODY|TEST_KEY|https:|compact-model/u);
+  });
+});
 
 test('附加参数走宿主自定义通道，保留独立凭证、材料与 schema；排除参数最后生效', async () => {
   const bodies = [];
@@ -40,6 +64,136 @@ test('非法附加 JSON、危险对象键或试图改任务归属时在请求前
   }
   assert.equal(calls, 0);
 });
+
+test('GPT-6输出上限使用completion字段，避免原400且只发送一次', async () => {
+  let calls = 0;
+  const client = createCompactApiClient({ fetchImpl: async (_path, options) => {
+    calls += 1;
+    const body = JSON.parse(options.body);
+    if (Object.hasOwn(body, 'max_tokens')) return jsonResponse({ error: { message: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead." } }, 400);
+    if (Object.hasOwn(body, 'temperature')) return jsonResponse({ error: { message: "Unsupported parameter: 'temperature' is not supported with this reasoning mode." } }, 400);
+    assert.equal(body.max_completion_tokens, 12000);
+    return jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] });
+  } });
+  assert.deepEqual((await client.generateTask({ config: config({ model: 'gpt-6-luna' }), taskMessages: [] })).jsonData, { ok: true });
+  assert.equal(calls, 1);
+});
+
+test('输出上限按已知模型系列选择字段，旧模型与未知别名保留原字段', async t => {
+  for (const [model, field] of [
+    ['gpt-5', 'max_completion_tokens'], ['gpt-5.1-mini', 'max_completion_tokens'],
+    ['gpt-6-luna', 'max_completion_tokens'], ['openai/gpt-6-luna', 'max_completion_tokens'],
+    [' OPENAI/GPT-5.2-2026-10-01 ', 'max_completion_tokens'],
+    ['o1', 'max_completion_tokens'], ['o1-preview', 'max_completion_tokens'],
+    ['o3-mini', 'max_completion_tokens'], ['openai/o4-mini', 'max_completion_tokens'],
+    ['gpt-4o-mini', 'max_tokens'], ['glm-5.2', 'max_tokens'], ['private-model', 'max_tokens'],
+    ['gpt-50', 'max_tokens'], ['o10', 'max_tokens'],
+  ]) await t.test(model, async () => {
+    let calls = 0;
+    const client = createCompactApiClient({ fetchImpl: async (_path, options) => {
+      calls += 1;
+      const body = JSON.parse(options.body);
+      assert.equal(body.chat_completion_source, 'openai');
+      assert.deepEqual(Object.keys(body).filter(key => ['max_tokens', 'max_completion_tokens'].includes(key)), [field]);
+      assert.equal(body[field], 16000);
+      return jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] });
+    } });
+    await client.generateTask({ config: config({ model }), taskMessages: [], maxTokens: 16000 });
+    assert.equal(calls, 1);
+  });
+});
+
+test('输出上限尊重排除后的显式附加字段，普通与自定义上游合并后互斥', async t => {
+  const cases = [
+    { name: '旧模型显式completion', model: 'gpt-4o-mini', additional: { max_completion_tokens: 321 }, expected: { max_completion_tokens: 321 } },
+    { name: '新模型显式legacy', additional: { max_tokens: 654 }, expected: { max_tokens: 654 } },
+    { name: '两者显式以completion为准', additional: { max_tokens: 654, max_completion_tokens: 321 }, expected: { max_completion_tokens: 321 } },
+    { name: '显式零值', additional: { max_completion_tokens: 0 }, expected: { max_completion_tokens: 0 } },
+    { name: '显式null', additional: { max_tokens: null }, expected: { max_tokens: null } },
+    { name: '先排除completion后采用显式legacy', additional: { max_tokens: 654, max_completion_tokens: 321 }, excluded: ['max_completion_tokens'], expected: { max_tokens: 654 } },
+    { name: '先排除legacy后采用显式completion', additional: { max_tokens: 654, max_completion_tokens: 321 }, excluded: ['max_tokens'], expected: { max_completion_tokens: 321 } },
+    { name: '排除新模型默认字段', excluded: [' max_completion_tokens '], expected: {} },
+    { name: '排除旧模型默认字段', model: 'gpt-4o-mini', excluded: ['max_tokens'], expected: {} },
+    { name: '排除旧字段不影响新默认', excluded: ['max_tokens'], expected: { max_completion_tokens: 12000 } },
+    { name: '排除显式字段后使用未排除默认', additional: { max_tokens: 654 }, excluded: ['max_tokens'], expected: { max_completion_tokens: 12000 } },
+    { name: '排除两个字段', additional: { max_tokens: 654, max_completion_tokens: 321 }, excluded: ['max_tokens', 'max_completion_tokens'], expected: {} },
+  ];
+  for (const item of cases) for (const extra of [false, true]) await t.test(`${item.name}/${extra ? 'custom' : 'token only'}`, async () => {
+    let calls = 0;
+    const additional = { ...(item.additional ?? {}), ...(extra ? { seed: 42 } : {}) };
+    const client = createCompactApiClient({ fetchImpl: async (_path, options) => {
+      calls += 1;
+      const body = JSON.parse(options.body);
+      const included = JSON.parse(body.custom_include_body ?? '{}');
+      const upstream = { ...body, ...included };
+      assert.deepEqual(Object.fromEntries(Object.entries(upstream).filter(([key]) => ['max_tokens', 'max_completion_tokens'].includes(key))), item.expected);
+      for (const field of item.excluded ?? []) {
+        assert.equal(Object.hasOwn(body, field.trim()), false);
+        assert.equal(Object.hasOwn(included, field.trim()), false);
+      }
+      if (extra) { assert.equal(body.chat_completion_source, 'custom'); assert.equal(included.seed, 42); }
+      return jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] });
+    } });
+    await client.generateTask({ config: config({ model: item.model ?? 'gpt-6-luna', qqjAdditionalParams: JSON.stringify(additional), excludeParams: item.excluded ?? [] }), taskMessages: [] });
+    assert.equal(calls, 1);
+  });
+});
+
+test('推理系列省略程序默认温度，显式温度与none推理配置沿用当前参数', async t => {
+  const cases = [
+    { name: 'Luna服务默认推理', model: 'gpt-6-luna' },
+    { name: 'GPT5服务默认推理', model: 'openai/gpt-5.2' },
+    { name: 'o系列默认推理', model: 'o3-mini' },
+    { name: '显式非none推理', additional: { reasoning_effort: 'medium' } },
+    { name: 'none推理保留自动温度', additional: { reasoning_effort: 'none' }, expected: 0.2 },
+    { name: '被排除的none无效', additional: { reasoning_effort: 'none' }, excluded: ['reasoning_effort'] },
+    { name: '配置温度零值', temperature: 0, expected: 0 },
+    { name: '配置显式温度', temperature: 0.63, expected: 0.63 },
+    { name: '附加温度优先', temperature: 0.63, additional: { temperature: 0.4 }, expected: 0.4 },
+    { name: '附加温度零值', additional: { temperature: 0 }, expected: 0 },
+    { name: '附加温度null', additional: { temperature: null }, expected: null },
+    { name: '清空配置温度', temperature: '' },
+    { name: '无效配置温度', temperature: true },
+    { name: '温度排除优先', temperature: 0.63, additional: { reasoning_effort: 'none', temperature: 0.4 }, excluded: ['temperature'] },
+    { name: '旧模型保留自动温度', model: 'gpt-4o-mini', expected: 0.2 },
+    { name: '未知模型保留自动温度', model: 'private-model', expected: 0.2 },
+  ];
+  for (const item of cases) await t.test(item.name, async () => {
+    let calls = 0;
+    const client = createCompactApiClient({ fetchImpl: async (_path, options) => {
+      calls += 1;
+      const body = JSON.parse(options.body);
+      const upstream = { ...body, ...JSON.parse(body.custom_include_body ?? '{}') };
+      assert.equal(Object.hasOwn(upstream, 'temperature'), Object.hasOwn(item, 'expected'));
+      assert.equal(upstream.temperature, item.expected);
+      return jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] });
+    } });
+    await client.generateTask({ config: config({ model: item.model ?? 'gpt-6-luna', qqjTemperature: item.temperature, qqjAdditionalParams: JSON.stringify(item.additional ?? {}), excludeParams: item.excluded ?? [] }), taskMessages: [] });
+    assert.equal(calls, 1);
+  });
+});
+
+test('分析副API召回与连接测试共享输出上限兼容且各发送一次', async () => {
+  const requests = [];
+  const client = createCompactApiClient({ fetchImpl: async (path, options) => {
+    const body = JSON.parse(options.body);
+    const upstream = { ...body, ...JSON.parse(body.custom_include_body ?? '{}') };
+    requests.push({ path, upstream });
+    assert.equal(Object.hasOwn(upstream, 'max_tokens'), false);
+    return jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] });
+  } });
+  const route = source => ({ kind: 'independent', source, sourceLabel: source, config: config({ model: 'gpt-6-luna', qqjAdditionalParams: source === 'recall' ? '{"max_completion_tokens":4321}' : '' }) });
+  const router = createTaskRouter({ compactClient: client, resolver: { resolve: () => route('analysis'), resolveUtility: () => route('utility'), resolveRecall: () => route('recall') } });
+  for (const method of ['generateAnalysisTask', 'generateUtilityTask', 'generateRecallTask']) {
+    const result = await router[method]({ taskMessages: [], maxTokens: 16000 });
+    assert.equal(result.taskMetadata.transportAttempts, 1);
+  }
+  await client.testConnection({ config: config({ model: 'gpt-6-luna' }) });
+  assert.equal(requests.length, 4);
+  assert.ok(requests.every(request => request.path === '/api/backends/chat-completions/generate'));
+  assert.deepEqual(requests.map(request => request.upstream.max_completion_tokens), [16000, 16000, 4321, 12000]);
+  assert.ok(requests.every(request => !Object.hasOwn(request.upstream, 'temperature')));
+});
 const jsonResponse = (data, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => data });
 const sseResponse = (chunks, contentType = 'text/event-stream') => {
   const encoder = new TextEncoder(); let index = 0;
@@ -52,8 +206,8 @@ test('HTTP 200 provider errors are preserved safely in JSON, SSE and streaming J
       ? sseResponse([`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`])
       : { ...jsonResponse(payload), headers: { get: () => 'application/json' } } });
     await assert.rejects(client.generateTask({ config: config({ stream: mode !== 'json' }), taskMessages: [], transportBudget: { remaining: 3, used: 0 } }), error => {
-      assert.equal(error.code, 'QQJ_PROVIDER_ERROR');
-      assert.equal(error.httpStatus, 200);
+      assert.equal(error.code, 'QQJ_REQUEST_FORMAT');
+      assert.equal(error.httpStatus, undefined);
       assert.equal(error.transportAttempts, 1);
       assert.equal(error.providerError.code, 'invalid_argument');
       assert.equal(error.providerError.type, '[REDACTED]');
@@ -75,7 +229,7 @@ test('unclassified provider explanation remains available with only credentials 
     await assert.rejects(client.generateTask({ config: config(), taskMessages: [] }), error => {
       if (!suffix) {
         assert.equal(error.providerError.message, '上游错误详情已隐藏');
-        assert.match(error.message, /接口错误原文/);
+        assert.equal(error.code, 'QQJ_REQUEST_FORMAT');
       }
       assert.match(error.providerErrorDetails, /Bad Request: max_tokens=30000 exceeds endpoint allowance/);
       assert.doesNotMatch(error.providerErrorDetails, /OTHER_KEY|abc123|private.invalid|TEST_KEY/);
@@ -88,10 +242,10 @@ test('string and boolean error envelopes remain errors with safe descriptions', 
   for (const payload of [{ error: 'context length limit exceeded PRIVATE_STORY' }, { error: true, code: 'bad_request', message: 'invalid argument PRIVATE_STORY' }]) {
     const client = createCompactApiClient({ fetchImpl: async () => jsonResponse(payload) });
     await assert.rejects(client.generateTask({ config: config(), taskMessages: [] }), error => {
-      assert.equal(error.code, 'QQJ_PROVIDER_ERROR');
+      assert.equal(error.code, payload.error === true ? 'QQJ_REQUEST_FORMAT' : 'QQJ_UPSTREAM');
       assert.doesNotMatch(JSON.stringify(error.providerError), /PRIVATE_STORY/);
       assert.match(error.providerErrorDetails, /PRIVATE_STORY/);
-      assert.match(error.message, /超过限制|请求参数/);
+      assert.match(error.providerError.message, /超过限制|请求参数/);
       return true;
     });
   }
@@ -127,6 +281,102 @@ test('empty SSE diagnostics preserve reasoning/refusal flags across terminal eve
     return true;
   });
 });
+
+test('HTTP200原生错误包按明确失败原因分类，不记录推断状态或新增请求', async t => {
+  const cases = [
+    [{ message: 'Unauthorized' }, 'QQJ_AUTH'],
+    [{ message: 'Forbidden' }, 'QQJ_AUTH'],
+    [{ message: 'Too Many Requests' }, 'QQJ_RATE_LIMIT'],
+    [{ message: 'Bad Request' }, 'QQJ_REQUEST_FORMAT'],
+    [{ message: 'Not Found' }, 'QQJ_NOT_FOUND'],
+    [{ message: 'Service Unavailable' }, 'QQJ_SERVER'],
+    [{ code: 'invalid_api_key', message: 'upstream rejected credential' }, 'QQJ_AUTH'],
+    [{ status: 'RESOURCE_EXHAUSTED' }, 'QQJ_RATE_LIMIT'],
+    [{ status: 'INVALID_ARGUMENT' }, 'QQJ_REQUEST_FORMAT'],
+    [{ code: 'model_not_found' }, 'QQJ_NOT_FOUND'],
+    [{ message: 'unrecognized upstream failure' }, 'QQJ_UPSTREAM'],
+    ['unrecognized upstream failure', 'QQJ_UPSTREAM'],
+  ];
+  for (const stream of [false, true]) for (const [error, code] of cases) await t.test(`${stream ? 'stream JSON' : 'JSON'} ${JSON.stringify(error)}`, async () => {
+    let calls = 0, waits = 0;
+    const budget = { remaining: 3, used: 0, diagnostic: {} };
+    const client = createCompactApiClient({ retryWait: async () => { waits++; }, fetchImpl: async () => { calls++; return { ...jsonResponse({ error, quota_error: false }), headers: { get: () => 'application/json; charset=utf-8' } }; } });
+    await assert.rejects(client.generateTask({ config: config({ stream }), taskMessages: [], transportBudget: budget }), failure => {
+      assert.equal(failure.code, code);
+      assert.equal(Object.hasOwn(failure, 'status'), false);
+      assert.equal(Object.hasOwn(failure, 'httpStatus'), false);
+      assert.equal(budget.diagnostic.error.httpStatus, null);
+      assert.notEqual(publicErrorMessage(failure), '模型没有返回可用结果，请重试。');
+      if (code === 'QQJ_UPSTREAM') assert.equal(publicErrorMessage(failure), 'API 请求失败，上游返回了错误。');
+      return true;
+    });
+    assert.equal(calls, 1); assert.equal(waits, 0); assert.equal(budget.used, 1);
+  });
+});
+
+test('HTTP200原生错误包保留明确数字状态，真实HTTP非2xx映射和重试不变', async () => {
+  for (const [error, status, code] of [[{ status: 401 }, 401, 'QQJ_AUTH'], [{ code: 422 }, 422, 'QQJ_REQUEST_FORMAT'], [{ status: '503' }, 503, 'QQJ_SERVER']]) {
+    let calls = 0;
+    const client = createCompactApiClient({ retryWait: async () => assert.fail('200错误包不重试'), fetchImpl: async () => { calls++; return jsonResponse({ error }); } });
+    await assert.rejects(client.generateTask({ config: config(), taskMessages: [] }), failure => failure.code === code && failure.httpStatus === status && failure.status === status);
+    assert.equal(calls, 1);
+  }
+  for (const [status, code, expectedCalls] of [[401, 'QQJ_AUTH', 1], [400, 'QQJ_REQUEST_FORMAT', 1], [429, 'QQJ_RATE_LIMIT', 3], [503, 'QQJ_SERVER', 3]]) {
+    let calls = 0;
+    const client = createCompactApiClient({ retryWait: async () => {}, fetchImpl: async () => { calls++; return jsonResponse({ error: { message: 'upstream failure' } }, status); } });
+    await assert.rejects(client.generateTask({ config: config(), taskMessages: [] }), failure => failure.code === code && failure.httpStatus === status);
+    assert.equal(calls, expectedCalls);
+  }
+});
+
+test('HTTP200原生错误包优先于伪成功choices，错误详情经路由后仍不回显原始材料', async () => {
+  const body = { error: { code: 'https://private.test/secret', status: 'TEST_KEY', message: 'Unauthorized; TEST_KEY; private story body; https://private.test', raw_response: 'RAW_RESPONSE_TOKEN', tokens: 'TOKEN_DUMP' }, choices: [{ message: { content: '{"ok":true}' } }] };
+  for (const mode of ['json', 'stream-json', 'sse']) {
+    const budget = { remaining: 3, used: 0, diagnostic: {} };
+    const client = createCompactApiClient({ fetchImpl: async () => mode === 'sse' ? sseResponse(['data: '+JSON.stringify(body)+'\n\n']) : { ...jsonResponse(body), headers: { get: () => 'application/json' } } });
+    const route = () => ({ kind: 'independent', source: 'test', sourceLabel: '主配置', config: config({ stream: mode !== 'json' }) });
+    const router = createTaskRouter({ resolver: { resolve: route }, compactClient: client });
+    await assert.rejects(router.generateAnalysisTask({ taskMessages: [{ role: 'user', content: 'PRIVATE_REQUEST' }], transportBudget: budget }), error => {
+      assert.equal(error.code, 'QQJ_AUTH');
+      assert.deepEqual(error.providerError, { code: '[REDACTED]', status: '[REDACTED]', message: '上游认证或权限检查失败' });
+      assert.equal(publicErrorMessage(error), 'API 认证失败，请检查 Key 和模型权限。');
+      assert.equal(Object.hasOwn(error.taskMetadata, 'httpStatus'), false);
+      assert.doesNotMatch(JSON.stringify({ error, diagnostic: budget.diagnostic, message: error.message }), /TEST_KEY|private\.test|private story|PRIVATE_REQUEST|RAW_RESPONSE_TOKEN|TOKEN_DUMP/u);
+      return true;
+    });
+  }
+});
+
+test('HTTP200原生错误包从测试连接和模型列表入口保留认证失败', async () => {
+  for (const method of ['testConnection', 'fetchModels']) {
+    let calls = 0;
+    const client = createCompactApiClient({ fetchImpl: async () => { calls++; return jsonResponse({ error: { message: 'Unauthorized' }, quota_error: false }); } });
+    await assert.rejects(client[method]({ config: config() }), error => error.code === 'QQJ_AUTH');
+    assert.equal(calls, 1);
+  }
+});
+
+test('HTTP200成功正文中的error属于任务内容，false/null不阻断；真实空答仍报EMPTY', async () => {
+  for (const stream of [false, true]) {
+    for (const error of [undefined, false, null, '']) {
+      const client = createCompactApiClient({ fetchImpl: async () => ({ ...jsonResponse({ error, choices: [{ message: { content: '{"error":"story field","ok":true}' } }] }), headers: { get: () => 'application/json' } }) });
+      assert.deepEqual((await client.generateTask({ config: config({ stream }), taskMessages: [] })).jsonData, { error: 'story field', ok: true });
+    }
+    for (const message of [{ content: ' ' }, { content: '', reasoning_content: 'private reasoning tokens' }]) {
+      const client = createCompactApiClient({ fetchImpl: async () => ({ ...jsonResponse({ choices: [{ message }] }), headers: { get: () => 'application/json' } }) });
+      await assert.rejects(client.generateTask({ config: config({ stream }), taskMessages: [] }), error => error.code === 'QQJ_EMPTY' && !JSON.stringify(error).includes('private reasoning'));
+    }
+  }
+});
+
+test('原生错误包在SSE事件中沿同一失败分类，部分正文也不能掩盖错误', async () => {
+  for (const [error, code] of [[{ message: 'Unauthorized' }, 'QQJ_AUTH'], [{ message: 'Too Many Requests' }, 'QQJ_RATE_LIMIT'], [{ message: 'opaque failure' }, 'QQJ_UPSTREAM']]) {
+    let calls = 0;
+    const client = createCompactApiClient({ retryWait: async () => assert.fail('SSE错误不重试'), fetchImpl: async () => { calls++; return sseResponse(['data: {"choices":[{"delta":{"content":"partial"}}]}\n\n', 'data: '+JSON.stringify({ error })+'\n\n']); } });
+    await assert.rejects(client.generateTask({ config: config({ stream: true }), taskMessages: [], parseMode: 'semantic' }), failure => failure.code === code && failure.httpStatus === undefined);
+    assert.equal(calls, 1);
+  }
+});
 async function settlesSoon(promise) {
   let timer;
   try { return await Promise.race([promise.then(() => 'success', error => typeof error.code === 'string' ? error.code : error.name), new Promise(resolve => { timer = setTimeout(() => resolve('still-pending'), 150); })]); }
@@ -138,8 +388,8 @@ test('破限提示词仅用 trim 判断空白，自定义值逐字替换默认�
   assert.equal(resolveProcessingPrompt(''), BASE_PROCESSING_PROMPT);
   assert.equal(resolveProcessingPrompt(' \n\t '), BASE_PROCESSING_PROMPT);
   assert.equal(resolveProcessingPrompt(custom), custom);
-  assert.equal(withBaseProcessingPrompt('业务与机器合同', custom), `${custom}\n\n业务与机器合同`);
-  assert.equal(withBaseProcessingPrompt('业务与机器合同', ' \n '), `${BASE_PROCESSING_PROMPT}\n\n业务与机器合同`);
+  assert.equal(withBaseProcessingPrompt('业务与机器合同', custom), '业务与机器合同');
+  assert.equal(withBaseProcessingPrompt('业务与机器合同', ' \n '), '业务与机器合同');
 });
 
 test('未注入 fetch 时在请求发生时读取宿主最新实现，显式注入不受全局替换影响', async () => {
@@ -175,10 +425,10 @@ test('Base URL 规范化且独立请求只含紧凑 system/user、schema 与代�
 });
 
 test('任务可注入独立 system 文案并显式传递 maxTokens，默认任务 system 保持中性', async () => {
-  const bodies = []; const client = createCompactApiClient({ fetchImpl: async (_path, options) => { bodies.push(JSON.parse(options.body)); return jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] }); } });
+  const bodies = []; const client = createCompactApiClient({ processingPrompt:()=>'', fetchImpl: async (_path, options) => { bodies.push(JSON.parse(options.body)); return jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] }); } });
   await client.generateTask({ config: config(), systemPrompt: 'RELATION SYSTEM {{user}} {{char}}', taskMessages: [{ role: 'user', content: 'x' }], maxTokens: 16000 });
   await client.generateTask({ config: config(), taskMessages: [{ role: 'user', content: 'x' }] });
-  assert.equal(bodies[0].messages[0].content, 'RELATION SYSTEM {{user}} {{char}}'); assert.equal(bodies[0].max_tokens, 16000);
+  assert.equal(bodies[0].messages[0].content, BASE_PROCESSING_PROMPT+'\n\nRELATION SYSTEM {{user}} {{char}}'); assert.equal(bodies[0].max_tokens, 16000);
   assert.match(bodies[1].messages[0].content, /supplied task input/i);
 });
 
@@ -221,7 +471,7 @@ test('SSE [DONE] 后代理不关闭连接时仍结束请求并释放忙碌状态
   assert.deepEqual(busy, [true, false]); assert.equal(reads, 1); assert.equal(cancelled, 1);
 });
 
-test('超时会退出不响应 abort 的 fetch、JSON body 和 SSE reader，且不自动重发', async () => {
+test('零次重试时超时会退出不响应 abort 的 fetch、JSON body 和 SSE reader', async () => {
   for (const stage of ['fetch', 'json', 'sse']) {
     const busy = []; let calls = 0;
     const client = createCompactApiClient({ onBusyChange: value => busy.push(value), timeoutMs: () => 10,
@@ -231,7 +481,7 @@ test('超时会退出不响应 abort 的 fetch、JSON body 和 SSE reader，且�
         return { ok: true, status: 200, headers: { get: () => 'text/event-stream' }, body: { getReader: () => ({ read: () => new Promise(() => {}), cancel: () => new Promise(() => {}), releaseLock() {} }) } };
       },
     });
-    assert.equal(await settlesSoon(client.generateTask({ config: config({ stream: stage === 'sse' }), taskMessages: [] })), 'QQJ_TIMEOUT', stage);
+    assert.equal(await settlesSoon(client.generateTask({ config: config({ stream: stage === 'sse', qqjRetryCount: 0 }), taskMessages: [] })), 'QQJ_TIMEOUT', stage);
     assert.deepEqual(busy, [true, false], stage); assert.equal(calls, 1, 'timeout must not automatically resend');
   }
 });
@@ -272,6 +522,88 @@ test('completion JSON 兼容纯对象、完整围栏、单个说明围栏与唯�
     '以下是结果：\n```json\n{"schemaVersion":1,"patches":[]}\n```\n请查收。',
     '以下是唯一结果： {"schemaVersion":1,"patches":[]} 请查收。',
   ]) assert.deepEqual(parseJsonOutput(value), expected);
+});
+
+test('完整前置思考包装与嵌套引文唯一缺结束引号：恢复原字符串且不重发', async () => {
+  const broken = String.raw`{"placePaths":[{"path":[{"name":"地下车库"}],"evidence":[{"source":"worldbook","sourceKey":"worldbook-2","exactQuote":"\"地址\": \"首尔特别市龙山区汉南洞\"}]}]}`;
+  const expected = { placePaths: [{ path: [{ name: '地下车库' }], evidence: [{ source: 'worldbook', sourceKey: 'worldbook-2', exactQuote: '"地址": "首尔特别市龙山区汉南洞"' }] }] };
+  const repaired = parseJsonWithSymbolRepair(broken, { finishReason: 'stop' });
+  assert.deepEqual(repaired?.value, expected);
+  assert.deepEqual(repaired.operations.map(operation => operation.type), ['insert-string-closing-quote']);
+  assert.equal(repaired.text.length, broken.length + 1);
+  for (const raw of [broken, '<think>比较示例 {"placePaths":[]} 和 {"example":true}。</think>\n' + broken, '<reasoning>示例 {"ok":false}</reasoning>\n<THINK>另一示例 {"ok":true}</THINK>\n' + '```json\n' + broken + '\n```']) {
+    let calls = 0;
+    const client = createCompactApiClient({ fetchImpl: async () => { calls++; return jsonResponse({ choices: [{ finish_reason: 'stop', message: { content: raw } }] }); } });
+    assert.deepEqual((await client.generateTask({ config: config(), taskMessages: [] })).jsonData, expected);
+    assert.equal(calls, 1);
+  }
+  const literal = { text: '保留<think>{"示例":true}</think>与</reasoning>字样' };
+  assert.deepEqual(parseJsonOutput(JSON.stringify(literal)), literal);
+  assert.throws(() => parseJsonOutput('<think>前置</think>{"a":1}{"b":2}', { finishReason: 'stop' }), error => error.code === 'QQJ_COMPLETION_JSON');
+  for (const finishReason of [undefined, 'length', 'max_tokens', 'other']) assert.equal(parseJsonWithSymbolRepair(broken, { finishReason }), null);
+  assert.equal(parseJsonWithSymbolRepair(String.raw`{"a":"甲\","b":"乙\"}`, { finishReason: 'stop' }), null, '两处缺结束引号不猜');
+});
+
+test('正常结束别名：共享解析逐字恢复句中、句末及英文逗号旁的成对台词引号', () => {
+  for (const summary of ['他自我安慰"忍一忍"，随后继续前行。', '他自我安慰"忍一忍"', '他自我安慰"忍一忍",随后继续前行。', '他提醒"note: wait",随后继续前行。', '他提醒"name: 张三"']) {
+    const raw = '{"summary":"' + summary + '","facts":[]}';
+    for (const finishReason of ['stop', 'end_turn']) for (const fenced of [false, true]) {
+      const text = fenced ? '```json\n' + raw + '\n```' : raw;
+      assert.deepEqual(parseJsonOutput(text, { finishReason }), { summary, facts: [] });
+      const repaired = parseJsonWithSymbolRepair(raw, { finishReason });
+      assert.equal(repaired.value.summary, summary);
+      assert.deepEqual(repaired.operations.map(item => item.type), ['escape-string-quote', 'escape-string-quote']);
+    }
+    assert.deepEqual(parseJsonOutput('```json\n' + JSON.stringify({ summary }) + '\n```', { finishReason: 'end_turn' }), { summary });
+  }
+  const escaped = String.raw`{"summary":"他自我安慰"忍\"一\"忍",然后读到路径 C:\\tmp。😀"}`;
+  assert.equal(parseJsonOutput(escaped, { finishReason: 'end_turn' }).summary, '他自我安慰"忍"一"忍",然后读到路径 C:\\tmp。😀');
+});
+
+test('正常结束别名：非流式与SSE的end_turn共享修复且一次返回完整原文', async () => {
+  const summary = '他自我安慰"忍一忍",随后继续前行。', content = '{"summary":"' + summary + '"}';
+  for (const stream of [false, true]) {
+    let calls = 0;
+    const client = createCompactApiClient({ fetchImpl: async () => {
+      calls++;
+      return stream ? sseResponse([
+        'data: ' + JSON.stringify({ choices: [{ delta: { content: content.slice(0, 17) } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ delta: { content: content.slice(17) }, finish_reason: 'end_turn' }] }) + '\n\ndata: [DONE]\n\n',
+      ]) : jsonResponse({ choices: [{ finish_reason: 'end_turn', message: { content } }] });
+    } });
+    const result = await client.generateTask({ config: config({ stream }), taskMessages: [] });
+    assert.deepEqual(result.jsonData, { summary });
+    assert.equal(result.taskMetadata.finishReason, 'stop');
+    assert.equal(calls, 1);
+  }
+});
+
+test('字面引号兼容：英寸单枚引号保基线文本，对象与数组的真实闭引号不被吞掉', () => {
+  const summary = '这根棒长6"。';
+  for (const finishReason of ['stop', 'end_turn']) {
+    assert.deepEqual(parseJsonOutput('{"summary":"这根棒长6"。","people":[]}', { finishReason }), { summary, people: [] });
+    assert.deepEqual(parseJsonOutput('{"notes":["这根棒长6"。","下一项"]}', { finishReason }), { notes: [summary, '下一项'] });
+    assert.deepEqual(parseJsonOutput('{"summary":"这根棒长6"。"}', { finishReason }), { summary });
+    assert.deepEqual(parseJsonOutput('{"summary":"这根棒长6"。",}', { finishReason }), { summary });
+    assert.deepEqual(parseJsonOutput('{"notes":["这根棒长6"。",]}', { finishReason }), { notes: [summary] });
+    assert.deepEqual(parseJsonOutput('{"notes":["这根棒长6"。",true,"这根棒长6"。",-12.5e-2,"这根棒长6"。"]}', { finishReason }), { notes: [summary, true, summary, -0.125, summary] });
+    assert.deepEqual(parseJsonOutput('{"notes":["他说"好",then leaves。","下一项"]}', { finishReason }), { notes: ['他说"好",then leaves。', '下一项'] });
+  }
+});
+
+test('正常结束别名：缺结束证据和结构歧义不启动台词修复，真正截断仍拒收', () => {
+  const raw = '{"summary":"他自我安慰"忍一忍""}';
+  for (const finishReason of [undefined, '', 'other', 'unknown', 'content_filter', 'refusal', 'tool_calls', 'function_call', 'length', 'max_tokens']) {
+    assert.equal(parseJsonWithSymbolRepair(raw, { finishReason }), null);
+    assert.throws(() => parseJsonOutput(raw, { finishReason }), error => /^QQJ_(?:COMPLETION_JSON|OUTPUT_TRUNCATED)$/u.test(error.code));
+  }
+  for (const value of ['{"summary":"一段" "facts":[]}', '{"summary":"一段""facts":[]}', '{"summary":"一段"facts:[],"next":"尾"}', '["a""b"]', '{"summary":"他说"忍一忍"', '{"summary":"一段","summary":"另一段",}']) {
+    assert.equal(parseJsonWithSymbolRepair(value, { finishReason: 'end_turn' }), null, value);
+    assert.throws(() => parseJsonOutput(value, { finishReason: 'end_turn' }), error => /^QQJ_(?:COMPLETION_JSON|OUTPUT_TRUNCATED)$/u.test(error.code), value);
+  }
+  assert.throws(() => parseJsonOutput('{"summary":"甲"}\n{"summary":"乙"}', { finishReason: 'end_turn' }), error => error.code === 'QQJ_COMPLETION_JSON');
+  assert.throws(() => parseJsonOutput('```json\n{"summary":"甲"}', { finishReason: 'end_turn' }), error => error.code === 'QQJ_OUTPUT_TRUNCATED');
+  assert.equal(parseJsonWithSymbolRepair('{"summary":"' + '说"话"。'.repeat(33) + '"}', { finishReason: 'end_turn' }), null, '保留64次修复上限');
 });
 
 test('completion JSON 拒绝多对象、顶层数组和普通乱码；未闭合对象/围栏判截断', () => {
@@ -423,33 +755,33 @@ test('同一任务的运输重试复用启动时提示词快照', async () => {
   await client.generateTask({ config: config(), systemPrompt: promptSnapshot, taskMessages: [{ role: 'user', content: '{}' }] });
   assert.equal(selected, '摘要指导第二版');
   assert.equal(bodies.length, 2);
-  assert.deepEqual(bodies.map(body => body.messages[0].content), [promptSnapshot, promptSnapshot]);
+  assert.deepEqual(bodies.map(body => body.messages[0].content), [BASE_PROCESSING_PROMPT+'\n\n'+promptSnapshot, BASE_PROCESSING_PROMPT+'\n\n'+promptSnapshot]);
   assert.deepEqual(bodies.map(body => body.messages[0].content.split(BASE_PROCESSING_PROMPT).length - 1), [1, 1]);
   assert.doesNotMatch(bodies[1].messages[0].content, /摘要指导第二版/);
 });
 
 test('统一 request 忙灯覆盖并发、运输重试、失败和取消，最后一个请求结束才熄灭', async () => {
-  const busy = [], resolvers = [];
+  const busy = [], resolvers = new Map();let startedResolve;const started=new Promise(resolve=>{startedResolve=resolve;});
   const concurrent = createCompactApiClient({
     onBusyChange: value => busy.push(value),
-    fetchImpl: async () => new Promise(resolve => resolvers.push(resolve)),
+    fetchImpl: async (_path,options) => new Promise(resolve => {resolvers.set(JSON.parse(options.body).messages[1].content,resolve);if(resolvers.size===2)startedResolve();}),
   });
-  const first = concurrent.generateTask({ config: config(), taskMessages: [] });
-  const second = concurrent.generateTask({ config: config(), taskMessages: [] });
-  await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(busy, [true]);
-  resolvers[0](jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] })); await first; assert.deepEqual(busy, [true]);
-  resolvers[1](jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] })); await second; assert.deepEqual(busy, [true, false]);
+  const first = concurrent.generateTask({ config: config(), taskMessages: [{role:'user',content:'first'}] });
+  const second = concurrent.generateTask({ config: config(), taskMessages: [{role:'user',content:'second'}] });
+  await started; assert.deepEqual(busy, [true]);
+  resolvers.get('first')(jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] })); await first; assert.deepEqual(busy, [true]);
+  resolvers.get('second')(jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] })); await second; assert.deepEqual(busy, [true, false]);
 
-  const streamBusy = []; let releaseStream, reads = 0; const encoder = new TextEncoder();
+  const streamBusy = []; let readingResolve;const reading=new Promise(resolve=>{readingResolve=resolve;});let releaseStream, reads = 0; const encoder = new TextEncoder();
   const streaming = createCompactApiClient({
     onBusyChange: value => streamBusy.push(value),
     fetchImpl: async () => ({ ok: true, status: 200, body: { getReader: () => ({ read: async () => {
-      if (reads++ === 0) await new Promise(resolve => { releaseStream = resolve; });
+      if (reads++ === 0) await new Promise(resolve => { releaseStream = resolve;readingResolve(); });
       return reads === 1 ? { done: false, value: encoder.encode('data: {"choices":[{"delta":{"content":"{\\"ok\\":true}"},"finish_reason":"stop"}]}\n\n') } : { done: true };
     } }) } }),
   });
   const streamResult = streaming.generateTask({ config: config({ stream: true }), taskMessages: [] });
-  await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(streamBusy, [true], '收到响应头但 SSE 正文未完成时仍须保持忙灯');
+  await reading; assert.deepEqual(streamBusy, [true], '收到响应头但 SSE 正文未完成时仍须保持忙灯');
   releaseStream(); assert.deepEqual((await streamResult).jsonData, { ok: true }); assert.deepEqual(streamBusy, [true, false]);
 
   const retryBusy = []; let attempts = 0;
@@ -512,7 +844,7 @@ test('模型列表与测试连接走安全代理；短测试不含聊天、人�
   assert.equal(requests[0].path, '/api/backends/chat-completions/status'); const testBody = requests[1].body; assert.equal(testBody.max_tokens, 12000); assert.equal(testBody.temperature, 0); assert.equal(testBody.stream, false);
   assert.doesNotMatch(JSON.stringify(testBody.messages), /人物甲|档案|worldbook|greeting|聊天正文/i); assert.equal(testBody.messages.length, 2); assert.equal(Object.hasOwn(testBody, 'json_schema'), false);
   assert.match(testBody.messages[0].content, /plain-text connection check/); assert.equal(testBody.messages[1].content, 'Reply with OK.');
-  assert.equal(testBody.messages[0].content.includes(BASE_PROCESSING_PROMPT), false, '连接测试不得携带内容处理层');
+  assert.equal(testBody.messages[0].content.split(BASE_PROCESSING_PROMPT).length - 1, 1, '连接测试同样使用全局默认处理层一次');
   await client.testConnection({ config: config({ excludeParams: ['temperature'] }) });
   assert.equal(Object.hasOwn(requests[2].body, 'temperature'), false, '连接测试仍须沿用现有排除参数合同');
   await client.testConnection({ config: config({ qqjTemperature: 0.63 }) });
@@ -557,4 +889,100 @@ test('测试连接沿用流式配置并拼接纯文本，空回、截断和认�
   await assert.rejects(truncated.testConnection({ config: config() }), error => error.code === 'QQJ_OUTPUT_TRUNCATED' && error.finishReason === 'length');
   const unauthorized = createCompactApiClient({ fetchImpl: async () => jsonResponse({}, 401) });
   await assert.rejects(unauthorized.testConnection({ config: config() }), error => error.code === 'QQJ_AUTH');
+});
+
+
+test('全局破限文本连接测试取最新值且保留纯文本确认，不影响模型列表', async () => {
+  let processing = '连接共用第一版';
+  const sent = [];
+  const client = createCompactApiClient({ processingPrompt:()=>processing, fetchImpl: async (_path, options) => {
+    const body = JSON.parse(options.body); sent.push(body);
+    return _path.endsWith('/status') ? jsonResponse({ data: [{ id: 'test-model' }] }) : jsonResponse({ choices: [{ message: { content: 'OK' }, finish_reason: 'stop' }] });
+  } });
+  const tools = createApiTools({ resolver: { resolve: () => ({ kind: 'independent', config: config() }) }, compactClient: client, processingPrompt: () => processing });
+  for (const value of ['连接共用第一版', '连接共用第二版', '  \n ']) {
+    processing = value;
+    assert.equal((await tools.testConnection()).ok, true);
+    const messages = sent.at(-1).messages;
+    const prefix = resolveProcessingPrompt(value).trim();
+    assert.equal(messages[0].content.split(prefix).length - 1, 1);
+    assert.ok(messages[0].content.startsWith(prefix));
+    assert.match(messages[0].content, /plain-text connection check/);
+    assert.deepEqual(messages.slice(1), [{ role: 'user', content: 'Reply with OK.' }]);
+  }
+  assert.deepEqual(await tools.fetchModels(), ['test-model']);
+  assert.equal(Object.hasOwn(sent.at(-1), 'messages'), false);
+});
+
+
+test('每连接额外重试次数覆盖网络、超时、空输出和客户端格式，共同限制真实请求', async () => {
+  for (const retryCount of [0, 1, 4]) for (const kind of ['network', 'timeout', 'empty', 'format']) {
+    let calls = 0;
+    const client = createCompactApiClient({ retryWait: async () => {}, timeoutMs: () => 2, fetchImpl: async (_path, options) => {
+      calls++;
+      if (kind === 'network') throw new TypeError('offline');
+      if (kind === 'timeout') return await new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true }));
+      return jsonResponse({ choices: [{ message: { content: kind === 'empty' ? '' : '不是JSON' } }] });
+    } });
+    await assert.rejects(client.generateTask({ config: config({ qqjRetryCount: retryCount }), taskMessages: [] }));
+    assert.equal(calls, retryCount + 1, `${retryCount}/${kind}`);
+  }
+});
+
+test('网络与客户端格式失败共享次数，成功后下一次正常请求另起预算', async () => {
+  let calls = 0;
+  const client = createCompactApiClient({ retryWait: async () => {}, fetchImpl: async () => {
+    calls++;
+    if (calls === 1) return jsonResponse({}, 503);
+    return jsonResponse({ choices: [{ message: { content: calls === 2 ? '不是JSON' : calls === 3 ? '' : '{"ok":true}' } }] });
+  } });
+  const request = { config: config({ qqjRetryCount: 3 }), taskMessages: [] };
+  const result = await client.generateTask(request);
+  assert.deepEqual(result.jsonData, { ok: true }); assert.equal(calls, 4); assert.equal(result.taskMetadata.transportAttempts, 4);
+  await client.generateTask(request); assert.equal(calls, 5);
+});
+
+test('不可重试HTTP与主动取消不因高重试次数重复请求，工具也尊重零次', async () => {
+  for (const status of [400, 401, 403, 404, 422]) {
+    let calls = 0; const client = createCompactApiClient({ retryWait: async () => {}, fetchImpl: async () => { calls++; return jsonResponse({}, status); } });
+    await assert.rejects(client.generateTask({ config: config({ qqjRetryCount: 4 }), taskMessages: [] })); assert.equal(calls, 1);
+  }
+  const controller = new AbortController(); let calls = 0;
+  const client = createCompactApiClient({ retryWait: async () => controller.abort(), fetchImpl: async () => { calls++; throw new TypeError('offline'); } });
+  await assert.rejects(client.generateTask({ config: config({ qqjRetryCount: 4 }), taskMessages: [], signal: controller.signal }), { name: 'AbortError' }); assert.equal(calls, 1);
+  const check = createCompactApiClient({ retryWait: async () => {}, fetchImpl: async () => { calls++; return jsonResponse({}, 503); } });
+  const before = calls; await assert.rejects(check.testConnection({ config: config({ qqjRetryCount: 0 }) })); assert.equal(calls - before, 1);
+});
+
+test('运行保存解耦：已知HTTP失败正文挂起保原分类且不重派，主动取消仍AbortError', async t => {
+  for (const status of [400, 401, 403]) for (const stage of ['read', 'cancel']) await t.test(`${status}/${stage}`, async () => {
+    let calls = 0, cancelled = 0, released = 0;
+    const busy = [];
+    const client = createCompactApiClient({ timeoutMs: () => 8, retryWait: async () => {}, onBusyChange: value => busy.push(value), fetchImpl: async () => {
+      calls++;
+      return { ok: false, status, body: { getReader: () => ({
+        read: () => stage === 'read' ? new Promise(() => {}) : Promise.resolve({ done: false, value: new TextEncoder().encode('x'.repeat(5000)) }),
+        cancel: () => { cancelled++; return new Promise(() => {}); }, releaseLock: () => { released++; },
+      }) } };
+    } });
+    await assert.rejects(client.generateTask({ config: config({ qqjRetryCount: 2 }), taskMessages: [] }), error => error.code === (status === 400 ? 'QQJ_REQUEST_FORMAT' : 'QQJ_AUTH') && error.httpStatus === status);
+    assert.equal(calls, 1); assert.equal(cancelled, 1); assert.equal(released, 1); assert.deepEqual(busy, [true, false]);
+  });
+  const controller = new AbortController(); let start; const started = new Promise(resolve => { start = resolve; });
+  const client = createCompactApiClient({ fetchImpl: async () => ({ ok: false, status: 401, body: { getReader: () => ({ read: () => { start(); return new Promise(() => {}); }, cancel() {}, releaseLock() {} }) } }) });
+  const pending = client.generateTask({ config: config(), taskMessages: [], signal: controller.signal }); await started; controller.abort();
+  await assert.rejects(pending, { name: 'AbortError' });
+});
+
+test('运行保存解耦：重试释放弃用HTTP正文，默认backoff结束清abort监听', async () => {
+  const controller = new AbortController(), listeners = new Set();
+  const add = controller.signal.addEventListener.bind(controller.signal), remove = controller.signal.removeEventListener.bind(controller.signal);
+  controller.signal.addEventListener = (type, listener, options) => { if (type === 'abort') listeners.add(listener); return add(type, listener, options); };
+  controller.signal.removeEventListener = (type, listener, options) => { if (type === 'abort') listeners.delete(listener); return remove(type, listener, options); };
+  let calls = 0, cancelled = 0;
+  const client = createCompactApiClient({ timeoutMs: () => 100, fetchImpl: async () => ++calls === 1
+    ? { ok: false, status: 503, body: { cancel: () => { cancelled++; return new Promise(() => {}); } } }
+    : jsonResponse({ choices: [{ message: { content: '{"ok":true}' } }] }) });
+  assert.deepEqual((await client.generateTask({ config: config({ qqjRetryCount: 1 }), taskMessages: [], signal: controller.signal })).jsonData, { ok: true });
+  assert.equal(calls, 2); assert.equal(cancelled, 1); assert.equal(listeners.size, 0);
 });

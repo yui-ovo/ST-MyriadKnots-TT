@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createVectorApiClient, normalizeVectorConfig, resolveVectorConfig, VECTOR_DEFAULT_URL, VECTOR_DEFAULT_MODEL } from '../src/vector-api.js';
+import { createVectorApiClient, normalizeVectorConfig, resolveVectorConfig, vectorRequestBatchSize, VECTOR_DEFAULT_URL, VECTOR_DEFAULT_MODEL } from '../src/vector-api.js';
 import { createVectorIndex, rawSourceChunks, VECTOR_INDEX_ID, VECTOR_SHARD_PREFIX } from '../src/v3/vector-index.js';
 import { createVectorAutoUpdater } from '../src/v3/vector-auto-update.js';
-import { projectVectorSources, rawWitnessValid, summaryCandidateText, summaryWitnessValid } from '../src/v3/vector-source.js';
+import { createRawSourceLookup, projectVectorSources, rawWitnessValid, summaryCandidateText, summaryWitnessValid } from '../src/v3/vector-source.js';
 import { readVectorSource } from '../src/v3/vector-source-reader.js';
 import { projectRecallSource, selectRecallMemories } from '../src/v3/recall-source.js';
 import { selectRecallWithLlm } from '../src/v3/recall-llm-selector.js';
-import { addSemanticHistory, buildRecallHistoryCandidatePool, historySelectionContext, mergeSemanticHistoryPool } from '../src/v3/recall-selector.js';
+import { addSemanticHistory, buildRecallHistoryCandidatePool, buildRecallQueryContext, historySelectionContext, mergeSemanticHistoryPool } from '../src/v3/recall-selector.js';
 import { createSettingsStore } from '../src/settings.js';
 import { classifyStorageRecords } from '../src/storage-management.js';
 import { sha256 } from '../src/identity.js';
@@ -17,6 +17,66 @@ import { projectPrivateRecallDiagnostic } from '../src/private-recall-diagnostic
 const hash = async text => `sha256:${await sha256(text)}`;
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const config = { url: 'https://vector.invalid/v1', model: 'mock-embedding', key: 'test-key', dimensions: null };
+test('向量分支逐包保存768维分片、保留四片源读取且最后发布manifest', async () => {
+  const count = 12000, graph = await branchVectorFixture('batch-vector-source', 'batch-vector-generation', count);
+  const projection = await projectVectorSources(selectRecallMemories(graph).activeMemories, graph.floors, { includeSummaries: false });
+  const source = { status: 'ready', chatId: graph.root.chatId, narrativeGeneration: graph.root.narrativeGeneration, rawSources: projection.rawSources };
+  const backend = vectorBackend(); let embeddings = 0;
+  const api = { embed: async (_config, texts) => { embeddings++; return texts.map(() => Array.from({ length: 768 }, (_, i) => i === 0 ? 1 : 0)); } };
+  // Build one real cache row group, then prepare an existing-cache fixture without another full embedding task.
+  const seedSource = { ...source, rawSources: source.rawSources.slice(0, 16) };
+  const initial = createVectorIndex({ client: backend.client, api, configProvider: () => config, identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => seedSource });
+  assert.equal((await initial.build()).status, 'ready'); const beforeEmbeddings = embeddings;
+  const seedManifest = backend.records.get(`chat-${source.chatId}/${VECTOR_INDEX_ID}`).data;
+  const vector = backend.records.get(`chat-${source.chatId}/${seedManifest.shardIds[0]}`).data.rows[0].vector;
+  const shardIds = []; let currentRows = [];
+  for (const chunk of rawSourceChunks(source)) {
+    currentRows.push({ witness: { ...chunk.witness, textFingerprint: await hash(chunk.text) }, vector });
+    if (currentRows.length === 16) {
+      const id = VECTOR_SHARD_PREFIX + (await sha256(`persisted-fixture-${shardIds.length}`)).slice(0, 40);
+      backend.records.set(`chat-${source.chatId}/${id}`, { revision: 1, data: { schemaVersion: 1, recordType: 'vectorCache', chatId: source.chatId, narrativeGeneration: source.narrativeGeneration, modelKey: seedManifest.modelKey, rows: currentRows } });
+      shardIds.push(id); currentRows = [];
+    }
+  }
+  assert.equal(currentRows.length, 0);
+  const sourceManifest = { ...seedManifest, shardIds, chunkCount: count };
+  backend.records.set(`chat-${source.chatId}/${VECTOR_INDEX_ID}`, { revision: 1, data: sourceManifest });
+  console.log(JSON.stringify({ vectorFixtureSourceReady: { shards: shardIds.length, rows: count, dimensions: 768 } }));
+  let active = 0, maxActive = 0, packets = 0, sourceReadMax = 0; const events = [], progress = [];
+  const targetId = 'batch-vector-target';
+  const client = createBackendClient({ fetchImpl: async (url, options = {}) => {
+    const path = url.split('/v1/')[1].split('/').map(decodeURIComponent), body = options.body ? JSON.parse(options.body) : {};
+    try {
+      if (path[0] === 'health') return Response.json({ ok: true, api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true, recordBatchRead: true, recordBatchWrite: true } });
+      const collection = path[2], key = path[3];
+      if (path[0] === 'record-batch' && options.method === 'POST') {
+        if (collection === `chat-${source.chatId}`) sourceReadMax = Math.max(sourceReadMax, body.recordIds.length);
+        return Response.json(await Promise.all(body.recordIds.map(async recordId => {
+          try { return { recordId, status: 200, envelope: await backend.client.get(collection, recordId) }; }
+          catch (error) { return { recordId, status: error.status, error: 'not_found', message: 'Record not found' }; }
+        })));
+      }
+      if (path[0] === 'record-batch') {
+        packets++; active++; maxActive = Math.max(maxActive, active);
+        try { assert.ok(body.records.length <= 64); assert.ok(Buffer.byteLength(options.body) <= 1048576);
+          const saved = []; for (const item of body.records) saved.push({ recordId: item.recordId, status: 200, envelope: await backend.client.put(collection, item.recordId, item.data, 0) });
+          events.push('batch'); return Response.json(saved);
+        } finally { active--; }
+      }
+      if (options.method === 'PUT') { if (key === VECTOR_INDEX_ID) events.push('manifest'); return Response.json(await backend.client.put(collection, key, body.data, body.expectedRevision)); }
+      return Response.json(await backend.client.get(collection, key));
+    } catch (error) { return Response.json({}, { status: error.status ?? 500 }); }
+  } });
+  await client.health();
+  const index = createVectorIndex({ client, api, configProvider: () => config, identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => source });
+  const copied = await index.copyPrefix({ chatId: source.chatId }, { chatId: targetId }, 'target-generation', graph, { onProgress: value => progress.push(value) });
+  assert.equal(copied.length, sourceManifest.shardIds.length); assert.equal(maxActive, 1); assert.ok(packets > 0); assert.ok(sourceReadMax <= 4); assert.equal(embeddings, beforeEmbeddings);
+  const manifest = backend.records.get(`chat-${targetId}/${VECTOR_INDEX_ID}`).data;
+  assert.equal(manifest.chunkCount, count); assert.equal(manifest.dimensions, 768); assert.equal(events.at(-1), 'manifest');
+  assert.ok(progress.some(value => value.completed === copied.length && value.total === copied.length));
+  for (let i = 0; i < copied.length; i++) assert.deepEqual(backend.records.get(`chat-${targetId}/${copied[i]}`).data.rows, backend.records.get(`chat-${source.chatId}/${sourceManifest.shardIds[i]}`).data.rows);
+  console.log(JSON.stringify({ vectorBatchFixture: { shards: copied.length, rows: count, dimensions: 768, packets, maxInflightBatch: maxActive, sourceReadMax, extraEmbeddingCalls: embeddings - beforeEmbeddings } }));
+});
 const vectors = texts => texts.map(text => text.includes('苹果') ? [1, 0] : [0, 1]);
 async function sourceFixture() {
   const floorMemories = Array.from({ length: 8 }, (_, i) => ({
@@ -29,8 +89,8 @@ async function sourceFixture() {
     rawSources: [{ floorId: 'floor-1', assistantSeq: 1, floorMemoryId: 'memory-1', memoryFloorId: 'floor-1', memoryAssistantSeq: 1, canonicalContent, fingerprint: await hash(canonicalContent) }],
   };
 }
-function harness(source, { api = { embed: async (_config, texts) => vectors(texts) } } = {}) {
-  const records = new Map(), calls = []; let current = source, route = config;
+function harness(source, { api = { embed: async (_config, texts) => vectors(texts) }, isEnabled = () => true } = {}) {
+  const records = new Map(), calls = []; let current = source, route = config, identity = { chatId: source.chatId };
   const client = { get: async (_collection, id) => {
     if (!records.has(id)) throw Object.assign(new Error('not_found'), { status: 404 });
     const { recordId: _recordId, ...envelope } = records.get(id);
@@ -40,9 +100,98 @@ function harness(source, { api = { embed: async (_config, texts) => vectors(text
       assert.equal(revision, records.get(id)?.revision ?? 0);
       const record = { recordId: id, revision: revision + 1, data: structuredClone(data) }; records.set(id, record); calls.push({ collection, id }); return record;
     } };
-  const index = createVectorIndex({ client, api, configProvider: () => route, identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => current });
-  return { index, records, calls, client, setSource: value => { current = value; }, setConfig: value => { route = value; } };
+  const index = createVectorIndex({ client, api, configProvider: () => route, identityProvider: () => identity, sourceProvider: async () => current, isEnabled });
+  return { index, records, calls, client, setSource: value => { current = value; }, setConfig: value => { route = value; }, setIdentity: value => { identity = value; } };
 }
+
+test('向量查询文本在6000字符内逐字保留，长上下文保留完整本轮输入', async t => {
+  const latest = `本轮苹果问题:${'新'.repeat(3900)}本轮问题结束。`;
+  const longContext = length => buildRecallQueryContext({ coreChat: [
+    { is_user: true, mes: '旧'.repeat(length) },
+    { is_user: false, mes: '邻'.repeat(length) },
+    { is_user: true, mes: latest },
+  ] });
+  const cases = [
+    { name: '短查询', context: { text: '用户：苹果  原文\nAI：背景', latestUserText: '不能替换短查询' }, expected: '用户：苹果  原文\nAI：背景' },
+    { name: '恰好6000字符', context: { text: '界'.repeat(6000), latestUserText: '不能替换边界查询' }, expected: '界'.repeat(6000) },
+    { name: '本轮输入全部被旧截断丢弃', context: longContext(4000) },
+    { name: '本轮输入尾部被旧截断丢弃', context: longContext(2000) },
+    { name: '背景裁剪不拆开emoji', context: { text: '旧'.repeat(7000), latestUserText: latest, backgroundText: `${'😀'.repeat(3999)}邻` } },
+    { name: '没有独立本轮字段的旧调用', context: { text: '旧'.repeat(7000) }, expected: '旧'.repeat(6000) },
+  ];
+  for (const { name, context, expected } of cases) await t.test(name, async () => {
+    const requests = [];
+    const api = createVectorApiClient({ fetchImpl: async (_url, options) => {
+      const { input } = JSON.parse(options.body);
+      requests.push(input);
+      return Response.json({ data: input.map((_, index) => ({ index, embedding: [1, 0] })) });
+    } });
+    const source = await sourceFixture(), h = harness(source, { api });
+    assert.equal((await h.index.build()).status, 'ready');
+    requests.length = 0;
+    const recordsBefore = structuredClone([...h.records]);
+    const result = await h.index.query({ source, queryContext: context });
+    assert.equal(result.diagnostic.status, 'ready');
+    assert.equal(requests.length, 1, '一次查询只发原有的一次embedding请求');
+    assert.equal(requests[0].length, 1, '不拆成多个查询');
+    const [text] = requests[0];
+    assert.ok(text.length <= 6000);
+    assert.ok(text.isWellFormed(), '实际embedding输入不含裁剪产生的孤立代理项');
+    if (expected !== undefined) assert.equal(text, expected);
+    else {
+      assert.equal(context.latestUserText, latest);
+      assert.ok(text.includes(latest), '实际embedding输入保留完整本轮问题');
+      assert.ok(text.includes('邻'), '剩余预算仍携带邻近背景');
+    }
+    assert.deepEqual([...h.records], recordsBefore, '查询不写入或重建索引');
+  });
+});
+
+test('已读manifest只服务索引读取，查询回执仍独立保留', async () => {
+  const source = await sourceFixture(), h = harness(source);
+  await h.index.query({ source, queryContext: { text: '苹果' } });
+  const receipt = h.index.getState().query;
+  assert.equal(h.index.getState().indexAvailability, undefined, '索引提示不再从查询暖缓存投影');
+  await h.index.readIndexStatus({ chatId: source.chatId, narrativeGeneration: source.narrativeGeneration });
+  assert.equal(h.index.getState().query, receipt, '单manifest读取不改写已完成的查询回执');
+});
+
+test('显式目标索引状态只读取当前manifest并按真实chunkCount返回', async () => {
+  const chatId = 'direct-count-chat', narrativeGeneration = 'generation-current';
+  const route = { ...config }, records = new Map(), gets = [], sourceCalls = [], embeds = [], puts = [];
+  let enabled = true, identityReads = 0, readFailure = null;
+  const index = createVectorIndex({
+    client: { async get(collection, id) { gets.push({ collection, id }); if (readFailure) throw readFailure; if (!records.has(id)) throw Object.assign(new Error('not_found'), { status: 404 }); return structuredClone(records.get(id)); },
+      async put(...args) { puts.push(args); } },
+    api: { async embed(...args) { embeds.push(args); return []; } }, configProvider: () => route,
+    sourceProvider: async () => { sourceCalls.push(true); throw new Error('readIndexStatus must not project source'); },
+    identityProvider: () => { identityReads += 1; throw new Error('readIndexStatus must not read session identity'); }, isEnabled: () => enabled,
+  });
+  assert.deepEqual(await index.readIndexStatus({ chatId, narrativeGeneration }), { status: 'ready', chunkCount: 0 });
+  assert.deepEqual(gets, [{ collection: `chat-${chatId}`, id: VECTOR_INDEX_ID }]);
+  assert.equal(identityReads, 0); assert.equal(sourceCalls.length, 0); assert.equal(embeds.length, 0); assert.equal(puts.length, 0);
+
+  const modelKey = await hash(JSON.stringify([route.url, route.model, route.dimensions]));
+  const manifest = count => ({ recordId: VECTOR_INDEX_ID, revision: 1, data: { schemaVersion: 1, recordType: 'vectorCache', chatId,
+    narrativeGeneration, modelKey, dimensions: 2, shardIds: [], chunkCount: count } });
+  records.set(VECTOR_INDEX_ID, manifest(0));
+  assert.deepEqual(await index.readIndexStatus({ chatId, narrativeGeneration }), { status: 'ready', chunkCount: 0 }, '合法空manifest仍是0');
+  records.set(VECTOR_INDEX_ID, manifest(7));
+  assert.deepEqual(await index.readIndexStatus({ chatId, narrativeGeneration }), { status: 'ready', chunkCount: 7 });
+  records.set(VECTOR_INDEX_ID, { ...manifest(7), data: { ...manifest(7).data, chatId: 'other-chat' } });
+  await assert.rejects(index.readIndexStatus({ chatId, narrativeGeneration }), { code: 'VECTOR_CACHE_OWNER_MISMATCH' }, 'manifest归属冲突不能误报为零');
+  records.set(VECTOR_INDEX_ID, manifest(7));
+  assert.deepEqual(await index.readIndexStatus({ chatId, narrativeGeneration: 'old-generation' }), { status: 'ready', chunkCount: 0 }, '旧代际索引不计入当前聊天');
+  route.model = 'changed-model';
+  assert.deepEqual(await index.readIndexStatus({ chatId, narrativeGeneration }), { status: 'ready', chunkCount: 0 }, '旧配置索引不计入当前聊天');
+  records.set(VECTOR_INDEX_ID, { recordId: VECTOR_INDEX_ID, revision: 2, data: { schemaVersion: 1, recordType: 'unexpected' } });
+  await assert.rejects(index.readIndexStatus({ chatId, narrativeGeneration }), { code: 'VECTOR_CACHE_INVALID' }, '损坏manifest不得伪报为0');
+  readFailure = Object.assign(new Error('backend failure'), { code: 'BACKEND_UNAVAILABLE' });
+  await assert.rejects(index.readIndexStatus({ chatId, narrativeGeneration }), { code: 'BACKEND_UNAVAILABLE' }, '真实读取失败继续明确失败');
+  enabled = false; const before = gets.length;
+  assert.deepEqual(await index.readIndexStatus({ chatId, narrativeGeneration }), { status: 'disabled' });
+  assert.equal(gets.length, before, '向量关闭时不读取manifest');
+});
 
 async function rawFloor(source, seq, content = `第${seq}楼的原文苹果内容。`) {
   return { floorId: `floor-${seq}`, assistantSeq: seq, floorMemoryId: `memory-${seq}`, memoryFloorId: `floor-${seq}`,
@@ -168,6 +317,37 @@ test('向量原文reader逐次轻读root并仅借用完全匹配的已验证来�
   assert.deepEqual(cold.sourceReadAttempts, { lightweightRootReads: 1, reachableReads: 1, exitPoint: 'ready' });
   assert.equal(rootReads, 3, '冷fallback计入显式root读和原readReachable内部root读');
   assert.equal(reachableReads, 1, 'root版本不匹配只触发既有完整校验回退');
+});
+
+test('向量root等待读取结束后取最新已验证图，启动期间完成加载不重复读全图', async () => {
+  const reachable = await vectorReachableFixture();
+  let current = null, release, reachableReads = 0, snapshotReads = 0;
+  const root = new Promise(resolve => { release = resolve; });
+  const store = { readRoot: () => root, readReachable: async () => { reachableReads++; return reachable; } };
+  const pending = readVectorSource({ store, targetIdentity: { chatId: 'chat' }, getReachable: () => { snapshotReads++; return current; } });
+  assert.equal(snapshotReads, 0);
+  current = reachable;
+  release({ status: 'ready', data: reachable.root, revision: reachable.rootRevision });
+  const result = await pending;
+  assert.equal(result.status, 'ready');
+  assert.equal(snapshotReads, 1);
+  assert.equal(reachableReads, 0);
+  assert.equal(result.sourceReadAttempts.exitPoint, 'validatedSnapshot');
+  const selected = selectRecallMemories(reachable);
+  assert.deepEqual(result.rawSources, (await projectVectorSources(selected.activeMemories, selected.floors, { includeSummaries: false })).rawSources);
+});
+
+test('向量延后取图仍逐项核验root版本与目标，失配照常读取正式图', async () => {
+  const reachable = await vectorReachableFixture();
+  for (const mutate of [value => { value.root.chatId = 'other-chat'; }, value => { value.rootRevision++; }, value => { value.root.headCheckpointId = 'changed'; }, value => { value.root.narrativeGeneration++; }, value => { value.root.sourceSnapshotFingerprint = 'changed'; }]) {
+    const changed = structuredClone(reachable); mutate(changed);
+    let reads = 0;
+    const result = await readVectorSource({ targetIdentity: { chatId: 'chat' }, getReachable: () => changed,
+      store: { readRoot: async () => ({ status: 'ready', data: reachable.root, revision: reachable.rootRevision }), readReachable: async () => { reads++; return reachable; } } });
+    assert.equal(result.status, 'ready');
+    assert.equal(reads, 1);
+    assert.equal(result.sourceReadAttempts.exitPoint, 'ready');
+  }
 });
 
 test('正式vector build两阶段都复用命中快照，不读完整图或完整召回DTO', async () => {
@@ -311,6 +491,77 @@ test('后台增量复用完整旧shard：16变17只为新片请求embedding并�
   assert.equal(coldReads.filter(id => id === coldOldShard).length, 1, '冷状态恢复一次已提交旧shard');
   assert.equal(coldReads.length, 2, '另一次读取仅是新增shard的存在性检查');
   assert.equal(coldWrites.length, 2, '冷增量只PUT新增shard和manifest，不重写未变shard');
+});
+
+test('冷态自动检查完整内容目录一致时不读分片，首次查询仍实际加载校验', async () => {
+  const source = await sourceFixture(); source.rawSources = [];
+  for (let seq = 1; seq <= 17; seq++) source.rawSources.push(await rawFloor(source, seq));
+  const h = harness(source); await h.index.build();
+  const expected = await h.index.query({ source, queryContext: { text: '苹果' } });
+  const gets = [], writes = [], embeds = [], decode = globalThis.atob;
+  let decoded = 0;
+  const cold = createVectorIndex({ client: { ...h.client,
+    get: async (collection, id) => { gets.push(id); return h.client.get(collection, id); },
+    put: async (...args) => { writes.push(args[1]); return h.client.put(...args); } },
+    api: { embed: async (_config, texts) => { embeds.push([...texts]); return vectors(texts); } },
+    configProvider: () => config, identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => source });
+  globalThis.atob = (...args) => { decoded++; return decode(...args); };
+  try {
+    assert.deepEqual(await cold.updateIncrementally(), { status: 'unchanged', chunkCount: 17 });
+    assert.deepEqual(gets, [VECTOR_INDEX_ID], '只读一次已发布目录，不预加载向量');
+    assert.equal(decoded, 0); assert.equal(embeds.length, 0); assert.equal(writes.length, 0);
+    assert.equal(cold.getActivityState().busy, false);
+    assert.equal(cold.getState().buildDiagnostic.status, 'ready');
+    const actual = await cold.query({ source, queryContext: { text: '苹果' } });
+    assert.equal(actual.diagnostic.status, 'ready');
+    assert.deepEqual(actual.candidates, expected.candidates);
+    assert.deepEqual(gets.slice(1), [VECTOR_INDEX_ID, ...h.records.get(VECTOR_INDEX_ID).data.shardIds]);
+    assert.equal(decoded, 17, '真实查询仍完整解码，不伪造暖缓存');
+    assert.equal(embeds.length, 1);
+  } finally { globalThis.atob = decode; }
+});
+
+test('冷态目录内容、顺序或旧摘要身份不一致仍走原增量复用', async () => {
+  for (const change of ['content', 'order', 'summary']) {
+    const source = await sourceFixture(); source.rawSources = [];
+    for (let seq = 1; seq <= 17; seq++) source.rawSources.push(await rawFloor(source, seq));
+    const h = harness(source); await h.index.build();
+    const latest = structuredClone(source), gets = [], puts = [], embeds = [];
+    if (change === 'content') latest.rawSources[0] = await rawFloor(source, 1, '相同数量，但已保存正文换成梨。');
+    if (change === 'summary') latest.rawSources = latest.rawSources.map(raw => ({ ...raw, floorMemoryId: `revised-${raw.floorMemoryId}` }));
+    if (change === 'order') h.records.get(VECTOR_INDEX_ID).data.shardIds.reverse();
+    const cold = createVectorIndex({ client: { ...h.client,
+      get: async (collection, id) => { gets.push(id); return h.client.get(collection, id); },
+      put: async (...args) => { puts.push(args[1]); return h.client.put(...args); } },
+      api: { embed: async (_config, texts) => { embeds.push(...texts); return vectors(texts); } },
+      configProvider: () => config, identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => latest });
+    const result = await cold.updateIncrementally();
+    assert.equal(result.status, change === 'content' ? 'ready' : 'unchanged');
+    assert.equal(gets.filter(id => id === VECTOR_INDEX_ID).length, 2, `${change}不得凭数量或部分ID跳过`);
+    assert.ok(h.records.get(VECTOR_INDEX_ID).data.shardIds.every(id => gets.includes(id) || puts.includes(id)));
+    assert.equal(embeds.length, change === 'content' ? 1 : 0, '只补真正变化的原文，旧摘要ID不增加embedding');
+    if (change !== 'content') assert.equal(puts.length, 0);
+  }
+});
+
+test('冷态内容目录快路不代替手动建立或真实查询的分片校验', async () => {
+  for (const mode of ['build', 'missing', 'invalid']) {
+    const source = await sourceFixture(), h = harness(source); await h.index.build();
+    const shard = h.records.get(VECTOR_INDEX_ID).data.shardIds[0], gets = [];
+    if (mode === 'missing') h.records.delete(shard);
+    if (mode === 'invalid') h.records.get(shard).data.rows[0].vector = 'AAAA';
+    const cold = createVectorIndex({ client: { ...h.client, get: async (collection, id) => { gets.push(id); return h.client.get(collection, id); } },
+      api: { embed: async () => { assert.fail('此路径不得请求新embedding'); } },
+      configProvider: () => config, identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => source });
+    if (mode === 'build') assert.equal((await cold.build()).status, 'ready');
+    else {
+      assert.equal((await cold.updateIncrementally()).status, 'unchanged');
+      assert.deepEqual(gets, [VECTOR_INDEX_ID]);
+      const queried = await cold.query({ source, queryContext: { text: '苹果' } });
+      assert.equal(queried.diagnostic.status, 'unavailable'); assert.deepEqual(queried.candidates, []);
+    }
+    assert.ok(gets.includes(shard), '手动建立与真实查询都必须读取实际分片');
+  }
 });
 
 test('摘要记录ID变化但原文锚点不变时手动重建保留旧shard见证', async () => {
@@ -609,6 +860,7 @@ test('后台embedding挂起期间旧manifest仍可召回，增量未提交且查
 test('白鳥 HTTP 合同：首次不存在返回404可建立，读取不带recordId的信封可恢复缓存', async () => {
   const records = new Map();
   const client = createBackendClient({ baseUrl: 'https://offline.invalid', fetchImpl: async (url, options) => {
+    if (new URL(url).pathname === '/v1/health') return Response.json({ ok: true, api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true } });
     const [, namespace, collection, recordId] = new URL(url).pathname.match(/^\/v1\/records\/([^/]+)\/([^/]+)\/([^/]+)$/u);
     const key = `${namespace}/${collection}/${recordId}`;
     if (options.method === 'PUT') {
@@ -1123,7 +1375,12 @@ test('手动建索引：缓存不复制正文/Key；一次批量 API，查询验
   const source = await sourceFixture(), h = harness(source); let calls = 0;
   const api = { embed: async (_config, texts) => { calls++; return vectors(texts); } };
   const index = createVectorIndex({ client: h.client, api, configProvider: () => config, identityProvider: () => ({ chatId: 'chat' }), sourceProvider: async () => source });
+  await index.query({ source, queryContext: { text: '苹果配方' } });
+  const missingQueryReceipt = index.getState().query;
+  assert.equal((await index.readIndexStatus({ chatId: source.chatId, narrativeGeneration: source.narrativeGeneration })).chunkCount, 0);
   await index.build(); assert.equal(calls, 1);
+  assert.equal(index.getState().query, missingQueryReceipt, 'build成功隐藏提示不依赖改写旧查询回执');
+  assert.ok((await index.readIndexStatus({ chatId: source.chatId, narrativeGeneration: source.narrativeGeneration })).chunkCount > 0, '正式build后manifest反映实际片段数');
   const persisted = JSON.stringify([...h.records.values()]);
   assert.equal(persisted.includes(source.rawSources[0].canonicalContent), false); assert.equal(persisted.includes('test-key'), false);
   const selected = await index.query({ source, queryContext: { text: '苹果配方' }, eligibleFloorMemoryIds: ['memory-1'] });
@@ -1207,6 +1464,44 @@ test('普通分支仅复制有效前缀向量且B查询不泄漏截止楼后内�
   const selected = await reader.query({ source: targetSource, queryContext: { text: '苹果配方' } });
   assert.deepEqual(selected.candidates.map(candidate => candidate.witness.floorId), ['branch-floor-1']);
   assert.equal(embedCalls, 2, '实际B查询单独调用一次查询embedding');
+});
+
+test('合档向量复制以四片为一组批读，旧客户端逐片回落', async () => {
+  const sourceGraph = await branchVectorFixture('copy-batch-source', 'copy-batch-generation', 17);
+  const selected = selectRecallMemories(sourceGraph);
+  const projection = await projectVectorSources(selected.activeMemories, selected.floors, { includeSummaries: false });
+  const source = { status: 'ready', chatId: sourceGraph.root.chatId, narrativeGeneration: sourceGraph.root.narrativeGeneration,
+    rawSources: projection.rawSources };
+  const backend = vectorBackend(); let batchCalls = 0, maxBatch = 0;
+  const batchClient = {
+    ...backend.client,
+    async getMany(collection, ids) {
+      batchCalls += 1; maxBatch = Math.max(maxBatch, ids.length);
+      return Promise.all(ids.map(async id => {
+        try { const { recordId: _recordId, ...envelope } = await backend.client.get(collection, id); return { recordId: id, status: 200, envelope }; }
+        catch (error) { if (error?.status === 404) return { recordId: id, status: 404, error: 'not_found', message: 'Record not found' }; throw error; }
+      }));
+    },
+  };
+  const api = { embed: async (_config, texts) => vectors(texts) };
+  const sourceIndex = createVectorIndex({ client: batchClient, api, configProvider: () => config,
+    identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => source });
+  await sourceIndex.build();
+  const manifest = backend.records.get(`chat-${source.chatId}/${VECTOR_INDEX_ID}`);
+  assert.equal(manifest.data.shardIds.length, 2, '17条正文片段跨越两个16行分片');
+  const targetGeneration = 'copy-batch-target-generation';
+  const copied = await sourceIndex.copyPrefix({ chatId: source.chatId }, { chatId: 'copy-batch-target' }, targetGeneration, sourceGraph);
+  assert.equal(copied.length, 2);
+  assert.ok(batchCalls >= 2, '源分片和目标分片均按组批读');
+  assert.equal(maxBatch, 2, '每组批读不超过当前两个目标分片');
+
+  const fallbackTarget = 'copy-fallback-target';
+  const getsBefore = backend.gets.length;
+  const fallbackIndex = createVectorIndex({ client: backend.client, api, configProvider: () => config,
+    identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => source });
+  const fallbackCopied = await fallbackIndex.copyPrefix({ chatId: source.chatId }, { chatId: fallbackTarget }, `${targetGeneration}-fallback`, sourceGraph);
+  assert.equal(fallbackCopied.length, 2, '不提供getMany时仍逐片复制');
+  assert.ok(backend.gets.length > getsBefore, '旧客户端按get回落');
 });
 
 test('普通分支发现B已有索引后直接保留，不读改写目标目录', async () => {
@@ -1555,11 +1850,14 @@ test('首轮召回等待读完现成索引后查询；不重建，不重复查�
   let calls = 0, reads = 0;
   const index = createVectorIndex({ client: { ...h.client, get: async (...args) => { reads++; await flush(); return h.client.get(...args); } },
     api: { embed: async (_config, texts) => { calls++; return vectors(texts); } }, configProvider: () => config, identityProvider: () => ({ chatId: 'chat' }) });
+  const activities = []; index.subscribe(() => activities.push(index.getActivityState()));
   const first = await index.query({ source, queryContext: { text: '苹果' } });
   assert.equal(first.diagnostic.status, 'ready'); assert.equal(first.candidates.length, 1);
   assert.equal(index.getState().status, 'ready'); assert.equal(reads, 2); assert.equal(calls, 1);
   assert.equal((await index.query({ source, queryContext: { text: '苹果' } })).candidates.length, 1);
   assert.equal(reads, 2); assert.equal(calls, 1); assert.equal(h.calls.length, 2, '只读取已经落盘的 manifest 和 shard');
+  assert.equal(activities.some(value => value.busy), true);
+  assert.equal(activities.at(-1).busy, false, '冷读与查询都settled后发出闲置通知');
 });
 
 test('新增楼和 checkpoint 推进不要求重建；冷读旧索引仍可召回有效旧楼', async () => {
@@ -1654,6 +1952,7 @@ test('索引读取失败保留安全阶段与后端码，并继续既有 unavail
   const index = createVectorIndex({ client: { get: async () => { throw Object.assign(new Error('private body'), { code: 'BACKEND_UNAVAILABLE', status: 503 }); } },
     api: { embed: async () => { throw new Error('must not call'); } }, configProvider: () => config,
     identityProvider: () => ({ chatId: source.chatId }) });
+  const activities = []; index.subscribe(() => activities.push(index.getActivityState()));
   const result = await index.query({ source, queryContext: { text: '苹果' } });
   assert.equal(result.diagnostic.status, 'unavailable');
   assert.equal(index.getState().query.pendingStep, 'indexLoad');
@@ -1661,6 +1960,8 @@ test('索引读取失败保留安全阶段与后端码，并继续既有 unavail
   assert.equal(index.getState().query.load.backendCode, 'BACKEND_UNAVAILABLE');
   assert.equal(index.getState().query.load.httpStatus, 503);
   assert.equal(JSON.stringify(index.getState()).includes('private body'), false);
+  assert.equal(activities.some(value => value.busy), true);
+  assert.equal(activities.at(-1).busy, false, '读取失败也以settled通知熄灯');
 });
 
 test('不同聊天或纪元的来源不复用其他来源缓存；人工摘要撤来源后无旧命中', async () => {
@@ -1961,4 +2262,457 @@ test('手动建立分批串行；重复建立复用当前有效向量，不增�
   } } });
   await h.index.build(); assert.equal(maximum, 1); assert.ok(calls >= 2);
   const previousCalls = calls; await h.index.build(); assert.equal(calls, previousCalls);
+});
+
+test('正式召回与向量来源投影复用楼层已验证的原文指纹', async t => {
+  const digest = globalThis.crypto.subtle.digest.bind(globalThis.crypto.subtle);
+  const rawTexts = new Set();
+  let summaryDigests = 0;
+  const summaryText = '人物状态已由用户整理。';
+  const expectedSummaryFingerprint = await hash(summaryText);
+  for (const count of [8, 16]) {
+    const floors = [], snapshots = [], sourceFloorIds = [];
+    for (let index = 1; index <= count; index += 1) {
+      const id = `fingerprint-floor-${count}-${index}`;
+      const canonicalContent = `第${index}楼的已验证正文。`;
+      floors.push({ id, assistantSeq: index, content: { canonicalContent, canonicalFingerprint: await hash(canonicalContent) } });
+      snapshots.push({ floorId: id, canonicalContent }); sourceFloorIds.push(id); rawTexts.add(canonicalContent);
+    }
+    const reachable = { status: 'ready', root: { chatId: `fingerprint-chat-${count}`, narrativeGeneration: 'generation', headCheckpointId: 'head' },
+      rootRevision: 1, checkpoint: { id: 'head' }, floors,
+      floorMemories: [{ id: `aggregate-${count}`, floorId: floors.at(-1).id, recordStatus: 'active', sourceFloorIds, sourceFloorSnapshots: snapshots,
+        summary: { effectiveSource: 'user', userText: summaryText } }],
+      entities: [], stateDeltas: [], currentStates: [], baseline: null, cseUnavailable: true };
+    const store = { readRoot: async () => ({ status: 'ready', data: reachable.root, revision: 1 }), readReachable: async () => reachable };
+    const counts = new Map();
+    t.mock.method(globalThis.crypto.subtle, 'digest', async function (algorithm, bytes) {
+      const text = new TextDecoder().decode(bytes);
+      if (rawTexts.has(text)) counts.set(text, (counts.get(text) ?? 0) + 1);
+      if (text === summaryText) summaryDigests += 1;
+      return digest(algorithm, bytes);
+    });
+
+    const recall = await projectRecallSource(reachable, () => new Date('2026-10-16T00:00:00.000Z'));
+    assert.equal(recall.rawSources.length, count);
+    assert.equal(recall.summarySources.length, 1);
+    assert.equal(recall.summarySources[0].fingerprint, expectedSummaryFingerprint);
+    assert.deepEqual(recall.rawSources.map(item => item.floorId), sourceFloorIds);
+    assert.ok(recall.rawSources.every(item => item.fingerprint === floors.find(floor => floor.id === item.floorId).content.canonicalFingerprint));
+    assert.equal([...counts.values()].reduce((sum, value) => sum + value, 0), 0,
+      'selected raw text matches the validated floor fingerprints and should not be hashed again');
+
+    counts.clear();
+    const vectorSource = await readVectorSource({ store, targetIdentity: { chatId: reachable.root.chatId }, cachedReachable: reachable });
+    assert.equal(vectorSource.status, 'ready');
+    assert.equal(vectorSource.rawSources.length, count);
+    assert.deepEqual(vectorSource.rawSources.map(item => item.fingerprint), recall.rawSources.map(item => item.fingerprint));
+    assert.equal([...counts.values()].reduce((sum, value) => sum + value, 0), 0,
+      'vector source reader should reuse the same validated floor fingerprints');
+    assert.equal('summarySources' in vectorSource, false);
+    t.mock.restoreAll();
+  }
+  assert.equal(summaryDigests, 2, '摘要来源仍各自执行一次独立SHA');
+  const legacyText = '缺少已验证指纹的旧单楼正文。';
+  const legacy = await projectVectorSources([{ id: 'legacy-memory', floorId: 'legacy-floor', sourceFloorIds: ['legacy-floor'] }],
+    [{ id: 'legacy-floor', assistantSeq: 1, content: { canonicalContent: legacyText } }], { includeSummaries: false });
+  assert.equal(legacy.rawSources[0].fingerprint, await hash(legacyText), '旧输入没有指纹时仍计算真实原文摘要');
+});
+
+function reverseBatchRecordClient(records) {
+  const gets = [], completed = [], pending = [];
+  let active = 0, maximum = 0, scheduled = false;
+  const scheduleDrain = () => {
+    if (scheduled) return;
+    scheduled = true;
+    setImmediate(() => {
+      scheduled = false;
+      const batch = pending.splice(0).reverse();
+      for (const item of batch) {
+        active -= 1;
+        if (item.id !== VECTOR_INDEX_ID) completed.push(item.id);
+        if (!records.has(item.id)) item.reject(Object.assign(new Error('missing'), { status: 404 }));
+        else {
+          const { recordId: _recordId, ...record } = records.get(item.id);
+          item.resolve(structuredClone(record));
+        }
+      }
+      if (pending.length) scheduleDrain();
+    });
+  };
+  return { gets, completed, maximum: () => maximum, client: { get(_collection, id) {
+    gets.push(id); active += 1; maximum = Math.max(maximum, active);
+    return new Promise((resolve, reject) => { pending.push({ id, resolve, reject }); scheduleDrain(); });
+  } } };
+}
+
+test('首次索引冷读最多四个分片并发、按manifest顺序拼接且保留暖缓存与零向量跳过', async () => {
+  const makeRecords = async count => {
+    const modelKey = await hash(JSON.stringify([config.url, config.model, config.dimensions]));
+    const ids = Array.from({ length: count }, (_, index) => `${VECTOR_SHARD_PREFIX}${String(index + 1).padStart(40, '0')}`);
+    const source = { chatId: `cold-${count}`, narrativeGeneration: 'generation', rawSources: [] };
+    const records = new Map();
+    for (let index = 0; index < count; index += 1) {
+      const assistantSeq = index + 1, floorId = `cold-floor-${count}-${assistantSeq}`;
+      const canonicalContent = `正文${assistantSeq}`;
+      const raw = { floorId, assistantSeq, floorMemoryId: `memory-${assistantSeq}`, memoryFloorId: floorId,
+        memoryAssistantSeq: assistantSeq, canonicalContent, fingerprint: await hash(canonicalContent) };
+      source.rawSources.push(raw);
+      const witness = { floorId, assistantSeq, floorMemoryId: raw.floorMemoryId, memoryFloorId: floorId,
+        memoryAssistantSeq: assistantSeq, offset: 0, length: 1, fingerprint: raw.fingerprint, textFingerprint: await hash(canonicalContent.slice(0, 1)) };
+      records.set(ids[index], { recordId: ids[index], revision: 1, data: { schemaVersion: 1, recordType: 'vectorCache',
+        chatId: source.chatId, narrativeGeneration: source.narrativeGeneration, modelKey,
+        rows: [{ witness, vector: 'AACAPwAAAAA=' }] } });
+    }
+    records.set(VECTOR_INDEX_ID, { recordId: VECTOR_INDEX_ID, revision: 1, data: { schemaVersion: 1, recordType: 'vectorCache',
+      chatId: source.chatId, narrativeGeneration: source.narrativeGeneration, modelKey, dimensions: 2, shardIds: ids, chunkCount: count } });
+    return { records, source, ids };
+  };
+  for (const count of [8, 16]) {
+    const { records, source, ids } = await makeRecords(count);
+    let embeds = 0;
+    const backend = reverseBatchRecordClient(records), { gets, completed } = backend;
+    const client = backend.client;
+    const index = createVectorIndex({ client, api: { embed: async (_config, texts) => { embeds += 1; return vectors(texts); } },
+      configProvider: () => config, identityProvider: () => ({ chatId: source.chatId }) });
+    const result = await index.query({ source, queryContext: { text: '当前描述' } });
+    assert.equal(result.diagnostic.status, 'ready');
+    assert.equal(backend.maximum(), Math.min(4, count), 'cold reads should use the approved bounded parallelism');
+    assert.equal(gets[0], VECTOR_INDEX_ID);
+    assert.deepEqual([...gets.slice(1)].sort(), [...ids].sort(), '所有shard恰读一次');
+    assert.deepEqual(completed.slice(0, 4), ids.slice(0, 4).reverse(), '首批响应按manifest逆序完成');
+    assert.deepEqual(result.candidates.map(candidate => candidate.witness.assistantSeq), Array.from({ length: Math.min(12, count) }, (_, index) => index + 1),
+      '真实楼序与manifest一致时，反序响应不改变候选结果');
+    assert.equal(embeds, 1);
+    const getCount = gets.length;
+    const warm = await index.query({ source, queryContext: { text: '当前描述' } });
+    assert.deepEqual(warm.candidates, result.candidates);
+    assert.equal(gets.length, getCount, '同一查询暖命中不再读取manifest或shard');
+    assert.equal(embeds, 1, '同一查询复用已有query vector');
+  }
+  let gets = 0, embeds = 0;
+  const disabled = createVectorIndex({ client: { get: async () => { gets += 1; throw new Error('must not read'); } },
+    api: { embed: async () => { embeds += 1; return [[1, 0]]; } }, configProvider: () => null,
+    identityProvider: () => ({ chatId: 'vector-off' }), isEnabled: () => true });
+  const skipped = await disabled.query({ source: { chatId: 'vector-off', narrativeGeneration: 'generation', rawSources: [] }, queryContext: { text: 'x' } });
+  assert.equal(skipped.diagnostic.status, 'disabled');
+  assert.equal(gets, 0); assert.equal(embeds, 0);
+});
+
+test('冷读58个16行1024维分片在受限并发内完整解码928行', async () => {
+  const shardCount = 58, rowsPerShard = 16, dimensions = 1024;
+  const scaleConfig = { ...config, dimensions };
+  const modelKey = await hash(JSON.stringify([scaleConfig.url, scaleConfig.model, scaleConfig.dimensions]));
+  const ids = Array.from({ length: shardCount }, (_, index) => `${VECTOR_SHARD_PREFIX}${String(index + 1).padStart(40, '0')}`);
+  const source = { chatId: 'bounded-scale', narrativeGeneration: 'generation', rawSources: [] };
+  const records = new Map();
+  const vector = new Float32Array(dimensions); vector[0] = 1;
+  const encodedVector = Buffer.from(vector.buffer).toString('base64');
+  for (let shardIndex = 0; shardIndex < shardCount; shardIndex += 1) {
+    const rows = [];
+    for (let rowIndex = 0; rowIndex < rowsPerShard; rowIndex += 1) {
+      const sourceIndex = shardIndex * rowsPerShard + rowIndex;
+      const floorId = `scale-floor-${sourceIndex + 1}`, canonicalContent = `有界分片原文${sourceIndex + 1}。`;
+      const raw = { floorId, assistantSeq: sourceIndex + 1, floorMemoryId: `scale-memory-${sourceIndex + 1}`, memoryFloorId: floorId,
+        memoryAssistantSeq: sourceIndex + 1, canonicalContent, fingerprint: await hash(canonicalContent) };
+      source.rawSources.push(raw);
+      rows.push({ witness: { floorId, assistantSeq: raw.assistantSeq, floorMemoryId: raw.floorMemoryId, memoryFloorId: floorId,
+        memoryAssistantSeq: raw.memoryAssistantSeq, offset: 0, length: 1, fingerprint: raw.fingerprint, textFingerprint: await hash(canonicalContent.slice(0, 1)) },
+      vector: encodedVector });
+    }
+    records.set(ids[shardIndex], { recordId: ids[shardIndex], revision: 1, data: { schemaVersion: 1, recordType: 'vectorCache',
+      chatId: source.chatId, narrativeGeneration: source.narrativeGeneration, modelKey, rows } });
+  }
+  records.set(VECTOR_INDEX_ID, { recordId: VECTOR_INDEX_ID, revision: 1, data: { schemaVersion: 1, recordType: 'vectorCache',
+    chatId: source.chatId, narrativeGeneration: source.narrativeGeneration, modelKey, dimensions, shardIds: ids, chunkCount: shardCount * rowsPerShard } });
+  let embeds = 0;
+  const backend = reverseBatchRecordClient(records), { gets, completed } = backend;
+  const client = backend.client;
+  const index = createVectorIndex({ client, api: { embed: async (_config, texts) => { embeds += 1; return texts.map(() => new Array(dimensions).fill(0).map((_, i) => i === 0 ? 1 : 0)); } },
+    configProvider: () => scaleConfig, identityProvider: () => ({ chatId: source.chatId }) });
+  const result = await index.query({ source, queryContext: { text: '当前描述' } });
+  assert.equal(result.diagnostic.status, 'ready');
+  assert.equal(index.getState().query.totalIndexRows, shardCount * rowsPerShard);
+  assert.ok(backend.maximum() > 1 && backend.maximum() <= 4);
+  assert.equal(gets[0], VECTOR_INDEX_ID);
+  assert.deepEqual([...gets.slice(1)].sort(), [...ids].sort());
+  assert.notDeepEqual(completed.slice(0, 4), ids.slice(0, 4), 'fixture makes initial shard responses complete out of manifest order');
+  assert.deepEqual(result.candidates.map(candidate => candidate.witness.floorId),
+    Array.from({ length: 12 }, (_, index) => `scale-floor-${index + 1}`), '928行解码后仍按稳定候选排序返回前12条');
+  assert.equal(embeds, 1);
+});
+
+test('冷读遇到非法分片不发布部分索引，修复后下一次读取完整索引', async () => {
+  const { records, source, ids } = await (async () => {
+    const modelKey = await hash(JSON.stringify([config.url, config.model, config.dimensions]));
+    const shardIds = Array.from({ length: 8 }, (_, index) => `${VECTOR_SHARD_PREFIX}${String(index + 1).padStart(40, '0')}`);
+    const value = { chatId: 'invalid-cold', narrativeGeneration: 'generation', rawSources: [] }, stored = new Map();
+    for (let index = 0; index < shardIds.length; index += 1) {
+      const floorId = `invalid-floor-${index + 1}`, canonicalContent = `可读原文${index + 1}`;
+      const raw = { floorId, assistantSeq: index + 1, floorMemoryId: `invalid-memory-${index + 1}`, memoryFloorId: floorId,
+        memoryAssistantSeq: index + 1, canonicalContent, fingerprint: await hash(canonicalContent) };
+      value.rawSources.push(raw);
+      const witness = { floorId, assistantSeq: raw.assistantSeq, floorMemoryId: raw.floorMemoryId, memoryFloorId: floorId,
+        memoryAssistantSeq: raw.memoryAssistantSeq, offset: 0, length: 1, fingerprint: raw.fingerprint, textFingerprint: await hash(canonicalContent.slice(0, 1)) };
+      stored.set(shardIds[index], { recordId: shardIds[index], revision: 1, data: { schemaVersion: 1, recordType: 'vectorCache',
+        chatId: value.chatId, narrativeGeneration: value.narrativeGeneration, modelKey, rows: [{ witness, vector: 'AACAPwAAAAA=' }] } });
+    }
+    stored.set(VECTOR_INDEX_ID, { recordId: VECTOR_INDEX_ID, revision: 1, data: { schemaVersion: 1, recordType: 'vectorCache',
+      chatId: value.chatId, narrativeGeneration: value.narrativeGeneration, modelKey, dimensions: 2, shardIds, chunkCount: shardIds.length } });
+    return { records: stored, source: value, ids: shardIds };
+  })();
+  const validFirstRows = structuredClone(records.get(ids[0]).data.rows);
+  records.get(ids[0]).data.rows = [];
+  const client = { async get(_collection, id) {
+    if (!records.has(id)) throw Object.assign(new Error('missing'), { status: 404 });
+    const { recordId: _recordId, ...record } = records.get(id); return structuredClone(record);
+  } };
+  const index = createVectorIndex({ client, api: { embed: async (_config, texts) => vectors(texts) }, configProvider: () => config,
+    identityProvider: () => ({ chatId: source.chatId }) });
+  const unavailable = await index.query({ source, queryContext: { text: '当前描述' } });
+  assert.equal(unavailable.diagnostic.status, 'unavailable');
+  assert.equal(index.getState().query.load.exitReason, 'invalid');
+  assert.deepEqual(unavailable.candidates, []);
+  records.get(ids[0]).data.rows = validFirstRows;
+  const ready = await index.query({ source, queryContext: { text: '当前描述' } });
+  assert.equal(ready.diagnostic.status, 'ready');
+  assert.equal(ready.candidates.length, 8);
+});
+
+test('原文见证使用本次来源lookup，仍逐片核正文指纹与来源字段', async () => {
+  const raw = await rawFloor({}, 1, '本轮已保存的连续原文。');
+  const chunk = rawSourceChunks({ rawSources: [raw] })[0];
+  const witness = { ...chunk.witness, textFingerprint: await hash(chunk.text) };
+  const key = value => JSON.stringify([value.floorId, value.assistantSeq, value.memoryFloorId, value.memoryAssistantSeq, value.fingerprint]);
+  let scans = 0;
+  const source = { rawSources: { find(predicate) { scans += 1; return [raw].find(predicate); } } };
+  const lookup = new Map([[key(raw), raw]]);
+  assert.equal(await rawWitnessValid(witness, source, lookup), true);
+  assert.equal(scans, 0, '显式lookup不再为每个片段线性查找全体来源');
+  assert.equal(await rawWitnessValid({ ...witness, memoryAssistantSeq: 2 }, source, lookup), false);
+  assert.equal(await rawWitnessValid({ ...witness, offset: raw.canonicalContent.length }, source, lookup), false);
+  assert.equal(await rawWitnessValid({ ...witness, textFingerprint: await hash('另一段正文') }, source, lookup), false);
+  assert.equal(await rawWitnessValid({ ...witness, floorMemoryId: 'revision-after-summary-edit' }, source, lookup), true, '摘要修订仍不改变原文五字段身份');
+  raw.canonicalContent = '同一来源对象中的正文已经改变。';
+  assert.equal(await rawWitnessValid(witness, source, lookup), false, 'lookup不替代逐片正文hash');
+});
+
+test('原文来源lookup重复键保首，摘要记录ID不参与原文资格', async () => {
+  const first = await rawFloor({}, 1, '首个来源的原文。');
+  const duplicate = { ...first, floorMemoryId: 'later-memory', canonicalContent: '后一个同键来源。' };
+  const source = { rawSources: [first, duplicate] };
+  const lookup = createRawSourceLookup(source);
+  assert.equal(lookup.size, 1);
+  assert.equal([...lookup.values()][0], first);
+  const chunk = rawSourceChunks({ rawSources: [first] })[0];
+  const witness = { ...chunk.witness, floorMemoryId: 'revised-memory', textFingerprint: await hash(chunk.text) };
+  assert.equal(await rawWitnessValid(witness, source, lookup), await rawWitnessValid(witness, source));
+  assert.equal(await rawWitnessValid(witness, source, lookup), true);
+});
+
+test('连续普通分支复制各用本次目标原文，保持有效行次序', async () => {
+  const sourceGraph = await branchVectorFixture('lookup-source', 'lookup-source-generation');
+  const selected = selectRecallMemories(sourceGraph);
+  const projection = await projectVectorSources(selected.activeMemories, selected.floors, { includeSummaries: false });
+  const source = { status: 'ready', chatId: sourceGraph.root.chatId,
+    narrativeGeneration: sourceGraph.root.narrativeGeneration, rawSources: projection.rawSources };
+  const backend = vectorBackend(); let embeds = 0;
+  const index = createVectorIndex({ client: backend.client,
+    api: { embed: async (_config, texts) => { embeds++; return vectors(texts); } }, configProvider: () => config,
+    identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => source });
+  await index.build();
+  const allRows = [];
+  for (const changed of [false, true]) {
+    const targetId = `lookup-target-${changed}`, generation = `lookup-generation-${changed}`;
+    const target = await branchVectorFixture(targetId, generation);
+    if (changed) {
+      target.floors[0].content.canonicalContent = '这次目标第一楼是另一份原文。';
+      target.floorMemories[0].sourceFloorSnapshots[0].canonicalContent = target.floors[0].content.canonicalContent;
+    }
+    const ids = await index.copyPrefix({ chatId: source.chatId }, { chatId: targetId }, generation, sourceGraph,
+      { retainedFloorIds: target.floors.map(floor => floor.id), targetReachable: target });
+    allRows.push(ids.flatMap(id => backend.records.get(`chat-${targetId}/${id}`).data.rows));
+  }
+  assert.deepEqual(allRows.map(rows => rows.map(row => row.witness.floorId)),
+    [['branch-floor-1', 'branch-floor-2'], ['branch-floor-2']]);
+  assert.deepEqual(allRows[1][0], allRows[0][1], '有效片段的见证、向量与原次序保持');
+  assert.equal(embeds, 1, '只有准备源索引的模拟embedding，复制不生成向量');
+});
+
+test('HTML正文同raw已保存快照可替旧清洗文本，chunks新指纹且旧见证失效', async () => {
+ const raw = await hash('<html><body><p>她递回钥匙。</p></body></html>');
+ const oldText = '<!doctype html>', text = '她递回钥匙。';
+ const floor = { id: 'html-floor', assistantSeq: 1, content: { canonicalContent: oldText, canonicalFingerprint: await hash(oldText), rawFingerprint: raw } };
+ const memory = { id: 'html-memory', floorId: floor.id, sourceFloorIds: [floor.id], sourceCanonicalContent: text, sourceRawFingerprint: raw };
+ const projection = await projectVectorSources([memory], [floor]);assert.equal(projection.rawSources.length, 1);assert.equal(projection.rawSources[0].canonicalContent, text);assert.equal(projection.rawSources[0].fingerprint, await hash(text));
+ const chunk = rawSourceChunks(projection)[0];assert.equal(chunk.text, text);chunk.witness.textFingerprint = await hash(text);
+ assert.equal(await rawWitnessValid(chunk.witness, projection), true);
+ const old = { ...chunk.witness, fingerprint: floor.content.canonicalFingerprint, length: oldText.length, textFingerprint: await hash(oldText) };
+ assert.equal(await rawWitnessValid(old, projection), false);
+ for (const value of [undefined, 'sha256:invalid', await hash('different raw')]) assert.equal((await projectVectorSources([{ ...memory, sourceRawFingerprint: value }], [floor])).rawSources.length, 0);
+ const legacy = await projectVectorSources([{ id: memory.id, floorId: floor.id }], [floor]);assert.equal(legacy.rawSources[0].canonicalContent, oldText);
+});
+
+test('HTML正文聚合只凭每个成员snapshot自己的raw，不借anchor或整段聚合正文', async () => {
+ const rawA = await hash('raw A'), rawB = await hash('raw B');
+ const floors = [{ id: 'member-a', assistantSeq: 1, content: { canonicalContent: '<!doctype html>', rawFingerprint: rawA } },
+  { id: 'member-b', assistantSeq: 2, content: { canonicalContent: '<!doctype html>', rawFingerprint: rawB } }];
+ const memory = { id: 'aggregate', floorId: 'member-b', sourceFloorIds: ['member-a', 'member-b'], sourceCanonicalContent: '整段聚合不能借给锚楼', sourceRawFingerprint: rawB,
+  sourceFloorSnapshots: [{ floorId: 'member-a', canonicalContent: '第一楼故事', rawFingerprint: rawA }, { floorId: 'member-b', canonicalContent: '第二楼故事', rawFingerprint: rawA }] };
+ let result = await projectVectorSources([memory], floors);assert.deepEqual(result.rawSources.map(s=>s.floorId), ['member-a']);
+ memory.sourceFloorSnapshots.pop();result = await projectVectorSources([memory], floors);assert.deepEqual(result.rawSources.map(s=>s.floorId), ['member-a']);
+ memory.sourceFloorSnapshots.push({ floorId: 'member-b', canonicalContent: '第二楼故事', rawFingerprint: rawB });result = await projectVectorSources([memory], floors);assert.deepEqual(result.rawSources.map(s=>s.canonicalContent), ['第一楼故事','第二楼故事']);
+ assert.equal(rawSourceChunks(result).map(chunk=>chunk.text).join('|'), '第一楼故事|第二楼故事');
+});
+
+test('百炼v4官方兼容端点按10条请求，保16行分片及顺序和缓存', async t => {
+  for (const url of ['https://dashscope.aliyuncs.com/compatible-mode/v1', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+    'https://dashscope-us.aliyuncs.com/compatible-mode/v1', 'https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1',
+    ...['cn-beijing', 'ap-southeast-1', 'cn-hongkong', 'eu-central-1', 'ap-northeast-1', 'us-east-1'].map(region => `https://workspace-123.${region}.maas.aliyuncs.com/compatible-mode/v1`)]) {
+    await t.test(url, async () => {
+      const source = await sourceFixture();
+      source.rawSources = await Promise.all(Array.from({ length: 17 }, (_, index) => rawFloor(source, index + 1, `batch-row-${index + 1}`)));
+      const requests = [];
+      const api = createVectorApiClient({ fetchImpl: async (target, options) => {
+        const body = JSON.parse(options.body); requests.push({ target, body });
+        if (body.input.length > 10) return Response.json({ error: { code: 'InvalidParameter' } }, { status: 400 });
+        return Response.json({ data: body.input.map((text, index) => ({ index, embedding: [Number(text.split('-').at(-1)), 1] })).reverse() });
+      } });
+      const h = harness(source, { api }); h.setConfig(normalizeVectorConfig({ url, key: 'fixture-key', model: 'text-embedding-v4' }));
+      assert.equal((await h.index.build()).status, 'ready');
+      assert.deepEqual(requests.map(request => request.body.input.length), [10, 6, 1]);
+      assert.ok(requests.every(request => request.target === `${url}/embeddings`));
+      assert.deepEqual(requests.flatMap(request => request.body.input), source.rawSources.map(raw => raw.canonicalContent));
+      const manifest = h.records.get(VECTOR_INDEX_ID).data;
+      assert.equal(manifest.chunkCount, 17); assert.equal(manifest.dimensions, 2);
+      const shards = manifest.shardIds.map(id => h.records.get(id).data);
+      assert.deepEqual(shards.map(shard => shard.rows.length), [16, 1]);
+      for (const [index, row] of shards.flatMap(shard => shard.rows).entries()) {
+        assert.equal(row.witness.floorId, source.rawSources[index].floorId);
+        assert.equal(Buffer.from(row.vector, 'base64').readFloatLE(0), Math.fround((index + 1) / Math.hypot(index + 1, 1)));
+      }
+      const oldIds = [...manifest.shardIds], before = requests.length;
+      assert.equal((await h.index.build()).status, 'ready');
+      assert.equal(requests.length, before);
+      assert.deepEqual(h.records.get(VECTOR_INDEX_ID).data.shardIds, oldIds);
+    });
+  }
+});
+
+test('百炼v4请求容量只应用官方HTTPS兼容地址和精确模型', async () => {
+  const official = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+  for (const url of ['https://vector.invalid/v1', 'http://dashscope.aliyuncs.com/compatible-mode/v1',
+    'https://dashscope.aliyuncs.com:8443/compatible-mode/v1', 'https://dashscope.aliyuncs.com/v1',
+    'https://dashscope.aliyuncs.com/compatible-mode/v1?other=1', 'https://dashscope.aliyuncs.com/compatible-mode/v1#other',
+    'https://user:pass@dashscope.aliyuncs.com/compatible-mode/v1', 'https://sub.dashscope.aliyuncs.com/compatible-mode/v1',
+    'https://dashscope.aliyuncs.com.invalid/compatible-mode/v1', 'https://extra.workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+    'https://cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'not a URL']) {
+    assert.equal(vectorRequestBatchSize({ url, model: 'text-embedding-v4' }), 16, url);
+  }
+  for (const model of ['text-embedding-v3', 'TEXT-EMBEDDING-V4', 'vendor/text-embedding-v4', 'Qwen/Qwen3-Embedding-8B']) {
+    assert.equal(vectorRequestBatchSize({ url: official, model }), 16, model);
+  }
+  for (const [url, model] of [['https://vector.invalid/v1', 'text-embedding-v4'], [official, 'text-embedding-v3']]) {
+    const source = await sourceFixture();
+    source.rawSources = await Promise.all(Array.from({ length: 16 }, (_, index) => rawFloor(source, index + 1)));
+    const counts = [], api = createVectorApiClient({ fetchImpl: async (_target, options) => {
+      const body = JSON.parse(options.body); counts.push(body.input.length);
+      return Response.json({ data: body.input.map((_, index) => ({ index, embedding: [1, 0] })) });
+    } });
+    const h = harness(source, { api }); h.setConfig(normalizeVectorConfig({ url, key: 'fixture', model }));
+    assert.equal((await h.index.build()).status, 'ready');
+    assert.deepEqual(counts, [16]);
+  }
+});
+
+test('百炼v4部分缓存仅嵌缺项，子请求失败或取消保原16行原子分片', async t => {
+  const route = normalizeVectorConfig({ url: 'https://workspace.cn-hongkong.maas.aliyuncs.com/compatible-mode/v1', key: 'fixture', model: 'text-embedding-v4' });
+  const source = await sourceFixture();
+  source.rawSources = await Promise.all(Array.from({ length: 16 }, (_, index) => rawFloor(source, index + 1)));
+  const counts = [];
+  const api = createVectorApiClient({ fetchImpl: async (_target, options) => {
+    const body = JSON.parse(options.body); counts.push(body.input.length);
+    return Response.json({ data: body.input.map((_, index) => ({ index, embedding: [1, 0] })) });
+  } });
+  const h = harness(source, { api }); h.setConfig(route);
+  await h.index.build();
+  const changed = { ...source, rawSources: await Promise.all(source.rawSources.map((raw, index) => index < 11 ? rawFloor(source, index + 1, '修改后的原文'+index) : raw)) };
+  h.setSource(changed); await h.index.build();
+  assert.deepEqual(counts, [10, 6, 10, 1]);
+  assert.equal(h.records.get(h.records.get(VECTOR_INDEX_ID).data.shardIds[0]).data.rows.length, 16);
+
+  for (const interruption of ['http400', 'cancel', 'changedConfig']) await t.test(interruption, async () => {
+    let index, currentRoute = route;
+    const requests = [];
+    const api = createVectorApiClient({ fetchImpl: async (_target, options) => {
+      const body = JSON.parse(options.body); requests.push(body.input);
+      if (interruption === 'http400' && requests.length === 2) return Response.json({ error: { code: 'InvalidParameter' } }, { status: 400 });
+      if (requests.length === 1) {
+        if (interruption === 'cancel') index.abortAll();
+        if (interruption === 'changedConfig') currentRoute = { ...route, model: 'different-model' };
+      }
+      return Response.json({ data: body.input.map((_, position) => ({ index: position, embedding: [1, 0] })) });
+    } });
+    const saved = harness(source);
+    index = createVectorIndex({ client: saved.client, api, configProvider: () => currentRoute, identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => source });
+    await assert.rejects(index.build(), { code: interruption === 'http400' ? 'VECTOR_HTTP_ERROR' : 'VECTOR_ABORTED' });
+    assert.deepEqual(requests.map(input => input.length), interruption === 'http400' ? [10, 6] : [10]);
+    assert.equal(saved.records.size, 0);
+    if (interruption === 'http400') {
+      const diagnostic = index.getState().buildDiagnostic;
+      assert.equal(diagnostic.inputCount, 6); assert.equal(diagnostic.httpStatus, 400);
+    }
+  });
+});
+
+test('第七批向量：订阅异常隔离构建增量冷读暖查，健康订阅和下一操作继续', async t => {
+  for (const phase of ['build', 'incremental', 'cold', 'warm']) await t.test(phase, async () => {
+    const source = await sourceFixture(), h = harness(source);
+    let index = h.index;
+    if (['cold', 'warm', 'incremental'].includes(phase)) await index.build();
+    if (phase === 'incremental') {
+      const canonicalContent = '苹果新的计划';
+      source.rawSources.push({ ...source.rawSources[0], floorId: 'floor-2', assistantSeq: 2, floorMemoryId: 'memory-2',
+        memoryFloorId: 'floor-2', memoryAssistantSeq: 2, canonicalContent, fingerprint: await hash(canonicalContent) });
+    }
+    if (phase === 'cold') index = createVectorIndex({ client: h.client, api: { embed: async (_config, texts) => vectors(texts) },
+      configProvider: () => config, identityProvider: () => ({ chatId: source.chatId }), sourceProvider: async () => source });
+    let healthy = 0;
+    const unsubscribe = index.subscribe(() => { throw new Error('TEST_LISTENER'); });
+    index.subscribe(() => { healthy++; });
+    if (phase === 'build') assert.equal((await index.build()).status, 'ready');
+    else if (phase === 'incremental') assert.equal((await index.updateIncrementally()).status, 'ready');
+    else {
+      const result = await index.query({ source, queryContext: { text: '苹果' } });
+      assert.equal(result.diagnostic.status, 'ready'); assert.ok(result.candidates.length > 0);
+    }
+    assert.equal(index.getActivityState().busy, false);
+    assert.ok(healthy > 0);
+    unsubscribe();
+    assert.equal((await index.query({ source, queryContext: { text: '苹果' } })).diagnostic.status, 'ready');
+    assert.equal(index.getActivityState().busy, false);
+  });
+});
+
+test('328manifest已存丢回执同页建立复用全部已提交分片，初建与增量零重嵌入',async t=>{
+ for(const incremental of [false,true])await t.test(incremental?'增量1行':'初建17行',async()=>{
+  const base=await sourceFixture();const all=Array.from({length:17},(_,i)=>({...base.rawSources[0],floorId:`floor-${i+1}`,floorMemoryId:`memory-${i+1}`,memoryFloorId:`floor-${i+1}`,assistantSeq:i+1,memoryAssistantSeq:i+1}));let inputs=0;
+  const h=harness({...base,rawSources:incremental?all.slice(0,16):all},{api:{embed:async(c,texts)=>{inputs+=texts.length;return texts.map(()=>[1,0]);}}});
+  const put=h.client.put;let lose=!incremental;
+  h.client.put=async(...args)=>{const value=await put(...args);if(lose&&args[1]===VECTOR_INDEX_ID){lose=false;throw Object.assign(Error('lost'),{code:'BACKEND_NETWORK'});}return value;};
+  if(incremental){await h.index.build();h.setSource({...base,rawSources:all});lose=true;assert.equal((await h.index.updateIncrementally()).status,'error');}else await assert.rejects(h.index.build());
+  const before=inputs;assert.equal((await h.index.build()).status,'ready');assert.equal(inputs,before);assert.equal(h.records.get(VECTOR_INDEX_ID).data.chunkCount,17);assert.equal(h.index.getState().status,'ready');
+ });
+});
+
+test('328冷坏缺分片原建立只修坏片并结算忙态，权限网络不作缺片',async t=>{
+ for(const kind of ['missing','invalid','owner','permission','network'])await t.test(kind,async()=>{
+  const base=await sourceFixture(),all=Array.from({length:17},(_,i)=>({...base.rawSources[0],floorId:`floor-${i+1}`,floorMemoryId:`memory-${i+1}`,memoryFloorId:`floor-${i+1}`,assistantSeq:i+1,memoryAssistantSeq:i+1}));let inputs=0;
+  const h=harness({...base,rawSources:all},{api:{embed:async(c,texts)=>{inputs+=texts.length;return texts.map(()=>[1,0]);}}});await h.index.build();
+  const manifest=h.records.get(VECTOR_INDEX_ID),id=manifest.data.shardIds[1];if(kind==='missing')h.records.delete(id);if(kind==='invalid')h.records.get(id).data.rows[0].vector='AAAA';if(kind==='owner')h.records.get(id).data.chatId='other';
+  const get=h.client.get;h.client.get=async(c,key)=>{if(key===id&&['permission','network'].includes(kind))throw Object.assign(Error('offline'),kind==='permission'?{status:403}:{code:'BACKEND_NETWORK'});return get(c,key);};
+  const cold=createVectorIndex({client:h.client,api:{embed:async(c,texts)=>{inputs+=texts.length;return texts.map(()=>[1,0]);}},configProvider:()=>config,identityProvider:()=>({chatId:base.chatId}),sourceProvider:async()=>({...base,rawSources:all})});const before=inputs;
+  if(['permission','network'].includes(kind)){await assert.rejects(cold.build());assert.equal(inputs,before);assert.equal(cold.getState().status,'error');}
+  else {assert.equal((await cold.build()).status,'ready');assert.equal(inputs-before,1);assert.equal(cold.getState().status,'ready');}
+  assert.notEqual(cold.getState().status,'building');
+ });
 });

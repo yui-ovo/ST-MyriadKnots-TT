@@ -29,20 +29,46 @@ export function planAutoHide({ chat = [], memoryState = null, keepAiCount = 3, r
   const source = Array.isArray(chat) ? chat : [];
   const assistants = source.map((message, messageIndex) => isAssistantMessage(message) ? { message, messageIndex } : null).filter(Boolean);
   const owned = source.map((message, messageIndex) => ownsMessage(message, stableChatId) ? messageIndex : null).filter(Number.isInteger);
+  // Reserve the current reply for a possible roll; recall body matching remains at the user-set N.
+  const retainedAiCount = normalizeAutoHideKeepAiCount(keepAiCount) + 1;
   let hideThrough = -1;
   let keepFrom = 0;
-  if (!restoreAll && assistants.length > normalizeAutoHideKeepAiCount(keepAiCount)) {
-    const earliestKeptPosition = assistants.length - normalizeAutoHideKeepAiCount(keepAiCount);
+  if (!restoreAll && assistants.length > retainedAiCount) {
+    const earliestKeptPosition = assistants.length - retainedAiCount;
     const previousAssistant = assistants[earliestKeptPosition - 1];
     keepFrom = previousAssistant ? previousAssistant.messageIndex + 1 : 0;
     const floors = [...(memoryState?.floors ?? [])].sort((left, right) => (left.assistantSeq ?? 0) - (right.assistantSeq ?? 0));
+    let liveStartIndex = 0;
+    // Frozen imported floors retain source coordinates and cannot prove current body coverage.
+    if (Array.isArray(memoryState?.migrationAliases) && memoryState.migrationAliases.length === 0 && floors[0]?.frozen === true) {
+      let prefixEnd = 0;
+      while (floors[prefixEnd]?.frozen === true) prefixEnd += 1;
+      if (prefixEnd > 0 && prefixEnd < floors.length) {
+        let hasLaterFrozenFloor = false;
+        for (let index = prefixEnd; index < floors.length; index += 1) {
+          if (floors[index]?.frozen === true) { hasLaterFrozenFloor = true; break; }
+        }
+        if (!hasLaterFrozenFloor) liveStartIndex = prefixEnd;
+      }
+    }
+    const previousAssistantSeq = liveStartIndex ? floors[liveStartIndex - 1]?.assistantSeq : 0;
+    let expectedSeq = Number.isSafeInteger(previousAssistantSeq) ? previousAssistantSeq + 1 : NaN;
     let reliableThrough = -1;
-    for (let index = 0; index < floors.length; index += 1) {
+    coverage: for (let index = liveStartIndex; index < floors.length; index += 1) {
       const floor = floors[index];
-      const messageIndex = floor?.messageIndex;
-      if (floor?.assistantSeq !== index + 1 || !Number.isInteger(messageIndex) || !isAssistantMessage(source[messageIndex])) break;
-      if (!floor.memoryId || !READY_MEMORY.has(floor.status) || !READY_CSE.has(floor.cse?.status)) break;
-      reliableThrough = messageIndex;
+      if (floor.memoryExcluded !== true && (!floor.memoryId || !READY_MEMORY.has(floor.status) || !READY_CSE.has(floor.cse?.status))) break;
+      // Range cards share summary/CSE readiness, but each bound source floor must prove continuous body coverage.
+      const ids = floor.sourceFloorIds ?? [floor.floorId];
+      const seqs = floor.sourceAssistantSeqs ?? [floor.assistantSeq];
+      const indexes = floor.sourceMessageIndexes ?? [floor.messageIndex];
+      if (!Array.isArray(ids) || !ids.length || !Array.isArray(seqs) || !Array.isArray(indexes)
+        || ids.length !== seqs.length || ids.length !== indexes.length) break;
+      for (let member = 0; member < ids.length; member += 1) {
+        const messageIndex = indexes[member];
+        if (!ids[member] || seqs[member] !== expectedSeq || !Number.isInteger(messageIndex) || !isAssistantMessage(source[messageIndex])) break coverage;
+        reliableThrough = messageIndex;
+        expectedSeq += 1;
+      }
     }
     hideThrough = Math.min(keepFrom - 1, reliableThrough);
   }
@@ -67,17 +93,17 @@ export function planAutoHide({ chat = [], memoryState = null, keepAiCount = 3, r
 function snapshotMessages(chat, range) {
   return Array.from({ length: range.end - range.start + 1 }, (_, offset) => {
     const message = chat[range.start + offset];
-    return { message, hadIsSystem: Boolean(message && Object.hasOwn(message, 'is_system')), isSystem: message?.is_system, hadExtra: Boolean(message && Object.hasOwn(message, 'extra')), extra: message?.extra === undefined ? undefined : structuredClone(message.extra) };
+    return { message, hadMarker: Object.hasOwn(message?.extra ?? {}, MARKER_KEY), marker: message?.extra?.[MARKER_KEY] };
   });
 }
 
 function restoreMessages(snapshots) {
   for (const saved of snapshots) {
     if (!saved.message) continue;
-    if (saved.hadIsSystem) saved.message.is_system = saved.isSystem;
-    else delete saved.message.is_system;
-    if (saved.hadExtra) saved.message.extra = saved.extra;
-    else delete saved.message.extra;
+    if (saved.hadMarker) {
+      saved.message.extra ??= {};
+      saved.message.extra[MARKER_KEY] = saved.marker;
+    } else if (saved.message.extra && typeof saved.message.extra === 'object') delete saved.message.extra[MARKER_KEY];
   }
 }
 
@@ -116,12 +142,8 @@ export function createAutoHideController({ hostAdapter, memoryRuntime, settings,
     const saved = snapshotMessages(snapshot.chat, range);
     markRange(snapshot.chat, range, stableChatId, hide);
     try {
-      await execute.call(snapshot.context, `/${hide ? 'hide' : 'unhide'} ${rangeArgument(range)}`);
-      const current = assertSameHost(hostChatId);
-      for (let index = range.start; index <= range.end; index += 1) {
-        const message = current.chat[index];
-        if (!message || message.is_system !== hide || ownsMessage(message, stableChatId) !== hide) throw autoHideError('QQJ_AUTO_HIDE_VERIFY_FAILED', '酒馆没有确认自动隐藏结果。');
-      }
+      const result = await execute.call(snapshot.context, `/${hide ? 'hide' : 'unhide'} ${rangeArgument(range)}`, { handleParserErrors: false });
+      if (result?.isError === true || result?.isAborted === true) throw autoHideError('QQJ_AUTO_HIDE_COMMAND_FAILED', '酒馆未能完成自动隐藏命令。');
     } catch (error) {
       restoreMessages(saved);
       throw error;

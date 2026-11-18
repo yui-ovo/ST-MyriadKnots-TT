@@ -1,17 +1,17 @@
 import { sha256 } from '../identity.js';
-import { normalizeVector } from '../vector-api.js';
+import { recordWriteBatches } from '../backend-client.js';
+import { normalizeVector, vectorRequestBatchSize } from '../vector-api.js';
 import { rawWitnessShape, rawWitnessValid, vectorWitnessShape } from './vector-source.js';
-import { projectVectorSources } from './vector-source.js';
+import { createRawSourceLookup, projectVectorSources, rawSourceKey } from './vector-source.js';
 import { selectRecallMemories } from './recall-source.js';
 
 export const VECTOR_INDEX_ID = 'qqj-vector-index';
 export const VECTOR_SHARD_PREFIX = 'qqj-vector-shard-';
-const SCHEMA = 1, BATCH = 16, INDEX_LOAD_TIMEOUT_MS = 15000, VECTOR_QUERY_TIMEOUT_MS = 15000;
+const SCHEMA = 1, BATCH = 16, COPY_BATCH = 4, INDEX_LOAD_TIMEOUT_MS = 15000, VECTOR_QUERY_TIMEOUT_MS = 15000;
+const MAX_QUERY_CHARACTERS = 6000;
 const hash = async value => `sha256:${await sha256(value)}`;
 const configKey = config => JSON.stringify([config.url, config.model, config.dimensions]);
 const ownerKey = (source, modelKey) => JSON.stringify([source.chatId, source.narrativeGeneration, modelKey]);
-// 摘要修订会换 FloorMemory.id；缓存复用仅依赖真实原文楼、锚点与正文指纹。
-const rawSourceKey = value => JSON.stringify([value.floorId, value.assistantSeq, value.memoryFloorId, value.memoryAssistantSeq, value.fingerprint]);
 const rawChunkKey = value => JSON.stringify([rawSourceKey(value), value.offset, value.length]);
 const bindRawWitness = (raw, witness) => ({ floorId: raw.floorId, assistantSeq: raw.assistantSeq, floorMemoryId: raw.floorMemoryId,
   memoryFloorId: raw.memoryFloorId, memoryAssistantSeq: raw.memoryAssistantSeq, fingerprint: raw.fingerprint,
@@ -25,6 +25,17 @@ const witnessMatches = (actual, expected) => {
   return keys.every(key => Object.prototype.hasOwnProperty.call(actual, key) && actual[key] === expected[key]);
 };
 const errorWith = (code, message) => Object.assign(new Error(message), { code });
+
+function vectorQueryText(context) {
+  const text = String(context?.text ?? '');
+  const latest = String(context?.latestUserText ?? '');
+  if (text.length <= MAX_QUERY_CHARACTERS || !latest) return text.slice(0, MAX_QUERY_CHARACTERS);
+  // The merged context can already be truncated before the latest user turn.
+  const current = `用户:${latest}`.slice(0, MAX_QUERY_CHARACTERS);
+  const remaining = MAX_QUERY_CHARACTERS - current.length - 1;
+  const background = remaining > 0 ? String(context?.backgroundText ?? context?.recentAssistantText ?? '').slice(-remaining).replace(/^[\uDC00-\uDFFF]/u, '') : '';
+  return background ? `${background}\n${current}` : current;
+}
 
 // vectorWitnessShape 保持 schema 1 的旧摘要行可读；查询阶段只接受原文见证。
 export function vectorRecordOwned(record) {
@@ -132,7 +143,12 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
   let state = { status: 'idle', completed: 0, total: 0, error: null, cancelled: false, userCancelled: false, buildDiagnostic: null };
   const subscribers = new Set();
   // Cancellation markers describe this notification only; query progress must not replay an old cancel.
-  const notify = patch => { state = { ...state, ...patch, cancelled: patch?.cancelled === true, userCancelled: patch?.userCancelled === true }; for (const fn of subscribers) fn({ ...state }); };
+  const notify = patch => {
+    state = { ...state, ...patch, cancelled: patch?.cancelled === true, userCancelled: patch?.userCancelled === true };
+    for (const fn of subscribers) {
+      try { fn({ ...state }); } catch { /* A view failure does not own the vector task or other subscribers. */ }
+    }
+  };
   const updateBuildDiagnostic = (operation, patch) => {
     operation.buildDiagnostic = { ...(operation.buildDiagnostic ?? {}), ...patch };
     const safe = safeBuildDiagnostic(operation.buildDiagnostic);
@@ -147,6 +163,24 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
     // 新派生记录尚不存在是正常状态；白鳥 GET 的信封不带编号，由请求路径提供。
     try { return { ...await client.get(collection, recordId), recordId }; }
     catch (error) { if (error?.status === 404) return null; throw error; }
+  };
+  const readRecords = async (collection, recordIds, { negotiate = false } = {}) => {
+    if ((recordIds.length > 1 || negotiate) && typeof client.getMany === 'function') {
+      const result = await client.getMany(collection, recordIds, { negotiate });
+      if (!Array.isArray(result) || result.length !== recordIds.length) throw new Error('后端批量读取结果无效');
+      return result.map((item, index) => {
+        const recordId = recordIds[index];
+        if (!item || item.recordId !== recordId) throw new Error('后端批量读取结果无效');
+        if (item.status === 404) return null;
+        if (item.status === 200 && item.envelope && typeof item.envelope === 'object') return { ...item.envelope, recordId };
+        const error = new Error('后端批量读取失败');
+        if (Number.isSafeInteger(item.status)) error.status = item.status;
+        throw error;
+      });
+    }
+    const records = [];
+    for (const recordId of recordIds) records.push(await readRecord(collection, recordId));
+    return records;
   };
   async function batchWitnesses(source, modelKey, batch, reusable = null) {
     const witnesses = [];
@@ -185,8 +219,9 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
     const reportLoad = value => { if (diagnostic) { diagnostic.load = value; diagnostic.onLoadProgress?.(); } };
     if (loading?.key === key && loading.epoch === captured) return loading.promise;
     const job = { key, epoch: captured, promise: null }; loading = job;
-    job.promise = (async () => {
+    job.promise = Promise.resolve().then(async () => {
       try {
+        notify({});
         if (!isEnabled()) { reportLoad({ pending: null, shardsRead: 0, shardCount: null, exitReason: 'disabled', backendCode: null, httpStatus: null }); return; }
         reportLoad({ pending: 'manifest', shardsRead: 0, shardCount: null, exitReason: null, backendCode: null, httpStatus: null });
         const manifest = await readRecord(`chat-${source.chatId}`, VECTOR_INDEX_ID);
@@ -209,15 +244,45 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
         const dimensions = manifest.data.dimensions;
         reportLoad({ ...diagnostic?.load, pending: 'shard', shardCount: manifest.data.shardIds.length });
         if (!Number.isSafeInteger(dimensions) || dimensions < 1 || dimensions > 8192) { reportLoad({ ...diagnostic?.load, pending: null, exitReason: 'invalid' }); return; }
-        for (const id of manifest.data.shardIds) {
-          if (!isEnabled() || captured !== epoch || active && !allowActive) return;
-          const shard = await readRecord(`chat-${source.chatId}`, id);
-          if (!shard) { reportLoad({ ...diagnostic?.load, pending: null, exitReason: 'missing' }); return; }
-          if (!vectorRecordOwned(shard)) { reportLoad({ ...diagnostic?.load, pending: null, exitReason: 'invalid' }); return; }
-          if (ownerKey(shard.data, shard.data.modelKey) !== key) { reportLoad({ ...diagnostic?.load, pending: null, exitReason: 'ownerMismatch' }); return; }
-          for (const row of shard.data.rows) rows.push({ witness: row.witness, vector: decodeVector(row.vector, dimensions), shardId: id });
-          reportLoad({ ...diagnostic?.load, shardsRead: (diagnostic?.load?.shardsRead ?? 0) + 1 });
+        const shardIds = manifest.data.shardIds, shards = new Array(shardIds.length);
+        let nextShard = 0, shardsRead = 0, exitReason = null, readError = null;
+        const acceptShard = (shard, index, id) => {
+          if (!shard) { exitReason = 'missing'; return; }
+          if (!vectorRecordOwned(shard)) { exitReason = 'invalid'; return; }
+          if (ownerKey(shard.data, shard.data.modelKey) !== key) { exitReason = 'ownerMismatch'; return; }
+          shards[index] = shard.data.rows.map(row => ({ witness: row.witness, vector: decodeVector(row.vector, dimensions), shardId: id }));
+          shardsRead += 1;
+          reportLoad({ ...diagnostic?.load, shardsRead });
+        };
+        const readShard = async () => {
+          while (!exitReason && !readError) {
+            if (!isEnabled() || captured !== epoch || active && !allowActive) { exitReason = 'cancelled'; return; }
+            const index = nextShard++;
+            if (index >= shardIds.length) return;
+            const id = shardIds[index];
+            try {
+              acceptShard(await readRecord(`chat-${source.chatId}`, id), index, id);
+            } catch (error) {
+              readError = error;
+            }
+          }
+        };
+        if (typeof client.getMany === 'function') {
+          for (let start = 0; start < shardIds.length && !exitReason && !readError; start += COPY_BATCH) {
+            if (!isEnabled() || captured !== epoch || active && !allowActive) { exitReason = 'cancelled'; break; }
+            const ids = shardIds.slice(start, start + COPY_BATCH);
+            try {
+              const records = await readRecords(`chat-${source.chatId}`, ids, { negotiate: true });
+              for (let index = 0; index < records.length && !exitReason; index++) acceptShard(records[index], start + index, ids[index]);
+            } catch (error) { readError = error; }
+          }
+        } else await Promise.all(Array.from({ length: Math.min(4, shardIds.length) }, () => readShard()));
+        if (readError) throw readError;
+        if (exitReason) {
+          if (exitReason !== 'cancelled') reportLoad({ ...diagnostic?.load, pending: null, exitReason });
+          return;
         }
+        for (const shardRows of shards) rows.push(...shardRows);
         if (isEnabled() && captured === epoch && (!active || allowActive) && configKey(configProvider()) === configKey(config)) {
           cached = { key, rows, dimensions, manifest: { revision: manifest.revision, shardIds: [...manifest.data.shardIds], chunkCount: manifest.data.chunkCount } };
           if (!active && !updating) notify({ status: 'ready', completed: rows.length, total: rows.length, error: null });
@@ -229,8 +294,8 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
           httpStatus: Number.isSafeInteger(error?.status) && error.status >= 100 && error.status <= 599 ? error.status : null });
         /* 缓存读取失败仍按既有行为退回无索引召回；快照只保留安全错误元数据。 */
       }
-      finally { if (loading === job) loading = null; }
-    })();
+      finally { if (loading === job) loading = null; notify({}); }
+    });
     return job.promise;
   }
 
@@ -242,9 +307,10 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
         || JSON.stringify(configProvider()) !== operation.config) throw errorWith('VECTOR_ABORTED', '索引建立已取消。');
     };
     let phase = 'source';
-    updateBuildDiagnostic(operation, { status: 'building', phase, batchNumber: 0, completedChunks: 0, totalChunks: 0,
-      inputCount: 0, inputCharacters: 0, longestInputCharacters: 0, errorCode: null, httpStatus: null, request: null });
     try {
+      if (!incremental) notify({ status: 'building', completed: 0, total: 0, error: null, background: false, cancelled: false });
+      updateBuildDiagnostic(operation, { status: 'building', phase, batchNumber: 0, completedChunks: 0, totalChunks: 0,
+        inputCount: 0, inputCharacters: 0, longestInputCharacters: 0, errorCode: null, httpStatus: null, request: null });
       const source = await sourceProvider({ targetIdentity: operation.targetIdentity, stage: 'source', sourceKey: operation.sourceKey });
       if (source?.status !== 'ready') {
         if (incremental) { updateBuildDiagnostic(operation, { status: 'skipped', phase: 'source' }); return { status: 'notReady' }; }
@@ -263,14 +329,29 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
       if (incremental && (!previous || !vectorRecordOwned(previous) || ownerKey(previous.data, previous.data.modelKey) !== key)) {
         updateBuildDiagnostic(operation, { status: 'skipped', phase: 'cache' }); return { status: 'notIndexed' };
       }
-      // 冷启动和手动重复建索引先恢复已提交向量；后台不因缓存冷而重算整档。
-      if (cached?.key !== key) await load(source, operation.configValue, modelKey, null, { allowActive: !incremental });
-      guard(source);
-      if (cached?.key !== key) {
-        updateBuildDiagnostic(operation, { status: 'skipped', phase: 'cache' });
-        return incremental ? { status: 'notIndexed' } : { status: 'unavailable' };
+      if (incremental && cached?.key !== key && previous.data.chunkCount === chunks.length
+        && previous.data.shardIds.length === Math.ceil(chunks.length / BATCH)) {
+        // 目录ID由完整原文见证生成；一致只说明无需增量更新，真正查询仍加载并校验向量。
+        let matches = true;
+        for (let start = 0; start < chunks.length; start += BATCH) {
+          const { id } = await batchWitnesses(source, modelKey, chunks.slice(start, start + BATCH));
+          guard(source);
+          if (previous.data.shardIds[start / BATCH] !== id) { matches = false; break; }
+        }
+        guard(source);
+        if (matches) {
+          updateBuildDiagnostic(operation, { status: 'ready', phase: 'complete', completedChunks: chunks.length, totalChunks: chunks.length });
+          return { status: 'unchanged', chunkCount: chunks.length };
+        }
       }
-      const cachedRawRows = cached.rows.filter(row => rawWitnessShape(row.witness));
+      // 后台先恢复完整旧缓存；手动建立在下方逐片读回，坏派生片可独立重建。
+      if (incremental && cached?.key !== key) await load(source, operation.configValue, modelKey, null);
+      guard(source);
+      if (incremental && cached?.key !== key) {
+        updateBuildDiagnostic(operation, { status: 'skipped', phase: 'cache' });
+        return { status: 'notIndexed' };
+      }
+      const cachedRawRows = cached?.key === key ? cached.rows.filter(row => rawWitnessShape(row.witness)) : [];
       if (incremental && previous.data.chunkCount > 0 && cachedRawRows.length === 0) {
         updateBuildDiagnostic(operation, { status: 'skipped', phase: 'cache' });
         return { status: 'legacySummaryOnly' };
@@ -284,6 +365,7 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
       notify({ status: 'building', completed: 0, total: chunks.length, error: null, background: incremental, cancelled: false });
       const rows = [], shardIds = [];
       const previousShardIds = new Set(previous?.data?.shardIds ?? []);
+      const requestBatchSize = vectorRequestBatchSize(operation.configValue);
       let dimensions = null;
       for (let start = 0; start < chunks.length; start += BATCH) {
         guard(source);
@@ -302,7 +384,7 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
           }
         }
         // A failed build may already have persisted this exact batch; check its deterministic ID before re-embedding.
-        if (!previousShardIds.has(expectedId)) {
+        if (!savedBatch || !previousShardIds.has(expectedId)) {
           phase = 'cache';
           existingBatch = await readRecord(collection, expectedId); guard(source);
           const persisted = await validSavedBatch(existingBatch, source, modelKey, batch, witnesses, expectedId, dimensions);
@@ -315,15 +397,21 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
         } else {
           const missing = batch.filter((value, index) => !cachedBatchRows[index] || !witnessMatches(cachedBatchRows[index].witness, witnesses[index]));
           phase = 'embedding';
-          const inputCharacters = missing.reduce((sum, value) => sum + value.text.length, 0);
-          updateBuildDiagnostic(operation, { phase, batchNumber: Math.floor(start / BATCH) + 1, completedChunks: rows.length,
-            totalChunks: chunks.length, inputCount: missing.length, inputCharacters,
-            longestInputCharacters: missing.reduce((max, value) => Math.max(max, value.text.length), 0), request: null });
-          const newVectors = missing.length ? await api.embed(operation.configValue, missing.map(value => value.text), {
-            signal: operation.controller.signal,
-            onProgress: value => updateBuildDiagnostic(operation, { request: value }),
-            onDiagnostic: value => updateBuildDiagnostic(operation, { request: value, httpStatus: value.httpStatus ?? operation.buildDiagnostic?.httpStatus }),
-          }) : [];
+          const newVectors = [];
+          for (let offset = 0; offset < missing.length; offset += requestBatchSize) {
+            guard(source);
+            const request = missing.slice(offset, offset + requestBatchSize);
+            updateBuildDiagnostic(operation, { phase, batchNumber: Math.floor(start / BATCH) + 1, completedChunks: rows.length,
+              totalChunks: chunks.length, inputCount: request.length, inputCharacters: request.reduce((sum, value) => sum + value.text.length, 0),
+              longestInputCharacters: request.reduce((max, value) => Math.max(max, value.text.length), 0), httpStatus: null, request: null });
+            const vectors = await api.embed(operation.configValue, request.map(value => value.text), {
+              signal: operation.controller.signal,
+              onProgress: value => updateBuildDiagnostic(operation, { request: value }),
+              onDiagnostic: value => updateBuildDiagnostic(operation, { request: value, httpStatus: value.httpStatus ?? operation.buildDiagnostic?.httpStatus }),
+            });
+            guard(source);
+            newVectors.push(...vectors);
+          }
           let nextVector = 0;
           const vectors = batch.map((value, index) => {
             const cachedRow = cachedBatchRows[index];
@@ -337,7 +425,7 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
           }));
         }
         const id = `${VECTOR_SHARD_PREFIX}${(await sha256(JSON.stringify([source.narrativeGeneration, modelKey, batchRows.map(row => row.witness)]))).slice(0, 40)}`;
-        if (!persistedBatch && !previousShardIds.has(id)) {
+        if (!persistedBatch && (!savedBatch || !previousShardIds.has(id))) {
           const storedRows = batchRows.map(row => ({ witness: row.witness, vector: encodeVector(row.vector) }));
           phase = 'cache';
           const existing = id === expectedId ? existingBatch : await readRecord(collection, id); guard(source);
@@ -357,9 +445,9 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
         || rows.some(row => !valid.has(rawSourceKey(row.witness)))) throw errorWith('VECTOR_SOURCE_CHANGED', '来源已变化，请重新建立索引。');
       phase = 'save';
       updateBuildDiagnostic(operation, { phase, completedChunks: rows.length, totalChunks: chunks.length });
-      await client.put(collection, VECTOR_INDEX_ID, { schemaVersion: SCHEMA, recordType: 'vectorCache', chatId: source.chatId, narrativeGeneration: source.narrativeGeneration, modelKey, dimensions: dimensions ?? cached.dimensions ?? operation.configValue.dimensions ?? 1024, shardIds, chunkCount: rows.length }, previous?.revision ?? 0, { signal: operation.controller.signal });
+      await client.put(collection, VECTOR_INDEX_ID, { schemaVersion: SCHEMA, recordType: 'vectorCache', chatId: source.chatId, narrativeGeneration: source.narrativeGeneration, modelKey, dimensions: dimensions ?? cached?.dimensions ?? operation.configValue.dimensions ?? 1024, shardIds, chunkCount: rows.length }, previous?.revision ?? 0, { signal: operation.controller.signal });
       guard(source);
-      cached = { key, rows, dimensions: dimensions ?? cached.dimensions ?? operation.configValue.dimensions ?? 1024,
+      cached = { key, rows, dimensions: dimensions ?? cached?.dimensions ?? operation.configValue.dimensions ?? 1024,
         manifest: { revision: (previous?.revision ?? 0) + 1, shardIds, chunkCount: rows.length } };
       lastIncrementalFailureKey = null; lastIncrementalCancelledKey = null;
       updateBuildDiagnostic(operation, { status: 'ready', phase: 'complete', completedChunks: rows.length, totalChunks: chunks.length, errorCode: null, httpStatus: null });
@@ -384,10 +472,25 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
       if (incremental && updating === operation) {
         updating = null; notify({});
       }
-      if (!incremental && active === operation) { active = null; notify({}); }
+      if (!incremental && active === operation) { active = null; notify(state.status === 'building' ? { status: cached?.rows?.length ? 'ready' : 'idle', background: false } : {}); }
     }
   }
 
+  async function readIndexStatus({ chatId, narrativeGeneration } = {}) {
+    if (!isEnabled()) return { status: 'disabled' };
+    const config = configProvider?.();
+    if (!config) return { status: 'disabled' };
+    if (typeof chatId !== 'string' || !chatId || typeof narrativeGeneration !== 'string' || !narrativeGeneration) return { status: 'unavailable' };
+    const modelKey = await hash(configKey(config));
+    const manifest = await readRecord(`chat-${chatId}`, VECTOR_INDEX_ID);
+    if (!manifest) return { status: 'ready', chunkCount: 0 };
+    if (!vectorRecordOwned(manifest)) throw errorWith('VECTOR_CACHE_INVALID', '当前聊天的向量索引格式无效。');
+    if (manifest.data.chatId !== chatId) throw errorWith('VECTOR_CACHE_OWNER_MISMATCH', '向量索引归属与当前聊天不一致。');
+    if (manifest.data.narrativeGeneration !== narrativeGeneration || manifest.data.modelKey !== modelKey) {
+      return { status: 'ready', chunkCount: 0 };
+    }
+    return { status: 'ready', chunkCount: manifest.data.chunkCount };
+  }
   async function build() {
     if (active || updating) return { status: 'busy' };
     queryOperation?.controller.abort();
@@ -395,7 +498,6 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
     if (!config || !isEnabled()) throw errorWith('VECTOR_DISABLED', '请先启用向量 API。');
     const operation = { controller: new AbortController(), epoch, targetIdentity: targetIdentity(), configValue: config, config: JSON.stringify(config), sourceKey: null };
     active = operation; lastIncrementalFailureKey = null; lastIncrementalCancelledKey = null;
-    notify({ status: 'building', completed: 0, total: 0, error: null, background: false, cancelled: false });
     return executeBuild(operation, false);
   }
 
@@ -418,6 +520,7 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
   }
 
   async function copyPrefix(sourceIdentity, targetIdentity, targetNarrativeGeneration, sourceReachable, options = null) {
+    const report = value => { try { options?.onProgress?.(value); } catch { /* Display only. */ } };
     const config = configProvider();
     if (!config || !sourceIdentity?.chatId || !targetIdentity?.chatId || sourceIdentity.chatId === targetIdentity.chatId
       || typeof targetNarrativeGeneration !== 'string' || sourceReachable?.root?.chatId !== sourceIdentity.chatId
@@ -433,6 +536,7 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
     const sourceManifest = await readRecord(sourceCollection, VECTOR_INDEX_ID);
     if (!sourceManifest || !vectorRecordOwned(sourceManifest) || sourceManifest.data.modelKey !== modelKey
       || ownerKey(sourceManifest.data, modelKey) !== ownerKey(sourceReachable.root, modelKey)) return Object.freeze([]);
+    report({ phase: 'readingVectors' });
     let rawSources;
     if (branchPrefix) {
       const retained = new Set(options.retainedFloorIds);
@@ -450,37 +554,80 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
       ? { status: 'ready', chatId: targetIdentity.chatId, narrativeGeneration: targetNarrativeGeneration, rawSources }
       : { ...source, chatId: targetIdentity.chatId, narrativeGeneration: targetNarrativeGeneration };
     const witnessSource = branchPrefix ? target : source;
+    const rawLookup = createRawSourceLookup(witnessSource);
     const rows = [], seen = new Set();
-    for (const id of sourceManifest.data.shardIds) {
-      const shard = await readRecord(sourceCollection, id);
-      if (!shard || !vectorRecordOwned(shard) || shard.data.modelKey !== modelKey
-        || ownerKey(shard.data, modelKey) !== ownerKey(source, modelKey)) return Object.freeze([]);
-      for (const row of shard.data.rows) {
-        if (!rawWitnessShape(row.witness) || !await rawWitnessValid(row.witness, witnessSource)
-          || seen.has(rawChunkKey(row.witness))) continue;
-        try { decodeVector(row.vector, sourceManifest.data.dimensions); } catch { continue; }
-        seen.add(rawChunkKey(row.witness));
-        rows.push(row);
+    for (let start = 0; start < sourceManifest.data.shardIds.length; start += COPY_BATCH) {
+      const ids = sourceManifest.data.shardIds.slice(start, start + COPY_BATCH);
+      const shards = await readRecords(sourceCollection, ids);
+      for (const shard of shards) {
+        if (!shard || !vectorRecordOwned(shard) || shard.data.modelKey !== modelKey
+          || ownerKey(shard.data, modelKey) !== ownerKey(source, modelKey)) return Object.freeze([]);
+        for (const row of shard.data.rows) {
+          if (!rawWitnessShape(row.witness) || !await rawWitnessValid(row.witness, witnessSource, rawLookup)
+            || seen.has(rawChunkKey(row.witness))) continue;
+          try { decodeVector(row.vector, sourceManifest.data.dimensions); } catch { continue; }
+          seen.add(rawChunkKey(row.witness));
+          rows.push(row);
+        }
       }
     }
     if (!rows.length) return Object.freeze([]);
     const shardIds = [];
-    for (let start = 0; start < rows.length; start += BATCH) {
-      const batch = rows.slice(start, start + BATCH);
-      const copiedRows = batch.map(row => ({ ...row, witness: orderedRawWitness(row.witness) }));
-      const witnesses = copiedRows.map(row => row.witness);
-      const id = `${VECTOR_SHARD_PREFIX}${(await sha256(JSON.stringify([targetNarrativeGeneration, modelKey, witnesses]))).slice(0, 40)}`;
-      const savedShard = await readRecord(targetCollection, id);
-      if (!await validSavedBatch(savedShard, target, modelKey, copiedRows, witnesses, id, sourceManifest.data.dimensions)) {
-        if (savedShard) return Object.freeze([]);
-        try { await client.put(targetCollection, id, { schemaVersion: SCHEMA, recordType: 'vectorCache',
-          chatId: targetIdentity.chatId, narrativeGeneration: targetNarrativeGeneration, modelKey, rows: copiedRows }, 0); }
-        catch {
-          const persisted = await readRecord(targetCollection, id);
-          if (!await validSavedBatch(persisted, target, modelKey, copiedRows, witnesses, id, sourceManifest.data.dimensions)) return Object.freeze([]);
-        }
+    const totalShards = Math.ceil(rows.length / BATCH);
+    for (let start = 0; start < rows.length; start += BATCH * 64) {
+      const work = [];
+      for (let offset = start; offset < Math.min(rows.length, start + BATCH * 64); offset += BATCH) {
+        const copiedRows = rows.slice(offset, offset + BATCH).map(row => ({ ...row, witness: orderedRawWitness(row.witness) }));
+        const witnesses = copiedRows.map(row => row.witness);
+        const id = `${VECTOR_SHARD_PREFIX}${(await sha256(JSON.stringify([targetNarrativeGeneration, modelKey, witnesses]))).slice(0, 40)}`;
+        work.push({ id, copiedRows, witnesses });
       }
-      shardIds.push(id);
+      const saved = await readRecords(targetCollection, work.map(item => item.id));
+      const pending = [];
+      for (let index = 0; index < work.length; index += 1) {
+        const item = work[index], savedShard = saved[index];
+        if (await validSavedBatch(savedShard, target, modelKey, item.copiedRows, item.witnesses, item.id, sourceManifest.data.dimensions)) continue;
+        if (savedShard) return Object.freeze([]);
+        pending.push(item);
+      }
+      const pendingById = new Map(pending.map(item => [item.id, item]));
+      let completed = shardIds.length + work.length - pending.length;
+      if (!pending.length) report({ phase: 'copyingVectors', completed, total: totalShards });
+      const writes = pending.map(item => ({ recordId: item.id, data: { schemaVersion: SCHEMA, recordType: 'vectorCache',
+        chatId: targetIdentity.chatId, narrativeGeneration: targetNarrativeGeneration, modelKey, rows: item.copiedRows }, expectedRevision: 0 }));
+      for (const group of recordWriteBatches(writes)) {
+        let response = null;
+        if (!group.single && typeof client.putMany === 'function') {
+          try { response = await client.putMany(targetCollection, group.records); }
+          catch {
+            // Keep the existing vector read-back contract without resending the failed write.
+            const persisted = await readRecords(targetCollection, group.records.map(item => item.recordId));
+            response = persisted.map((record, index) => ({ recordId: group.records[index].recordId, status: record ? 200 : 500, envelope: record }));
+          }
+        }
+        const written = new Array(group.records.length); let cursor = 0;
+        await Promise.all(Array.from({ length: Math.min(4, group.records.length) }, async () => {
+          while (true) {
+            const index = cursor++; if (index >= group.records.length) return;
+            const entry = group.records[index], item = pendingById.get(entry.recordId);
+            let persisted;
+            if (response === null) {
+              try { persisted = { ...await client.put(targetCollection, item.id, entry.data, 0), recordId: item.id }; }
+              catch { persisted = await readRecord(targetCollection, item.id); }
+            } else {
+              const result = response[index];
+              if (result?.recordId !== item.id) { written[index] = false; continue; }
+              persisted = result.status === 200 ? { ...result.envelope, recordId: item.id } : await readRecord(targetCollection, item.id);
+            }
+            written[index] = Boolean(await validSavedBatch(persisted, target, modelKey, item.copiedRows, item.witnesses, item.id, sourceManifest.data.dimensions));
+          }
+        }));
+        completed += written.filter(Boolean).length;
+        report({ phase: 'copyingVectors', completed, total: totalShards });
+        if (written.some(value => !value)) return Object.freeze([]);
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      shardIds.push(...work.map(item => item.id));
     }
     const manifest = { schemaVersion: SCHEMA, recordType: 'vectorCache',
       chatId: targetIdentity.chatId, narrativeGeneration: targetNarrativeGeneration, modelKey,
@@ -703,7 +850,7 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
       operation.eligibleRows = rows.length;
       if (changed(signature)) return complete('changed');
       if (!rows.length) return complete('unindexed');
-      const text = String(queryContext?.text ?? '').slice(0, 6000);
+      const text = vectorQueryText(queryContext);
       requestText = text;
       const reused = lastQuery?.key === key && lastQuery.text === text;
       let vector;
@@ -791,11 +938,12 @@ export function createVectorIndex({ client, api, configProvider, sourceProvider,
       return code.startsWith('VECTOR_') ? { ...result, diagnostic: { ...result.diagnostic, status: code } } : result;
     } finally {
       signal?.removeEventListener('abort', abortQuery);
-      if (queryOperation === operation) queryOperation = null;
+      if (queryOperation === operation) queryOperation = null; notify({});
     }
   }
   return Object.freeze({
-    build, updateIncrementally, query, getState: () => ({ ...state, active: Boolean(active || updating && state.status === 'building'), updating: Boolean(updating), background: Boolean(updating && state.status === 'building'), query: querySnapshot }), subscribe(fn) { subscribers.add(fn); return () => subscribers.delete(fn); },
+    getActivityState: () => ({ busy: Boolean(active || updating || loading || queryOperation), phase: queryOperation ? 'selecting' : active || updating ? 'building' : loading ? 'loading' : null }),
+    build, updateIncrementally, query, readIndexStatus, getState: () => ({ ...state, active: Boolean(active || updating && state.status === 'building'), updating: Boolean(updating), background: Boolean(updating && state.status === 'building'), query: querySnapshot }), subscribe(fn) { subscribers.add(fn); return () => subscribers.delete(fn); },
     cancelIncrementally,
     copyPrefix,
     getResumableShardIds,

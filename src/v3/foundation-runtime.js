@@ -1,3 +1,4 @@
+import { createActivitySignal } from '../plugin-activity.js';
 import { isUuid, newIdentityUuid, sha256 } from '../identity.js';
 import { readHostState } from '../host-context.js';
 import {
@@ -26,8 +27,8 @@ import { collectFloorMemoryEntityIds, collectStateDeltaEntityIds, memorySourceFl
 import { filterReachableDeltas, replayCurrentState } from './cse-engine.js';
 import { validateCseGraph } from './cse-schema.js';
 import { diagnosticsWithRealtimeOrigin, realtimeOriginFromReachable } from './memory-coverage.js';
-import { matchFloorCandidates } from './floor-binding.js';
-import { clearExactMessageFloorAnchor, inspectMessageFloorAnchor, messageFloorAnchorCandidateSnapshot, MESSAGE_FLOOR_ANCHOR_KEY, readTargetChat } from './message-floor-anchor.js';
+import { matchFloorCandidates, unregisteredTailCandidates } from './floor-binding.js';
+import { clearExactMessageFloorAnchor, inspectMessageFloorAnchor, messageFloorAnchorCandidateSnapshot, MESSAGE_FLOOR_ANCHOR_KEY, persistMessageMemoryExclusion, readTargetChat } from './message-floor-anchor.js';
 import { captureTargetChatDescriptor } from './host-adapter.js';
 import { migrationPartition, partitionScannedCandidates } from './migration-prefix.js';
 
@@ -132,7 +133,7 @@ function exactOrphanMarkerRepair(value, candidates, bindings, stableCount) {
 function normalizedIdentity(contextProvider) {
   const raw = contextProvider();
   const state = readHostState(raw);
-  if (state?.ok !== true || !isUuid(state.chatId)) throw new Error('当前聊天尚未建立稳定 chatId');
+  if (state?.ok !== true || !isUuid(state.chatId)) throw new Error('当前聊天身份尚未准备好，请稍候。');
   return Object.freeze({
     hostChatId: state.hostChatId,
     chatId: state.chatId,
@@ -145,15 +146,16 @@ function commonRecord({ recordType, id, chatId, narrativeGeneration, now, record
   return { schemaVersion: 3, recordType, id, chatId, narrativeGeneration, createdAt: now, updatedAt: now, recordStatus, supersedes };
 }
 
-export async function projectFoundationPrefix({ source, floors, chatId, narrativeGeneration, now, currentStateId, previousCurrentStateId = null }) {
+export async function projectFoundationPrefix({ source, floors, excludedFloorIds = new Set(), chatId, narrativeGeneration, now, currentStateId, previousCurrentStateId = null }) {
   const floorIdSet = new Set(floors.map(floor => floor.id));
   const sourceFloorOrder = new Map((source.floors ?? []).map((floor, index) => [floor.id, index]));
   const brokenAggregateOrder = (source.floorMemories ?? [])
-    .filter(memory => memorySourceFloorIds(memory).length > 1 && !memorySourceFloorIds(memory).every(floorId => floorIdSet.has(floorId)))
+    .filter(memory => memorySourceFloorIds(memory).length > 1 && (!memorySourceFloorIds(memory).every(floorId => floorIdSet.has(floorId))
+      || memorySourceFloorIds(memory).some(floorId => excludedFloorIds.has(floorId))))
     .reduce((earliest, memory) => Math.min(earliest, sourceFloorOrder.get(memory.floorId) ?? Number.POSITIVE_INFINITY), Number.POSITIVE_INFINITY);
-  const floorMemories = (source.floorMemories ?? []).filter(memory => memorySourceFloorIds(memory).every(floorId => floorIdSet.has(floorId))
+  const floorMemories = (source.floorMemories ?? []).filter(memory => memorySourceFloorIds(memory).every(floorId => floorIdSet.has(floorId) && !excludedFloorIds.has(floorId))
     && (memorySourceFloorIds(memory).length === 1 || (sourceFloorOrder.get(memory.floorId) ?? Number.POSITIVE_INFINITY) < brokenAggregateOrder));
-  const survivingDeltas = (source.stateDeltas ?? []).filter(delta => floorIdSet.has(delta.floorId)
+  const survivingDeltas = (source.stateDeltas ?? []).filter(delta => floorIdSet.has(delta.floorId) && !excludedFloorIds.has(delta.floorId)
     && (sourceFloorOrder.get(delta.floorId) ?? Number.POSITIVE_INFINITY) < brokenAggregateOrder);
   let stateDeltas = filterReachableDeltas({ floors, floorMemories, stateDeltas: survivingDeltas });
   const referencedEntityIds = new Set();
@@ -161,7 +163,7 @@ export async function projectFoundationPrefix({ source, floors, chatId, narrativ
   stateDeltas.forEach(delta => collectStateDeltaEntityIds(delta).forEach(id => referencedEntityIds.add(id)));
   if (source.baseline) { referencedEntityIds.add(source.baseline.userPersona.entityId); referencedEntityIds.add(source.baseline.characterCard.entityId); }
   const entities = projectEntityFloorBounds((source.entities ?? []).filter(entity => referencedEntityIds.has(entity.id)
-    || (entity.firstSeenFloorId && floorIdSet.has(entity.firstSeenFloorId))), floors, floorMemories, stateDeltas);
+    || (entity.firstSeenFloorId && floorIdSet.has(entity.firstSeenFloorId) && !excludedFloorIds.has(entity.firstSeenFloorId))), floors, floorMemories, stateDeltas);
   const entityIds = new Set(entities.map(entity => entity.id));
   const baseline = source.baseline && entityIds.has(source.baseline.userPersona.entityId) && entityIds.has(source.baseline.characterCard.entityId) ? source.baseline : null;
   if (!baseline) stateDeltas = [];
@@ -172,10 +174,18 @@ export async function projectFoundationPrefix({ source, floors, chatId, narrativ
   return Object.freeze({ floorMemories, stateDeltas, entities, baseline, currentState, capabilities });
 }
 
-export async function buildFoundationIndexes({ chatId, narrativeGeneration, checkpointId, floors, candidates, now }) {
+export async function buildFoundationIndexes({ chatId, narrativeGeneration, checkpointId, floors, candidates = [], existingIndexes = [], now }) {
   const records = [];
   const add = async (kind, shard, entries) => {
     if (!entries.length) return;
+    const existing = existingIndexes.find(index => index?.chatId === chatId
+      && index?.narrativeGeneration === narrativeGeneration
+      && index?.kind === kind && index?.shard === shard
+      && JSON.stringify(index.entries) === JSON.stringify(entries));
+    if (existing) {
+      records.push(existing);
+      return;
+    }
     records.push(validateFoundationIndex({
       ...commonRecord({ recordType: 'index', id: await deterministicUuid(['index', checkpointId, kind, shard, entries]), chatId, narrativeGeneration, now }),
       kind, shard, sourceCheckpointId: checkpointId, entries, entryCount: entries.length,
@@ -228,7 +238,7 @@ function runSummary(run, result = null) {
   if (!run) return null;
   return Object.freeze({ id: run.id, mode: run.mode, phase: run.phase, ...(result ? { result } : {}) });
 }
-function statusError(status, message = '后端操作未完成，请稍后重试。') {
+function statusError(status, message = '聊天记忆操作失败。请到“记忆管理”页点击“复制状态诊断”反馈。') {
   return Object.assign(new Error(message), { code: `V3_${String(status).toUpperCase()}`, operationStatus: status });
 }
 
@@ -263,6 +273,8 @@ export function createFoundationRuntime({
   let activeOperation = null;
   let scheduled = null;
   let inspectionScheduled = null;
+  let inspectionController = null;
+  const activity = createActivitySignal(() => ({ busy: Boolean(activeOperation || inspectionScheduled), phase: activeOperation?.phase ?? (inspectionScheduled ? 'inspecting' : null) }));
   let dirtyReason = null;
   let dirtyStableThrough = null;
   let dirtyTailDeletion = null;
@@ -271,6 +283,7 @@ export function createFoundationRuntime({
   let lastRun = null;
   let lastError = null;
   let reviewReason = null;
+  let bindingIssues = Object.freeze([]);
   let unreachableCount = 0;
   let metrics = Object.freeze({});
   let emptyRealtimeObservation = null;
@@ -319,13 +332,14 @@ export function createFoundationRuntime({
     consecutiveAssistantConfirmation,
     headCheckpointId: cache?.root?.headCheckpointId ?? null,
     activeRun: activeOperation ? { id: activeOperation.id, phase: activeOperation.phase, reason: activeOperation.reason } : null,
-    lastRun, lastError, reviewReason: status === 'needsReview' ? reviewReason : null, unreachableCount, sessionEpoch, metrics,
+    lastRun, lastError, reviewReason: status === 'needsReview' ? reviewReason : null, bindingIssues, unreachableCount, sessionEpoch, metrics,
     inspectedStableCount,
     canInitialize: !cache?.root && inspectedStableCount > 0,
   });
   let publicState = state(enabled() ? 'idle' : 'disabled');
   const publish = status => {
     publicState = state(status);
+    activity.notifyActivity();
     for (const listener of subscribers) {
       try { listener(publicState); } catch { /* read-only completion listeners are isolated */ }
     }
@@ -381,6 +395,8 @@ export function createFoundationRuntime({
   function invalidate() {
     sessionEpoch += 1;
     activeOperation?.controller.abort();
+    inspectionController?.abort();
+    inspectionController = null;
     activeOperation = null;
     scheduled = null;
     inspectionScheduled = null;
@@ -395,6 +411,7 @@ export function createFoundationRuntime({
     inspectedStableCount = 0;
     emptyRealtimeObservation = null;
     reviewReason = null;
+    bindingIssues = Object.freeze([]);
     requestConfirmations.clear();
     store.invalidate();
     publish(enabled() ? 'idle' : 'disabled');
@@ -439,7 +456,7 @@ export function createFoundationRuntime({
           settled = await store.replaceRecord(completed, winner.revision, { signal: operation.controller.signal });
         }
       }
-      if (!['saved', 'reused'].includes(settled.status)) throw statusError(settled.status, '待完成的后端写入恢复失败。');
+      if (!['saved', 'reused'].includes(settled.status)) throw statusError(settled.status, '继续保存聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。');
       loaded = { ...loaded, run: settled.data ?? completed, runRevision: settled.revision };
     }
     const orderedFloors = [...loaded.floors].sort((left, right) => left.assistantSeq - right.assistantSeq);
@@ -467,11 +484,11 @@ export function createFoundationRuntime({
   const confirmationScopeFor = (candidates, floors, stableCount) => {
     if (!projectedChatId || stableCount >= candidates.length) return null;
     const bindings = matchFloorCandidates(floors ?? [], candidates);
-    if (bindings.issue) return null;
+    const tail = new Set(unregisteredTailCandidates(floors ?? [], candidates, bindings));
     const last = candidates.at(-1);
     const end = last?.stabilityProof?.kind === 'nextUser' ? candidates.length : candidates.length - 1;
     if (end <= stableCount) return null;
-    const selected = candidates.slice(stableCount, end);
+    const selected = candidates.slice(stableCount, end).filter(candidate => candidate?.memoryExcluded !== true && tail.has(candidate));
     if (selected.some(candidate => candidate?.messageAnchor?.status !== 'none')) return null;
     const items = selected.map(candidate => confirmationEvidence(candidate, candidate.stabilityProof?.kind !== 'nextUser'));
     if (!items.some(item => item.confirmationRequired)) return null;
@@ -485,7 +502,7 @@ export function createFoundationRuntime({
         hostLocator: { messageIndex: right.candidates[index]?.messageIndex, swipeId: right.candidates[index]?.swipeId, selectedSwipeIndex: right.candidates[index]?.selectedSwipeIndex },
         rawFingerprint: right.candidates[index]?.rawFingerprint, canonicalFingerprint: right.candidates[index]?.canonicalFingerprint,
         sanitizerFingerprint: right.candidates[index]?.sanitizerFingerprint }, item)));
-  function stableCountFor(candidates, floors, confirmLatest, stableThrough = null, manualConfirmation = null) {
+  function stableCountFor(candidates, floors, stableThrough = null, manualConfirmation = null) {
     if (stableThrough) {
       const boundaryIndex = candidates.findIndex(candidate => candidate.assistantSeq === stableThrough.assistantSeq
         && candidate.hostLocator.messageIndex === stableThrough.messageIndex
@@ -498,30 +515,41 @@ export function createFoundationRuntime({
     }
     const bindings = matchFloorCandidates(floors, candidates);
     const savedFloorIds = new Set((cache?.floorMemories ?? []).filter(memory => memory.recordStatus === 'active').flatMap(memorySourceFloorIds));
+    const rejected = new Set(bindings.issues.map(issue => issue.candidateIndex));
+    const lastMatchedIndex = bindings.matches.at(-1)?.candidateIndex ?? -1;
     let count = 0;
     while (candidates[count]) {
       const marker = candidates[count].messageAnchor;
       const match = bindings.candidateMatches.get(count);
       const matchedFloor = match?.floor ?? null;
+      // Unknown earlier sources are isolated, so they cannot block a confirmed later floor.
+      if (!match && (marker?.status !== 'none' || rejected.has(count) || count < lastMatchedIndex)) { count += 1; continue; }
+      const unconfirmedManualTail = count === candidates.length - 1 && !candidates[count]?.stabilityProof;
       const manuallySaved = matchedFloor?.stability?.stabilizedBy === 'manual'
+        && !unconfirmedManualTail
         && match.rawFingerprintMatches && match.canonicalFingerprintMatches && match.sanitizerFingerprintMatches;
       const permanentlySaved = Boolean(matchedFloor && (candidates[count].archiveCandidate === true || marker?.status === 'valid' || savedFloorIds.has(matchedFloor.id) || manuallySaved));
       const requestConfirmed = marker?.status === 'none' && matchedFloor
         && requestConfirmations.has(matchedFloor.id);
       const manuallyConfirmed = Array.isArray(manualConfirmation)
         && manualConfirmation.some(evidence => evidence.confirmationRequired === true && manualConfirmationMatches(candidates[count], evidence));
+      if (candidates[count].memoryExcluded === true) {
+        count += 1;
+        continue;
+      }
       if (candidates[count].stabilityProof?.kind !== 'nextUser' && !permanentlySaved && !requestConfirmed && !manuallyConfirmed) break;
       count += 1;
       if (Array.isArray(manualConfirmation) && manualConfirmation.length
-        && manualConfirmationMatches(candidates[count - 1], manualConfirmation.at(-1))) break;
+        && manualConfirmationMatches(candidates[count - 1], manualConfirmation.at(-1))
+        && candidates[count]?.memoryExcluded !== true) break;
     }
     return count;
   }
-  async function findOrphanAnchorRepair(value, candidates, bindings, { confirmLatest = false, stableThrough = null, manualConfirmation = null } = {}) {
+  async function findOrphanAnchorRepair(value, candidates, bindings, { stableThrough = null, manualConfirmation = null } = {}) {
     const tailRepair = orphanTailAnchorRepair(value, candidates, bindings);
     if (tailRepair) return tailRepair;
     let stableCount = 0;
-    try { stableCount = stableCountFor(candidates, value?.floors ?? [], confirmLatest, stableThrough, manualConfirmation); }
+    try { stableCount = stableCountFor(candidates, value?.floors ?? [], stableThrough, manualConfirmation); }
     catch { return null; }
     const replacement = exactOrphanMarkerRepair(value, candidates, bindings, stableCount);
     if (!replacement || !hasTimeFloorReference) return null;
@@ -538,7 +566,13 @@ export function createFoundationRuntime({
     if (!value?.root) return reason('missingRoot');
     const bindings = matchFloorCandidates(value.floors ?? [], candidates);
     if (bindings.issue) return reason('markerMismatch', bindings.issue.assistantSeq, bindings.issue.messageIndex, value.floors.length, candidates.length, { markerStatus: bindings.issue.markerStatus, bindingIssue: bindings.issue.code });
-    const stableCount = stableCountFor(candidates, value.floors ?? [], false, null);
+    const inputFingerprints = value.checkpoint?.inputFingerprints ?? [];
+    for (let index = 0; index < candidates.length; index += 1) {
+      if ((inputFingerprints[index]?.memoryExcluded === true) !== (candidates[index]?.memoryExcluded === true)) {
+        return reason('memoryExclusionChanged', candidates[index]?.assistantSeq ?? null, candidates[index]?.hostLocator?.messageIndex ?? null, value.floors.length, candidates.length);
+      }
+    }
+    const stableCount = stableCountFor(candidates, value.floors ?? []);
     if (stableCount !== (value.floors?.length ?? 0)) {
       const differenceIndex = Math.min(stableCount, value.floors?.length ?? 0);
       return reason('stableCountMismatch', candidates[differenceIndex]?.assistantSeq ?? value.floors?.[differenceIndex]?.assistantSeq ?? null,
@@ -575,8 +609,10 @@ export function createFoundationRuntime({
   function updateCandidateProjection(candidates, floors, pendingIndex) {
     pending = candidates[pendingIndex] ?? null;
     const bindings = matchFloorCandidates(floors ?? [], candidates);
+    bindingIssues = bindings.issues;
     unregisteredCandidates = Object.freeze(bindings.unmatchedCandidateIndexes.map(index => {
       const candidate = candidates[index];
+      if (candidate?.memoryExcluded === true) return null;
       const markerStatus = candidate?.messageAnchor?.status ?? 'none';
       const reason = markerStatus !== 'none'
         ? 'registrationNeedsReview'
@@ -588,7 +624,7 @@ export function createFoundationRuntime({
         messageIndex: candidate.hostLocator.messageIndex,
         reason,
       });
-    }));
+    }).filter(Boolean));
     consecutiveAssistantConfirmation = confirmationScopeFor(candidates, floors, pendingIndex);
   }
 
@@ -600,13 +636,18 @@ export function createFoundationRuntime({
   async function performInspect(reason = 'inspect', { allowCached = false } = {}) {
     if (!enabled()) return publish('disabled');
     const inspectEpoch = sessionEpoch;
+    const controller = new AbortController();
+    inspectionController = controller;
+    const hadError = Boolean(lastError);
     let captured = null;
     try {
       captured = capture();
+      lastError = null;
+      if (hadError || !allowCached) publish('running');
       projectedChatId = captured.identity.chatId;
       let candidates = await scanGraphCandidates(captured.host.chat, captured.identity.chatId);
       if (inspectEpoch !== sessionEpoch) return publicState;
-      if (allowCached && !lastError && cacheMatchesCandidates(candidates)) {
+      if (allowCached && !hadError && cacheMatchesCandidates(candidates)) {
         inspectedStableCount = cache.floors.length;
         updateCandidateProjection(candidates, cache.floors, inspectedStableCount);
         if (cache.status === 'needsReseal') {
@@ -615,26 +656,27 @@ export function createFoundationRuntime({
         }
         return publish('ready');
       }
-      if (!allowCached && cache?.status !== 'needsReseal' && !lastError && cacheMatchesCandidates(candidates)
+      if (publicState.status !== 'running') publish('running');
+      if (cache?.root?.chatId === captured.identity.chatId && cache.status !== 'needsReseal' && !hadError
         && typeof store.readRoot === 'function') {
         const rootResult = await store.readRoot();
         if (inspectEpoch !== sessionEpoch) return publicState;
         if (sameCachedRoot(rootResult)) {
-          inspectedStableCount = cache.floors.length;
+          inspectedStableCount = stableCountFor(candidates, cache.floors);
           updateCandidateProjection(candidates, cache.floors, inspectedStableCount);
-          reviewReason = null;
-          return publish('ready');
+          reviewReason = graphReviewReason(cache, candidates);
+          return publish(reviewReason ? 'needsReview' : 'ready');
         }
       }
-      const loaded = await store.readReachable({ mode: 'projection' });
+      const loaded = await store.readReachable({ mode: 'projection', signal: controller.signal });
       if (inspectEpoch !== sessionEpoch) return publicState;
-      inspectedStableCount = stableCountFor(candidates, loaded?.floors ?? [], false, null);
+      inspectedStableCount = stableCountFor(candidates, loaded?.floors ?? []);
       if (['ready', 'needsReseal'].includes(loaded.status)) {
         const orderedFloors = [...loaded.floors].sort((left, right) => left.assistantSeq - right.assistantSeq);
         cache = { ...loaded, floors: restoreActiveFloorViews(orderedFloors, loaded.indexes) };
         if (loaded.migrationDescriptor) {
           candidates = await scanGraphCandidates(captured.host.chat, captured.identity.chatId);
-          inspectedStableCount = stableCountFor(candidates, cache.floors, false, null);
+          inspectedStableCount = stableCountFor(candidates, cache.floors);
         }
         lastRun = runSummary(loaded.run, 'inspected');
       } else if (loaded.status === 'uninitialized') {
@@ -655,7 +697,7 @@ export function createFoundationRuntime({
     } catch (error) {
       if (inspectEpoch !== sessionEpoch) return publicState;
       if (captured) {
-        lastError = publicErrorMessage(error, { fallback: '后端数据检查失败，请稍后重试。' });
+        lastError = publicErrorMessage(error, { fallback: '读取聊天记忆失败。请稍后重试；仍失败时，请到“记忆管理”页点击“复制状态诊断”反馈。' });
         return publish('error');
       }
       if (cache?.root) return publicState;
@@ -666,39 +708,40 @@ export function createFoundationRuntime({
         const candidates = await scanCandidates(host.chat, { sanitizerOptions: sanitizerOptions() });
         if (inspectEpoch !== sessionEpoch) return publicState;
         if (cache?.root) return publicState;
-        inspectedStableCount = stableCountFor(candidates, [], false, null);
+        inspectedStableCount = stableCountFor(candidates, []);
         updateCandidateProjection(candidates, [], inspectedStableCount);
         cache = null;
         lastRun = null;
         lastError = null;
         return publish('uninitialized');
       } catch {
-        lastError = publicErrorMessage(error, { fallback: '后端数据检查失败，请稍后重试。' });
+        lastError = publicErrorMessage(error, { fallback: '读取聊天记忆失败。请稍后重试；仍失败时，请到“记忆管理”页点击“复制状态诊断”反馈。' });
         return publish('error');
       }
-    }
+    } finally { if (inspectionController === controller) inspectionController = null; }
   }
 
   function inspect(reason = 'inspect', options = {}) {
     if (!enabled()) return Promise.resolve(publish('disabled'));
+    const inspectEpoch = sessionEpoch;
     const allowCached = options.allowCached === true;
     const pendingWriter = !allowCached ? (scheduled ?? activeOperation?.promise ?? null) : null;
-    if (pendingWriter) return pendingWriter.then(() => inspect(reason, options));
+    if (pendingWriter) return pendingWriter.then(() => inspectEpoch === sessionEpoch ? inspect(reason, options) : publicState);
     if (inspectionScheduled) {
       if (!allowCached && inspectionScheduled.allowCached) {
         const predecessor = inspectionScheduled.promise;
-        const fresh = predecessor.then(() => performInspect(reason, { ...options, allowCached: false }));
+        const fresh = predecessor.then(() => inspectEpoch === sessionEpoch ? performInspect(reason, { ...options, allowCached: false }) : publicState);
         const entry = { allowCached: false, promise: null };
-        entry.promise = fresh.finally(() => { if (inspectionScheduled === entry) inspectionScheduled = null; });
-        inspectionScheduled = entry;
+        entry.promise = fresh.finally(() => { if (inspectionScheduled === entry) inspectionScheduled = null; activity.notifyActivity(); });
+        inspectionScheduled = entry; activity.notifyActivity();
         return entry.promise;
       }
       return inspectionScheduled.promise;
     }
-    const request = Promise.resolve().then(() => performInspect(reason, options));
+    const request = Promise.resolve().then(() => inspectEpoch === sessionEpoch ? performInspect(reason, options) : publicState);
     const entry = { allowCached, promise: null };
-    entry.promise = request.finally(() => { if (inspectionScheduled === entry) inspectionScheduled = null; });
-    inspectionScheduled = entry;
+    entry.promise = request.finally(() => { if (inspectionScheduled === entry) inspectionScheduled = null; activity.notifyActivity(); });
+    inspectionScheduled = entry; activity.notifyActivity();
     return entry.promise;
   }
 
@@ -709,7 +752,7 @@ export function createFoundationRuntime({
   function observeDeferredPreparation(expectedEpoch) {
     void Promise.resolve().then(() => prepareSession()).catch(error => {
       if (expectedEpoch !== sessionEpoch || !enabled()) return;
-      lastError = publicErrorMessage(error, { fallback: '聊天身份准备失败，请稍后重试。' });
+      lastError = publicErrorMessage(error, { fallback: '聊天身份准备失败。请到“记忆管理”页点击“复制状态诊断”反馈。' });
       publish('error');
     });
   }
@@ -742,7 +785,7 @@ export function createFoundationRuntime({
         else result = await store.replaceRecord(record, winner.revision, { signal: operation.controller.signal });
       }
     }
-    if (!['saved', 'reused'].includes(result.status)) throw statusError(result.status, '后端任务状态写入失败。');
+    if (!['saved', 'reused'].includes(result.status)) throw statusError(result.status, '保存聊天记忆进度失败。请到“记忆管理”页点击“复制状态诊断”反馈。');
     operation.runRevision = result.revision;
     operation.runRecord = result.data ?? record;
     return operation.runRecord;
@@ -751,12 +794,12 @@ export function createFoundationRuntime({
   async function recoverPreparedRun(operation, runId, { parentCheckpointId, inputSnapshotFingerprint, narrativeGeneration }) {
     const result = await store.readRecord('run', runId);
     if (result.status === 'missing') return null;
-    if (result.status !== 'ready') throw statusError(result.status, '待提交任务读取失败。');
+    if (result.status !== 'ready') throw statusError(result.status, '读取未完成的聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。');
     const record = result.data;
     if (record.parentCheckpointId !== parentCheckpointId
       || record.inputSnapshotFingerprint !== inputSnapshotFingerprint
       || record.narrativeGeneration !== narrativeGeneration) {
-      throw Object.assign(new Error('待提交任务与当前输入不一致。'), { code: 'V3_STAGED_SCOPE_MISMATCH' });
+      throw Object.assign(new Error('未完成的记忆与当前聊天内容不一致，无法继续保存。请到“记忆管理”页点击“复制状态诊断”反馈。'), { code: 'V3_STAGED_SCOPE_MISMATCH' });
     }
     operation.runRevision = result.revision;
     operation.runRecord = record;
@@ -769,7 +812,7 @@ export function createFoundationRuntime({
     if (operation.resumePreparedRefs?.has(key)) {
       const existing = await store.readRecord(record.recordType, key);
       if (existing.status === 'ready' && sameFoundationRecordContent(existing.data, record)) return { status: 'reused', data: existing.data, revision: existing.revision, recordId: key };
-      if (existing.status !== 'missing') throw Object.assign(new Error('待提交记录内容发生冲突。'), { code: 'V3_STAGED_CONFLICT' });
+      if (existing.status !== 'missing') throw Object.assign(new Error('聊天记忆记录与待保存内容不一致，无法继续保存。请到“记忆管理”页点击“复制状态诊断”反馈。'), { code: 'V3_STAGED_CONFLICT' });
     }
     return store.putRecord(record, { signal: operation.controller.signal });
   }
@@ -786,8 +829,8 @@ export function createFoundationRuntime({
           const freshness = current(operation);
           if (freshness !== 'current') throw statusError(freshness);
           const result = await persistPreparedRecord(operation, records[index]);
-          if (result.status === 'conflict') throw Object.assign(new Error('待提交记录发生冲突。'), { code: 'V3_STAGED_CONFLICT' });
-          if (!['saved', 'reused'].includes(result.status)) throw statusError(result.status, '待提交记录写入失败。');
+          if (result.status === 'conflict') throw Object.assign(new Error('聊天记忆记录发生冲突，无法完成保存。请到“记忆管理”页点击“复制状态诊断”反馈。'), { code: 'V3_STAGED_CONFLICT' });
+          if (!['saved', 'reused'].includes(result.status)) throw statusError(result.status, '保存聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。');
         } catch (error) {
           firstError ??= error;
         }
@@ -797,15 +840,13 @@ export function createFoundationRuntime({
     if (firstError) throw firstError;
   }
 
-  async function scanCurrentSnapshot(operation, { confirmLatest = false, stableThrough = operation?.stableThrough ?? null, manualConfirmation = operation?.manualConfirmation ?? null } = {}) {
+  async function scanCurrentSnapshot(operation, { stableThrough = operation?.stableThrough ?? null, manualConfirmation = operation?.manualConfirmation ?? null } = {}) {
     if (current(operation) !== 'current') throw statusError('stale');
     if (targetRecoveryLeaf && targetChatIo?.requireSourceValidation === true) await targetChatIo.readLatest();
     const captured = capture();
     const candidates = await scanGraphCandidates(captured.host.chat, captured.identity.chatId);
     if (current(operation) !== 'current') throw statusError('stale');
-    const bindings = matchFloorCandidates(cache?.floors ?? [], candidates);
-    if (bindings.issue) throw statusError('needsReview', '当前消息记忆标识存在冲突，本次操作不再提交。');
-    const stableCount = stableCountFor(candidates, cache?.floors ?? [], confirmLatest, stableThrough, manualConfirmation);
+    const stableCount = stableCountFor(candidates, cache?.floors ?? [], stableThrough, manualConfirmation);
     const snapshot = await inputSnapshotForCandidates(candidates, stableCount);
     return { candidates, stableCount, snapshot };
   }
@@ -853,7 +894,7 @@ export function createFoundationRuntime({
     if (captured.host.context.groupId !== null && captured.host.context.groupId !== undefined) return publicState;
     const evidence = { identity: captured.identity, epoch: sessionEpoch, newLen: captured.host.chat.length };
     const candidates = await scanGraphCandidates(captured.host.chat, captured.identity.chatId);
-    if (!tailDeletionMatches(evidence, candidates, cache?.floors ?? [], stableCountFor(candidates, cache?.floors ?? [], false))) return publicState;
+    if (!tailDeletionMatches(evidence, candidates, cache?.floors ?? [], stableCountFor(candidates, cache?.floors ?? []))) return publicState;
     const messageSnapshot = messages => JSON.stringify(messages.map(message => ({
       is_user: message?.is_user, is_system: message?.is_system, mes: message?.mes,
       swipes: message?.swipes, swipe_id: message?.swipe_id, send_date: message?.send_date,
@@ -1010,6 +1051,7 @@ export function createFoundationRuntime({
         publish(targetState.status);
         return result;
       };
+      if (sameCapturedTarget()) { lastError = null; publish('running'); }
       const inspected = await fixedRuntime.inspect('orphanTailRecovery', { allowCached: false });
       if (inspected.status !== 'needsReview' || inspected.reviewReason?.code !== 'markerMismatch'
         || inspected.reviewReason?.bindingIssue !== 'markerConflict') {
@@ -1075,31 +1117,53 @@ export function createFoundationRuntime({
     const frozenFloorIds = new Set(migrationPartition(cache).frozenFloorIds);
     const memoryFloorIds = new Set((cache.floorMemories ?? []).filter(memory => memory.recordStatus === 'active').flatMap(memorySourceFloorIds));
     const bindings = matchFloorCandidates(existing, stableCandidates);
-    if (bindings.issue?.code === 'markerRejected') throw statusError('needsReview', '消息记忆标识无效或来自其他聊天，未静默接管。');
-    if (bindings.issue?.code === 'markerConflict') throw statusError('needsReview', '消息记忆标识指向当前图中不存在的楼，未静默猜测。');
-    if (bindings.issue?.code === 'duplicateMarker' || bindings.issue?.code === 'duplicateBinding') throw statusError('needsReview', '多条消息使用了同一个记忆楼标识，未静默合并。');
-    if (bindings.issue) throw statusError('needsReview', '旧聊天存在重复正文，无法唯一迁移消息记忆标识。');
-    const aligned = stableCandidates.map((_, index) => bindings.candidateMatches.get(index)?.floor ?? null);
-    const usedFloorIds = new Set(bindings.matches.map(match => match.floor.id));
-    const unmatchedCandidates = bindings.unmatchedCandidateIndexes.map(index => stableCandidates[index]);
-    for (const floor of existing) {
-      const unresolvedReplacement = unmatchedCandidates.some(candidate => candidate?.messageAnchor?.status === 'none'
-        && sameLocator(floor.hostLocator, candidate.hostLocator));
-      if (!usedFloorIds.has(floor.id) && memoryFloorIds.has(floor.id) && unresolvedReplacement) {
-        throw statusError('needsReview', '已保存摘要的旧消息缺少可证明的唯一绑定，未自动覆盖。');
+    const lastMatchedIndex = bindings.floorMatches.get(existing.length - 1)?.candidateIndex ?? -1;
+    const unresolvedSource = bindings.unmatchedFloorIndexes.length > 0
+      && bindings.unmatchedCandidateIndexes.some(index => index <= lastMatchedIndex
+        || bindings.unmatchedFloorIndexes.some(floorIndex => sameLocator(existing[floorIndex].hostLocator, stableCandidates[index].hostLocator)));
+    const localReview = Boolean(bindings.issue) || unresolvedSource;
+    const tail = localReview ? unregisteredTailCandidates(existing, stableCandidates, bindings) : [];
+    const floorCandidates = localReview
+      ? [...existing.map((floor, index) => bindings.floorMatches.get(index)?.candidate ?? null), ...tail]
+        .map((candidate, index) => candidate ? { ...candidate, assistantSeq: index + 1 } : null)
+      : stableCandidates;
+    const aligned = localReview
+      ? [...existing, ...tail.map(() => null)]
+      : stableCandidates.map((_, index) => bindings.candidateMatches.get(index)?.floor ?? null);
+    const usedFloorIds = localReview ? new Set(existing.map(floor => floor.id)) : new Set(bindings.matches.map(match => match.floor.id));
+    for (let index = 0; index < floorCandidates.length; index += 1) {
+      if (floorCandidates[index]?.memoryExcluded === true && aligned[index] && memoryFloorIds.has(aligned[index].id)) {
+        throw statusError('needsReview', '已有摘要的楼不能标为不计入记忆；如需移除，请在酒馆删除这条消息。');
       }
     }
     const removedFloorIds = existing.filter(floor => !usedFloorIds.has(floor.id)).map(floor => floor.id);
-    const destructiveRemoval = stableCandidates.length < existing.length || removedFloorIds.some(floorId => memoryFloorIds.has(floorId));
+    const dropsOnlyUnreferencedManualTail = stableCandidates.length < existing.length
+      && removedFloorIds.length === 1
+      && removedFloorIds[0] === existing.at(-1)?.id
+      && stableCandidates.length === existing.length - 1
+      && candidates.length === stableCandidates.length + 1
+      && existing.at(-1)?.stability?.stabilizedBy === 'manual'
+      && !existing.at(-1)?.stability?.proof
+      && !candidates.at(-1)?.stabilityProof
+      && sameLocator(existing.at(-1).hostLocator, candidates.at(-1)?.hostLocator)
+      && existing.at(-1).content.rawFingerprint === candidates.at(-1)?.rawFingerprint
+      && existing.at(-1).content.canonicalFingerprint === candidates.at(-1)?.canonicalFingerprint
+      && existing.at(-1).content.sanitizerFingerprint === candidates.at(-1)?.sanitizerFingerprint
+      && !(cache.floorMemories ?? []).some(memory => memorySourceFloorIds(memory).includes(existing.at(-1).id))
+      && !(cache.stateDeltas ?? []).some(delta => delta.floorId === existing.at(-1).id);
+    // An unrecorded manual tail without user confirmation returns to waiting; it has no saved facts to remove.
+    const destructiveRemoval = !localReview && !dropsOnlyUnreferencedManualTail
+      && (stableCandidates.length < existing.length || removedFloorIds.some(floorId => memoryFloorIds.has(floorId)));
     if (destructiveRemoval && operation.chatComplete !== true && !(operation.chatComplete == null && tailDeletionMatches(operation.tailDeletion, candidates, existing, stableCount))) throw statusError('needsReview', '当前聊天没有完整加载证明，未把暂时不可见的消息当作已删除。');
-    const locatorChanged = existing.length === stableCandidates.length && existing.some((floor, index) => !sameLocator(floor.hostLocator, stableCandidates[index]?.hostLocator));
+    const locatorChanged = existing.length === floorCandidates.length && existing.some((floor, index) => floorCandidates[index] && !sameLocator(floor.hostLocator, floorCandidates[index].hostLocator));
     const identityChanged = existing.length !== aligned.length || existing.some((floor, index) => aligned[index]?.id !== floor.id);
     if (!identityChanged && !locatorChanged && !cache.indexesMissing
       && cache.root?.sourceSnapshotFingerprint === snapshot.fingerprint) {
       updateCandidateProjection(candidates, cache.floors, stableCount);
       lastError = null;
       lastRun = runSummary(cache.run, 'unchanged');
-      return publishOperation(operation, cache.root ? 'ready' : 'uninitialized');
+      reviewReason = cache.root ? graphReviewReason(cache, candidates) : null;
+      return publishOperation(operation, reviewReason ? 'needsReview' : cache.root ? 'ready' : 'uninitialized');
     }
 
     const narrativeGeneration = cache.root?.narrativeGeneration
@@ -1116,35 +1180,38 @@ export function createFoundationRuntime({
     const recoveredRun = await recoverPreparedRun(operation, runId, { parentCheckpointId, inputSnapshotFingerprint: snapshot.fingerprint, narrativeGeneration });
     const nowValue = recoveredRun?.createdAt ?? timestamp(now());
     const floors = [], newFloors = [];
-    for (let index = 0; index < stableCount; index += 1) {
-      const prior = aligned[index];
+    for (let index = 0; index < floorCandidates.length; index += 1) {
+      const prior = aligned[index], candidate = floorCandidates[index];
+      if (localReview && !candidate) { floors.push(prior); continue; }
       if (!prior) {
         const created = createFloorRecord({
-        id: await deterministicUuid(['floor', operation.chatId, narrativeGeneration, runId, index + 1, stableCandidates[index].rawFingerprint, stableCandidates[index].canonicalFingerprint]),
-        chatId: operation.chatId, narrativeGeneration, candidate: stableCandidates[index], predecessorFloorId: floors.at(-1)?.id ?? null,
-        stabilizedBy: stableCandidates[index].stabilityProof ? 'nextUser' : 'manual', runId, checkpointId, now: nowValue,
+        id: await deterministicUuid(['floor', operation.chatId, narrativeGeneration, runId, index + 1, candidate.rawFingerprint, candidate.canonicalFingerprint]),
+        chatId: operation.chatId, narrativeGeneration, candidate, predecessorFloorId: floors.at(-1)?.id ?? null,
+        stabilizedBy: candidate.memoryExcluded === true ? 'manual' : candidate.stabilityProof ? 'nextUser' : 'manual', runId, checkpointId, now: nowValue,
         });
         floors.push(created); newFloors.push(created); continue;
       }
       if (frozenFloorIds.has(prior.id)) { floors.push(prior); continue; }
-      const rebound = validateFoundationFloor({ ...prior, assistantSeq: stableCandidates[index].assistantSeq ?? index + 1,
-        predecessorFloorId: floors.at(-1)?.id ?? null, hostLocator: { ...stableCandidates[index].hostLocator }, updatedAt: nowValue }, { expectedChatId: operation.chatId });
+      const rebound = validateFoundationFloor({ ...prior, assistantSeq: candidate.assistantSeq ?? index + 1,
+        predecessorFloorId: floors.at(-1)?.id ?? null, hostLocator: { ...candidate.hostLocator }, updatedAt: nowValue }, { expectedChatId: operation.chatId });
       floors.push(rebound);
     }
+    const excludedFloorIds = new Set(floorCandidates.flatMap((candidate, index) => candidate?.memoryExcluded === true && floors[index] ? [floors[index].id] : []));
     const { floorMemories, stateDeltas, entities, baseline, currentState, capabilities } = await projectFoundationPrefix({
       source: cache,
       floors,
+      excludedFloorIds,
       chatId: operation.chatId,
       narrativeGeneration,
       now: nowValue,
       currentStateId: await deterministicUuid(['v3-cse-current-state', checkpointId]),
       previousCurrentStateId: cache.currentStates?.at(-1)?.id ?? null,
     });
-    const indexes = await buildFoundationIndexes({ chatId: operation.chatId, narrativeGeneration, checkpointId, floors, candidates: stableCandidates, entities, now: nowValue });
+    const indexes = await buildFoundationIndexes({ chatId: operation.chatId, narrativeGeneration, checkpointId, floors, candidates: floorCandidates, entities, now: nowValue });
     const indexKeys = indexes.map(index => store.recordKey(index));
     const floorIds = floors.map(floor => floor.id);
     const priorRealtimeOrigin = realtimeOriginFromReachable(cache);
-    const carriesRealtimeOrigin = ['MESSAGE_SENT', 'MESSAGE_RECEIVED', 'earlyAssistantStarted'].includes(operation.reason)
+    const carriesRealtimeOrigin = operation.reason==='initializePlaces'&&floors.length===0 || ['MESSAGE_SENT', 'MESSAGE_RECEIVED', 'earlyAssistantStarted', 'memoryExclusionChanged'].includes(operation.reason)
       && (emptyRealtimeObservation?.chatId === operation.chatId || priorRealtimeOrigin !== null);
     const realtimeOrigin = carriesRealtimeOrigin ? {
       chatId: operation.chatId,
@@ -1164,7 +1231,7 @@ export function createFoundationRuntime({
       ...commonRecord({ recordType: 'checkpoint', id: checkpointId, chatId: operation.chatId, narrativeGeneration, now: nowValue, recordStatus: 'active' }),
       parentCheckpointId, runId, sourceSnapshotFingerprint: snapshot.fingerprint, indexLayout: V3_INDEX_LAYOUT_FLOOR_ORDER, capabilities: clone(capabilities),
       floorRange: { fromAssistantSeq: floors.length ? 1 : 0, toAssistantSeq: floors.length, floorIds },
-      inputFingerprints: createCheckpointInputFingerprints(floors, { candidates: stableCandidates, previous: cache.checkpoint?.inputFingerprints }),
+      inputFingerprints: createCheckpointInputFingerprints(floors, { candidates: floorCandidates, previous: cache.checkpoint?.inputFingerprints }),
       producedRefs: { floors: floorIds, floorMemories: floorMemories.map(memory => memory.id), entities: entities.map(entity => entity.id), events: [], claims: [], knowledge: [], stateDeltas: stateDeltas.map(delta => delta.id), currentStates: currentState ? [currentState.id] : [], stateProjections: [], episodes: [], threads: [], indexes: indexKeys },
       validation: { schemaValid: true, referencesValid: true, orderedReplayValid: true, stateFingerprint },
       sealedAt: nowValue,
@@ -1179,15 +1246,15 @@ export function createFoundationRuntime({
     await persistPreparedRecords(operation, [...newFloors, ...newStateDeltas, ...(currentState ? [currentState] : []), ...indexes]);
     const checkpointResult = await persistPreparedRecord(operation, checkpoint);
     if (checkpointResult.status === 'conflict') throw Object.assign(new Error('待提交的记忆快照发生冲突。'), { code: 'V3_STAGED_CONFLICT' });
-    if (!['saved', 'reused'].includes(checkpointResult.status)) throw statusError(checkpointResult.status, '待提交的记忆快照写入失败。');
+    if (!['saved', 'reused'].includes(checkpointResult.status)) throw statusError(checkpointResult.status, '保存聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。');
     run = await persistRunPhase(operation, 'committing', { completedFloorIds: newFloors.map(floor => floor.id) });
     const freshness = current(operation);
     if (freshness !== 'current') throw statusError(freshness);
-    const beforeCommit = await scanCurrentSnapshot(operation, { confirmLatest, stableThrough, manualConfirmation });
+    const beforeCommit = await scanCurrentSnapshot(operation, { stableThrough, manualConfirmation });
     if (beforeCommit.snapshot.fingerprint !== snapshot.fingerprint) {
       const staleRun = await persistRunPhase(operation, 'stale', { completedFloorIds: newFloors.map(floor => floor.id) });
       lastRun = runSummary(staleRun, 'sourceChangedBeforeCommit');
-      lastError = '后端数据的输入在提交前已变化，旧快照已作废并将自动同步。';
+      lastError = '聊天内容在保存前发生变化，本次保存未完成，正在同步最新内容。';
       dirtyReason = 'sourceChangedBeforeCommit';
       return publishOperation(operation, 'stale');
     }
@@ -1207,7 +1274,7 @@ export function createFoundationRuntime({
     if (committed.status === 'conflict') {
       unreachableCount += newFloors.length + indexes.length + 2;
       const winner = await store.readReachable();
-      const currentInput = await scanCurrentSnapshot(operation, { confirmLatest, stableThrough, manualConfirmation });
+      const currentInput = await scanCurrentSnapshot(operation, { stableThrough, manualConfirmation });
       const samePreparedWinner = winner.status === 'ready'
         && winner.checkpoint.runId === runId
         && winner.root.sourceSnapshotFingerprint === snapshot.fingerprint;
@@ -1216,7 +1283,7 @@ export function createFoundationRuntime({
         : await persistRunPhase(operation, 'stale', { completedFloorIds: newFloors.map(floor => floor.id) });
       if (currentInput.snapshot.fingerprint !== snapshot.fingerprint) {
         lastRun = runSummary(staleRun, 'casConflictSourceChanged');
-        lastError = '并发提交期间正文又发生变化，旧快照已作废并将自动收敛。';
+        lastError = '聊天内容在同步期间发生变化，正在更新记忆。';
         cache = winner.status === 'ready' ? { ...winner, floors: restoreActiveFloorViews([...winner.floors].sort((left, right) => left.assistantSeq - right.assistantSeq), winner.indexes) } : null;
         updateCandidateProjection(currentInput.candidates, cache?.floors ?? [], currentInput.stableCount);
         dirtyReason = 'casConflictSourceChanged';
@@ -1228,18 +1295,19 @@ export function createFoundationRuntime({
           updateCandidateProjection(candidates, cache.floors, stableCount);
           lastRun = runSummary(staleRun, 'winnerAlreadyCurrent');
           lastError = null;
-          return publishOperation(operation, 'ready');
+          reviewReason = graphReviewReason(cache, candidates);
+          return publishOperation(operation, reviewReason ? 'needsReview' : 'ready');
         }
         if (rebaseAttempt < 2) {
           return seal(operation, { candidates, stableCount, confirmLatest, stableThrough, manualConfirmation, sourceSnapshot: snapshot, rebaseAttempt: rebaseAttempt + 1 });
         }
       }
       lastRun = runSummary(staleRun, 'casConflict');
-      lastError = '后端数据提交遇到并发更新，当前快照无法安全同步。';
+      lastError = '聊天记忆同时被其他操作更新，当前内容未能保存。请到“记忆管理”页点击“复制状态诊断”反馈。';
       cache = null;
       return publishOperation(operation, 'conflict');
     }
-    if (committed.status !== 'saved') throw statusError(committed.status, '后端入口记录提交失败。');
+    if (committed.status !== 'saved') throw statusError(committed.status, '保存聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。');
     const committedReachable = committed.reachable;
     if (!committedReachable || committedReachable.status !== 'ready'
       || committedReachable.rootRevision !== committed.revision
@@ -1247,17 +1315,17 @@ export function createFoundationRuntime({
       || committedReachable.root?.headCheckpointId !== checkpointId
       || committedReachable.root?.narrativeGeneration !== narrativeGeneration
       || committedReachable.root?.sourceSnapshotFingerprint !== snapshot.fingerprint) {
-      throw Object.assign(new Error('后端入口记录已提交，但无法读到一致的完整记忆数据。'), { code: 'V3_COMMIT_REACHABLE_MISMATCH' });
+      throw Object.assign(new Error('聊天记忆保存后无法确认完整结果。请到“记忆管理”页点击“复制状态诊断”反馈。'), { code: 'V3_COMMIT_REACHABLE_MISMATCH' });
     }
-    cache = { ...committedReachable, floors: activeFloorViews(committedReachable.floors, stableCandidates) };
-    const afterCommit = await scanCurrentSnapshot(operation, { confirmLatest, stableThrough, manualConfirmation });
+    cache = { ...committedReachable, floors: activeFloorViews(committedReachable.floors, floorCandidates) };
+    const afterCommit = await scanCurrentSnapshot(operation, { stableThrough, manualConfirmation });
     if (afterCommit.snapshot.fingerprint !== snapshot.fingerprint) {
       const staleRun = await persistRunPhase(operation, 'stale', { completedFloorIds: newFloors.map(floor => floor.id) });
       cache.run = staleRun;
       lastRun = runSummary(staleRun, 'sourceChangedAfterCommit');
-      lastError = '提交响应返回时正文已变化，正在自动收敛到最新快照。';
+      lastError = '聊天内容在保存期间发生变化，正在同步最新内容。';
       if (rebaseAttempt < 2) {
-        const latest = await scanCurrentSnapshot(operation, { confirmLatest: false, stableThrough, manualConfirmation });
+        const latest = await scanCurrentSnapshot(operation, { stableThrough, manualConfirmation });
         return seal(operation, { ...latest, confirmLatest: false, stableThrough, manualConfirmation, sourceSnapshot: latest.snapshot, rebaseAttempt: rebaseAttempt + 1 });
       }
       dirtyReason = 'sourceChangedAfterCommit';
@@ -1269,10 +1337,11 @@ export function createFoundationRuntime({
     updateCandidateProjection(afterCommit.candidates, cache.floors, afterCommit.stableCount);
     lastRun = runSummary(completedRun, 'committed');
     lastError = null;
-    return publishOperation(operation, 'ready');
+    reviewReason = graphReviewReason(cache, afterCommit.candidates);
+    return publishOperation(operation, reviewReason ? 'needsReview' : 'ready');
   }
 
-  async function reconcile(reason = 'manualRefresh', { confirmLatest = false, stableThrough = null, tailDeletion = null, manualConfirmation = null, verifyRoot = false } = {}) {
+  async function reconcile(reason = 'manualRefresh', { confirmLatest = false, stableThrough = null, tailDeletion = null, manualConfirmation = null, verifyRoot = false, allowEmptyInitialize = false } = {}) {
     if (!enabled()) return publish('disabled');
     if (activeOperation) {
       dirtyReason = reason;
@@ -1289,12 +1358,14 @@ export function createFoundationRuntime({
       manualConfirmation: Array.isArray(manualConfirmation) ? Object.freeze(manualConfirmation.map(item => Object.freeze({ ...item }))) : null,
     };
     activeOperation = operation;
+    lastError = null;
     publishOperation(operation, 'running');
     let settledPublicState = null;
     const runPromise = (async () => {
       try {
         if (prepareSession) {
           const prepared = await prepareSession();
+          if (prepared?.status === 'idle') return publishOperation(operation, 'uninitialized');
           if (prepared?.status && prepared.status !== 'ready') throw statusError(prepared.status, '当前聊天身份尚未准备完成。');
         }
         if (operation.epoch !== sessionEpoch || operation.controller.signal.aborted) return publishOperation(operation, enabled() ? 'stale' : 'disabled');
@@ -1313,7 +1384,7 @@ export function createFoundationRuntime({
         metrics = Object.freeze({ assistantFloors: candidates.length, canonicalCharacters: candidates.reduce((sum, item) => sum + item.canonicalContent.length, 0), scanMs: elapsed, maximumChunkMs: scanMetrics.maximumChunkMs ?? elapsed, algorithm: 'ordered-O(n)' });
         let candidateBindings = matchFloorCandidates(loaded.floors, candidates);
         const orphanRepair = await findOrphanAnchorRepair(loaded, candidates, candidateBindings,
-          { confirmLatest, stableThrough, manualConfirmation: operation.manualConfirmation });
+          { stableThrough, manualConfirmation: operation.manualConfirmation });
         if (orphanRepair && operation.orphanRepairAttempted !== true && !targetRecoveryLeaf) {
           operation.orphanRepairAttempted = true;
           if (operation.recoveryTarget) return await runOrphanTargetRecovery(operation.recoveryTarget);
@@ -1328,22 +1399,21 @@ export function createFoundationRuntime({
           candidateBindings = matchFloorCandidates(loaded.floors, candidates);
         }
         if (candidateBindings.issue) {
-          inspectedStableCount = stableCountFor(candidates, loaded.floors, confirmLatest, stableThrough, operation.manualConfirmation);
+          inspectedStableCount = stableCountFor(candidates, loaded.floors, stableThrough, operation.manualConfirmation);
           updateCandidateProjection(candidates, loaded.floors, inspectedStableCount);
           reviewReason = bindingReviewReason(candidateBindings.issue, loaded.floors, candidates);
           lastError = null;
-          return publishOperation(operation, 'needsReview');
         }
         if (operation.manualConfirmation) {
-          const ordinaryStableCount = stableCountFor(candidates, loaded.floors, confirmLatest, stableThrough, null);
+          const ordinaryStableCount = stableCountFor(candidates, loaded.floors, stableThrough, null);
           const currentScope = confirmationScopeFor(candidates, loaded.floors, ordinaryStableCount);
           if (!sameConfirmationScope({ chatId: operation.chatId, candidates: operation.manualConfirmation }, currentScope)) {
             throw statusError('stale', '连续 AI 确认范围已经变化，本次操作未写入。');
           }
         }
-        const stableCount = stableCountFor(candidates, loaded.floors, confirmLatest, stableThrough, operation.manualConfirmation);
+        const stableCount = stableCountFor(candidates, loaded.floors, stableThrough, operation.manualConfirmation);
     const sourceSnapshot = await inputSnapshotForCandidates(candidates, stableCount);
-        if (!loaded.root && stableCount === 0) {
+        if (!loaded.root && stableCount === 0 && !allowEmptyInitialize) {
           emptyRealtimeObservation = Object.freeze({ chatId: operation.chatId });
           updateCandidateProjection(candidates, [], 0);
           lastRun = null;
@@ -1368,7 +1438,7 @@ export function createFoundationRuntime({
         } else if (!lastRun || lastRun.id !== operation.id) {
           lastRun = Object.freeze({ id: operation.id, mode: reason, phase: 'retryableError', code: error?.code ?? null });
         }
-        lastError = publicErrorMessage(error, { fallback: '后端数据处理失败，请稍后重试。' });
+        lastError = publicErrorMessage(error, { fallback: '处理聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。' });
         logger?.warn?.('[qianqianjie] V3 foundation failed', { code: error?.code ?? error?.name ?? 'V3_FOUNDATION_FAILED' });
         return publishOperation(operation, 'error');
       } finally {
@@ -1383,7 +1453,7 @@ export function createFoundationRuntime({
           dirtyReason = null;
           dirtyStableThrough = null;
           dirtyTailDeletion = null;
-          Promise.resolve().then(() => reconcile(nextReason, { stableThrough: nextStableThrough, tailDeletion: nextTailDeletion })).catch(error => { lastError = publicErrorMessage(error, { fallback: '后端数据同步任务启动失败，请稍后重试。' }); publish('error'); });
+          Promise.resolve().then(() => reconcile(nextReason, { stableThrough: nextStableThrough, tailDeletion: nextTailDeletion })).catch(error => { lastError = publicErrorMessage(error, { fallback: '同步聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。' }); publish('error'); });
         }
       }
     })();
@@ -1402,7 +1472,7 @@ export function createFoundationRuntime({
       const nextTailDeletion = dirtyTailDeletion; dirtyTailDeletion = null;
       return reconcile(next, { tailDeletion: nextTailDeletion });
     }).catch(error => {
-      lastError = publicErrorMessage(error, { fallback: '后端数据同步任务启动失败，请稍后重试。' });
+      lastError = publicErrorMessage(error, { fallback: '同步聊天记忆失败。请到“记忆管理”页点击“复制状态诊断”反馈。' });
       logger?.warn?.('[qianqianjie] V3 foundation schedule failed', { code: error?.code ?? error?.name ?? 'V3_SCHEDULE_FAILED' });
       return publish('error');
     });
@@ -1471,7 +1541,7 @@ export function createFoundationRuntime({
     try { identity = capture().identity; } catch { return false; }
     if (value.root.chatId !== identity.chatId || (cache?.rootRevision ?? 0) > value.rootRevision) return false;
     cache = value;
-    const registeredMessageIndexes = new Set((cache.floors ?? []).map(floor => floor.hostLocator?.messageIndex));
+    const registeredMessageIndexes = new Set(migrationPartition(cache).liveFloors.map(floor => floor.hostLocator?.messageIndex));
     unregisteredCandidates = Object.freeze(unregisteredCandidates.filter(candidate => !registeredMessageIndexes.has(candidate.messageIndex)));
     if (consecutiveAssistantConfirmation) {
       const candidates = consecutiveAssistantConfirmation.candidates.filter(candidate => !registeredMessageIndexes.has(candidate.messageIndex));
@@ -1481,8 +1551,7 @@ export function createFoundationRuntime({
     if (registeredMessageIndexes.has(pending?.hostLocator?.messageIndex)) pending = null;
     lastRun = runSummary(cache.run, 'adopted');
     lastError = null;
-    reviewReason = null;
-    publish('ready');
+    publish(reviewReason ? 'needsReview' : 'ready');
     return true;
   }
   function holdExtractionConfirmation(floorId, token) {
@@ -1518,9 +1587,7 @@ export function createFoundationRuntime({
     const captured = capture();
     const candidates = await scanGraphCandidates(captured.host.chat, captured.identity.chatId);
     if (captured.identity.chatId !== projectedChatId || scope?.chatId !== captured.identity.chatId) return publish('stale');
-    const bindings = matchFloorCandidates(cache.floors ?? [], candidates);
-    if (bindings.issue) return reconcile('manualConfirmConsecutive');
-    const stableCount = stableCountFor(candidates, cache.floors ?? [], false, null);
+    const stableCount = stableCountFor(candidates, cache.floors ?? []);
     const currentScope = confirmationScopeFor(candidates, cache.floors ?? [], stableCount);
     if (!sameConfirmationScope(scope, currentScope)) {
       updateCandidateProjection(candidates, cache.floors ?? [], stableCount);
@@ -1528,7 +1595,51 @@ export function createFoundationRuntime({
     }
     return reconcile('manualConfirmConsecutive', { manualConfirmation: currentScope.candidates });
   }
-  return Object.freeze({
+  async function setMemoryExcluded(messageIndex, excluded) {
+    if (typeof excluded !== 'boolean' || !Number.isSafeInteger(messageIndex) || messageIndex < 0) {
+      throw statusError('conflict', '待标记的消息范围无效。');
+    }
+    if (activeOperation) return Object.freeze({ status: 'busy', message: '记忆正在处理，请稍后再试。' });
+    const captured = capture();
+    if (!cache || cache.status === 'needsReview' || reviewReason) {
+      return Object.freeze({ status: 'unavailable', message: '当前记忆状态尚未核对，暂时不能更改。' });
+    }
+    const candidates = await scanGraphCandidates(captured.host.chat, captured.identity.chatId);
+    const candidateIndex = candidates.findIndex(item => item?.hostLocator?.messageIndex === messageIndex);
+    const candidate = candidates[candidateIndex];
+    if (!candidate) return Object.freeze({ status: 'unavailable', message: '当前 AI 楼尚未进入可处理范围。' });
+    if (excluded && candidate.archiveCandidate === true) {
+      return Object.freeze({ status: 'rejected', message: '这楼已有记忆，不能标为不记忆；如需移除，请在酒馆删除这条消息。' });
+    }
+    if (excluded && cache.root) {
+      const bindings = matchFloorCandidates(cache.floors ?? [], candidates);
+      if (bindings.issue) return Object.freeze({ status: 'unavailable', message: '当前消息与已有记忆的对应关系需要先核对。' });
+      const matched = bindings.candidateMatches.get(candidateIndex)?.floor;
+      if (matched) {
+        const floorId = matched.id;
+        const partition = migrationPartition(cache);
+        if (partition.isFrozenFloor(floorId)) return Object.freeze({ status: 'unavailable', message: '归档来源楼不能在当前聊天中更改。' });
+        const hasSavedMemory = (cache.floorMemories ?? []).some(memory => memorySourceFloorIds(memory).includes(floorId));
+        const hasSavedState = (cache.stateDeltas ?? []).some(delta => delta.floorId === floorId);
+        if (hasSavedMemory || hasSavedState) {
+          return Object.freeze({ status: 'rejected', message: '这楼已有记忆，不能标为不记忆；如需移除，请在酒馆删除这条消息。' });
+        }
+        let hasSavedTime = false;
+        if (typeof hasTimeFloorReference === 'function') {
+          try { hasSavedTime = await hasTimeFloorReference(captured.identity.chatId, floorId); }
+          catch { return Object.freeze({ status: 'unavailable', message: '当前楼的时间资料尚未核对，暂时不能更改。' }); }
+        }
+        if (hasSavedTime) {
+          return Object.freeze({ status: 'rejected', message: '这楼已有记忆，不能标为不记忆；如需移除，请在酒馆删除这条消息。' });
+        }
+      }
+    }
+    const result = await persistMessageMemoryExclusion({ hostAdapter, chatId: captured.identity.chatId, messageIndex, excluded });
+    if (result.status !== 'persisted') return result;
+    const state = await reconcile('memoryExclusionChanged');
+    return Object.freeze({ status: 'persisted', state });
+  }
+  return Object.freeze({ getActivityState: activity.getActivityState, subscribeActivity: activity.subscribeActivity,
     bind,
     start: () => enabled() ? reconcile('start') : Promise.resolve(publish('disabled')),
     inspect,
@@ -1539,8 +1650,9 @@ export function createFoundationRuntime({
     refreshStatus: (reason = 'manualRefresh', { verifyRoot = false } = {}) => reconcile(reason, { verifyRoot }),
     stabilizeThrough: boundary => reconcile('earlyAssistantStarted', { stableThrough: boundary }),
     cancelEarlyStabilization,
-    confirmLatest: () => pending ? reconcile('manualConfirm', { confirmLatest: true }) : Promise.resolve(publish('ready')),
+    confirmLatest: () => pending ? reconcile('manualConfirm', { confirmLatest: true }) : Promise.resolve(publicState),
     confirmConsecutiveAssistants,
+    setMemoryExcluded,
     invalidate, setEnabled, adoptReachable, holdExtractionConfirmation, authorizeRealtimeOrigin, getState: () => publicState,
     getPendingCandidate: () => pending,
     getReachable: () => cache,

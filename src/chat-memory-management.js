@@ -2,7 +2,7 @@ import { CHAT_IDENTITY_COLLECTION } from './chat-identity.js';
 import { isUuid, readHostState } from './host-context.js';
 import { V3_ROOT_RECORD_ID } from './v3/foundation-store.js';
 import { captureTargetChatDescriptor } from './v3/host-adapter.js';
-import { readTargetChat } from './v3/message-floor-anchor.js';
+import { readTargetChat, sameChatQqjData, snapshotChatQqjData, sameQqjChatMetadata } from './v3/message-floor-anchor.js';
 import { MESSAGE_FLOOR_ANCHOR_KEY } from './v3/message-floor-anchor.js';
 import { publicErrorMessage } from './public-error.js';
 
@@ -11,6 +11,9 @@ const AUTO_HIDE_KEY = 'qianqianjieAutoHide';
 const MEMORY_MESSAGE_KEYS = Object.freeze([RECEIPT_KEY, MESSAGE_FLOOR_ANCHOR_KEY, AUTO_HIDE_KEY]);
 const errorWith = (code, message) => Object.assign(new Error(message), { code });
 const clone = value => structuredClone(value);
+const ownedChatMetadata = metadata => Object.fromEntries(['qianqianjie', 'qianqianjiePrequel']
+  .filter(key => Object.hasOwn(metadata ?? {}, key)).map(key => [key, clone(metadata[key])]));
+const sameChatMetadataOwnership = (left, right, clearPrequel) => sameQqjChatMetadata(left, right, { includePrequel: clearPrequel });
 
 function publicError(error) {
   return publicErrorMessage(error, { fallback: '删除未完成，请重试。' });
@@ -53,6 +56,7 @@ export function createChatMemoryManagement({
     } catch { return false; }
   };
   const getState = () => {
+    refreshHistoricalRebuildState();
     const scopedActive = active && inCurrentHost(active.identity) ? active : null;
     const scopedPending = pending && inCurrentHost(pending.identity) ? pending : null;
     const scopedResult = lastResult && inCurrentHost({ hostChatId: lastResult.hostChatId, chatId: lastResult.chatId }, false);
@@ -86,11 +90,12 @@ export function createChatMemoryManagement({
     return snapshot;
   };
   function busy() {
-    const memory = memoryRuntime?.getState?.() ?? {};
+    const memory = memoryRuntime?.getActivityState?.() ?? {};
     const foundation = foundationRuntime?.getState?.() ?? {};
     const recall = recallRuntime?.getState?.() ?? {};
     const people = peopleRuntime?.getState?.() ?? {};
-    return Boolean(isMainGenerationActive?.() || memory.memoryWorkBusy || memory.activeAutoMemory || memory.activeExtraction || memory.activeCse
+    const mainGenerationActive = typeof memory.mainGenerationActive === 'boolean' ? memory.mainGenerationActive : isMainGenerationActive?.();
+    return Boolean(mainGenerationActive || memory.memoryWorkBusy || memory.activeAutoMemory || memory.activeExtraction || memory.activeCse
       || foundation.activeRun || recall.activeRecall || people.active || vectorRuntime?.getState?.().active);
   }
   const invalidateRuntimes = deletedChatId => {
@@ -104,18 +109,18 @@ export function createChatMemoryManagement({
     try { vectorRuntime?.abortAll?.(); } catch {}
   };
 
-  async function persistTargetCleanup(identity, target, initial, clearPrequel, allowMissingIdentity = false) {
-    const latest = await readTargetChat(target, { fetchImpl, allowMissingIdentity });
-    if (JSON.stringify(latest.header) !== JSON.stringify(initial.header) || JSON.stringify(latest.chat) !== JSON.stringify(initial.chat)) {
-      throw errorWith('QQJ_DELETE_HOST_CONFLICT', '原聊天正文或元数据已改变，未覆盖人工修改。');
+  async function persistTargetCleanup(identity, target, initial, clearPrequel, allowMissingIdentity = false, operation = null) {
+    const latest = await readTargetChat(target, { fetchImpl, allowMissingIdentity: allowMissingIdentity || Boolean(operation?.cleanup) });
+    const resumedCleanup = operation?.cleanup && latest.header.chat_metadata?.qianqianjie === undefined ? operation.cleanup : null;
+    if (!resumedCleanup && !sameChatMetadataOwnership(initial.header.chat_metadata, latest.header.chat_metadata, clearPrequel)) {
+      throw errorWith('QQJ_DELETE_HOST_CONFLICT', '原聊天千千结归属已改变，未覆盖自有元数据。');
     }
     const header = clone(latest.header), messages = clone(latest.chat);
+    initial = resumedCleanup?.initial ?? initial;
     const metadata = header.chat_metadata;
-    const hadPrequel = Object.hasOwn(metadata, 'qianqianjiePrequel');
-    const previousPrequel = metadata.qianqianjiePrequel;
     delete metadata.qianqianjie;
     if (clearPrequel) delete metadata.qianqianjiePrequel;
-    const restoredIndexes = new Set();
+    const restoredIndexes = new Set(resumedCleanup?.restoredIndexes ?? []);
     for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
       const message = messages[messageIndex];
       if (hasValidAutoHideMarker(message?.extra)) { message.is_system = false; restoredIndexes.add(messageIndex); }
@@ -127,32 +132,44 @@ export function createChatMemoryManagement({
       });
     }
     const expected = [header, ...messages];
-    const response = await fetchImpl('/api/chats/save', {
-      method: 'POST', cache: 'no-cache', headers: target.requestHeaders ?? {},
-      body: JSON.stringify({ ch_name: target.characterName, file_name: target.hostChatId, avatar_url: target.avatarUrl, chat: expected, force: false }),
-    });
-    if (!response?.ok) throw errorWith([400, 409].includes(response?.status) ? 'QQJ_DELETE_HOST_CONFLICT' : 'QQJ_DELETE_HOST_SAVE_FAILED', '原聊天清理未能保存。');
-    const persisted = await readTargetChat(target, { fetchImpl, allowMissingIdentity: true });
-    const stripIntegrity = value => { const next = clone(value); if (next?.chat_metadata) delete next.chat_metadata.integrity; return next; };
-    if (persisted.chat.length !== messages.length || JSON.stringify(persisted.chat) !== JSON.stringify(messages)
+    // Retain only this deletion's expected QQJ cleanup for its existing retry.
+    // A missing identity is accepted only after this exact file save was attempted.
+    if (operation && !resumedCleanup) operation.cleanup = {
+      initial: { header: { chat_metadata: ownedChatMetadata(initial.header.chat_metadata) }, chat: snapshotChatQqjData(initial.chat) },
+      header: { chat_metadata: ownedChatMetadata(header.chat_metadata) }, messages: snapshotChatQqjData(messages), restoredIndexes: [...restoredIndexes],
+    };
+    let persisted = latest;
+    if (!resumedCleanup) {
+      const response = await fetchImpl('/api/chats/save', {
+        method: 'POST', cache: 'no-cache', headers: target.requestHeaders ?? {},
+        body: JSON.stringify({ ch_name: target.characterName, file_name: target.hostChatId, avatar_url: target.avatarUrl, chat: expected, force: false }),
+      });
+      if (!response?.ok) throw errorWith([400, 409].includes(response?.status) ? 'QQJ_DELETE_HOST_CONFLICT' : 'QQJ_DELETE_HOST_SAVE_FAILED', '原聊天清理未能保存。');
+      persisted = await readTargetChat(target, { fetchImpl, allowMissingIdentity: true });
+    }
+    if (!sameChatQqjData(persisted.chat, resumedCleanup?.messages ?? messages)
       || persisted.header.chat_metadata?.qianqianjie !== undefined
       || (clearPrequel && persisted.header.chat_metadata?.qianqianjiePrequel !== undefined)
-      || JSON.stringify(stripIntegrity(persisted.header)) !== JSON.stringify(stripIntegrity(header))
+      || !sameChatMetadataOwnership(resumedCleanup?.header.chat_metadata ?? header.chat_metadata, persisted.header.chat_metadata, clearPrequel)
       || persisted.chat.some(hasMemoryKeys)
       || [...restoredIndexes].some(index => persisted.chat[index]?.is_system !== false)) {
       throw errorWith('QQJ_DELETE_HOST_VERIFY_FAILED', '原聊天清理没有通过读回核验，可重试。');
     }
     if (inCurrentHost(identity)) {
       const current = hostAdapter.snapshot();
-      const previous = initial.chat;
-      if (current.chat?.length === previous.length && JSON.stringify(current.chat) === JSON.stringify(previous)) {
-        if (JSON.stringify(current.context.chatMetadata) !== JSON.stringify(initial.header.chat_metadata)) return messages.length;
+      if (sameChatQqjData(current.chat, initial.chat)
+        && sameChatMetadataOwnership(initial.header.chat_metadata, current.context.chatMetadata, clearPrequel)) {
         current.chat.forEach((message, index) => {
-          for (const key of Object.keys(message)) delete message[key];
-          Object.assign(message, clone(persisted.chat[index]));
+          if (restoredIndexes.has(index)) message.is_system = false;
+          const extra = clearMemoryKeys(message?.extra);
+          if (extra) message.extra = extra;
+          if (Array.isArray(message?.swipe_info)) message.swipe_info = message.swipe_info.map(swipe => {
+            const swipeExtra = clearMemoryKeys(swipe?.extra);
+            return swipeExtra ? { ...swipe, extra: swipeExtra } : swipe;
+          });
         });
-        for (const key of Object.keys(current.context.chatMetadata)) delete current.context.chatMetadata[key];
-        Object.assign(current.context.chatMetadata, clone(persisted.header.chat_metadata));
+        delete current.context.chatMetadata.qianqianjie;
+        if (clearPrequel) delete current.context.chatMetadata.qianqianjiePrequel;
         try {
           if (globalThis.document) for (const node of globalThis.document.querySelectorAll('#chat .mes[mesid]')) {
             if (restoredIndexes.has(Number(node.getAttribute('mesid')))) node.setAttribute('is_system', 'false');
@@ -170,16 +187,16 @@ export function createChatMemoryManagement({
       const rebuiltTarget = { ...target, chatId: rebuilt.chatId };
       const persisted = await readTargetChat(rebuiltTarget, { fetchImpl });
       const current = hostAdapter.snapshot();
-      const currentMetadata = clone(current.context.chatMetadata ?? {});
+      const currentMetadata = { ...(current.context.chatMetadata ?? {}) };
       if (currentMetadata.qianqianjie?.schemaVersion === 2 && currentMetadata.qianqianjie.chatId === rebuilt.chatId) delete currentMetadata.qianqianjie;
-      if (current.chatId !== identity.hostChatId || JSON.stringify(current.chat) !== JSON.stringify(chatBaseline)
-        || JSON.stringify(currentMetadata) !== JSON.stringify(cleaned.header.chat_metadata ?? {})) return false;
+      if (current.chatId !== identity.hostChatId || !sameChatQqjData(current.chat, chatBaseline)
+        || !sameQqjChatMetadata(currentMetadata, cleaned.header.chat_metadata ?? {})) return false;
       current.chat.forEach((message, index) => {
-        for (const key of Object.keys(message)) delete message[key];
-        Object.assign(message, clone(persisted.chat[index]));
+        syncOwnedMessageKeys(message, persisted.chat[index]);
       });
-      for (const key of Object.keys(current.context.chatMetadata)) delete current.context.chatMetadata[key];
-      Object.assign(current.context.chatMetadata, clone(persisted.header.chat_metadata ?? {}));
+      const persistedQqj = persisted.header.chat_metadata?.qianqianjie;
+      if (persistedQqj === undefined) delete current.context.chatMetadata.qianqianjie;
+      else current.context.chatMetadata.qianqianjie = clone(persistedQqj);
       onAdopted?.(captureChatAdoptionBaseline(current.chat));
       const prepared = await session.prepare();
       if (prepared?.status !== 'ready' || prepared.identity?.chatId !== rebuilt.chatId) return false;
@@ -190,15 +207,24 @@ export function createChatMemoryManagement({
     return false;
   }
 
-  function captureChatAdoptionBaseline(chat) {
-    return chat.map(message => message && typeof message === 'object' ? {
-      ...message,
-      extra: message.extra && typeof message.extra === 'object' ? { ...message.extra } : message.extra,
-      swipe_info: Array.isArray(message.swipe_info) ? message.swipe_info.map(swipe => swipe && typeof swipe === 'object' ? {
-        ...swipe,
-        extra: swipe.extra && typeof swipe.extra === 'object' ? { ...swipe.extra } : swipe.extra,
-      } : swipe) : message.swipe_info,
-    } : message);
+  const captureChatAdoptionBaseline = snapshotChatQqjData;
+
+  function syncOwnedMessageKeys(target, source) {
+    const syncExtra = (owner, sourceExtra) => {
+      let targetExtra = owner?.extra;
+      if (!targetExtra || typeof targetExtra !== 'object') {
+        if (!MEMORY_MESSAGE_KEYS.some(key => sourceExtra && Object.hasOwn(sourceExtra, key))) return;
+        targetExtra = owner.extra = {};
+      }
+      for (const key of MEMORY_MESSAGE_KEYS) {
+        if (sourceExtra && Object.hasOwn(sourceExtra, key)) targetExtra[key] = clone(sourceExtra[key]);
+        else delete targetExtra[key];
+      }
+    };
+    syncExtra(target, source?.extra);
+    if (Array.isArray(target?.swipe_info) && Array.isArray(source?.swipe_info)) {
+      target.swipe_info.forEach((swipe, index) => syncExtra(swipe, source.swipe_info[index]?.extra));
+    }
   }
 
   const clearMemoryKeys = extra => {
@@ -228,7 +254,7 @@ export function createChatMemoryManagement({
     const stopTime = timeRuntime?.stop?.();
     const stopAutoHide = autoHideController.stop();
     await Promise.all([stopTime, stopAutoHide]);
-    const initialTargetChat = await readTargetChat(operation.target, { fetchImpl, allowMissingIdentity: operation.skipSessionResume });
+    const initialTargetChat = await readTargetChat(operation.target, { fetchImpl, allowMissingIdentity: operation.skipSessionResume || Boolean(operation.cleanup) });
 
     operation.phase = 'deletingRecords'; notify();
     const listed = await client.list(collection, { signal: controller.signal });
@@ -259,16 +285,26 @@ export function createChatMemoryManagement({
     if (firstError) throw firstError;
 
     operation.phase = 'deletingBinding'; notify();
-    try {
-      const binding = await client.get(CHAT_IDENTITY_COLLECTION, `binding-${identity.chatId}`);
-      assertCurrent();
-      await removeEnvelope(CHAT_IDENTITY_COLLECTION, { ...binding, recordId: `binding-${identity.chatId}` }, controller.signal);
-      operation.deletedCount += 1;
-      assertCurrent();
-    } catch (error) { if (error?.status !== 404) throw error; }
+    let binding;
+    try { binding = await client.get(CHAT_IDENTITY_COLLECTION, `binding-${identity.chatId}`); }
+    catch (error) {
+      if (error?.name === 'AbortError' || controller.signal.aborted) throw error;
+      // Auxiliary directory cleanup does not block the saved file cleanup.
+    }
+    assertCurrent();
+    if (binding) {
+      try {
+        await removeEnvelope(CHAT_IDENTITY_COLLECTION, { ...binding, recordId: `binding-${identity.chatId}` }, controller.signal);
+        operation.deletedCount += 1;
+      } catch (error) {
+        if (error?.name === 'AbortError' || controller.signal.aborted) throw error;
+        // The directory is auxiliary to the graph and file.
+      }
+    }
+    assertCurrent();
 
     operation.phase = 'clearingHost'; notify();
-    await persistTargetCleanup(identity, operation.target, initialTargetChat, operation.clearPrequel, operation.skipSessionResume);
+    await persistTargetCleanup(identity, operation.target, operation.cleanup?.initial ?? initialTargetChat, operation.clearPrequel, operation.skipSessionResume, operation);
     if (!operation.skipSessionResume) session.resume(identity.chatId);
     return Object.freeze({ status: 'completed', hostChatId: identity.hostChatId, chatId: identity.chatId, deletedCount: operation.deletedCount });
   }
@@ -295,13 +331,13 @@ export function createChatMemoryManagement({
       if (!pending && busy()) throw errorWith('QQJ_DELETE_BUSY', '当前正在生成或处理记忆，请等待完成后再删除。');
       if (!pending && !skipSuspend) session.suspend(identity.chatId);
     } catch (error) { return Promise.reject(error); }
-    const operation = { identity, target, assertOwner: assertOwner ?? pending?.assertOwner, clearPrequel: clearPrequel || pending?.clearPrequel === true, skipSessionResume: skipSuspend, controller: new AbortController(), phase: 'starting', deletedCount: pending?.deletedCount ?? 0, promise: null };
+    const operation = { identity, target, assertOwner: assertOwner ?? pending?.assertOwner, clearPrequel: clearPrequel || pending?.clearPrequel === true, skipSessionResume: skipSuspend, cleanup: pending?.cleanup ?? null, controller: new AbortController(), phase: 'starting', deletedCount: pending?.deletedCount ?? 0, promise: null };
     active = operation; pending = null; lastResult = null; notify();
     operation.promise = perform(operation).then(result => {
       lastResult = result;
       return result;
     }).catch(error => {
-      pending = Object.freeze({ identity, target, assertOwner: operation.assertOwner, clearPrequel: operation.clearPrequel, error: publicError(error), deletedCount: operation.deletedCount });
+      pending = Object.freeze({ identity, target, assertOwner: operation.assertOwner, clearPrequel: operation.clearPrequel, cleanup: operation.cleanup, error: publicError(error), deletedCount: operation.deletedCount });
       logger?.warn?.('[qianqianjie] current chat memory deletion incomplete', { code: error?.code ?? error?.name ?? 'QQJ_DELETE_FAILED' });
       throw error;
     }).finally(() => { if (active === operation) active = null; notify(); });
@@ -310,6 +346,7 @@ export function createChatMemoryManagement({
 
   function fullRebuild(expectedChatId, options = {}) {
     if (typeof createHistoricalRebuild !== 'function') return Promise.reject(errorWith('QQJ_REBUILD_UNAVAILABLE', '目标聊天重构任务尚未接入。'));
+    refreshHistoricalRebuildState();
     if (rebuilding) {
       let sameTarget = false;
       try {
@@ -319,7 +356,8 @@ export function createChatMemoryManagement({
       } catch { /* another active target is busy */ }
       if (!sameTarget) return Promise.reject(errorWith('QQJ_REBUILD_BUSY', '另一聊天的完全重构仍在执行。'));
       if (rebuilding.promise) return rebuilding.promise;
-      if (!rebuilding.taskControl || !['paused', 'failed'].includes(rebuilding.taskState?.rebuildStatus)) return Promise.resolve(rebuilding.taskState);
+      if (!rebuilding.taskControl || !['paused', 'failed', 'partial'].includes(rebuilding.taskState?.rebuildStatus)) return Promise.resolve(rebuilding.taskState);
+      if (busy()) return Promise.reject(errorWith('QQJ_REBUILD_BUSY', '当前记忆管理或生成任务仍在执行，请稍候再重构。'));
       return continueHistoricalRebuild(rebuilding);
     }
     let identity, target, sources, initialSnapshot, provisionalIdentity = false, preserveMigrationPrefix = false;
@@ -339,14 +377,13 @@ export function createChatMemoryManagement({
       }
       if (expectedChatId && identity.chatId !== expectedChatId) throw errorWith('QQJ_REBUILD_TARGET_INVALID', '重构目标身份与当前请求不一致。');
       target = pending?.identity?.chatId === identity.chatId ? pending.target : captureTargetChatDescriptor(initialSnapshot, identity);
-      sources = captureHistoricalRebuildSources(initialSnapshot);
+      sources = captureHistoricalRebuildSources(initialSnapshot, { chatId: identity.chatId });
       const reachable = foundationRuntime?.getReachable?.();
       preserveMigrationPrefix = reachable?.root?.chatId === identity.chatId && Boolean(reachable.migrationDescriptor);
       if (busy()) throw errorWith('QQJ_REBUILD_BUSY', '当前记忆管理或生成任务仍在执行，请稍候再重构。');
-      if (!pending && !provisionalIdentity && !preserveMigrationPrefix && inCurrentHost(identity)) session.suspend(identity.chatId);
     } catch (error) { return Promise.reject(error); }
     const operation = { identity, hostChatId: identity.hostChatId, chatId: identity.chatId, taskControl: null, taskState: null, unsubscribeTask: null, promise: null };
-    rebuilding = operation; notify();
+    rebuilding = operation;
     operation.promise = (async () => {
       let cleaned;
       if (preserveMigrationPrefix) {
@@ -361,6 +398,7 @@ export function createChatMemoryManagement({
       operation.target = target; operation.cleaned = cleaned; operation.aggregate = options?.aggregate === true;
       const result = await createHistoricalRebuild({ identity, target, cleanedChat: cleaned, sourceContext: sources.context,
         sourceUserIdentity: sources.userIdentity, sourceWorldInfo: sources.worldInfo,
+        storyCalendar: sources.storyCalendar,
         provisionalIdentity, aggregate: options?.aggregate === true, forceMigrationRebuild: preserveMigrationPrefix,
         onTaskControl: control => attachTaskControl(operation, control) });
       return finishHistoricalRebuild(operation, identity, target, cleaned, result);
@@ -370,6 +408,7 @@ export function createChatMemoryManagement({
       if (!operation.taskControl && rebuilding === operation) rebuilding = null;
       notify(); throw error;
     });
+    notify();
     return operation.promise;
   }
 
@@ -391,14 +430,44 @@ export function createChatMemoryManagement({
     notify();
   }
 
+  function readHistoricalRebuildState(operation, result = null) {
+    const state = operation.taskControl?.getState?.() ?? operation.taskState ?? result;
+    return state?.rebuildStatus ? state : state?.state?.rebuildStatus ? state.state : state;
+  }
+
+  function readCompletedVisibleRebuildState(operation, state) {
+    if (state?.rebuildStatus !== 'partial' || !isUuid(state.chatId) || !inCurrentHost({ hostChatId: operation.identity.hostChatId, chatId: state.chatId })) return state;
+    const current = memoryRuntime?.getState?.();
+    const sameGeneration = state.narrativeGeneration == null || current?.narrativeGeneration === state.narrativeGeneration;
+    const memoryWorkActive = current?.memoryWorkBusy || current?.activeMemoryWork || current?.activeAutoMemory || current?.activeExtraction || current?.activeCse;
+    return current?.chatId === state.chatId && sameGeneration && current.status === 'ready' && !memoryWorkActive
+      && current.foundationStatus === 'ready'
+      && current.memorySnapshotStatus === 'ready' && current.memorySyncStatus === 'idle'
+      && ['caughtUp', 'waitingRealtime'].includes(current.rebuildStatus) && current.rebuildHasActionableWork === false
+      ? current : state;
+  }
+
+  function refreshHistoricalRebuildState() {
+    if (!rebuilding) return;
+    rebuilding.taskState = readHistoricalRebuildState(rebuilding);
+    if (rebuilding.promise) return;
+    rebuilding.taskState = readCompletedVisibleRebuildState(rebuilding, rebuilding.taskState);
+    if (['caughtUp', 'waitingRealtime'].includes(rebuilding.taskState?.rebuildStatus)) {
+      rebuilding.unsubscribeTask?.();
+      rebuilding.unsubscribeTask = null;
+      rebuilding = null;
+    }
+  }
+
   async function finishHistoricalRebuild(operation, identity, target, cleaned, result) {
-    const rebuilt = result?.rebuildStatus ? result : result?.state?.rebuildStatus ? result.state : result;
+    let rebuilt = readHistoricalRebuildState(operation, result);
+    await adoptRebuiltTarget(identity, target, cleaned, rebuilt, operation.chatBaseline, baseline => { operation.chatBaseline = baseline; });
+    // Adoption can await host refreshes while the original task publishes its final state.
+    rebuilt = readCompletedVisibleRebuildState(operation, readHistoricalRebuildState(operation, rebuilt));
     operation.taskState = rebuilt;
     if (['paused', 'failed', 'partial'].includes(rebuilt?.rebuildStatus)) {
-      await adoptRebuiltTarget(identity, target, cleaned, rebuilt, operation.chatBaseline, baseline => { operation.chatBaseline = baseline; });
       operation.promise = null; notify(); return rebuilt;
     }
-    await adoptRebuiltTarget(identity, target, cleaned, rebuilt, operation.chatBaseline, baseline => { operation.chatBaseline = baseline; });
     operation.unsubscribeTask?.();
     operation.unsubscribeTask = null;
     if (rebuilding === operation) rebuilding = null;
@@ -413,7 +482,7 @@ export function createChatMemoryManagement({
     return operation.promise;
   }
 
-  return Object.freeze({
+  return Object.freeze({ getActivityState: () => { const migrating = memoryMigration?.getState?.().status === 'migrating'; return { busy: Boolean(active || rebuilding?.promise || migrating), phase: active ? 'deleting' : rebuilding?.promise ? rebuilding.taskState?.phase ?? 'preparing' : migrating ? 'migrating' : null }; },
     deleteCurrent,
     fullRebuild,
     migrateCurrent,

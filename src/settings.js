@@ -1,4 +1,5 @@
-import { normalizeMemoryTagList } from './memory-content-sanitizer.js';
+import { getSharedBodyWrappers, updateSharedBodyWrappers } from './shared-body-wrappers.js';
+import { initializeSharedProcessingPrompt, getSharedProcessingPrompt, updateSharedProcessingPrompt } from './shared-processing-prompt.js';
 import { normalizeStoryClockReferenceTags } from './story-clock.js';
 import { normalizeStoryCalendar } from './v3/calendar-rules.js';
 
@@ -6,16 +7,19 @@ export const SETTINGS_ID = 'qianqianjie';
 
 export const DEFAULT_SETTINGS = Object.freeze({
   pluginEnabled: true,
+  coreCacheEnabled: true,
   storyClockEnabled: true,
   timeEvolutionEnabled: false,
   storyCalendars: {},
+  qianchuangBasemaps: {},
   storyClockPrompt: '',
   storyClockReferenceTags: '',
   autoMemoryBatchSize: 1,
-  autoHideEnabled: false,
+  autoHideEnabled: true,
   autoHideKeepAiCount: 3,
-  storageAutoCleanupEnabled: false,
+  storageAutoCleanupEnabled: true,
   storageAutoCleanupProgress: {},
+  storageTrashGcLastCompletedAt: '',
   apiMode: 'auto',
   selectedSevenDaysPresetId: '',
   summaryPresetId: '',
@@ -45,6 +49,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   csePrompt: '',
   profilePrompt: '',
   worldbookPrompt: '',
+  avatarPrompt: '',
   appearanceTheme: 'auto',
   inlineRecallVisible: true,
   inlineMemoryVisible: true,
@@ -78,6 +83,12 @@ export function normalizeAutoHideKeepAiCount(value) {
 export function normalizeTimeout(value) {
   const number = Number(value);
   return Number.isInteger(number) && number >= 5 && number <= 600 ? number : 180;
+}
+
+export function normalizeRetryCount(value) {
+  if (!['number', 'string'].includes(typeof value) || typeof value === 'string' && !value.trim()) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 && Number.isSafeInteger(number + 1) ? number : null;
 }
 
 export function normalizeTemperature(value) {
@@ -126,6 +137,8 @@ export function normalizePreset(value = {}) {
     timeoutSec: normalizeTimeout(value.timeoutSec),
     stream: value.stream === true,
   };
+  const qqjRetryCount = normalizeRetryCount(value.qqjRetryCount);
+  if (qqjRetryCount !== null) normalized.qqjRetryCount = qqjRetryCount;
   const qqjTemperature = normalizeTemperature(value.qqjTemperature);
   if (qqjTemperature !== null) normalized.qqjTemperature = qqjTemperature;
   if (text(value.qqjAdditionalParams).trim()) normalized.qqjAdditionalParams = text(value.qqjAdditionalParams).trim();
@@ -169,8 +182,12 @@ export async function applyPluginEnabledImmediately({ settings, enabled, onChang
   return task;
 }
 
+const normalizeQianchuangBasemaps = value => Object.fromEntries(Object.entries(value && typeof value === 'object' && !Array.isArray(value) ? value : {}).filter(([id, type]) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(id) && ['modern','town','palace','modern-town','old-town','sci-fi'].includes(type)));
+
 export function createSettingsStore({ extensionSettings, save = () => {}, now, random } = {}) {
   if (!extensionSettings || typeof extensionSettings !== 'object') throw new Error('千千结设置存储不可用');
+  getSharedBodyWrappers(extensionSettings);
+  initializeSharedProcessingPrompt(extensionSettings, save);
   const get = () => {
     const settings = extensionSettings[SETTINGS_ID] ??= { ...DEFAULT_SETTINGS, apiExcludeParams: [], apiPresets: [] };
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) if (!own(settings, key)) {
@@ -184,16 +201,20 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     settings.inlineRecallVisible = settings.inlineRecallVisible !== false;
     settings.inlineMemoryVisible = settings.inlineMemoryVisible !== false;
     settings.dynamicWorldbookHideSourceDisabled = settings.dynamicWorldbookHideSourceDisabled === true;
+    settings.coreCacheEnabled = settings.coreCacheEnabled !== false;
     settings.fabShow = settings.fabShow !== false;
     settings.appearanceScale = normalizeScale(settings.appearanceScale);
     settings.apiTimeoutSec = normalizeTimeout(settings.apiTimeoutSec);
     settings.autoMemoryBatchSize = normalizeAutoMemoryBatchSize(settings.autoMemoryBatchSize);
     settings.timeEvolutionEnabled = settings.timeEvolutionEnabled === true;
     settings.storyCalendars = normalizeStoryCalendars(settings.storyCalendars);
+    settings.qianchuangBasemaps = normalizeQianchuangBasemaps(settings.qianchuangBasemaps);
     settings.autoHideEnabled = settings.autoHideEnabled === true;
     settings.autoHideKeepAiCount = normalizeAutoHideKeepAiCount(settings.autoHideKeepAiCount);
     settings.storageAutoCleanupEnabled = settings.storageAutoCleanupEnabled === true;
     settings.storageAutoCleanupProgress = normalizeStorageCleanupProgress(settings.storageAutoCleanupProgress);
+    settings.storageTrashGcLastCompletedAt = Number.isFinite(Date.parse(settings.storageTrashGcLastCompletedAt))
+      ? new Date(settings.storageTrashGcLastCompletedAt).toISOString() : '';
     settings.storyClockReferenceTags = normalizeStoryClockReferenceTags(settings.storyClockReferenceTags).join(',');
     return settings;
   };
@@ -201,11 +222,23 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     try { return save(); }
     catch (error) { if (observeSaveFailure) throw error; }
   };
+  const persistApiEdit = (value, options, rollback) => {
+    if (options?.observeSaveFailure !== true) { notify(); return value; }
+    const failed = error => { rollback(); throw error; };
+    let saved;
+    try { saved = notify(true); } catch (error) { return failed(error); }
+    return saved && typeof saved.then === 'function' ? Promise.resolve(saved).then(() => value, failed) : value;
+  };
+  const restoreApiFields = (target, before, applied) => {
+    for (const key of Object.keys(before)) if (JSON.stringify(target[key]) === JSON.stringify(applied[key])) target[key] = before[key];
+  };
   const update = (patch, { observeSaveFailure = false } = {}) => {
     if (own(patch, 'apiAdditionalParams')) parseAdditionalParams(patch.apiAdditionalParams);
     const settings = get();
     if (own(patch, 'pluginEnabled')) settings.pluginEnabled = patch.pluginEnabled !== false;
+    if (own(patch, 'coreCacheEnabled')) settings.coreCacheEnabled = patch.coreCacheEnabled !== false;
     if (own(patch, 'timeEvolutionEnabled')) settings.timeEvolutionEnabled = patch.timeEvolutionEnabled === true;
+    if (own(patch, 'qianchuangBasemaps')) settings.qianchuangBasemaps = normalizeQianchuangBasemaps(patch.qianchuangBasemaps);
     if (own(patch, 'storyCalendars')) settings.storyCalendars = normalizeStoryCalendars(patch.storyCalendars);
     if (own(patch, 'storyClockEnabled')) settings.storyClockEnabled = patch.storyClockEnabled !== false;
     if (own(patch, 'storyClockPrompt')) settings.storyClockPrompt = text(patch.storyClockPrompt);
@@ -215,6 +248,8 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (own(patch, 'autoHideKeepAiCount')) settings.autoHideKeepAiCount = normalizeAutoHideKeepAiCount(patch.autoHideKeepAiCount);
     if (own(patch, 'storageAutoCleanupEnabled')) settings.storageAutoCleanupEnabled = patch.storageAutoCleanupEnabled === true;
     if (own(patch, 'storageAutoCleanupProgress')) settings.storageAutoCleanupProgress = normalizeStorageCleanupProgress(patch.storageAutoCleanupProgress);
+    if (own(patch, 'storageTrashGcLastCompletedAt')) settings.storageTrashGcLastCompletedAt = Number.isFinite(Date.parse(patch.storageTrashGcLastCompletedAt))
+      ? new Date(patch.storageTrashGcLastCompletedAt).toISOString() : '';
     if (own(patch, 'apiMode')) settings.apiMode = API_MODES.has(patch.apiMode) ? patch.apiMode : 'auto';
     if (own(patch, 'selectedSevenDaysPresetId')) settings.selectedSevenDaysPresetId = text(patch.selectedSevenDaysPresetId).trim();
     if (own(patch, 'summaryPresetId')) settings.summaryPresetId = text(patch.summaryPresetId).trim();
@@ -227,18 +262,23 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (own(patch, 'apiModel')) settings.apiModel = text(patch.apiModel).trim();
     if (own(patch, 'apiExcludeParams')) settings.apiExcludeParams = parseExcludeParams(patch.apiExcludeParams);
     if (own(patch, 'apiAdditionalParams')) settings.apiAdditionalParams = text(patch.apiAdditionalParams).trim();
+    if (own(patch, 'apiQianqianjieRetryCount')) {
+      const value = normalizeRetryCount(patch.apiQianqianjieRetryCount);
+      if (value === null) delete settings.apiQianqianjieRetryCount; else settings.apiQianqianjieRetryCount = value;
+    }
     if (own(patch, 'apiQianqianjieTemperature')) settings.apiQianqianjieTemperature = normalizeTemperature(patch.apiQianqianjieTemperature);
     if (own(patch, 'apiTimeoutSec')) settings.apiTimeoutSec = normalizeTimeout(patch.apiTimeoutSec);
     if (own(patch, 'apiStream')) settings.apiStream = patch.apiStream === true;
     if (own(patch, 'apiPresetActiveId')) settings.apiPresetActiveId = text(patch.apiPresetActiveId).trim();
     if (own(patch, 'sourceWorldInfoExcludedBooks')) settings.sourceWorldInfoExcludedBooks = Array.isArray(patch.sourceWorldInfoExcludedBooks) ? patch.sourceWorldInfoExcludedBooks : [];
-    if (own(patch, 'sourceKeepTags')) settings.sourceKeepTags = normalizeMemoryTagList(patch.sourceKeepTags).join(',');
-    if (own(patch, 'sourceExtraTags')) settings.sourceExtraTags = normalizeMemoryTagList(patch.sourceExtraTags).join(',');
-    if (own(patch, 'processingPrompt')) settings.processingPrompt = text(patch.processingPrompt);
+    if (own(patch, 'sourceKeepTags')) updateSharedBodyWrappers(extensionSettings, { keepTags: patch.sourceKeepTags });
+    if (own(patch, 'sourceExtraTags')) updateSharedBodyWrappers(extensionSettings, { extraTags: patch.sourceExtraTags });
+    if (own(patch, 'processingPrompt')) updateSharedProcessingPrompt(extensionSettings, patch.processingPrompt);
     if (own(patch, 'summaryPrompt')) settings.summaryPrompt = text(patch.summaryPrompt);
     if (own(patch, 'csePrompt')) settings.csePrompt = text(patch.csePrompt);
     if (own(patch, 'profilePrompt')) settings.profilePrompt = text(patch.profilePrompt);
     if (own(patch, 'worldbookPrompt')) settings.worldbookPrompt = text(patch.worldbookPrompt);
+    if (own(patch, 'avatarPrompt')) settings.avatarPrompt = text(patch.avatarPrompt);
     if (own(patch, 'appearanceTheme')) settings.appearanceTheme = APPEARANCE_THEMES.has(patch.appearanceTheme) ? patch.appearanceTheme : 'auto';
     if (own(patch, 'inlineRecallVisible')) settings.inlineRecallVisible = patch.inlineRecallVisible !== false;
     if (own(patch, 'inlineMemoryVisible')) settings.inlineMemoryVisible = patch.inlineMemoryVisible !== false;
@@ -261,6 +301,7 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
       timeoutSec: settings.apiTimeoutSec,
       stream: settings.apiStream,
       qqjTemperature: settings.apiQianqianjieTemperature,
+      qqjRetryCount: settings.apiQianqianjieRetryCount,
     });
   };
   const mainConfig = () => ({ ...localConfig(), name: '主配置' });
@@ -345,12 +386,16 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
       if (!value || typeof value !== 'object') return null;
       const normalized = normalizePreset(value), preset = { ...value, ...normalized };
       if (normalized.qqjTemperature === undefined) delete preset.qqjTemperature;
+      if (normalized.qqjRetryCount === undefined) delete preset.qqjRetryCount;
       return preset;
     }).filter(value => value?.id);
   };
-  const saveMainConfig = config => {
+  const saveMainConfig = (config, options = {}) => {
     parseAdditionalParams(config?.qqjAdditionalParams);
     const current = get(), normalized = normalizePreset(config);
+    const keys = ['apiUrl', 'apiKey', 'apiModel', 'apiExcludeParams', 'apiAdditionalParams', 'apiTimeoutSec', 'apiStream', 'apiQianqianjieTemperature', 'apiQianqianjieRetryCount'];
+    const before = Object.fromEntries(keys.map(key => [key, current[key]]));
+    const hadRetryCount = own(current, 'apiQianqianjieRetryCount');
     current.apiUrl = normalized.url;
     current.apiKey = normalized.key;
     current.apiModel = normalized.model;
@@ -359,17 +404,24 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     current.apiTimeoutSec = normalized.timeoutSec;
     current.apiStream = normalized.stream;
     current.apiQianqianjieTemperature = normalized.qqjTemperature ?? null;
-    notify();
-    return mainConfig();
+    if (normalized.qqjRetryCount === undefined) delete current.apiQianqianjieRetryCount; else current.apiQianqianjieRetryCount = normalized.qqjRetryCount;
+    const result = mainConfig(), applied = Object.fromEntries(keys.map(key => [key, current[key]]));
+    return persistApiEdit(result, options, () => {
+      restoreApiFields(current, before, applied);
+      if (!hadRetryCount && current.apiQianqianjieRetryCount === undefined) delete current.apiQianqianjieRetryCount;
+    });
   };
-  const upsertSharedPreset = (name, config, id = '') => {
+  const upsertSharedPreset = (name, config, id = '', options = {}) => {
     parseAdditionalParams(config?.qqjAdditionalParams);
     // Every mutation re-reads the shared source so a concurrently changed preset pool is never replaced from a stale UI snapshot.
-    const shared = ensureSevenDaysSettings();
+    const priorShared = sevenDaysSettings(), shared = ensureSevenDaysSettings();
+    const previous = shared.apiPresets;
     const list = Array.isArray(shared.apiPresets) ? [...shared.apiPresets] : [];
     const requestedId = text(id).trim();
     const presetId = requestedId || createPresetId(now, random).replace(/^q/, 'p');
     const index = list.findIndex(value => value && typeof value === 'object' && text(value.id).trim() === presetId);
+    if (options.requireExisting && index < 0) throw new Error('这个共享预设已不存在，请重新选择。');
+    const priorRecord = index >= 0 ? { ...list[index] } : null;
     const normalized = normalizePreset({ ...config, id: presetId, name });
     const snapshot = {
       name: normalized.name,
@@ -380,6 +432,11 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
       timeoutSec: normalized.timeoutSec,
       stream: normalized.stream,
     };
+    if (normalized.qqjRetryCount !== undefined) snapshot.qqjRetryCount = normalized.qqjRetryCount;
+    else if (index >= 0 && list[index] && typeof list[index] === 'object') {
+      list[index] = { ...list[index] };
+      delete list[index].qqjRetryCount;
+    }
     if (normalized.qqjTemperature !== undefined) snapshot.qqjTemperature = normalized.qqjTemperature;
     else if (index >= 0 && list[index] && typeof list[index] === 'object') {
       list[index] = { ...list[index] };
@@ -393,8 +450,25 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (index >= 0) list[index] = { ...list[index], ...snapshot, id: presetId };
     else list.push({ ...snapshot, id: presetId });
     shared.apiPresets = list;
-    notify();
-    return presetId;
+    const appliedRecord = list[index >= 0 ? index : list.length - 1];
+    const fields = ['name', 'url', 'key', 'model', 'excludeParams', 'timeoutSec', 'stream', 'qqjTemperature', 'qqjAdditionalParams', 'qqjRetryCount'];
+    const appliedValues = options.observeSaveFailure ? Object.fromEntries(fields.map(field => [field, JSON.stringify(appliedRecord[field])])) : {};
+    const createdSnapshot = options.observeSaveFailure && !priorRecord ? JSON.stringify(appliedRecord) : '';
+    return persistApiEdit(presetId, options, () => {
+      const owner = sevenDaysSettings();
+      if (!Array.isArray(owner?.apiPresets)) return;
+      owner.apiPresets = owner.apiPresets.flatMap(record => {
+        if (!record || typeof record !== 'object' || text(record.id).trim() !== presetId) return [record];
+        if (!priorRecord) return JSON.stringify(record) === createdSnapshot ? [] : [record];
+        const restored = { ...record };
+        for (const field of fields) if (JSON.stringify(record[field]) === appliedValues[field]) {
+          if (own(priorRecord, field)) restored[field] = priorRecord[field]; else delete restored[field];
+        }
+        return [restored];
+      });
+      if (previous === undefined && !owner.apiPresets.length) delete owner.apiPresets;
+      if (!priorShared && !Object.keys(owner).length) delete extensionSettings['schedule-planner'];
+    });
   };
   const renameSharedPreset = (id, name) => {
     const presetId = text(id).trim(), nextName = text(name).trim();
@@ -408,7 +482,7 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     notify();
     return true;
   };
-  const deleteSharedPreset = id => {
+  const deleteSharedPreset = (id, options = {}) => {
     const presetId = text(id).trim();
     if (!presetId) return false;
     const shared = ensureSevenDaysSettings();
@@ -417,6 +491,8 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (next.length === list.length) return false;
     shared.apiPresets = next;
     const current = get();
+    const keys = ['apiMode', 'selectedSevenDaysPresetId', 'summaryPresetId', 'recallPresetId', 'worldbookPresetId', 'vectorEnabled'];
+    const before = Object.fromEntries(keys.map(key => [key, current[key]]));
     if (current.apiMode === 'seven-preset' && text(current.selectedSevenDaysPresetId).trim() === presetId) {
       current.apiMode = 'auto';
       current.selectedSevenDaysPresetId = '';
@@ -425,8 +501,14 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (text(current.recallPresetId).trim() === presetId) current.recallPresetId = '';
     if (text(current.worldbookPresetId).trim() === presetId) current.worldbookPresetId = '';
     if (text(current.vectorPresetId).trim() === presetId) current.vectorEnabled = false;
-    notify();
-    return true;
+    const applied = Object.fromEntries(keys.map(key => [key, current[key]]));
+    return persistApiEdit(true, options, () => {
+      const owner = sevenDaysSettings(), original = list.find(value => value && typeof value === 'object' && text(value.id).trim() === presetId);
+      if (Array.isArray(owner?.apiPresets) && !owner.apiPresets.some(value => value && typeof value === 'object' && text(value.id).trim() === presetId)) {
+        const restored = [...owner.apiPresets]; restored.splice(Math.min(list.indexOf(original), restored.length), 0, original); owner.apiPresets = restored;
+      }
+      restoreApiFields(current, before, applied);
+    });
   };
   const sharedSnapshotKey = () => {
     const shared = sevenDaysSettings() || {};
@@ -481,6 +563,9 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
   return {
     get,
     update,
+    processingPrompt: () => getSharedProcessingPrompt(extensionSettings),
+    wrappers: () => getSharedBodyWrappers(extensionSettings),
+    updateWrappers: patch => { updateSharedBodyWrappers(extensionSettings, patch); notify(); },
     localConfig,
     mainConfig,
     presets,

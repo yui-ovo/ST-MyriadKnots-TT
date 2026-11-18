@@ -49,10 +49,20 @@ export function createGouhuaDialogCore({ $, mount, getRootClass = () => '', subs
         };
         const externalClose = () => finish(null);
         activeCancel = externalClose;
-        $overlay.on('click', function (event) { if (event.target === this) externalClose(); });
+        // A drag crossing the sheet can produce a click on its overlay ancestor.
+        let backdropDown = false, backdropUp = false;
+        $overlay.on('pointerdown', function (event) { backdropDown = event.target === this; backdropUp = false; });
+        $overlay.on('pointerup', function (event) { backdropUp = event.target === this; });
+        $overlay.on('pointercancel', () => { backdropDown = false; backdropUp = false; });
+        $overlay.on('click', function (event) {
+            const outsideClick = event.target === this && backdropDown && backdropUp;
+            backdropDown = false; backdropUp = false;
+            if (outsideClick) externalClose();
+        });
         $overlay.on('keydown', event => {
             if (event.key !== 'Escape') return;
             event.preventDefault();
+            event.stopPropagation?.();
             externalClose();
         });
         $overlay.addClass(String(getRootClass() || ''));
@@ -73,8 +83,10 @@ export function createGouhuaDialogCore({ $, mount, getRootClass = () => '', subs
             const $overlay = $(`<div id="${OVERLAY_ID}" class="sp-dialog-overlay">
                 <div class="sp-dialog-sheet" role="dialog" aria-modal="true" aria-labelledby="sp-dialog-title">
                     <div id="sp-dialog-title" class="sp-dialog-head">${escapeHtml(title)}</div>
-                    <div class="sp-dialog-body">${escapeHtml(body)}</div>
-                    ${note ? `<div class="sp-dialog-note">${escapeHtml(note)}</div>` : ''}
+                    <div class="sp-dialog-content">
+                        <div class="sp-dialog-body">${escapeHtml(body)}</div>
+                        ${note ? `<div class="sp-dialog-note">${escapeHtml(note)}</div>` : ''}
+                    </div>
                     <div class="sp-dialog-actions">${buttons}</div>
                 </div>
             </div>`);
@@ -107,7 +119,7 @@ export function createGouhuaDialogCore({ $, mount, getRootClass = () => '', subs
             const $overlay = $(`<div id="${OVERLAY_ID}" class="sp-dialog-overlay">
                 <div class="sp-dialog-sheet" role="dialog" aria-modal="true" aria-labelledby="sp-dialog-title">
                     <div id="sp-dialog-title" class="sp-dialog-head">${escapeHtml(title)}</div>
-                    ${body ? `<div class="sp-dialog-body">${escapeHtml(body)}</div>` : ''}
+                    ${body ? `<div class="sp-dialog-content"><div class="sp-dialog-body">${escapeHtml(body)}</div></div>` : ''}
                     <input type="text" class="sp-dialog-input" value="${escapeHtml(initialValue)}" placeholder="${escapeHtml(placeholder)}" maxlength="${limit}" autocomplete="off">
                     <div class="sp-dialog-input-error" aria-live="polite"></div>
                     <div class="sp-dialog-actions">
@@ -132,7 +144,7 @@ export function createGouhuaDialogCore({ $, mount, getRootClass = () => '', subs
             $overlay.find('.sp-dialog-cancel').on('click', session.close);
             $overlay.find('.sp-dialog-input').on('input', () => $overlay.find('.sp-dialog-input-error').empty()).on('keydown', event => {
                 if (event.key === 'Enter') { event.preventDefault(); submit(); }
-                else if (event.key === 'Escape') { event.preventDefault(); session.close(); }
+                else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation?.(); session.close(); }
             });
             schedule(() => $overlay.find('.sp-dialog-input').trigger('focus').trigger('select'), 0);
         });
@@ -158,17 +170,32 @@ export function createGouhuaDialogCore({ $, mount, getRootClass = () => '', subs
             $overlay.find('.sp-dialog-custom')[0]?.appendChild?.(content);
             const session = mountDialog($overlay, resolve, { onClose: () => { try { onClose?.(); } finally { restoreFocus(previousFocus); } } });
             let submitting = false;
+            const submitButton = $overlay.find('.sp-dialog-submit')[0];
+            const showSubmitting = value => {
+                submitting = value;
+                submitButton.disabled = value;
+                submitButton.textContent = value ? '处理中…' : confirmText;
+                submitButton.setAttribute('aria-busy', String(value));
+            };
             const runSubmit = async () => {
                 if (submitting || session.isDone()) return;
-                submitting = true; $overlay.find('.sp-dialog-input-error').empty();
+                showSubmitting(true); $overlay.find('.sp-dialog-input-error').empty();
                 try { const value = await submit(); session.finish(value ?? true); }
                 catch (error) {
-                    submitting = false;
                     $overlay.find('.sp-dialog-input-error').html(`<i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i> ${escapeHtml(publicErrorMessage(error, { fallback: '操作失败，请重试。' }))}`);
-                }
+                } finally { showSubmitting(false); }
             };
             $overlay.find('.sp-dialog-submit').on('click', runSubmit);
             $overlay.find('.sp-dialog-cancel').on('click', session.close);
+            if (String(content.tagName ?? content.tag ?? '').toLowerCase() === 'form') {
+                content.addEventListener?.('submit', event => { event.preventDefault(); runSubmit(); });
+                content.addEventListener?.('keydown', event => {
+                    const target = event.target;
+                    const type = String(target?.type ?? target?.getAttribute?.('type') ?? 'text').toLowerCase();
+                    if (String(target?.tagName ?? target?.tag ?? '').toLowerCase() !== 'input' || !['text', 'search', 'url', 'tel', 'email', 'password', 'number', 'date', 'datetime-local', 'month', 'time', 'week'].includes(type) || event.key !== 'Enter' || event.isComposing || event.keyCode === 229) return;
+                    event.preventDefault(); runSubmit();
+                });
+            }
             schedule(() => $overlay.find('.sp-dialog-submit').trigger('focus'), 0);
         });
     }

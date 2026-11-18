@@ -5,7 +5,11 @@ const FORMAT = 'qqj-v3-core-cache-1';
 const CORE_TYPES = new Set(['floor', 'floorMemory', 'entity', 'stateDelta', 'index']);
 const MAX_BYTES = 128 * 1024 * 1024;
 const IO_TIMEOUT_MS = 900;
-const WRITE_CONCURRENCY = 16;
+// Background publication has room for slow commits; read-path cleanup keeps the short I/O budget.
+const WRITE_TIMEOUT_MS = 5000;
+const PUBLISH_BATCH_SIZE = 64;
+const PUBLISH_BATCH_BYTES = 1024 * 1024;
+const METADATA_READ_CONCURRENCY = 16;
 const encoder = new TextEncoder();
 const DB_NAME = 'qqj-v3-core-cache';
 const STORE_NAME = 'core_records';
@@ -59,7 +63,6 @@ function bounded(promise, timeoutMs = IO_TIMEOUT_MS, phase = 'storage-io', onFai
     throw error;
   }).finally(() => clearTimeout(timer));
 }
-
 function plainRecord(value) { return Boolean(value && typeof value === 'object' && !Array.isArray(value)); }
 function encoded(value) { return encodeURIComponent(String(value)); }
 function witnessKey(witness) { return JSON.stringify([
@@ -109,7 +112,7 @@ export function createIndexedDbCoreRecordCache({
       if (previous?.token === token) stats[key] = Object.freeze({ ...previous, lateResult, lateElapsedMs, lateAt });
     }
   };
-  const boundedIo = (promise, phase) => bounded(promise, ioTimeoutMs, phase, recordIoFailure, updateLateResult);
+  const boundedIo = (promise, phase, timeoutMs = ioTimeoutMs) => bounded(promise, timeoutMs, phase, recordIoFailure, updateLateResult);
   const publicFailure = value => {
     if (!value) return null;
     const { token, ...fields } = value;
@@ -122,10 +125,8 @@ export function createIndexedDbCoreRecordCache({
   let budgetReady = false;
   let budgetPromise = null;
   let ioUnavailable = false;
-  let publishUnavailable = false;
-  const disableIo = () => { ioUnavailable = true; publishUnavailable = true; stats.available = false; };
+  const disableIo = () => { ioUnavailable = true; stats.available = false; };
   const publishers = new Map();
-  const publishingScopes = new Map();
   const scopeVersions = new Map();
   const identityVersions = new Map();
 
@@ -159,7 +160,7 @@ export function createIndexedDbCoreRecordCache({
         return instance;
       } catch (error) {
         recordIoFailure('ready', error, 0, 0, 'rejected');
-        stats.available = false;
+        disableIo();
         return null;
       }
     })();
@@ -178,41 +179,47 @@ export function createIndexedDbCoreRecordCache({
   function openNativeDatabase() {
     if (nativeDatabase) return Promise.resolve(nativeDatabase);
     if (nativeReadyPromise) return nativeReadyPromise;
-    nativeReadyPromise = new Promise((resolve, reject) => {
-      let request;
+    nativeReadyPromise = boundedIo(new Promise((resolve, reject) => {
+      let request, accepting = true;
       try {
         const factory = indexedDBProvider?.();
         if (typeof factory?.open !== 'function') { resolve(null); return; }
         request = factory.open(DB_NAME);
       } catch (error) { reject(error); return; }
-      request.onblocked = () => reject(Object.assign(new Error('IDB_CACHE_DATABASE_BLOCKED'), { code: 'IDB_CACHE_DATABASE_BLOCKED' }));
-      request.onerror = () => reject(request.error ?? new Error('IDB_CACHE_DATABASE_OPEN_FAILED'));
+      request.onblocked = () => { accepting = false; reject(Object.assign(new Error('IDB_CACHE_DATABASE_BLOCKED'), { code: 'IDB_CACHE_DATABASE_BLOCKED' })); };
+      request.onerror = () => { accepting = false; reject(request.error ?? new Error('IDB_CACHE_DATABASE_OPEN_FAILED')); };
       request.onsuccess = () => {
         const database = request.result;
+        if (!accepting || ioUnavailable) { database?.close?.(); resolve(null); return; }
         if (!database?.objectStoreNames?.contains?.(STORE_NAME)) {
           database?.close?.(); resolve(null); return;
         }
         database.onversionchange = () => { database.close(); if (nativeDatabase === database) nativeDatabase = null; nativeReadyPromise = null; };
         nativeDatabase = database; resolve(database);
       };
-    }).catch(error => { recordIoFailure('native-open', error, 0, 0, 'rejected'); return null; }).finally(() => { if (!nativeDatabase) nativeReadyPromise = null; });
+    }), 'native-open').catch(error => { recordIoFailure('native-open', error, 0, 0, 'rejected'); disableIo(); return null; }).finally(() => { if (!nativeDatabase) nativeReadyPromise = null; });
     return nativeReadyPromise;
   }
 
-  function nativeTransaction(phase, begin) {
+  function nativeTransaction(phase, begin, mode = 'readwrite', timeoutMs = ioTimeoutMs) {
+    let transaction;
     return boundedIo(new Promise((resolve, reject) => {
       const database = nativeDatabase;
       if (!database) { resolve({ ok: false, unavailable: true }); return; }
-      let transaction;
       let value;
-      try { transaction = database.transaction(STORE_NAME, 'readwrite'); }
+      try { transaction = database.transaction(STORE_NAME, mode); }
       catch (error) { reject(error); return; }
       transaction.oncomplete = () => resolve(value);
       transaction.onerror = () => reject(transaction.error ?? new Error('IDB_CACHE_TRANSACTION_FAILED'));
       transaction.onabort = () => reject(transaction.error ?? new Error('IDB_CACHE_TRANSACTION_ABORTED'));
       try { begin(transaction.objectStore(STORE_NAME), transaction, result => { value = result; }); }
       catch (error) { try { transaction.abort(); } catch { /* transaction already ended */ } reject(error); }
-    }), phase);
+    }), phase, timeoutMs).catch(error => {
+      if (error?.code === 'IDB_CACHE_TIMEOUT') {
+        try { transaction?.abort(); } catch { /* transaction already ended */ }
+      }
+      throw error;
+    });
   }
 
   function entryBytes(key, value, metadataKey, metadata) {
@@ -383,14 +390,8 @@ export function createIndexedDbCoreRecordCache({
     } catch (error) { recordIoFailure('manifest-read', error, 0, 0, 'rejected'); disableIo(); return false; }
   }
 
-  async function readRecord(scope, witness, recordType, recordId, recordRefs = null) {
-    const db = await ensureReady();
-    if (!db || ioUnavailable || !scope || !CORE_TYPES.has(recordType) || !witness?.generationId || typeof recordId !== 'string') return null;
-    const refs = recordRefs?.recordRefs ?? recordRefs;
-    if (!Array.isArray(refs?.[recordType]) || !refs[recordType].includes(recordId)) { stats.misses += 1; return null; }
-    const key = `r:${scope}:${encoded(witness.generationId)}:${recordType}:${encoded(recordId)}`;
+  async function readCachedValue(value, scope, witness, recordType, recordId) {
     try {
-      const value = await boundedIo(db.getItem(key), 'record-read');
       if (!value) { stats.misses += 1; return null; }
       if (value.format !== FORMAT || value.scope !== scope || value.rootGenerationId !== witness.generationId
         || value.recordType !== recordType || value.recordId !== recordId
@@ -411,6 +412,53 @@ export function createIndexedDbCoreRecordCache({
       disableIo();
       return null;
     }
+  }
+
+  async function readRecord(scope, witness, recordType, recordId, recordRefs = null) {
+    const db = await ensureReady();
+    if (!db || ioUnavailable || !scope || !CORE_TYPES.has(recordType) || !witness?.generationId || typeof recordId !== 'string') return null;
+    const refs = recordRefs?.recordRefs ?? recordRefs;
+    if (!Array.isArray(refs?.[recordType]) || !refs[recordType].includes(recordId)) { stats.misses += 1; return null; }
+    const key = `r:${scope}:${encoded(witness.generationId)}:${recordType}:${encoded(recordId)}`;
+    try { return await readCachedValue(await boundedIo(db.getItem(key), 'record-read'), scope, witness, recordType, recordId); }
+    catch (error) { stats.misses += 1; recordIoFailure('record-read', error, 0, 0, 'rejected'); disableIo(); return null; }
+  }
+
+  async function readRecords(scope, witness, recordType, recordIds, recordRefs = null) {
+    if (!Array.isArray(recordIds) || recordIds.length > 64) throw new TypeError('缓存批次最多读取64条记录。');
+    const results = new Array(recordIds.length).fill(null), db = await ensureReady();
+    if (!db || ioUnavailable || !scope || !CORE_TYPES.has(recordType) || !witness?.generationId || !recordIds.length) return results;
+    const refs = recordRefs?.recordRefs ?? recordRefs, allowed = new Set(Array.isArray(refs?.[recordType]) ? refs[recordType] : []);
+    const selected = [];
+    for (const [index, id] of recordIds.entries()) {
+      if (typeof id !== 'string') continue;
+      if (!allowed.has(id)) { stats.misses += 1; continue; }
+      selected.push({ index, id, key: `r:${scope}:${encoded(witness.generationId)}:${recordType}:${encoded(id)}` });
+    }
+    if (!selected.length) return results;
+    let values;
+    try {
+      values = await nativeTransaction('record-read', (store, transaction, setResult) => {
+        const rows = new Array(selected.length); let remaining = rows.length;
+        // Queue every get before yielding; validation runs after the transaction.
+        selected.forEach(({ key }, index) => {
+          const request = store.get(key);
+          request.onsuccess = () => { rows[index] = request.result; if (--remaining === 0) setResult(rows); };
+        });
+      }, 'readonly');
+      if (values?.unavailable) { stats.misses += selected.length; return results; }
+    } catch (error) {
+      stats.misses += selected.length; recordIoFailure('record-read', error, 0, 0, 'rejected'); disableIo(); return results;
+    }
+    let cursor = 0;
+    await Promise.all(Array.from({ length: Math.min(16, selected.length) }, async () => {
+      while (cursor < selected.length) {
+        const row = cursor++, { index, id } = selected[row];
+        results[index] = await readCachedValue(values[row], scope, witness, recordType, id);
+        values[row] = null;
+      }
+    }));
+    return results;
   }
 
   async function removeRecord(scope, witness, recordType, recordId) {
@@ -454,8 +502,8 @@ export function createIndexedDbCoreRecordCache({
       let total = 0;
       const keys = await boundedIo(db.keys(), 'budget-key-list');
       const metadataKeys = Array.isArray(keys) ? keys.filter(key => typeof key === 'string' && key.startsWith('s:')) : [];
-      for (let offset = 0; offset < metadataKeys.length; offset += WRITE_CONCURRENCY) {
-        const values = await boundedIo(Promise.all(metadataKeys.slice(offset, offset + WRITE_CONCURRENCY).map(key => db.getItem(key))), 'budget-metadata-read');
+      for (let offset = 0; offset < metadataKeys.length; offset += METADATA_READ_CONCURRENCY) {
+        const values = await boundedIo(Promise.all(metadataKeys.slice(offset, offset + METADATA_READ_CONCURRENCY).map(key => db.getItem(key))), 'budget-metadata-read');
         for (const value of values) if (Number.isSafeInteger(value?.bytes) && value.bytes >= 0) total += value.bytes;
       }
       const result = await nativeTransaction('budget-initialize', (store, transaction, setResult) => {
@@ -573,34 +621,55 @@ export function createIndexedDbCoreRecordCache({
     return normalized;
   }
 
-  async function upsertRecord(scope, witness, recordType, recordId, envelope) {
-    const key = `r:${scope}:${encoded(witness.generationId)}:${recordType}:${encoded(recordId)}`;
-    const metadataKey = `s:${key}`;
-    const digest = await sha256(JSON.stringify(envelope));
-    const recordValue = { format: FORMAT, scope, rootGenerationId: witness.generationId, recordGenerationId: envelope.generationId,
-      recordType, recordId, revision: envelope.revision, digest, envelope };
-    const metadataBase = { cacheKey: key, recordKey: key, kind: 'record', createdAt: Date.now() };
-    const bytes = entryBytes(key, recordValue, metadataKey, metadataBase);
+  async function prepareRecords(scope, witness, records) {
+    const latest = new Map();
+    for (const { recordId, envelope } of records) {
+      const recordType = envelope.data.recordType;
+      const key = `r:${scope}:${encoded(witness.generationId)}:${recordType}:${encoded(recordId)}`;
+      latest.set(key, { key, recordType, recordId, envelope });
+    }
+    // Prepare every checksum before opening the transaction; duplicate keys keep the last valid input.
+    const prepared = [];
+    for (const { key, recordType, recordId, envelope } of latest.values()) {
+      const metadataKey = `s:${key}`, digest = await sha256(JSON.stringify(envelope));
+      const recordValue = { format: FORMAT, scope, rootGenerationId: witness.generationId, recordGenerationId: envelope.generationId,
+        recordType, recordId, revision: envelope.revision, digest, envelope };
+      const metadataBase = { cacheKey: key, recordKey: key, kind: 'record', createdAt: Date.now() };
+      const bytes = entryBytes(key, recordValue, metadataKey, metadataBase);
+      prepared.push({ key, metadataKey, digest, envelope, recordValue, metadataBase, bytes });
+    }
+    return prepared;
+  }
+
+  function upsertRecords(prepared) {
     return nativeTransaction('publish-record-transaction', (store, transaction, setResult) => {
-      const requests = [store.get(key), store.get(metadataKey), store.get(BUDGET_KEY)];
+      const requests = [...prepared.flatMap(item => [store.get(item.key), store.get(item.metadataKey)]), store.get(BUDGET_KEY)];
       const values = new Array(requests.length), ready = new Set();
       const finish = index => {
         values[index] = requests[index].result;
         ready.add(index);
         if (ready.size !== requests.length) return;
-        const [previous, previousMetadata, budget] = values;
-        const sameRecord = previous?.format === FORMAT && previous.digest === digest && previous.revision === envelope.revision;
-        const metadataMatches = Number.isSafeInteger(previousMetadata?.bytes) && previousMetadata.bytes === bytes
-          && previousMetadata.cacheKey === key && previousMetadata.kind === 'record';
-        if (!sameRecord) store.put(recordValue, key);
-        if (!metadataMatches) store.put({ ...metadataBase, createdAt: previousMetadata?.createdAt ?? metadataBase.createdAt, bytes }, metadataKey);
-        const previousBytes = Number.isSafeInteger(previousMetadata?.bytes) && previousMetadata.bytes >= 0 ? previousMetadata.bytes : 0;
-        const nextBytes = (Number.isSafeInteger(budget?.estimatedBytes) ? budget.estimatedBytes : 0) + (metadataMatches ? 0 : bytes - previousBytes);
-        if (!sameRecord || !metadataMatches) store.put({ format: FORMAT, estimatedBytes: Math.max(0, nextBytes) }, BUDGET_KEY);
-        setResult({ wrote: !sameRecord, repairedMetadata: !metadataMatches, estimatedBytes: Math.max(0, nextBytes) });
+        const budget = values.at(-1);
+        let nextBytes = Number.isSafeInteger(budget?.estimatedBytes) ? budget.estimatedBytes : 0;
+        let wrote = 0, repairedMetadata = false;
+        prepared.forEach(({ key, metadataKey, digest, envelope, recordValue, metadataBase, bytes }, recordIndex) => {
+          const previous = values[recordIndex * 2], previousMetadata = values[recordIndex * 2 + 1];
+          const sameRecord = previous?.format === FORMAT && previous.digest === digest && previous.revision === envelope.revision;
+          const metadataMatches = Number.isSafeInteger(previousMetadata?.bytes) && previousMetadata.bytes === bytes
+            && previousMetadata.cacheKey === key && previousMetadata.kind === 'record';
+          if (!sameRecord) { store.put(recordValue, key); wrote += 1; }
+          if (!metadataMatches) {
+            store.put({ ...metadataBase, createdAt: previousMetadata?.createdAt ?? metadataBase.createdAt, bytes }, metadataKey);
+            const previousBytes = Number.isSafeInteger(previousMetadata?.bytes) && previousMetadata.bytes >= 0 ? previousMetadata.bytes : 0;
+            nextBytes += bytes - previousBytes;
+            repairedMetadata = true;
+          }
+        });
+        if (wrote || repairedMetadata) store.put({ format: FORMAT, estimatedBytes: Math.max(0, nextBytes) }, BUDGET_KEY);
+        setResult({ wrote, repairedMetadata, estimatedBytes: Math.max(0, nextBytes) });
       };
       requests.forEach((request, index) => { request.onsuccess = () => finish(index); });
-    });
+    }, 'readwrite', WRITE_TIMEOUT_MS);
   }
 
   async function commitManifest(scope, witness, manifestKey, requestedRefs, observedDirectory, observedInvalidation, expectedVersion) {
@@ -667,7 +736,7 @@ export function createIndexedDbCoreRecordCache({
         staleMetaRequests.forEach((request, index) => { request.onsuccess = () => { staleMetadata[index] = request.result; if (--pending === 0) commit(); }; });
       };
       requests.forEach((request, index) => { request.onsuccess = () => finishRead(index); });
-    });
+    }, 'readwrite', WRITE_TIMEOUT_MS);
   }
 
   function captureScopeVersion(scope) { return scopeVersions.get(scope) ?? 0; }
@@ -677,25 +746,23 @@ export function createIndexedDbCoreRecordCache({
 
   async function publish(scope, witness, records, recordRefs = {}, expectedVersion = captureScopeVersion(scope), verifyRoot = null) {
     const lockKey = scope;
-    if (ioUnavailable || publishUnavailable) return false;
+    if (ioUnavailable) return false;
     const current = publishers.get(lockKey);
     if (current) return current;
-    if (publishingScopes.has(scope)) return false;
     if (!publicationVersionIsCurrent(scope, expectedVersion)) return false;
     const task = publishNow(scope, witness, records, recordRefs, expectedVersion, verifyRoot);
     publishers.set(lockKey, task);
-    publishingScopes.set(scope, lockKey);
     try { return await task; }
     finally {
       if (publishers.get(lockKey) === task) publishers.delete(lockKey);
-      if (publishingScopes.get(scope) === lockKey) publishingScopes.delete(scope);
     }
   }
 
   async function publishNow(scope, witness, records, recordRefs, expectedVersion, verifyRoot) {
     const db = await ensureReady();
     if (!db || !scope || !witness?.generationId || !Array.isArray(records)) return false;
-    if (!await migrateLegacyDirectories() || ioUnavailable || publishUnavailable) return false;
+    if (!await migrateLegacyDirectories()) return false;
+    if (ioUnavailable) return false;
     const requestedRefs = normalizeRecordRefs(recordRefs);
     let observedDirectory, observedInvalidation;
     try {
@@ -718,28 +785,39 @@ export function createIndexedDbCoreRecordCache({
     const existingRefs = normalizeRecordRefs(previousManifest?.recordRefs);
     for (const type of CORE_TYPES) requestedRefs[type] = [...new Set([...existingRefs[type], ...requestedRefs[type]])].sort();
     let wroteRecords = false;
+    let publicationFailed = false;
     await hydrateBudget(db);
     let cursor = 0;
     async function worker() {
-      while (!publishUnavailable && cursor < records.length) {
-        const record = records[cursor++];
-        const recordType = record?.envelope?.data?.recordType;
-        const recordId = record?.recordId;
-        const envelope = record?.envelope;
-        if (!CORE_TYPES.has(recordType) || typeof recordId !== 'string' || !plainRecord(envelope)
-          || typeof envelope.generationId !== 'string' || !Number.isSafeInteger(envelope.revision)) continue;
+      while (!ioUnavailable && !publicationFailed && publicationVersionIsCurrent(scope, expectedVersion) && cursor < records.length) {
+        const batch = records.slice(cursor, cursor + PUBLISH_BATCH_SIZE).filter(record => {
+          const envelope = record?.envelope;
+          return CORE_TYPES.has(envelope?.data?.recordType) && typeof record?.recordId === 'string' && plainRecord(envelope)
+            && typeof envelope.generationId === 'string' && Number.isSafeInteger(envelope.revision);
+        });
+        cursor += PUBLISH_BATCH_SIZE;
+        if (!batch.length) continue;
         try {
-          const outcome = await upsertRecord(scope, witness, recordType, recordId, envelope);
-          if (outcome?.unavailable) throw new Error('IDB_CACHE_TRANSACTION_UNAVAILABLE');
-          if (Number.isSafeInteger(outcome?.estimatedBytes)) stats.estimatedBytes = outcome.estimatedBytes;
-          if (outcome?.wrote) { stats.writes += 1; wroteRecords = true; }
-          if (outcome?.repairedMetadata) wroteRecords = true;
-        } catch (error) { stats.writeFailures += 1; recordIoFailure('publish-record', error, 0, 0, 'rejected'); disableIo(); }
+          const prepared = await prepareRecords(scope, witness, batch);
+          let offset = 0;
+          while (offset < prepared.length && !ioUnavailable && publicationVersionIsCurrent(scope, expectedVersion)) {
+            let end = offset, bytes = 0;
+            // A large record keeps its original standalone transaction instead of enlarging the batch.
+            while (end < prepared.length && (end === offset || bytes + prepared[end].bytes <= PUBLISH_BATCH_BYTES)) bytes += prepared[end++].bytes;
+            const outcome = await upsertRecords(prepared.slice(offset, end));
+            offset = end;
+            if (outcome?.unavailable) throw new Error('IDB_CACHE_TRANSACTION_UNAVAILABLE');
+            if (Number.isSafeInteger(outcome?.estimatedBytes)) stats.estimatedBytes = outcome.estimatedBytes;
+            if (outcome?.wrote) { stats.writes += outcome.wrote; wroteRecords = true; }
+            if (outcome?.repairedMetadata) wroteRecords = true;
+          }
+        } catch (error) { stats.writeFailures += 1; recordIoFailure('publish-record', error, 0, 0, 'rejected'); publicationFailed = true; }
       }
     }
     try {
-      await Promise.all(Array.from({ length: Math.min(WRITE_CONCURRENCY, records.length) }, worker));
-      if (ioUnavailable || publishUnavailable) return false;
+      // Native readwrite transactions share one store lock; queue the next only after this one completes.
+      await worker();
+      if (ioUnavailable || publicationFailed) return false;
       const manifestKey = `v:${scope}:${await sha256(witnessKey(witness))}`;
       if (!publicationVersionIsCurrent(scope, expectedVersion)) return false;
       const committed = await commitManifest(scope, witness, manifestKey, requestedRefs, observedDirectory, observedInvalidation, expectedVersion);
@@ -750,8 +828,6 @@ export function createIndexedDbCoreRecordCache({
     } catch (error) {
       stats.writeFailures += 1;
       recordIoFailure('publish', error, 0, 0, 'rejected');
-      disableIo();
-      try { logger?.debug?.('[qianqianjie] core cache publish skipped', { code: error?.code ?? 'IDB_CACHE_WRITE_FAILED' }); } catch { /* cache diagnostics are optional */ }
       return false;
     }
   }
@@ -808,16 +884,14 @@ export function createIndexedDbCoreRecordCache({
 
   async function maintain() {
     const db = await ensureReady();
-    if (!db || ioUnavailable || publishUnavailable) return false;
+    if (!db || ioUnavailable) return false;
     if (!await migrateLegacyDirectories() || ioUnavailable) return false;
     await hydrateBudget(db);
     if (!ioUnavailable && stats.estimatedBytes > maxBytes) await evictToBudget(db);
     return !ioUnavailable;
   }
 
-  return Object.freeze({ scopeFor, captureScopeVersion, captureIdentityVersion, readManifest, readRecord, removeRecord, publish, invalidateScope, invalidateIdentity,
+  return Object.freeze({ scopeFor, captureScopeVersion, captureIdentityVersion, readManifest, readRecord, readRecords, removeRecord, publish, invalidateScope, invalidateIdentity,
     maintain,
     getStats: () => Object.freeze({ ...stats, firstFailure: publicFailure(stats.firstFailure), lastFailure: publicFailure(stats.lastFailure) }) });
 }
-
-export const V3_CORE_CACHE_RECORD_TYPES = Object.freeze([...CORE_TYPES]);

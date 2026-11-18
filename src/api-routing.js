@@ -1,4 +1,4 @@
-import { normalizePreset } from './settings.js';
+import { normalizePreset, normalizeRetryCount } from './settings.js';
 
 const validConfig = config => Boolean(config?.url && config?.key);
 const sevenDaysPresets = value => Array.isArray(value?.apiPresets) ? value.apiPresets.map(item => item && typeof item === 'object' ? { ...item, ...normalizePreset(item) } : null).filter(item => item?.id) : [];
@@ -21,6 +21,7 @@ const taskMetadata = (route, finishReason = '', transportAttempts = null) => ({
 const withTaskMetadata = (result, route) => {
   const finishReason = result?.taskMetadata?.finishReason || result?.finishReason;
   const metadata = taskMetadata(route, finishReason, result?.taskMetadata?.transportAttempts);
+  for (const key of ['processingPromptFingerprint', 'systemPromptFingerprint']) if (/^sha256:[a-f0-9]{64}$/i.test(result?.taskMetadata?.[key] ?? '')) metadata[key] = result.taskMetadata[key];
   if (result && typeof result === 'object' && !Array.isArray(result) && (Object.hasOwn(result, 'jsonData') || Object.hasOwn(result, 'textData'))) return { ...result, taskMetadata: metadata };
   return { jsonData: result, taskMetadata: metadata };
 };
@@ -79,14 +80,23 @@ export function createApiResolver({ settings } = {}) {
 
 export function createTaskRouter({ resolver, compactClient, isEnabled = () => true } = {}) {
   if (!resolver?.resolve || !compactClient?.generateTask) throw new Error('API 路由依赖不可用');
-  const active = new Set(); let epoch = 0;
+  const active = new Set(), budgetRoutes = new WeakMap(); let epoch = 0;
   const abortAll = () => { epoch += 1; for (const controller of active) controller.abort(); active.clear(); };
   const run = async (options, resolveRoute) => {
     if (!isEnabled()) throw disabledError();
-    const mine = epoch, resolved = resolveRoute();
-    const route = resolved?.config
-      ? { ...resolved, config: Object.freeze({ ...resolved.config, excludeParams: Object.freeze([...(resolved.config.excludeParams || [])]) }) }
-      : resolved;
+    const mine = epoch, transportBudget = options?.transportBudget ?? { remaining: 0, used: 0 };
+    let route = budgetRoutes.get(transportBudget);
+    if (!route) {
+      const resolved = resolveRoute();
+      route = resolved?.config
+        ? { ...resolved, config: Object.freeze({ ...resolved.config, excludeParams: Object.freeze([...(resolved.config.excludeParams || [])]) }) }
+        : resolved;
+      if (route?.kind === 'independent') {
+        transportBudget.totalAttempts = 1 + (normalizeRetryCount(route.config?.qqjRetryCount) ?? 2);
+        transportBudget.remaining = Math.max(0, transportBudget.totalAttempts - transportBudget.used);
+        budgetRoutes.set(transportBudget, route);
+      }
+    }
     if (route.kind === 'unavailable') throw unavailableError(route);
     if (route.kind !== 'independent') throw new Error('API 路由类型不受支持');
     if (!isEnabled() || mine !== epoch) throw abortError();
@@ -95,7 +105,7 @@ export function createTaskRouter({ resolver, compactClient, isEnabled = () => tr
     const onExternalAbort = () => controller.abort();
     if (externalSignal?.aborted) controller.abort(); else externalSignal?.addEventListener?.('abort', onExternalAbort, { once: true });
     try {
-      const result = await compactClient.generateTask({ ...options, config: route.config, signal: controller.signal });
+      const result = await compactClient.generateTask({ ...options, transportBudget, config: route.config, signal: controller.signal });
       if (!isEnabled() || mine !== epoch) throw abortError();
       return withTaskMetadata(result, route);
     }
@@ -121,7 +131,7 @@ export function createTaskRouter({ resolver, compactClient, isEnabled = () => tr
   return { generateAnalysisTask, generateUtilityTask, generateRecallTask, generateWorldbookTask, abortAll, getActiveCount: () => active.size };
 }
 
-export function createApiTools({ resolver, compactClient, isEnabled = () => true } = {}) {
+export function createApiTools({ resolver, compactClient, processingPrompt = () => '', isEnabled = () => true } = {}) {
   const active = new Set(); let epoch = 0;
   const abortAll = () => { epoch += 1; for (const controller of active) controller.abort(); active.clear(); };
   const independent = (selection = null) => {
@@ -141,7 +151,7 @@ export function createApiTools({ resolver, compactClient, isEnabled = () => true
     if (!isEnabled() || mine !== epoch) throw abortError();
     const controller = new AbortController(); active.add(controller);
     try {
-      const result = await compactClient[method]({ config, signal: controller.signal });
+      const result = await compactClient[method]({ config, signal: controller.signal, ...(method === 'testConnection' ? { processingPrompt: typeof processingPrompt === 'function' ? processingPrompt() : processingPrompt } : {}) });
       if (!isEnabled() || mine !== epoch) throw abortError();
       return result;
     } finally { active.delete(controller); }

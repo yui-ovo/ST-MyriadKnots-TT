@@ -1,8 +1,12 @@
+import { cseQuantificationFields } from './cse-quantification.js';
+import { resolveIdentityEntityId, isIdentityDeleted } from './entity-identity.js';
+import { filterPlaceMemory } from './place-workspace.js';
+import { readManualArtifactBlocks, RECALL_KNOWLEDGE_GUIDANCE, RECALL_COMPACT_KNOWLEDGE_GUIDANCE } from './recall-text.js';
 import { sha256 } from '../identity.js';
-import { rawWitnessShape, rawWitnessValid, summaryWitnessShape, summaryWitnessValid } from './vector-source.js';
+import { rawWitnessShape, rawWitnessValid, summaryCandidateText, summaryWitnessShape, summaryWitnessValid } from './vector-source.js';
 import { sanitizeSensitiveText, sanitizeTaskMetadata } from './safe-metadata.js';
-import { projectRecallSource, readRecallSource } from './recall-source.js';
-import { buildRecallQueryContext, buildRecallQueryFrame, formatRecallInjection, estimateRecallTokens } from './recall-selector.js';
+import { projectRecallSource, readRecallSource, isolateRecallAuxiliarySources, stateDto, cseChangesDto } from './recall-source.js';
+import { buildRecallQueryContext, buildRecallQueryFrame, formatRecallInjection, estimateRecallTokens, recallBudget, groupRecallPlaces, historySelectionContext, placeRecallBlocks, CSE_RECALL_KNOWLEDGE_BOUNDARY, LEGACY_CSE_RECALL_KNOWLEDGE_BOUNDARY } from './recall-selector.js';
 import { selectRecallWithLlm } from './recall-llm-selector.js';
 import { selectAssistantMessage } from './foundation-domain.js';
 import { inspectMessageFloorAnchor } from './message-floor-anchor.js';
@@ -12,13 +16,16 @@ import { publicErrorMessage } from '../public-error.js';
 import { normalizeAutoHideKeepAiCount } from '../settings.js';
 import { createRecallRequestDiagnostic } from './recall-request-diagnostic.js';
 import { MIGRATION_ALIAS_KEY, migrationPartition } from './migration-prefix.js';
+import { readLocationReference } from './location-reference.js';
+import { isMemoryExcludedMessage } from './memory-exclusion.js';
+import { qianshiRecallPendingHeader, QIANSHI_RECALL_PENDING_HEADER, QIANSHI_RECALL_PROJECTION_VERSION } from './qianshi-domain.js';
 
 export const RECALL_PROMPT_SLOT = 'qqj_v3_recalled_context';
 export const RECALL_RECEIPT_KEY = 'qqj_v3_recall_receipt';
-export const RECALL_RECEIPT_SCHEMA_VERSION = 17;
-export const RECALL_STRATEGY_VERSION = 'continuity-v17';
+export const RECALL_RECEIPT_SCHEMA_VERSION = 18;
+export const RECALL_STRATEGY_VERSION = 'continuity-v32';
 const RECALL_PROMPT_DEPTH = 2;
-const IDENTIFIED_RECALL_STRATEGIES = [RECALL_STRATEGY_VERSION, 'continuity-v16', 'continuity-v15', 'continuity-v14', 'continuity-v13', 'continuity-v12', 'continuity-v11'];
+const IDENTIFIED_RECALL_STRATEGIES = [RECALL_STRATEGY_VERSION, 'continuity-v31', 'continuity-v30', 'continuity-v29', 'continuity-v28', 'continuity-v27', 'continuity-v26', 'continuity-v25', 'continuity-v24', 'continuity-v23', 'continuity-v22', 'continuity-v21', 'continuity-v20', 'continuity-v19', 'continuity-v18', 'continuity-v17', 'continuity-v16', 'continuity-v15', 'continuity-v14', 'continuity-v13', 'continuity-v12', 'continuity-v11'];
 
 const SUPPORTED_TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue']);
 const MAX_STOPPED_GENERATION_CHAINS = 16;
@@ -32,8 +39,22 @@ const LEGACY_MAX_RECEIPT_CSE_CHANGES = 24;
 const LEGACY_MAX_RECEIPT_STORYLINES = 4;
 const MAX_RECEIPT_STATE_PROGRESSIONS = 8;
 const MAX_RECEIPT_SKIP_REASONS = 32;
+const EXPANDED_RECALL_SELECTION_STRATEGIES = new Set([
+  RECALL_STRATEGY_VERSION, 'continuity-v31', 'continuity-v30', 'continuity-v29', 'continuity-v28', 'continuity-v27', 'continuity-v26', 'continuity-v25', 'continuity-v24', 'continuity-v23', 'continuity-v22', 'continuity-v21', 'continuity-v20', 'continuity-v19', 'continuity-v18',
+  'continuity-v17', 'continuity-v16', 'continuity-v15',
+]);
+const EXPANDED_RECALL_RECEIPT_LIMITS = Object.freeze({ expanded: true, floors: MAX_RECEIPT_FLOORS,
+  states: MAX_RECEIPT_STATES, cseChanges: MAX_RECEIPT_CSE_CHANGES, combinedStatesAndChanges: MAX_RECEIPT_CSE_CHANGES,
+  storylines: MAX_RECEIPT_STORYLINES });
+const LEGACY_RECALL_RECEIPT_LIMITS = Object.freeze({ expanded: false, floors: LEGACY_MAX_RECEIPT_FLOORS,
+  states: LEGACY_MAX_RECEIPT_STATES, cseChanges: LEGACY_MAX_RECEIPT_CSE_CHANGES,
+  combinedStatesAndChanges: LEGACY_MAX_RECEIPT_CSE_CHANGES, storylines: LEGACY_MAX_RECEIPT_STORYLINES });
+export function recallReceiptSelectionLimits(strategyVersion) {
+  return EXPANDED_RECALL_SELECTION_STRATEGIES.has(strategyVersion) ? EXPANDED_RECALL_RECEIPT_LIMITS : LEGACY_RECALL_RECEIPT_LIMITS;
+}
 // 单次来源准备共用一个期限覆盖身份、root、读取与投影；期限内结束仍须完成后续来源版本核验。
-const DEFAULT_PREPARATION_TIMEOUT_MS = 8000;
+const DEFAULT_PREPARATION_TIMEOUT_MS = 120000;
+const AUXILIARY_PREPARATION_TIMEOUT_MS = 8000;
 const RECALL_PRIORITY_STATUSES = new Set(['missing', 'empty', 'invalid', 'applied', 'timeGuard']);
 const safePriorityKeys = values => Array.isArray(values) && values.length <= 8
   && values.every(key => typeof key === 'string' && /^[RC]\d{1,4}$/u.test(key))
@@ -60,6 +81,31 @@ function latestUser(snapshot) {
 }
 
 const liveRecallFrameKey = snapshot => JSON.stringify(buildRecallQueryFrame({ coreChat: snapshot?.chat, assistantTurns: 1 }).messages.map(message => [message.role, message.text]));
+function captureLatestLocationReference(snapshot, sanitizerOptions, maximumFloors, beforeIndex = Infinity) {
+  const chat = Array.isArray(snapshot?.chat) ? snapshot.chat : [];
+  let visible = 0;
+  for (let index = Math.min(chat.length - 1, beforeIndex - 1); index >= 0 && visible < normalizeAutoHideKeepAiCount(maximumFloors); index -= 1) {
+    const message = chat[index];
+    if (!message || message.is_system === true || message.is_hidden === true || message.hidden === true) continue;
+    if (message.is_user === false && isMemoryExcludedMessage(message)) continue;
+    const selected = selectAssistantMessage(message);
+    if (!selected?.rawContent?.trim() || !sanitizeMemoryContent(selected.rawContent, sanitizerOptions)) continue;
+    visible += 1;
+    const values = readLocationReference(selected.rawContent) ?? [];
+    if (!values.length) return null;
+    return Object.freeze({ values, hostLocator: Object.freeze({ messageIndex: index,
+      swipeId: selected.swipeId ?? null, selectedSwipeIndex: selected.selectedSwipeIndex ?? null }) });
+  }
+  return null;
+}
+
+function locationReferenceDependencyMatches(saved, current) {
+  if (saved === JSON.stringify(current)) return true;
+  if (current !== null) return false;
+  // 已验签的旧空占位只代表无地点，不因当时消息定位不同而重选。
+  try { const value = JSON.parse(saved); return Array.isArray(value?.values) && value.values.length === 0; }
+  catch { return false; }
+}
 
 async function sourceRefsValid(receipt, source, onInvalid = () => {}, selectedFloorsForValidation = null) {
   // 失败回调只附带首个可定位引用，不参与下面的布尔判定或读取链。
@@ -102,6 +148,7 @@ async function sourceRefsValid(receipt, source, onInvalid = () => {}, selectedFl
     const subject = value && typeof value === 'object' ? subjects.get(value.subjectEntityId) : null;
     valid = valid && Array.isArray(subject?.[value.layer]) && subject[value.layer].some(item => (
       item.text === value.text && item.visibility === value.visibility && item.reason === value.reason
+      && (value.origin === undefined || item.origin === value.origin)
       && item.towardEntityId === (value.towardEntityId ?? null) && item.sourceAssistantSeq === (value.sourceAssistantSeq ?? null)
       && (!value.stateId || (item.stateId === value.stateId && (item.sourceFloorId ?? null) === (value.sourceFloorId ?? null) && (item.sourceDeltaId ?? null) === (value.sourceDeltaId ?? null)))
     ));
@@ -155,7 +202,7 @@ function selectedSourceFloorIds({ selectedFloors = [], selectedStates = [], sele
   return floorIds;
 }
 
-async function captureSelectedSourceGuards(receipt, source, snapshot, sanitizerOptions, fingerprint) {
+async function captureSelectedSourceGuards(receipt, source, snapshot) {
   if (source?.readiness?.hostConfirmed !== true) return Object.freeze([]);
   const expectedFloorIds = selectedSourceFloorIds(receipt, source);
   if (!expectedFloorIds.size) return Object.freeze([]);
@@ -164,6 +211,8 @@ async function captureSelectedSourceGuards(receipt, source, snapshot, sanitizerO
   const partition = migrationPartition(source);
   const guards = [];
   for (const floorId of expectedFloorIds) {
+    // Unbound manual summaries are checked against their saved memory revision.
+    if (source.readiness.unmatchedFloorIds?.includes(floorId)) continue;
     const ref = sourceRefs.get(floorId);
     if (partition.isFrozenFloor(floorId)) {
       // The frozen record is verified against the immutable reachable graph;
@@ -234,7 +283,7 @@ const legacyReceiptMaterial = receipt => [
   receipt.userMessageIndex, receipt.userContentFingerprint, receipt.queryFingerprint, receipt.generationType,
   receipt.selectedFloors, receipt.selectedStates, receipt.coverage, receipt.injectionText, receipt.stages, receipt.skipReasons, receipt.completionStatus, receipt.createdAt,
 ];
-const baseReceiptMaterial = receipt => receipt.schemaVersion >= 15 && receipt.qianshiProgress
+const legacyBaseReceiptMaterial = receipt => receipt.schemaVersion >= 15 && receipt.qianshiProgress
   ? [...legacyReceiptMaterial(receipt), receipt.bodyMatchFingerprint, receipt.strategyVersion, receipt.selectedCseChanges, receipt.selectorDiagnostic, receipt.timings, receipt.storylines, receipt.timeDependencies, receipt.qianshiProgress]
   : receipt.schemaVersion >= 15
   ? [...legacyReceiptMaterial(receipt), receipt.bodyMatchFingerprint, receipt.strategyVersion, receipt.selectedCseChanges, receipt.selectorDiagnostic, receipt.timings, receipt.storylines, receipt.timeDependencies]
@@ -248,9 +297,14 @@ const baseReceiptMaterial = receipt => receipt.schemaVersion >= 15 && receipt.qi
   ? [...legacyReceiptMaterial(receipt), receipt.bodyMatchFingerprint, receipt.strategyVersion, receipt.selectedCseChanges, receipt.selectorDiagnostic, receipt.timings]
   : receipt.schemaVersion >= 9 ? [...legacyReceiptMaterial(receipt), receipt.bodyMatchFingerprint, receipt.strategyVersion]
   : receipt.schemaVersion >= 8 ? [...legacyReceiptMaterial(receipt), receipt.bodyMatchFingerprint] : legacyReceiptMaterial(receipt);
+const baseReceiptMaterial = receipt => receipt.schemaVersion >= 18
+  ? [...legacyBaseReceiptMaterial(receipt), receipt.selectedLocationReferences, receipt.locationReferenceDependency]
+  : legacyBaseReceiptMaterial(receipt);
 // 删除见证是可选的签名扩展，旧回执维持原签名；只记录选中事项的删除指纹，不复制全档删除清单。
-const receiptMaterial = receipt => receipt.qianshiDeletionWitness === undefined ? baseReceiptMaterial(receipt)
-  : [...baseReceiptMaterial(receipt), receipt.qianshiDeletionWitness];
+const receiptMaterial = receipt => {
+  const material = receipt.qianshiDeletionWitness === undefined ? baseReceiptMaterial(receipt) : [...baseReceiptMaterial(receipt), receipt.qianshiDeletionWitness];
+  return receipt.placeWorkspaceDependency === undefined ? material : [...material, receipt.placeWorkspaceDependency, receipt.selectedPlaces ?? []];
+};
 async function qianshiDeletionWitness(receipt, deletedEvents, fingerprint) {
   const matterIds = [...new Set([...(receipt.qianshiProgress?.matterIds ?? []),
     ...(receipt.timeDependencies?.reminders ?? []).map(item => item.qianshiRef?.matterId).filter(Boolean)])];
@@ -262,6 +316,7 @@ async function qianshiDeletionWitness(receipt, deletedEvents, fingerprint) {
 
 const boundedString = (value, maximum, { empty = false } = {}) => typeof value === 'string' && value.length <= maximum && (empty || value.length > 0);
 const optionalBoundedString = (value, maximum) => value === null || boundedString(value, maximum);
+const optionalSwipeId = value => value === null || nonNegativeInteger(value) || boundedString(value, 500, { empty: true });
 const nonNegativeInteger = value => Number.isSafeInteger(value) && value >= 0;
 const optionalPositiveInteger = value => value === null || (Number.isSafeInteger(value) && value > 0);
 const finiteDuration = value => Number.isFinite(value) && value >= 0;
@@ -288,21 +343,25 @@ function timeDependenciesCurrent(value, projection) {
     && value.reminders.every(item => (projection?.reminders ?? []).some(current => sameItem(item, current)));
 }
 
+const qianshiProgressScopeLine = value => value?.text?.match(/(?:^|\n\n)(本轮千事资料来源截至：AI #\d+。)(?=\n\n|$)/u)?.[1] ?? '';
+const qianshiHasMaterialSection = sections => sections.some(section => section.startsWith('[相关时间线]')
+  || qianshiRecallPendingHeader(section, null) !== null);
 export function renderedQianshiProgressText(value, timeDependencies = null) {
   const source = typeof value?.text === 'string' ? value.text : '';
   const suppressed = new Set((timeDependencies?.reminders ?? []).map(item => item.qianshiRef?.matterId).filter(Boolean));
   if (!source || !suppressed.size || !Array.isArray(value?.matterIds) || !value.matterIds.length) return source;
   let matterIndex = 0;
-  return source.split(/\n\n/u).map(section => {
+  const sections = source.split(/\n\n/u).map(section => {
     const lines = section.split('\n');
-    if (lines[0] !== '[当前待接续]') return section;
+    if (qianshiRecallPendingHeader(lines[0], null) === null) return section;
     const kept = lines.slice(1).filter(line => {
       if (!line.startsWith('- ')) return true;
       const matterId = value.matterIds[matterIndex++];
       return !suppressed.has(matterId);
     });
     return kept.some(line => line.startsWith('- ')) ? [lines[0], ...kept].join('\n') : '';
-  }).filter(Boolean).join('\n\n');
+  }).filter(Boolean);
+  return (qianshiHasMaterialSection(sections) ? sections : sections.filter(section => section !== RECALL_KNOWLEDGE_GUIDANCE && !/^本轮千事资料来源截至：AI #\d+。$/u.test(section))).join('\n\n');
 }
 const qianshiBlock = (value, timeDependencies = null) => {
   const content = renderedQianshiProgressText(value, timeDependencies);
@@ -332,21 +391,38 @@ const removeQianshiProgress = (text, value, timeDependencies = null) => {
 const qianshiProgressCurrent = (saved, current) => !saved || Boolean(current && saved.fingerprint === current.fingerprint);
 
 // Re-render only the saved selection. A lost time estimate restores the saved CSE.
-function withoutStaleTime(receipt, source, projection) {
+function withoutStaleTime(receipt, source, projection, changeReason = 'optionalTimeChanged', { trimPlacesFirst = false } = {}) {
   const saved = receipt.timeDependencies;
   if (saved.mode !== 'selected' || !saved.renderPlan) return null;
   const same = (item, live) => live && item.itemId === live.itemId && item.text === live.text && item.sourceSignature === (live.sourceSignature ?? null);
   const corrections = Object.fromEntries(saved.corrections.filter(item => same(item, projection?.corrections?.[item.key])).map(item => [item.key, item]));
   const reminders = saved.reminders.filter(item => (projection?.reminders ?? []).some(live => same(item, live)));
   const floors = clone(saved.renderPlan.floors), states = clone(receipt.selectedStates), changes = clone(receipt.selectedCseChanges);
+  const places = clone(receipt.selectedPlaces ?? []), groupedPlaces = ['continuity-v29', 'continuity-v30', 'continuity-v31', RECALL_STRATEGY_VERSION].includes(receipt.strategyVersion);
+  const placeCount = () => groupedPlaces ? groupRecallPlaces(places).length : places.length;
+  const originalPlaceCount = placeCount();
+  const dropLastPlace = () => {
+    const removed = groupedPlaces ? new Set(groupRecallPlaces(places).at(-1)) : new Set([places.at(-1)]);
+    for (let index = places.length - 1; index >= 0; index--) if (removed.has(places[index])) places.splice(index, 1);
+  };
+  const locationReferences = clone(receipt.selectedLocationReferences ?? []);
   const limits = saved.renderPlan.limits;
+  const selectionLimits = recallReceiptSelectionLimits(receipt.strategyVersion);
+  states.splice(selectionLimits.states);
+  changes.splice(Math.min(selectionLimits.cseChanges, Math.max(0, selectionLimits.combinedStatesAndChanges - states.length)));
   const entityById = new Map((source.entities ?? []).map(entity => [entity.entityId, entity]));
+  const frozenNames = new Map(saved.renderPlan.entityNames ?? []);
+  for (const item of floors.flatMap(floor => floor.items).filter(item => item.kind === 'manualArtifact')) {
+    for (const entityId of item.knownEntityIds ?? []) if (frozenNames.has(entityId)) {
+      entityById.set(entityId, { entityId, displayName: frozenNames.get(entityId), entityType: 'person' });
+    }
+  }
   let text, ordinaryText, dependencies, storylines;
   const render = () => {
     const active = new Set([...floors.flatMap(floor => floor.items), ...states, ...changes].map(value => value.storylineId));
     storylines = receipt.storylines.filter(line => active.has(line.storylineId));
     dependencies = { mode: 'selected', corrections: [], reminders: [] };
-    ordinaryText = formatRecallInjection({ coverage: receipt.coverage, floors, states, cseChanges: changes, storylines, entityById,
+    ordinaryText = formatRecallInjection({ coverage: receipt.coverage, floors, manualPlaces: places, groupPlaces: groupedPlaces, deduplicatePlaces: receipt.strategyVersion === RECALL_STRATEGY_VERSION, states, cseChanges: changes, storylines, locationReferences, entityById,
       timeProjection: { corrections }, timeReminders: reminders, timeDependencies: dependencies });
     text = appendQianshiProgress(ordinaryText, receipt.qianshiProgress, dependencies);
   };
@@ -354,34 +430,366 @@ function withoutStaleTime(receipt, source, projection) {
   let budgetDropped = 0;
   const trimmedHistoryFloors = new Set();
   while (ordinaryText.length > limits.maxCharacters || estimateRecallTokens(ordinaryText) > limits.estimatedTokenBudget) {
-    if (reminders.length) reminders.pop();
+    if (trimPlacesFirst && places.length) dropLastPlace();
+    else if (reminders.length) reminders.pop();
     else if (floors.length) { const floor = floors.at(-1); trimmedHistoryFloors.add(floor.floorId); floor.items.pop(); if (!floor.items.length) floors.pop(); }
     else if (changes.length) changes.pop();
     else if (states.length) states.pop();
+    else if (locationReferences.length) locationReferences.pop();
+    else if (places.length) dropLastPlace();
     else break;
     budgetDropped += 1;
     render();
   }
   render();
-  dependencies.renderPlan = { floors, limits };
+  dependencies.renderPlan = { ...saved.renderPlan, floors, limits };
   const history = floors.flatMap(floor => floor.items);
   const originalHistory = saved.renderPlan.floors.flatMap(floor => floor.items);
   const recentDropped = originalHistory.filter(item => item.recallSection === 'recent').length - history.filter(item => item.recallSection === 'recent').length;
-  const distantDropped = originalHistory.length - history.length - recentDropped;
+  const distantDropped = originalHistory.length - history.length - recentDropped + originalPlaceCount - placeCount();
   const stages = receipt.stages ? { ...stagesWithQianshiBudget(receipt.stages, receipt.qianshiProgress), selected: floors.length, recentSummaryCount: history.filter(item => item.recallSection === 'recent').length,
-    distantHistoryItemCount: history.filter(item => item.recallSection !== 'recent').length,
+    distantHistoryItemCount: history.filter(item => item.recallSection !== 'recent').length + placeCount(),
     linkedHistoryItemCount: history.filter(item => item.recallSection !== 'recent' && ['source', 'topic'].includes(item.relationEvidence)).length,
     linkedCseChangeCount: changes.filter(item => item.relationEvidence === 'source').length, stateCount: states.length, currentStateCount: states.length, cseChangeCount: changes.length,
     storylineCount: storylines.length, timeReminderCount: dependencies.reminders.length, timeCorrectionCount: dependencies.corrections.length,
-    finalInjectionItemCount: history.length + states.length + changes.length + dependencies.reminders.length,
+    locationReferenceCount: locationReferences.length,
+    finalInjectionItemCount: history.length + placeCount() + states.length + changes.length + locationReferences.length + dependencies.reminders.length,
     estimatedTokenCount: estimateRecallTokens(text), optionalTimeDropped: (receipt.stages.optionalTimeDropped ?? 0) + saved.corrections.length + saved.reminders.length - dependencies.corrections.length - dependencies.reminders.length,
     recentSummaryDroppedByBudget: (receipt.stages.recentSummaryDroppedByBudget ?? 0) + recentDropped,
     distantHistoryDroppedByBudget: (receipt.stages.distantHistoryDroppedByBudget ?? 0) + distantDropped,
     budgetDroppedCount: (receipt.stages.budgetDroppedCount ?? 0) + budgetDropped } : null;
-  return { ...receipt, selectedFloors: floors.map(receiptFloorRef), selectedStates: states,
+  return { ...receipt, selectedPlaces: places, selectedFloors: floors.map(receiptFloorRef), selectedStates: states, selectedLocationReferences: locationReferences,
     selectedCseChanges: changes, storylines, timeDependencies: dependencies, injectionText: text, completionStatus: text ? 'ready' : 'empty', stages,
-    selectorDiagnostic: receipt.selectorDiagnostic ? { ...receipt.selectorDiagnostic, historyRetainedCount: history.length, stateRetainedCount: states.length + changes.length } : null,
-    skipReasons: [...new Set([...receipt.skipReasons, 'optionalTimeChanged'])] };
+    selectorDiagnostic: receipt.selectorDiagnostic ? { ...receipt.selectorDiagnostic, historyRetainedCount: history.length + placeCount(), stateRetainedCount: states.length + changes.length } : null,
+    skipReasons: [...new Set([...receipt.skipReasons, ...(changeReason ? [changeReason] : [])])] };
+}
+
+function selectedManualTimeScope(dependencies, projection) {
+  if (dependencies.renderPlan?.manualTimeItems) return clone(dependencies.renderPlan.manualTimeItems).filter(item => !item.itemId.startsWith('annual:'));
+  const selected = new Map();
+  for (const item of [...dependencies.corrections, ...dependencies.reminders]) {
+    if (item.itemId.startsWith('annual:')) continue;
+    const entry = selected.get(item.itemId) ?? { itemId: item.itemId, revision: null, correctionKeys: [], reminder: false };
+    const manual = projection?.manualTimeItems?.[item.itemId];
+    let observationKey = null;
+    try { observationKey = JSON.parse(item.sourceSignature)?.[1]; } catch { /* Older external projections may use opaque signatures. */ }
+    entry.revision = manual?.revisionsByObservation?.[observationKey] ?? null;
+    if (item.key) entry.correctionKeys.push(item.key); else entry.reminder = true;
+    selected.set(item.itemId, entry);
+  }
+  return [...selected.values()];
+}
+
+function refreshFrozenManualTime(receipt, source, projection) {
+  const saved = receipt.timeDependencies;
+  if (saved?.mode !== 'selected' || !saved.renderPlan) return receipt;
+  const scope = selectedManualTimeScope(saved, projection);
+  if (!scope.length) return receipt;
+  if (!projection) return withoutStaleTime(receipt, source, null) ?? receipt;
+  let changed = !saved.renderPlan.manualTimeItems;
+  const corrections = new Map(saved.corrections.map(item => [item.key, item]));
+  const reminders = new Map(saved.reminders.map(item => [item.itemId, item]));
+  for (const item of scope) {
+    const manual = projection.manualTimeItems?.[item.itemId];
+    const removed = Array.isArray(projection.presentItemIds) && !projection.presentItemIds.includes(item.itemId);
+    if (!removed && (!manual || manual.revision === item.revision)) continue;
+    changed = true;
+    item.revision = manual?.revision ?? item.revision;
+    for (const key of item.correctionKeys) {
+      const live = removed ? null : projection.corrections?.[key];
+      if (live?.itemId === item.itemId) corrections.set(key, { ...live, key }); else corrections.delete(key);
+    }
+    if (item.reminder) {
+      const live = removed ? null : projection.reminders?.find(value => value.itemId === item.itemId);
+      if (live) reminders.set(item.itemId, live); else reminders.delete(item.itemId);
+    }
+  }
+  if (!changed) return receipt;
+  const dependencies = { ...saved, corrections: [...corrections.values()], reminders: [...reminders.values()],
+    renderPlan: { ...saved.renderPlan, manualTimeItems: scope } };
+  return withoutStaleTime({ ...receipt, timeDependencies: dependencies }, source,
+    { corrections: Object.fromEntries(corrections), reminders: [...reminders.values()] }, null) ?? receipt;
+}
+
+function waitForRecallOperation(value, operation) {
+  const pending = Promise.resolve(value), signal = operation?.controller.signal;
+  if (!signal) return pending;
+  return new Promise((resolve, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); reject(new DOMException('Recall cancelled', 'AbortError')); };
+    pending.then(result => { signal.removeEventListener('abort', abort); resolve(result); }, error => { signal.removeEventListener('abort', abort); reject(error); });
+    if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function refreshFrozenManualCse(receipt, snapshot) {
+  if (snapshot?.root?.chatId !== receipt.chatId || snapshot.root.narrativeGeneration !== receipt.narrativeGeneration) return receipt;
+  const selected = [...receipt.selectedStates, ...receipt.selectedCseChanges];
+  const bindings = new Map(selected.map(value => [value.subjectEntityId, value]));
+  if (!bindings.size) return receipt;
+  const floorSeq = new Map((snapshot.floors ?? []).map(floor => [floor.id, floor.assistantSeq]));
+  const entities = (snapshot.entities ?? []).filter(entity => entity.recordStatus === 'active')
+    .map(entity => ({ entityId: entity.id, displayName: entity.displayName }));
+  const names = new Map(entities.map(entity => [entity.entityId, entity.displayName]));
+  const deltas = (snapshot.stateDeltas ?? []).filter(delta => delta.recordStatus === 'active' && delta.source?.manualSubjectEntityIds?.length);
+  const manualSubjects = new Map(deltas.map(delta => [delta.id, new Set(delta.source.manualSubjectEntityIds)]));
+  const timeline = deltas.map(delta => ({ deltaId: delta.id, floorId: delta.floorId,
+    changes: (delta.fixedChanges ?? []).filter(subject => manualSubjects.get(delta.id).has(subject.subjectEntityId)) }));
+  const operations = cseChangesDto(timeline, entities, floorSeq, null, new Set(), manualSubjects)
+    .filter(change => change.origin === 'manual' && bindings.has(change.subjectEntityId))
+    .sort((left, right) => left.assistantSeq - right.assistantSeq);
+  const current = stateDto(snapshot.currentStates?.at(-1), entities, floorSeq, new Set());
+  let states = clone(receipt.selectedStates), changes = clone(receipt.selectedCseChanges);
+  const groups = new Map();
+  for (const operation of operations) {
+    const key = `${operation.deltaId}:${operation.subjectEntityId}:${operation.layer}`;
+    const group = groups.get(key) ?? [];
+    group.push(operation); groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    const operation = group[0];
+    // An already selected manual operation stays frozen when later automatic plot advances.
+    const adopted = group.every(value => changes.some(saved => saved.origin === 'manual' && saved.deltaId === value.deltaId
+      && saved.subjectEntityId === value.subjectEntityId && saved.layer === value.layer && saved.action === value.action
+      && (saved.before?.stateId ?? null) === (value.before?.stateId ?? null)
+      && (saved.after?.stateId ?? null) === (value.after?.stateId ?? null))
+      || value.after && states.some(saved => saved.stateId === value.after.stateId));
+    if (adopted) continue;
+    const binding = bindings.get(operation.subjectEntityId);
+    const sameLayer = value => value.subjectEntityId === operation.subjectEntityId && value.layer === operation.layer;
+    const delta = deltas.find(value => value.id === operation.deltaId);
+    const subject = delta.subjectSnapshots.find(value => value.subjectEntityId === operation.subjectEntityId);
+    const clearing = group.some(value => value.action === 'remove') && !subject?.[operation.layer]?.length;
+    states = states.filter(value => !(sameLayer(value) && (clearing || group.some(change => value.stateId === change.before?.stateId)
+      || value.origin === 'manual' && value.sourceFloorId === operation.floorId)
+      && (value.sourceAssistantSeq ?? 0) <= operation.assistantSeq));
+    changes = changes.filter(value => !(sameLayer(value) && value.floorId === operation.floorId));
+    for (const change of group) {
+      const after = change.after;
+      const stillCurrent = after && current.find(value => value.subjectEntityId === change.subjectEntityId)?.[change.layer]
+        .some(value => value.stateId === after.stateId);
+      if (stillCurrent && !states.some(value => value.stateId === after.stateId)) states.push({ ...after,
+        subjectEntityId: change.subjectEntityId, subject: binding.subject, toward: names.get(after.towardEntityId) ?? null,
+        layer: change.layer, storylineId: binding.storylineId });
+      changes.push({ ...change, subject: binding.subject, storylineId: binding.storylineId,
+        before: change.before ? { ...change.before, toward: names.get(change.before.towardEntityId) ?? null } : null,
+        after: after ? { ...after, toward: names.get(after.towardEntityId) ?? null } : null });
+    }
+  }
+  if (JSON.stringify([states, changes]) === JSON.stringify([receipt.selectedStates, receipt.selectedCseChanges])) return receipt;
+  const limits = recallReceiptSelectionLimits(receipt.strategyVersion);
+  states.splice(limits.states);
+  changes.splice(Math.min(limits.cseChanges, Math.max(0, limits.combinedStatesAndChanges - states.length)));
+  const updated = { ...receipt, selectedStates: states, selectedCseChanges: changes };
+  const corrections = Object.fromEntries((receipt.timeDependencies?.corrections ?? []).map(item => [item.key, item]));
+  if (receipt.timeDependencies?.renderPlan) return withoutStaleTime(updated, { entities },
+    { corrections, reminders: receipt.timeDependencies.reminders ?? [] }, null) ?? receipt;
+  return replaceLegacyCseSelection(receipt, updated);
+}
+
+function replaceLegacyCseSelection(receipt, updated) {
+  const states = updated.selectedStates, changes = updated.selectedCseChanges;
+  const limits = recallReceiptSelectionLimits(receipt.strategyVersion);
+  const corrections = Object.fromEntries((receipt.timeDependencies?.corrections ?? []).map(item => [item.key, item]));
+  const protectedText = readManualArtifactBlocks(receipt.injectionText, { preserveHeaders: true });
+  if (!protectedText.valid) return receipt;
+  const format = value => formatRecallInjection({ coverage: receipt.coverage, floors: [], states: value.selectedStates,
+    cseChanges: value.selectedCseChanges, storylines: receipt.storylines, entityById: new Map(), timeProjection: { corrections } });
+  const oldLines = new Set(format(receipt).split('\n').filter(line => line.startsWith('- ')));
+  const originalText = protectedText.text.split('\n').filter(line => !oldLines.has(line)).join('\n');
+  const render = () => {
+    const newLines = format(updated).split('\n').filter(line => line.startsWith('- ')).join('\n');
+    let text = originalText.replace('</qqj_recalled_context>', () => `${newLines}\n</qqj_recalled_context>`);
+    for (const [token, literal] of protectedText.blocks) text = text.replace(token, () => literal);
+    return text;
+  };
+  let text = render();
+  const maxCharacters = limits.expanded ? 32000 : 16000;
+  const tokenBudget = receipt.stages?.estimatedTokenBudget ?? maxCharacters;
+  while (text.length > maxCharacters || estimateRecallTokens(text) > tokenBudget) {
+    if (changes.length) changes.pop();
+    else if (states.length) states.pop();
+    else break;
+    text = render();
+  }
+  return { ...updated, injectionText: text, stages: receipt.stages ? { ...receipt.stages, stateCount: states.length,
+    currentStateCount: states.length, cseChangeCount: changes.length,
+    linkedCseChangeCount: changes.filter(value => value.relationEvidence === 'source').length,
+    finalInjectionItemCount: Math.max(0, receipt.stages.finalInjectionItemCount - receipt.selectedStates.length - receipt.selectedCseChanges.length + states.length + changes.length),
+    estimatedTokenCount: estimateRecallTokens(text) } : null,
+    selectorDiagnostic: receipt.selectorDiagnostic ? { ...receipt.selectorDiagnostic, stateRetainedCount: states.length + changes.length } : null };
+}
+
+function refreshFrozenManualSummaries(receipt, snapshot) {
+  const plan = receipt.timeDependencies?.renderPlan;
+  if (snapshot?.root?.chatId !== receipt.chatId || snapshot.root.narrativeGeneration !== receipt.narrativeGeneration) return receipt;
+  const memories = new Map();
+  for (const memory of snapshot.floorMemories ?? []) {
+    if (memory.recordStatus !== 'active' || memory.summary?.effectiveSource !== 'user') continue;
+    memories.set(memory.floorId, memories.has(memory.floorId) ? null : memory);
+  }
+  if (!plan) {
+    // Older signed receipts have no render plan. Update only their explicit
+    // narrative summary lines, retaining the rest of the frozen text verbatim.
+    const targets = new Map(receipt.selectedFloors.filter(floor => memories.get(floor.floorId)
+      && memories.get(floor.floorId).id !== floor.floorMemoryId).map(floor => [floor.assistantSeq, memories.get(floor.floorId)]));
+    const rawSequences = new Set(receipt.selectedFloors.filter(floor => floor.rawWitnesses?.length).map(floor => floor.assistantSeq));
+    if (!targets.size) return receipt;
+    const pattern = /^\[来源 AI #(\d+)(?:（[^\n]*）)?\]$|^- (?:AI #[^\n]+：|\[旧事\] )\[人工原文｜(\d+)字符\]$|^\[(?:剧情线[^\n]*|已保存人物状态依据)\]$|^- \[旧事\] \[叙事回顾\] (?:邻近背景：|同人物与主题：|来源关联：)?[^\n]*$/gmu;
+    let currentSeq = null, literalEnd = 0, end = 0, injectionText = '';
+    const changed = new Set();
+    for (const match of receipt.injectionText.matchAll(pattern)) {
+      if (match.index < literalEnd) continue;
+      if (match[2]) { literalEnd = match.index + match[0].length + 1 + Number(match[2]); continue; }
+      if (match[1]) { currentSeq = Number(match[1]); continue; }
+      if (!match[0].startsWith('- ')) { currentSeq = null; continue; }
+      const memory = targets.get(currentSeq);
+      if (!memory) continue;
+      if (rawSequences.has(currentSeq) && /^- \[旧事\] \[叙事回顾\] (?:邻近背景：|同人物与主题：|来源关联：)?\[历史原文；时间未标注\] /u.test(match[0])) continue;
+      const text = summaryCandidateText(memory.summary.userText ?? '');
+      injectionText += receipt.injectionText.slice(end, match.index) + (text ? `- [旧事] [叙事回顾] ${text}` : '');
+      end = match.index + match[0].length;
+      changed.add(memory.floorId);
+    }
+    if (!changed.size) return receipt;
+    injectionText += receipt.injectionText.slice(end);
+    return { ...receipt, injectionText, selectedFloors: receipt.selectedFloors.map(floor => changed.has(floor.floorId)
+      ? { ...floor, floorMemoryId: memories.get(floor.floorId).id, summaryWitnesses: [],
+        ...(floor.rawWitnesses?.length ? { rawWitnesses: floor.rawWitnesses.map(witness => ({ ...witness, floorMemoryId: memories.get(floor.floorId).id })) } : {}) } : floor),
+      stages: receipt.stages ? { ...receipt.stages, estimatedTokenCount: estimateRecallTokens(injectionText) } : null };
+  }
+  let changed = false;
+  const floors = plan.floors.flatMap(floor => {
+    const memory = memories.get(floor.floorId);
+    const summary = floor.items.find(item => item.kind === 'summary');
+    const text = memory ? summaryCandidateText(memory.summary.userText ?? '') : null;
+    if (!summary || !memory || summary.text === text) return [floor];
+    changed = true;
+    const items = floor.items.flatMap(item => item.kind === 'summary' ? text ? [{ ...item, text, floorMemoryId: memory.id }] : []
+      : [{ ...item, ...(item.rawWitness ? { rawWitness: { ...item.rawWitness, floorMemoryId: memory.id } } : {}) }]);
+    return items.length ? [{ ...floor, floorMemoryId: memory.id, items }] : [];
+  });
+  if (!changed) return receipt;
+  const updated = { ...receipt, timeDependencies: { ...receipt.timeDependencies, renderPlan: { ...plan, floors } } };
+  const source = { entities: (plan.entityNames ?? []).map(([entityId, displayName]) => ({ entityId, displayName })) };
+  const corrections = Object.fromEntries((receipt.timeDependencies.corrections ?? []).map(item => [item.key, item]));
+  return withoutStaleTime(updated, source, { corrections, reminders: receipt.timeDependencies.reminders ?? [] }, null) ?? receipt;
+}
+function refreshLegacyAuxiliaryText(receipt, places, peopleUnavailable, placesUnavailable) {
+  const protectedText = readManualArtifactBlocks(receipt.injectionText, { preserveHeaders: true });
+  if (!protectedText.valid) return receipt.injectionText;
+  const blocks = protectedText.blocks;
+  // The existing raw fragment formatter writes one narrative line. Keep its whole line literal.
+  let text = protectedText.text.replace(/^- (?:AI #[^\n]+：|\[旧事\] )[^\n]*\[历史原文；时间未标注\][^\n]*$/gmu, value => {
+    const token = `\u0000qqj-raw-${blocks.size}\u0000`; blocks.set(token, value); return token;
+  });
+  const grouped = ['continuity-v29', 'continuity-v30', 'continuity-v31', RECALL_STRATEGY_VERSION].includes(receipt.strategyVersion);
+  const oldBlocks = placeRecallBlocks(receipt.selectedPlaces ?? [], false, grouped, receipt.strategyVersion === RECALL_STRATEGY_VERSION);
+  const replacementText = placeRecallBlocks(places, false, grouped, receipt.strategyVersion === RECALL_STRATEGY_VERSION).join('\n');
+  const replacement = replacementText ? `\u0000qqj-place-${blocks.size}\u0000` : '';
+  if (replacement) blocks.set(replacement, replacementText);
+  let replaced = false;
+  for (const block of oldBlocks) {
+    const index = text.lastIndexOf(block);
+    if (index < 0) continue;
+    text = text.slice(0, index) + (replaced ? '' : replacement) + text.slice(index + block.length);
+    replaced = true;
+  }
+  if (peopleUnavailable) {
+    text = text.split('\n').filter(line => {
+      const history = /^- \[旧事\] (.*)$/u.exec(line);
+      if (!history) return true;
+      const body = history[1].replace(/^(?:邻近背景：|同人物与主题：|来源关联：)/u, '');
+      return body.startsWith('[叙事回顾] ') || body.startsWith('[人工原文｜') || /^(?:当前地点设施：|历史地点设施（场地未核对）：|历史地点描述（持续性未标）：)/u.test(body)
+        || body.includes('\u0000qqj-manual-') || body.includes('\u0000qqj-raw-');
+    }).join('\n');
+    const formatted = formatRecallInjection({ coverage: receipt.coverage, floors: [], states: receipt.selectedStates,
+      cseChanges: receipt.selectedCseChanges, storylines: receipt.storylines, entityById: new Map(),
+      timeProjection: { corrections: Object.fromEntries((receipt.timeDependencies?.corrections ?? []).map(item => [item.key, item])) } });
+    const stateLines = new Set(formatted.split('\n').filter(line => line.startsWith('- ')));
+    text = text.split('\n').filter(line => !stateLines.has(line)).join('\n');
+  }
+  if (placesUnavailable) text = text.split('\n').filter(line => !/^- \[旧事\] (?:邻近背景：|同人物与主题：|来源关联：)?(?:当前地点设施：|历史地点设施（场地未核对）：|历史地点描述（持续性未标）：)/u.test(line)).join('\n');
+  let group = '';
+  text = text.split('\n').filter(line => {
+    if (line === '[叙事回顾]' || line.startsWith('[叙事回顾（')) group = 'narrative';
+    else if (line === '[客观相关旧事]') group = 'objective';
+    else if (line === '[已表达/已共享信息]' || line === '[已表达信息及接收范围]' || line.startsWith('[私有资料；知情：')) group = 'people';
+    else if (line.startsWith('[') && !line.startsWith('[人工原文｜')) group = '';
+    const row = /^- AI #[^\n]+?：(.*)$/u.exec(line);
+    if (!row || group === 'narrative' || row[1].startsWith('[人工原文｜')) return true;
+    const place = /(?:当前地点设施：|历史地点设施（场地未核对）：|历史地点描述（持续性未标）：)/u.test(row[1]);
+    return place ? !placesUnavailable : !peopleUnavailable || !['objective', 'people'].includes(group);
+  }).join('\n');
+  for (const [token, literal] of blocks) text = text.replace(token, () => literal);
+  return text;
+}
+function refreshAuxiliaryReceipt(receipt, source, queryContext) {
+  const oldPlaces = receipt.selectedPlaces ?? [], plan = receipt.timeDependencies?.renderPlan;
+  const peopleUnavailable = source.unavailableSources?.includes('people');
+  const placesUnavailable = source.unavailableSources?.includes('places');
+  const projection = source.identityProjection ?? {};
+  const names = new Map(source.entities.map(entity => [entity.entityId, entity.displayName]));
+  const resolveToward = value => {
+    if (!value?.towardEntityId) return value;
+    const id = resolveIdentityEntityId(value.towardEntityId, projection);
+    const towardEntityId = isIdentityDeleted(id, projection) ? null : id;
+    return towardEntityId === value.towardEntityId ? value : { ...value, towardEntityId,
+      toward: towardEntityId ? projection.currentNamesByEntityId?.[id] ?? names.get(id) ?? value.toward : null };
+  };
+  const resolveSubject = value => {
+    const id = resolveIdentityEntityId(value.subjectEntityId, projection);
+    if (isIdentityDeleted(id, projection)) return [];
+    const subject = id === value.subjectEntityId ? value.subject : projection.currentNamesByEntityId?.[id] ?? names.get(id) ?? value.subject;
+    const mapped = { ...resolveToward(value), subjectEntityId: id, subject };
+    if (Object.hasOwn(value, 'before')) Object.assign(mapped, { before: resolveToward(value.before), after: resolveToward(value.after) });
+    return [mapped];
+  };
+  const states = peopleUnavailable ? [] : receipt.selectedStates.flatMap(resolveSubject);
+  const changes = peopleUnavailable ? [] : receipt.selectedCseChanges.flatMap(resolveSubject);
+  const identitiesChanged = JSON.stringify([states, changes]) !== JSON.stringify([receipt.selectedStates, receipt.selectedCseChanges]);
+  const placeItemCurrent = (item, floorId) => {
+    if (!item.placeEntityId || !source.placeWorkspace) return true;
+    const field = item.kind === 'placeFeature' || item.kind === 'placeDescription' ? 'features'
+      : item.kind === 'spatialRelation' ? 'relations' : item.kind === 'placeScene' ? 'positions' : null;
+    if (!field) return true;
+    const projected = filterPlaceMemory({ floorId, spatialFacts: { [field]: [{ ...item,
+      sourceRefs: item.sourceRefs ?? [{ floorId: item.sourceFloorId ?? floorId }] }] } }, source.placeWorkspace);
+    return Boolean(projected.spatialFacts?.[field]?.length);
+  };
+  const scopedPlaceItems = plan?.floors.flatMap(floor => floor.items.filter(item => !placeItemCurrent(item, floor.floorId))) ?? [];
+  const scopedPlaceChanged = scopedPlaceItems.length > 0;
+  const placeIds = new Set([...oldPlaces, ...scopedPlaceItems].map(place => place.placeEntityId));
+  const facts = historySelectionContext(source, queryContext).facts.flatMap(item => item._placeMembers ?? [item]);
+  const places = placesUnavailable ? [] : facts.filter(item => placeIds.has(item.placeEntityId) && ['manualPlace', 'placeFoundation'].includes(item.kind)).map(item => {
+    const value = Object.fromEntries(Object.entries(item).filter(([key]) => !key.startsWith('_') && !['floorId', 'floorMemoryId', 'assistantSeq', 'branchScores', 'entityBranchScores', 'summaryScores', 'score'].includes(key)));
+    return value;
+  });
+  const meaning = rows => rows.map(({ kind, placeEntityId, itemId, itemIds, text, source, referencePlaceEntityIds }) => ({ kind, placeEntityId, itemId, itemIds, text, source, referencePlaceEntityIds }));
+  const placesChanged = JSON.stringify(meaning(oldPlaces)) !== JSON.stringify(meaning(places));
+  const selectedFloorIds = new Set(receipt.selectedFloors.map(floor => floor.floorId));
+  const legacyPlaceScopeUnconfirmed = !plan && (Object.values(source.placeWorkspace?.deletionsByEntityId ?? {}).some(scope =>
+    scope.coveredFloorIds?.some(id => selectedFloorIds.has(id)))
+    || Object.values(source.placeWorkspace?.placesByEntityId ?? {}).some(row =>
+      ['description', 'parentEntityId', 'relations', 'name'].some(field => Object.hasOwn(row, field)
+        && (!row.scopes?.[field] || row.scopes[field].coveredFloorIds?.some(id => selectedFloorIds.has(id))))));
+  if (!placesChanged && !peopleUnavailable && !placesUnavailable && !scopedPlaceChanged && !legacyPlaceScopeUnconfirmed && !identitiesChanged) return receipt;
+  const updated = { ...receipt, selectedPlaces: places,
+    ...(places.length && receipt.placeWorkspaceDependency === undefined ? { placeWorkspaceDependency: `${receipt.chatId}:0` } : {}),
+    selectedStates: states, selectedCseChanges: changes };
+  if (plan) {
+    const floors = plan.floors.flatMap(floor => {
+      const items = floor.items.filter(item => item.kind === 'manualArtifact' || item.rawWitness
+        || (!peopleUnavailable || item.kind === 'summary') && (!placesUnavailable || !item.placeEntityId)
+          && placeItemCurrent(item, floor.floorId));
+      return items.length ? [{ ...floor, items }] : [];
+    });
+    updated.timeDependencies = { ...receipt.timeDependencies, renderPlan: { ...plan, floors } };
+    const corrections = Object.fromEntries(receipt.timeDependencies.corrections.map(item => [item.key, item]));
+    return withoutStaleTime(updated, source, { corrections, reminders: receipt.timeDependencies.reminders }, null, { trimPlacesFirst: true }) ?? receipt;
+  }
+  updated.injectionText = refreshLegacyAuxiliaryText(receipt, places, peopleUnavailable, placesUnavailable || legacyPlaceScopeUnconfirmed);
+  updated.stages = receipt.stages ? { ...receipt.stages, estimatedTokenCount: estimateRecallTokens(updated.injectionText) } : null;
+  return identitiesChanged ? replaceLegacyCseSelection({ ...receipt, injectionText: updated.injectionText }, updated) : updated;
 }
 const selectorDiagnosticSnapshot = value => {
   const api = sanitizeTaskMetadata(value);
@@ -470,22 +878,31 @@ const stateChangeSideValid = (value, { identifiersRequired = false } = {}) => va
   && (value.stateId === undefined || optionalBoundedString(value.stateId, 500))
   && (value.sourceFloorId === undefined || optionalBoundedString(value.sourceFloorId, 500))
   && (value.sourceDeltaId === undefined || optionalBoundedString(value.sourceDeltaId, 500))
+  && (value.toward === undefined || optionalBoundedString(value.toward, 500))
   && boundedString(value.text, 4000) && ['private', 'observable', 'expressed', 'shared', 'authorial'].includes(value.visibility)
   && boundedString(value.reason, 4000, { empty: true }) && ['baseline', 'floor', 'reasonableProgression', 'manual'].includes(value.origin)
   && optionalBoundedString(value.towardEntityId, 500) && optionalPositiveInteger(value.sourceAssistantSeq));
 function receiptShapeValid(receipt, { historical = false } = {}) {
-  const expandedSelection = [RECALL_STRATEGY_VERSION, 'continuity-v16', 'continuity-v15'].includes(receipt?.strategyVersion);
-  const receiptFloorLimit = expandedSelection ? MAX_RECEIPT_FLOORS : LEGACY_MAX_RECEIPT_FLOORS;
-  const receiptStateLimit = expandedSelection ? MAX_RECEIPT_STATES : LEGACY_MAX_RECEIPT_STATES;
-  const receiptChangeLimit = expandedSelection ? MAX_RECEIPT_CSE_CHANGES : LEGACY_MAX_RECEIPT_CSE_CHANGES;
-  const receiptStorylineLimit = expandedSelection ? MAX_RECEIPT_STORYLINES : LEGACY_MAX_RECEIPT_STORYLINES;
+  if (receipt?.placeWorkspaceDependency !== undefined && (!boundedString(receipt.placeWorkspaceDependency, 200) || !Array.isArray(receipt.selectedPlaces) || !receipt.selectedPlaces.every(value => ['manualPlace','placeFoundation'].includes(value?.kind) && boundedString(value.text, 20000) && boundedString(value.placeEntityId, 500)))) return false;
+  const selectionLimits = recallReceiptSelectionLimits(receipt?.strategyVersion);
+  const expandedSelection = selectionLimits.expanded;
+  const receiptFloorLimit = selectionLimits.floors;
+  const receiptStateLimit = selectionLimits.states;
+  const receiptChangeLimit = selectionLimits.cseChanges;
+  const receiptStorylineLimit = selectionLimits.storylines;
   if (receipt?.qianshiDeletionWitness !== undefined && (!Array.isArray(receipt.qianshiDeletionWitness)
     || receipt.qianshiDeletionWitness.length > 160 + receiptStateLimit
     || !receipt.qianshiDeletionWitness.every(value => value && boundedString(value.matterId, 500) && boundedString(value.fingerprint, 200)))) return false;
   if (receipt?.schemaVersion >= 14 && !timeDependenciesValid(receipt.timeDependencies, { correctionLimit: receiptStateLimit })) return false;
   const plan = receipt?.timeDependencies?.renderPlan;
   if (plan && (!Array.isArray(plan.floors) || plan.floors.length > receiptFloorLimit
-    || !plan.floors.every(floor => Array.isArray(floor.items) && floor.items.every(item => item && boundedString(item.text, 4000)))
+    || (plan.entityNames !== undefined && (!Array.isArray(plan.entityNames) || plan.entityNames.length > 10000
+      || !plan.entityNames.every(value => Array.isArray(value) && value.length === 2 && value.every(text => boundedString(text, 500)))))
+    || !plan.floors.every(floor => Array.isArray(floor.items) && floor.items.every(item => item && (item.kind === 'manualArtifact'
+      ? boundedString(item.exactText, 32000) && boundedString(item.carrier, 500) && Array.isArray(item.knownEntityIds) && item.knownEntityIds.every(id => boundedString(id, 500))
+        && (item.knownEntityNames === undefined || Array.isArray(item.knownEntityNames) && item.knownEntityNames.length <= item.knownEntityIds.length
+          && item.knownEntityNames.every(pair => Array.isArray(pair) && pair.length === 2 && item.knownEntityIds.includes(pair[0]) && boundedString(pair[1], 500)))
+      : boundedString(item.text, 4000))))
     || !nonNegativeInteger(plan.limits?.maxCharacters) || plan.limits.maxCharacters > (expandedSelection ? 32000 : 20000)
     || !nonNegativeInteger(plan.limits?.estimatedTokenBudget) || plan.limits.estimatedTokenBudget > (expandedSelection ? 8000 : receipt.schemaVersion >= 15 ? 4000 : 5000)
     || (receipt.schemaVersion === 14 && (!nonNegativeInteger(plan.limits?.ordinaryMaxCharacters) || plan.limits.ordinaryMaxCharacters > 16000
@@ -501,9 +918,10 @@ function receiptShapeValid(receipt, { historical = false } = {}) {
     || !nonNegativeInteger(receipt.userMessageIndex)
     || !boundedString(receipt.userContentFingerprint, 200)
     || !boundedString(receipt.queryFingerprint, 200)
+    || (receipt.schemaVersion >= 18 && !boundedString(receipt.locationReferenceDependency, 4000, { empty: true }))
     || (receipt.schemaVersion >= 8 && !boundedString(receipt.bodyMatchFingerprint, 200))
     || (receipt.schemaVersion >= 9 && (historical
-      ? ![RECALL_STRATEGY_VERSION, 'continuity-v16', 'continuity-v15', 'continuity-v14', 'continuity-v13', 'continuity-v12', 'continuity-v11', 'continuity-v10', 'continuity-v9', 'continuity-v8', 'continuity-v7', 'continuity-v6', 'continuity-v5', 'continuity-v4', 'continuity-v3', 'continuity-v2', 'continuity-v1'].includes(receipt.strategyVersion)
+      ? ![RECALL_STRATEGY_VERSION, 'continuity-v31', 'continuity-v30', 'continuity-v29', 'continuity-v28', 'continuity-v27', 'continuity-v26', 'continuity-v25', 'continuity-v24', 'continuity-v23', 'continuity-v22', 'continuity-v21', 'continuity-v20', 'continuity-v19', 'continuity-v18', 'continuity-v17', 'continuity-v16', 'continuity-v15', 'continuity-v14', 'continuity-v13', 'continuity-v12', 'continuity-v11', 'continuity-v10', 'continuity-v9', 'continuity-v8', 'continuity-v7', 'continuity-v6', 'continuity-v5', 'continuity-v4', 'continuity-v3', 'continuity-v2', 'continuity-v1'].includes(receipt.strategyVersion)
       : receipt.strategyVersion !== RECALL_STRATEGY_VERSION))
     || !SUPPORTED_TYPES.has(receipt.generationType)
     || !Array.isArray(receipt.selectedFloors) || receipt.selectedFloors.length > receiptFloorLimit
@@ -513,6 +931,13 @@ function receiptShapeValid(receipt, { historical = false } = {}) {
     || !boundedString(receipt.receiptFingerprint, 200)
     || !boundedString(receipt.createdAt, 100) || !Number.isFinite(Date.parse(receipt.createdAt))
     || (receipt.completionStatus === 'ready') !== Boolean(receipt.injectionText)) return false;
+  if (receipt.schemaVersion >= 18 && (!Array.isArray(receipt.selectedLocationReferences) || receipt.selectedLocationReferences.length > 8
+    || !receipt.selectedLocationReferences.every(value => value && typeof value === 'object' && !Array.isArray(value)
+      && boundedString(value.text, 500)
+      && (value.sourceFloorId === null || boundedString(value.sourceFloorId, 500))
+      && (value.assistantSeq === null || optionalPositiveInteger(value.assistantSeq))
+      && (value.hostLocator === null || value.hostLocator && Number.isSafeInteger(value.hostLocator.messageIndex) && value.hostLocator.messageIndex >= 0
+        && optionalSwipeId(value.hostLocator.swipeId) && (value.hostLocator.selectedSwipeIndex === null || nonNegativeInteger(value.hostLocator.selectedSwipeIndex)))))) return false;
   if (receipt.schemaVersion >= 15 && receipt.qianshiProgress !== undefined && receipt.qianshiProgress !== null) {
     const value = receipt.qianshiProgress;
     if (!value || typeof value !== 'object' || Array.isArray(value) || !boundedString(value.fingerprint, 200)
@@ -539,16 +964,18 @@ function receiptShapeValid(receipt, { historical = false } = {}) {
     && boundedString(value.subjectEntityId, 500) && boundedString(value.subject, 500)
     && ['core', 'adaptive', 'situational'].includes(value.layer)
     && optionalBoundedString(value.towardEntityId, 500) && optionalBoundedString(value.toward, 500)
-    && boundedString(value.text, 4000) && boundedString(value.reason, 1000, { empty: true })
+    && boundedString(value.text, 4000) && boundedString(value.reason, 4000, { empty: true })
     && ['private', 'observable', 'expressed', 'shared', 'authorial'].includes(value.visibility)
+    && (value.origin === undefined || ['baseline', 'floor', 'reasonableProgression', 'manual'].includes(value.origin))
     && optionalPositiveInteger(value.sourceAssistantSeq))) return false;
   if (receipt.schemaVersion >= 10) {
     if (!Array.isArray(receipt.selectedCseChanges) || receipt.selectedCseChanges.length > receiptChangeLimit
-      || receipt.selectedStates.length + receipt.selectedCseChanges.length > receiptChangeLimit
+      || receipt.selectedStates.length + receipt.selectedCseChanges.length > selectionLimits.combinedStatesAndChanges
       || !receipt.selectedCseChanges.every(value => value && typeof value === 'object' && !Array.isArray(value)
         && boundedString(value.deltaId, 500) && boundedString(value.floorId, 500) && Number.isSafeInteger(value.assistantSeq) && value.assistantSeq > 0
         && boundedString(value.subjectEntityId, 500) && boundedString(value.subject, 500)
         && ['core', 'adaptive', 'situational'].includes(value.layer) && ['add', 'remove', 'update', 'refine'].includes(value.action)
+        && (value.origin === undefined || value.origin === 'manual')
         && stateChangeSideValid(value.before, { identifiersRequired: IDENTIFIED_RECALL_STRATEGIES.includes(receipt.strategyVersion) })
         && stateChangeSideValid(value.after, { identifiersRequired: IDENTIFIED_RECALL_STRATEGIES.includes(receipt.strategyVersion) })
         && (!IDENTIFIED_RECALL_STRATEGIES.includes(receipt.strategyVersion) || boundedString(value.storylineId, 80)))) return false;
@@ -618,7 +1045,7 @@ function receiptShapeValid(receipt, { historical = false } = {}) {
   return receipt.skipReasons.every(reason => boundedString(reason, 120));
 }
 
-async function persistedReceiptValid(receipt, { chatId, userIndex, userFingerprint, pluginVersion }, fingerprint = hashText) {
+async function persistedReceiptValid(receipt, { chatId, userIndex, userFingerprint, pluginVersion, placeWorkspaceDependency = `${chatId}:0` }, fingerprint = hashText) {
   try {
     const snapshot = clone(receipt);
     if (!receiptShapeValid(snapshot)
@@ -638,7 +1065,7 @@ async function historicalSignedReceiptValid(receipt, { chatId, userIndex, userFi
   try {
     const snapshot = clone(receipt);
     if (!receiptShapeValid(snapshot, { historical: true })
-      || ![6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, RECALL_RECEIPT_SCHEMA_VERSION].includes(snapshot.schemaVersion)
+      || ![6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, RECALL_RECEIPT_SCHEMA_VERSION].includes(snapshot.schemaVersion)
       || snapshot.chatId !== chatId
       || snapshot.userMessageIndex !== userIndex
       || snapshot.userContentFingerprint !== userFingerprint
@@ -647,6 +1074,11 @@ async function historicalSignedReceiptValid(receipt, { chatId, userIndex, userFi
   } catch {
     return null;
   }
+}
+
+function receiptStateItem(value, category) {
+  const { quantification, ...item } = value;
+  return { ...item, ...cseQuantificationFields(value, category) };
 }
 
 function stateFromReceipt(receipt, { generationType = receipt.generationType, restoredReceipt = false, reusedReceipt = !restoredReceipt, timings = null } = {}) {
@@ -658,8 +1090,12 @@ function stateFromReceipt(receipt, { generationType = receipt.generationType, re
     generationType,
     coverage: receipt.coverage,
     selectedFloors: Object.freeze(clone(receipt.selectedFloors ?? [])),
-    selectedStates: Object.freeze(clone(receipt.selectedStates ?? [])),
-    selectedCseChanges: Object.freeze(clone(receipt.selectedCseChanges ?? [])),
+    selectedLocationReferences: Object.freeze(clone(receipt.selectedLocationReferences ?? [])),
+    selectedPlaces: Object.freeze(clone(receipt.selectedPlaces ?? [])),
+    selectedStates: Object.freeze(clone(receipt.selectedStates ?? []).map(value => receiptStateItem(value, value.layer))),
+    selectedCseChanges: Object.freeze(clone(receipt.selectedCseChanges ?? []).map(value => ({ ...value,
+      before: value.before ? receiptStateItem(value.before, value.layer) : null,
+      after: value.after ? receiptStateItem(value.after, value.layer) : null }))),
     qianshiProgress: receipt.qianshiProgress ? Object.freeze(clone(receipt.qianshiProgress)) : null,
     // 实时楼内展示需沿用同一时间去重依据，否则千事尾块对不上会连带隐藏已召回旧事。
     timeDependencies: receipt.timeDependencies ? Object.freeze(clone(receipt.timeDependencies)) : null,
@@ -716,7 +1152,7 @@ export async function projectHistoricalRecallReceipt(message, { chatId, userMess
     || typeof fingerprint !== 'function') return null;
   const receipt = message.extra?.[RECALL_RECEIPT_KEY];
   if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return null;
-  if ([6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, RECALL_RECEIPT_SCHEMA_VERSION].includes(receipt.schemaVersion)) {
+  if ([6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, RECALL_RECEIPT_SCHEMA_VERSION].includes(receipt.schemaVersion)) {
     const snapshot = await historicalSignedReceiptValid(receipt, {
       chatId: chatId.trim(),
       userIndex: userMessageIndex,
@@ -727,7 +1163,60 @@ export async function projectHistoricalRecallReceipt(message, { chatId, userMess
   return legacyStateFromReceipt(receipt, { chatId: chatId.trim(), userIndex: userMessageIndex });
 }
 
-export async function captureCoreBodyWitness(coreChat, sanitizerOptions, fingerprint, maximumFloors = 3) {
+// A short host list alone is not proof that the chat has no older stored history.
+function earlyBodyScope(snapshot, coreChat, type, userIndex, keepCount, sanitizerOptions) {
+  const limit = normalizeAutoHideKeepAiCount(keepCount), replacing = ['swipe', 'regenerate'].includes(type);
+  let targetIndex = -1;
+  if (replacing) for (let index = snapshot.chat.length - 1; index > userIndex; index -= 1) {
+    if (snapshot.chat[index]?.is_system !== true && selectAssistantMessage(snapshot.chat[index])) { targetIndex = index; break; }
+  }
+  const targetIndexes = new Set(targetIndex >= 0 ? [targetIndex] : []), messages = [];
+  for (let index = snapshot.chat.length - 1; index >= 0; index -= 1) {
+    const message = snapshot.chat[index];
+    if (targetIndexes.has(index) || !message || message.is_system === true || isMemoryExcludedMessage(message)) continue;
+    const selected = selectAssistantMessage(message);
+    if (!selected?.rawContent?.trim()) continue;
+    // Early skipping proves the actual host body, not the stored selected-swipe version.
+    const canonicalContent = sanitizeMemoryContent(String(message.mes ?? '').replace(/\r\n?/g, '\n'), sanitizerOptions);
+    if (!canonicalContent) continue;
+    if (message.is_hidden === true || message.hidden === true || messages.length >= limit) return null;
+    messages.push({ canonicalContent });
+  }
+  let core = coreChat;
+  if (targetIndex >= 0) {
+    const latestCoreUser = core.findLastIndex(message => isPlayableUser(message));
+    const targetBody = sanitizeMemoryContent(String(snapshot.chat[targetIndex].mes ?? '').replace(/\r\n?/g, '\n'), sanitizerOptions);
+    for (let index = core.length - 1; index > latestCoreUser; index -= 1) {
+      if (core[index]?.is_user !== false) continue;
+      const body = sanitizeMemoryContent(String(core[index].mes ?? '').replace(/\r\n?/g, '\n'), sanitizerOptions);
+      if (core[index] === snapshot.chat[targetIndex] || targetBody && body === targetBody) core = core.filter((_message, position) => position !== index);
+      break;
+    }
+  }
+  return { messages, core, limit, targetIndexes, maximumSourceSeq: messages.length + targetIndexes.size };
+}
+
+function sourceFitsEarlyBody(source, matchedSource, scope, witness) {
+  if (source.migrationDescriptor || source.coverage.stableThroughAssistantSeq > scope.maximumSourceSeq
+    || source.readiness?.status === 'unknown' && source.readiness.hostConfirmed !== true) return false;
+  const remaining = [...witness];
+  for (const message of scope.messages) {
+    const index = remaining.findIndex(value => value.canonicalContent === message.canonicalContent);
+    if (index < 0) return false;
+    remaining.splice(index, 1);
+  }
+  const covered = new Set(matchedSource.bodyMatch?.recentBodyFloorIds ?? []);
+  const replacedFloors = new Set((source.bodyMatchRefs ?? []).filter(ref => scope.targetIndexes.has(ref.hostLocator?.messageIndex)).map(ref => ref.floorId));
+  const sourceIds = [
+    ...(source.bodyMatchRefs ?? []).map(ref => ref.floorId),
+    ...(source.floorMemories ?? []).flatMap(memory => memory.sourceFloorIds?.length ? memory.sourceFloorIds : [memory.floorId]),
+    ...(source.currentState ?? []).flatMap(subject => ['core', 'adaptive', 'situational'].flatMap(layer => (subject[layer] ?? []).map(item => item.sourceFloorId))),
+    ...(source.cseChanges ?? []).flatMap(change => [change.floorId, change.before?.sourceFloorId, change.after?.sourceFloorId]),
+  ].filter(Boolean);
+  return sourceIds.every(id => covered.has(id) || replacedFloors.has(id));
+}
+
+export async function captureCoreBodyWitness(coreChat, sanitizerOptions, fingerprint, maximumFloors = 3, canonicalByRaw = null) {
   const chat = Array.isArray(coreChat) ? coreChat : [];
   const selected = [];
   // The same N that guides optional auto-hide defines recall's raw-body base,
@@ -735,10 +1224,12 @@ export async function captureCoreBodyWitness(coreChat, sanitizerOptions, fingerp
   for (let index = chat.length - 1; index >= 0 && selected.length < normalizeAutoHideKeepAiCount(maximumFloors); index -= 1) {
     const message = chat[index];
     if (!message || message.is_system === true || message.is_hidden === true || message.hidden === true) continue;
+    if (message.is_user === false && isMemoryExcludedMessage(message)) continue;
     if (message.is_user !== false || typeof message.mes !== 'string') continue;
     const rawContent = message.mes.replace(/\r\n?/g, '\n');
     if (!rawContent.trim()) continue;
-    const canonical = sanitizeMemoryContent(rawContent, sanitizerOptions);
+    const canonical = canonicalByRaw?.has(rawContent) ? canonicalByRaw.get(rawContent) : sanitizeMemoryContent(rawContent, sanitizerOptions);
+    canonicalByRaw?.set(rawContent,canonical);
     if (!canonical) continue;
     selected.push(Object.freeze({
       coreIndex: index, message, rawContent, canonicalContent: canonical,
@@ -749,9 +1240,20 @@ export async function captureCoreBodyWitness(coreChat, sanitizerOptions, fingerp
   return Object.freeze(selected.reverse());
 }
 
-async function attachCoreBodyMatch(source, witness, snapshot, sanitizerOptions, fingerprint, maximumFloors = 3) {
+async function attachCoreBodyMatch(source, witness, snapshot, sanitizerOptions, fingerprint, maximumFloors = 3, capturedLocationReference = null) {
   // Recent-body overlap is trusted only when message position, selected swipe, and raw/canonical fingerprints agree.
   const visibleFloorIds = [...new Set(source.readiness?.visibleSummaryFloorIds ?? [])].sort();
+  const recentVisibleMessageIndexes = new Set();
+  let recentVisibleCount = 0;
+  for (let index = (snapshot?.chat?.length ?? 0) - 1; index >= 0 && recentVisibleCount < normalizeAutoHideKeepAiCount(maximumFloors); index -= 1) {
+    const message = snapshot.chat[index];
+    if (!message || message.is_system === true || message.is_hidden === true || message.hidden === true) continue;
+    if (message.is_user === false && isMemoryExcludedMessage(message)) continue;
+    const selected = selectAssistantMessage(message);
+    if (!selected?.rawContent?.trim() || !sanitizeMemoryContent(selected.rawContent, sanitizerOptions)) continue;
+    recentVisibleMessageIndexes.add(index);
+    recentVisibleCount += 1;
+  }
   const partition = migrationPartition(source);
   const aliasByFloor = new Map((partition.descriptor?.carriedAliases ?? []).map(alias => [alias.floorId, alias]));
   const aliasCounts = new Map(), aliasIndexes = new Map();
@@ -759,7 +1261,7 @@ async function attachCoreBodyMatch(source, witness, snapshot, sanitizerOptions, 
     const aliasId = message?.extra?.[MIGRATION_ALIAS_KEY];
     if (aliasId) { aliasCounts.set(aliasId, (aliasCounts.get(aliasId) ?? 0) + 1); aliasIndexes.set(aliasId, index); }
   }
-  const verified = [];
+  const eligibleRefs = [];
   for (const ref of source.bodyMatchRefs ?? []) {
     const alias = ref.frozen ? aliasByFloor.get(ref.floorId) : null;
     const liveIndex = alias ? aliasIndexes.get(alias.aliasId) : ref.hostLocator?.messageIndex;
@@ -767,28 +1269,85 @@ async function attachCoreBodyMatch(source, witness, snapshot, sanitizerOptions, 
     if (ref.frozen && (!alias || liveMessage?.extra?.[MIGRATION_ALIAS_KEY] !== alias.aliasId || aliasCounts.get(alias.aliasId) !== 1)) continue;
     const selected = selectAssistantMessage(liveMessage);
     if (!selected || !alias && (selected.swipeId !== ref.hostLocator.swipeId || selected.selectedSwipeIndex !== ref.hostLocator.selectedSwipeIndex)) continue;
-    const canonical = sanitizeMemoryContent(selected.rawContent, sanitizerOptions);
-    const [rawFingerprint, canonicalFingerprint] = await Promise.all([fingerprint(selected.rawContent), fingerprint(canonical)]);
+    eligibleRefs.push({ ref, alias, liveIndex, liveMessage, selected });
+  }
+  const witnessCounts = new Map();
+  for (const item of witness) {
+    const key = `${item.rawFingerprint}|${item.canonicalFingerprint}`;
+    witnessCounts.set(key, (witnessCounts.get(key) ?? 0) + 1);
+  }
+  const witnessRawContents = new Set(witness.filter(item => witnessCounts.get(`${item.rawFingerprint}|${item.canonicalFingerprint}`) === 1)
+    .map(item => item.rawContent));
+  const cloneSearchNeeded = witnessRawContents.size > 0 && eligibleRefs.some(({ liveMessage, selected }) => !witness.some(item => item.message === liveMessage && item.rawContent === selected.rawContent)
+    && witnessRawContents.has(selected.rawContent));
+  const liveCandidates = [];
+  const liveCandidateByIndex = new Map();
+  if (cloneSearchNeeded) for (let liveIndex = 0; liveIndex < (snapshot?.chat?.length ?? 0); liveIndex += 1) {
+    const liveMessage = snapshot.chat[liveIndex];
+    if (!liveMessage || liveMessage.is_system === true || liveMessage.is_hidden === true || liveMessage.hidden === true) continue;
+    if (liveMessage.is_user === false && isMemoryExcludedMessage(liveMessage)) continue;
+    const selected = selectAssistantMessage(liveMessage);
+    if (!selected?.rawContent?.trim() || !witnessRawContents.has(selected.rawContent)) continue;
+    const canonicalContent = sanitizeMemoryContent(selected.rawContent, sanitizerOptions);
+    if (!canonicalContent) continue;
+    const candidate = { liveIndex, liveMessage, rawContent: selected.rawContent, canonicalContent };
+    liveCandidates.push(candidate);
+    liveCandidateByIndex.set(liveIndex, candidate);
+  }
+  const cloneLiveByWitness = new Map(), cloneLiveIndexes = new Set();
+  for (const item of witness) {
+    const key = `${item.rawFingerprint}|${item.canonicalFingerprint}`;
+    if (witnessCounts.get(key) !== 1) continue;
+    const matches = liveCandidates.filter(candidate => candidate.rawContent === item.rawContent && candidate.canonicalContent === item.canonicalContent);
+    if (matches.length === 1) {
+      cloneLiveByWitness.set(item, matches[0]);
+      cloneLiveIndexes.add(matches[0].liveIndex);
+    }
+  }
+  const verified = [];
+  const fingerprintsByRawContent = new Map();
+  for (const { ref, alias, liveIndex, liveMessage, selected } of eligibleRefs) {
+    const identityWitness = witness.some(item => item.message === liveMessage && item.rawContent === selected.rawContent);
+    const capturedLocationSource = liveIndex === capturedLocationReference?.hostLocator?.messageIndex;
+    if (!recentVisibleMessageIndexes.has(liveIndex) && !identityWitness && !cloneLiveIndexes.has(liveIndex) && !capturedLocationSource) continue;
+    const canonical = liveCandidateByIndex.get(liveIndex)?.canonicalContent
+      ?? sanitizeMemoryContent(selected.rawContent, sanitizerOptions);
+    if (!canonical) continue;
+    let hashes = fingerprintsByRawContent.get(selected.rawContent);
+    if (!hashes) {
+      hashes = await Promise.all([fingerprint(selected.rawContent), fingerprint(canonical)]);
+      fingerprintsByRawContent.set(selected.rawContent, hashes);
+    }
+    const [rawFingerprint, canonicalFingerprint] = hashes;
     if (rawFingerprint !== ref.rawFingerprint || canonicalFingerprint !== ref.canonicalFingerprint) continue;
     verified.push({ ...ref, liveMessage, liveIndex, aliasId: alias?.aliasId ?? null,
       rawContent: selected.rawContent, canonicalContent: canonical, key: `${rawFingerprint}|${canonicalFingerprint}` });
   }
-  const recentVisibleMessageIndexes = new Set();
-  let recentVisibleCount = 0;
-  for (let index = (snapshot?.chat?.length ?? 0) - 1; index >= 0 && recentVisibleCount < normalizeAutoHideKeepAiCount(maximumFloors); index -= 1) {
-    const message = snapshot.chat[index];
-    if (!message || message.is_system === true || message.is_hidden === true || message.hidden === true) continue;
-    const selected = selectAssistantMessage(message);
-    if (!selected?.rawContent?.trim() || !sanitizeMemoryContent(selected.rawContent, sanitizerOptions)) continue;
-    recentVisibleMessageIndexes.add(index);
-    recentVisibleCount += 1;
-  }
   const recentVisibleFloorIds = [...new Set(verified.filter(ref => recentVisibleMessageIndexes.has(ref.liveIndex)).map(ref => ref.floorId))].sort();
+  let locationReferences = [];
+  if (capturedLocationReference?.hostLocator) {
+    const capturedMessage = snapshot?.chat?.[capturedLocationReference.hostLocator.messageIndex];
+    const capturedSelected = selectAssistantMessage(capturedMessage);
+    const sourceMatches = verified.filter(ref => ref.liveIndex === capturedLocationReference.hostLocator.messageIndex
+      && ref.liveMessage === capturedMessage && ref.rawContent === capturedSelected?.rawContent
+      && capturedSelected?.swipeId === capturedLocationReference.hostLocator.swipeId
+      && capturedSelected?.selectedSwipeIndex === capturedLocationReference.hostLocator.selectedSwipeIndex);
+    const sourceRef = sourceMatches.length === 1 ? sourceMatches[0] : null;
+    const sourceMemory = sourceRef ? (source.floorMemories ?? []).find(memory => memory.floorMemoryId === sourceRef.floorMemoryId) : null;
+    const frozenReference = sourceMemory?.locationReferenceSources?.find(value => value.sourceFloorId === sourceRef.floorId);
+    // An explicit manual clear on this exact source takes precedence over its raw tag.
+    const manuallyCleared = frozenReference?.cleared === true;
+    if (!sourceRef || !manuallyCleared) {
+      locationReferences = capturedLocationReference.values.map(text => Object.freeze({ text, sourceFloorId: sourceRef?.floorId ?? null, assistantSeq: sourceRef?.assistantSeq ?? null,
+        hostLocator: capturedLocationReference.hostLocator }));
+    }
+  }
   const materialFor = (covered, recentBodyFloorIds) => ({
     version: 3,
     covered: covered.map(item => [item.floorId, item.floorMemoryId, item.assistantSeq, item.rawFingerprint, item.canonicalFingerprint, item.liveIndex]),
     visibleFloorIds,
     recentBodyFloorIds,
+      locationReferences: Object.freeze(locationReferences),
   });
   const resultFor = async covered => {
     const recentBodyFloorIds = Object.freeze([...new Set([...covered.map(item => item.floorId), ...recentVisibleFloorIds])].sort());
@@ -801,32 +1360,15 @@ async function attachCoreBodyMatch(source, witness, snapshot, sanitizerOptions, 
       assistantSeq: item.assistantSeq, liveIndex: item.liveIndex, aliasId: item.aliasId ?? null }))),
     visibleFloorIds: Object.freeze(visibleFloorIds),
     recentBodyFloorIds,
+    locationReferences: Object.freeze(locationReferences),
   });
   };
   if (!verified.length || !witness.length) return resultFor([]);
-  const liveCandidates = [];
-  for (let liveIndex = 0; liveIndex < (snapshot?.chat?.length ?? 0); liveIndex += 1) {
-    const liveMessage = snapshot.chat[liveIndex];
-    if (!liveMessage || liveMessage.is_system === true || liveMessage.is_hidden === true || liveMessage.hidden === true) continue;
-    const selected = selectAssistantMessage(liveMessage);
-    if (!selected?.rawContent?.trim()) continue;
-    const canonicalContent = sanitizeMemoryContent(selected.rawContent, sanitizerOptions);
-    if (!canonicalContent) continue;
-    liveCandidates.push({ liveIndex, liveMessage, rawContent: selected.rawContent, canonicalContent });
-  }
-  const witnessCounts = new Map();
-  for (const item of witness) {
-    const key = `${item.rawFingerprint}|${item.canonicalFingerprint}`;
-    witnessCounts.set(key, (witnessCounts.get(key) ?? 0) + 1);
-  }
   const tentative = [];
   for (const item of witness) {
     const key = `${item.rawFingerprint}|${item.canonicalFingerprint}`;
     const identity = verified.find(ref => ref.liveMessage === item.message && ref.key === key);
-    const liveMatches = witnessCounts.get(key) === 1
-      ? liveCandidates.filter(candidate => candidate.rawContent === item.rawContent && candidate.canonicalContent === item.canonicalContent)
-      : [];
-    const cloneLive = liveMatches.length === 1 ? liveMatches[0] : null;
+    const cloneLive = cloneLiveByWitness.get(item) ?? null;
     const match = identity ?? (cloneLive ? verified.find(ref => ref.liveIndex === cloneLive.liveIndex && ref.key === key) : null);
     if (match) tentative.push({ coreIndex: item.coreIndex, match, identity: Boolean(identity) });
 
@@ -901,7 +1443,7 @@ function coveredBodyGuardsCurrent(guards, snapshot, sanitizerOptions) {
   });
 }
 
-export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask = null, isEnabled = true, memoryStatus = () => null, prepareMemory = null, preparationTimeoutMs = DEFAULT_PREPARATION_TIMEOUT_MS, realtimeOrigin = () => false, recentBodyFloorLimit = () => 3, notifyUser = null, sourceReader = readRecallSource, selector = null, semanticProvider = null, queryBuilder = buildRecallQueryContext, fingerprint = hashText, sanitizerOptions = () => ({}), identityProjectionProvider = null, timeProjectionProvider = null, qianshiProgressProvider = null, qianshiDeletionProvider = null, now = () => new Date(), pluginVersion, logger = console } = {}) {
+export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask = null, processingPrompt = () => '', isEnabled = true, memoryStatus = () => null, manualMemorySnapshot = null, prepareMemory = null, preparationTimeoutMs = DEFAULT_PREPARATION_TIMEOUT_MS, realtimeOrigin = () => false, recentBodyFloorLimit = () => 3, notifyUser = null, sourceReader = readRecallSource, selector = null, semanticProvider = null, queryBuilder = buildRecallQueryContext, fingerprint = hashText, sanitizerOptions = () => ({}), identityProjectionProvider = null, placeWorkspaceDependencyProvider = null, timeProjectionProvider = null, qianshiProgressProvider = null, qianshiDeletionProvider = null, now = () => new Date(), pluginVersion, logger = console } = {}) {
   if (!store || typeof store.readReachable !== 'function') throw new TypeError('V3 recall store 无效');
   if (!hostAdapter || typeof hostAdapter.snapshot !== 'function') throw new TypeError('V3 recall host adapter 无效');
   if (typeof fingerprint !== 'function') throw new TypeError('V3 recall fingerprint 无效');
@@ -915,9 +1457,10 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
   const hasRealtimeOrigin = () => { try { return (typeof realtimeOrigin === 'function' ? realtimeOrigin() : realtimeOrigin) === true; } catch { return false; } };
   const selectionRunner = typeof selector === 'function'
     ? selector
-    : input => selectRecallWithLlm({ ...input, generateUtilityTask, semanticProvider, signal: input.signal });
+    : input => selectRecallWithLlm({ ...input, generateUtilityTask, processingPrompt, semanticProvider, signal: input.signal });
   const readinessReasons = source => {
     if (!source?.readiness || source.readiness.status === 'caughtUp') return [];
+    if (source.readiness.unmatchedFloorIds?.length && !source.readiness.summaryMissingFloorIds?.length) return [];
     if (source.readiness.status === 'unknown' && source.readiness.hostConfirmed !== true) return ['memoryNotReady', 'coverageUnconfirmed'];
     const pendingSummaryFloorIds = source.readiness.summaryMissingFloorIds
       ?? (source.readiness.summaryPendingFloorIds ?? []).filter(floorId => !source.floorMemories?.some(memory => memory.floorId === floorId));
@@ -936,18 +1479,56 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
     const code = source?.error?.code ?? (status === 'timeout' ? 'V3_RECALL_MEMORY_PREPARATION_TIMEOUT' : 'V3_RECALL_SOURCE_UNAVAILABLE');
     return Object.assign(new Error(detail || (status === 'timeout' ? '当前聊天记忆准备超时。' : '当前聊天记忆暂时无法读取。')), { code });
   };
+  async function readAuxiliaryProjection(onPartial = null) {
+    if (typeof identityProjectionProvider !== 'function') return null;
+    try {
+      const projection = await identityProjectionProvider(undefined, { allowUnavailable: true, onPartial });
+      return projection?.data ?? projection;
+    } catch { return { unavailableSources: ['people', 'places'] }; }
+  }
+  function applyAuxiliaryProjection(source, projection) {
+    if (!source || !projection) return source;
+    const projected = { ...source, identityProjection: projection,
+      ...(Object.hasOwn(projection, 'placeWorkspace') ? { placeWorkspace: projection.placeWorkspace } : {}) };
+    return isolateRecallAuxiliarySources(projected, projection);
+  }
   const matchesSourceRoot = (value, root) => root?.status === 'ready'
     && root.revision === value.rootRevision && root.data?.chatId === value.chatId
     && root.data?.narrativeGeneration === value.narrativeGeneration && root.data?.headCheckpointId === value.headCheckpointId;
   const sourceVersion = value => value && typeof value === 'object' ? { chatId: value.chatId ?? value.data?.chatId ?? null,
     narrativeGeneration: value.narrativeGeneration ?? value.data?.narrativeGeneration ?? null,
     revision: value.rootRevision ?? value.revision ?? null, headCheckpointId: value.headCheckpointId ?? value.data?.headCheckpointId ?? null } : null;
-  async function basePreparedSource(snapshot, sanitizerSnapshot, { fresh = false, operation = null, rootResult = null, sourceToVerify = null } = {}) {
+  async function basePreparedSource(snapshot, sanitizerSnapshot, { fresh = false, operation = null, rootResult = null, sourceToVerify = null, auxiliarySource = null } = {}) {
     const started = Date.now(), budgetMs = Math.max(1, Number(preparationTimeoutMs) || DEFAULT_PREPARATION_TIMEOUT_MS);
     const timing = { phase: sourceToVerify ? 'commit' : 'source', mode: fresh ? 'fresh' : 'cached', stage: 'identity', status: 'unavailable', totalMs: 0, budgetMs,
       identityMs: 0, rootMs: 0, prepareMs: 0, readMs: 0, projectionMs: 0 };
     const timeout = Symbol('memoryPreparationTimeout'), stale = Symbol('memoryPreparationStale');
-    let timer = null, closed = false, stepStarted = null, abortListener;
+    let timer = null, closed = false, stepStarted = null, abortListener, auxiliaryFallback = null;
+    let auxiliaryProjection = { unavailableSources: ['people', 'places'] };
+    const preparationController = new AbortController();
+    const readAuxiliary = async () => {
+      if (typeof identityProjectionProvider !== 'function') return null;
+      let partial = { unavailableSources: ['people', 'places'] };
+      let accepting = true, auxiliaryTimer, auxiliaryAbort;
+      try {
+        return await Promise.race([
+          readAuxiliaryProjection(value => { if (accepting && !closed) auxiliaryProjection = partial = value; }).then(value => {
+            if (accepting && !closed && value) auxiliaryProjection = value;
+            return value;
+          }),
+          new Promise(resolve => { auxiliaryTimer = setTimeout(() => resolve(partial),
+            Math.min(AUXILIARY_PREPARATION_TIMEOUT_MS, Math.max(0, budgetMs - (Date.now() - started)))); }),
+          new Promise(resolve => {
+            auxiliaryAbort = () => resolve(partial);
+            preparationController.signal.addEventListener('abort', auxiliaryAbort, { once: true });
+          }),
+        ]);
+      } finally {
+        accepting = false;
+        clearTimeout(auxiliaryTimer);
+        preparationController.signal.removeEventListener('abort', auxiliaryAbort);
+      }
+    };
     // 最终fresh核验只留来源版本与阶段，不复制材料；这份诊断不参与来源比较。
     const sourceVerification = sourceToVerify ? { phase: 'commit', mode: fresh ? 'fresh' : 'cached', step: 'root', sourceStatus: sourceToVerify.status,
       preparationStatus: null, rootStatus: null, rootVerified: null, selectedSource: sourceVersion(sourceToVerify), checkedRoot: null } : null;
@@ -958,7 +1539,7 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
     };
     const check = () => {
       if (operation && (operation.token !== epoch || operation.controller.signal.aborted)) throw stale;
-      if (closed || Date.now() - started >= budgetMs) throw timeout;
+      if (closed || Date.now() - started >= budgetMs) { preparationController.abort(timeout); throw timeout; }
     };
     const step = async (stage, read) => {
       check(); timing.stage = stage; stepStarted = Date.now();
@@ -976,6 +1557,10 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       }
     };
     const run = async () => {
+      if (auxiliarySource) {
+        auxiliaryFallback = () => applyAuxiliaryProjection(auxiliarySource, auxiliaryProjection);
+        return applyAuxiliaryProjection(auxiliarySource, await step('identity', readAuxiliary));
+      }
       let latestRoot = rootResult;
       const canReadRoot = typeof store.readRoot === 'function';
       if (canReadRoot && (sourceToVerify || fresh && latestRoot === null && typeof prepareMemory === 'function')) {
@@ -984,20 +1569,50 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
         if (rootError) throw rootError;
       }
       if (sourceToVerify && matchesSourceRoot(sourceToVerify, latestRoot)) {
+        auxiliaryFallback = () => {
+          updateSourceVerification({ rootVerified: true });
+          return applyAuxiliaryProjection(sourceToVerify, auxiliaryProjection);
+        };
+        const projection = typeof identityProjectionProvider === 'function' ? await step('identity', readAuxiliary) : null;
         updateSourceVerification({ sourceStatus: sourceToVerify.status, rootVerified: true, step: 'root' });
-        return sourceToVerify;
+        if (projection && typeof prepareMemory === 'function') {
+          const prepared = await step('prepare', () => prepareMemory({ preferCached: true, rootResult: latestRoot, allowRefresh: false }));
+          if (prepared?.status === 'ready' && prepared.reachable?.root) {
+            const projected = await step('projection', () => projectRecallSource(prepared.reachable, now,
+              sourceToVerify.sourceReadAttempts, snapshot, sanitizerSnapshot, hasRealtimeOrigin(), projection));
+            return applyAuxiliaryProjection(Object.freeze({ ...projected, rootVerified: matchesSourceRoot(projected, latestRoot) }), projection);
+          }
+        }
+        return applyAuxiliaryProjection(sourceToVerify, projection);
       }
-      const identityProjection = typeof identityProjectionProvider === 'function' ? await step('identity', () => identityProjectionProvider()) : null;
       let result, prepared;
       if (typeof prepareMemory === 'function') {
         // fresh 校验不启动后台维护；可借同目标的已在途准备，否则独立核验已完成 checkpoint。
         prepared = await step('prepare', () => prepareMemory({ preferCached: !fresh, rootResult: latestRoot, allowRefresh: !fresh, reuseInFlight: fresh && !sourceToVerify }));
+        // 已确认尚未建立记忆时，没有可投影的记录；不再触发依赖身份的存储读取。
+        if (prepared?.status === 'uninitialized') return prepared;
+      }
+      const preparedReachable = prepared?.status === 'ready' ? prepared.reachable : null;
+      if (preparedReachable?.root && (!sourceToVerify || preparedReachable.checkpoint?.id === latestRoot?.data?.headCheckpointId
+        && preparedReachable.rootRevision === latestRoot?.revision
+        && preparedReachable.root.chatId === latestRoot?.data?.chatId
+        && preparedReachable.root.narrativeGeneration === latestRoot?.data?.narrativeGeneration
+        && preparedReachable.root.headCheckpointId === latestRoot?.data?.headCheckpointId
+        && preparedReachable.root.sourceSnapshotFingerprint === latestRoot?.data?.sourceSnapshotFingerprint)) {
+        auxiliaryFallback = () => {
+          if (sourceToVerify) updateSourceVerification({ rootVerified: true });
+          return projectRecallSource(preparedReachable, now, Object.freeze({ reachableReads: 0, exitPoint: 'validatedSnapshot' }),
+            snapshot, sanitizerSnapshot, hasRealtimeOrigin(), auxiliaryProjection);
+        };
+      }
+      const identityProjection = await step('identity', readAuxiliary);
+      if (prepared) {
         if (prepared?.status === 'ready' && prepared.reachable?.root) {
           result = await step('projection', () => projectRecallSource(prepared.reachable, now, Object.freeze({ reachableReads: 0, exitPoint: 'validatedSnapshot' }), snapshot, sanitizerSnapshot, hasRealtimeOrigin(), identityProjection?.data ?? identityProjection));
         } else if (['disabled', 'stale'].includes(prepared?.status)) return prepared;
       }
       if (!result) {
-        result = await step('read', () => sourceReader({ store, now, hostSnapshot: snapshot, sanitizerOptions: sanitizerSnapshot, realtimeOrigin: hasRealtimeOrigin(), identityProjection: identityProjection?.data ?? identityProjection }));
+        result = await step('read', () => sourceReader({ store, now, hostSnapshot: snapshot, sanitizerOptions: sanitizerSnapshot, realtimeOrigin: hasRealtimeOrigin(), identityProjection: identityProjection?.data ?? identityProjection, signal: preparationController.signal }));
         if (typeof prepareMemory === 'function' && !['ready', 'stale'].includes(result?.status) && !result?.error) {
           result = Object.freeze({ status: prepared?.status === 'error' ? 'unavailable' : prepared?.status ?? 'unavailable', sourceReadAttempts: Object.freeze({ reachableReads: 0, exitPoint: 'memoryPreparation' }) });
         }
@@ -1014,16 +1629,23 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
         updateSourceVerification({ sourceStatus: result.status, rootStatus: afterPreparation?.status ?? 'unavailable', checkedRoot: sourceVersion(afterPreparation), rootVerified: true, step: 'root' });
       }
       if (sourceToVerify) updateSourceVerification({ sourceStatus: result?.status ?? 'unavailable', rootVerified: canReadRoot ? (matchesSourceRoot(result, latestRoot) ? true : false) : null });
-      return result;
+      return applyAuxiliaryProjection(result, identityProjection);
+    };
+    const finishAuxiliaryFallback = async () => {
+      if (operation && (operation.token !== epoch || operation.controller.signal.aborted)) return Object.freeze({ status: 'stale' });
+      const value = await auxiliaryFallback();
+      return operation && (operation.token !== epoch || operation.controller.signal.aborted) ? Object.freeze({ status: 'stale' }) : value;
     };
     let result;
     try {
       // 全部准备等待共用期限；同步执行仍可能延后计时器。超时/取消后每个 await 边界阻止迟到分支启动后续读取。
-      result = await Promise.race([Promise.resolve().then(run), new Promise(resolve => { timer = setTimeout(() => resolve(timeout), budgetMs); }),
-        ...(operation ? [new Promise(resolve => { abortListener = () => resolve(stale); operation.controller.signal.addEventListener('abort', abortListener, { once: true }); })] : [])]);
+      result = await Promise.race([Promise.resolve().then(run), new Promise(resolve => { timer = setTimeout(() => { resolve(timeout); preparationController.abort(timeout); }, budgetMs); }),
+        ...(operation ? [new Promise(resolve => { abortListener = () => { resolve(stale); preparationController.abort(stale); }; operation.controller.signal.addEventListener('abort', abortListener, { once: true }); })] : [])]);
+      if (result === timeout && timing.stage === 'identity' && auxiliaryFallback) result = await finishAuxiliaryFallback();
       if (result === timeout || result === stale) result = Object.freeze({ status: result === timeout ? 'timeout' : 'stale', sourceReadAttempts: Object.freeze({ reachableReads: 0, exitPoint: result === timeout ? 'memoryPreparationTimeout' : 'stale' }) });
     } catch (error) {
-      result = error === timeout || error === stale
+      if (error === timeout && timing.stage === 'identity' && auxiliaryFallback) result = await finishAuxiliaryFallback();
+      else result = error === timeout || error === stale
         ? Object.freeze({ status: error === timeout ? 'timeout' : 'stale', sourceReadAttempts: Object.freeze({ reachableReads: 0, exitPoint: error === timeout ? 'memoryPreparationTimeout' : 'stale' }) })
         : Object.freeze({ status: 'unavailable', error: Object.freeze({ code: clean(error?.code ?? error?.name ?? 'V3_RECALL_SOURCE_UNAVAILABLE', 120), message: clean(error?.message ?? '记忆准备失败。') }), sourceReadAttempts: Object.freeze({ reachableReads: 0, exitPoint: 'memoryPreparationFailed' }) });
     } finally {
@@ -1033,7 +1655,7 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       closed = true;
       timing.totalMs = Date.now() - started;
       if (sourceToVerify) updateSourceVerification({ sourceStatus: result?.status ?? 'unavailable', rootVerified: result?.rootVerified === false ? false : sourceVerification.rootVerified });
-      timing.status = result?.rootVerified === false ? 'stale' : ['ready', 'timeout', 'stale', 'disabled'].includes(result?.status) ? result.status : 'unavailable';
+      timing.status = result?.rootVerified === false ? 'stale' : ['ready', 'uninitialized', 'timeout', 'stale', 'disabled'].includes(result?.status) ? result.status : 'unavailable';
       if (operation?.timings) (operation.timings.preparationAttempts ??= []).push(Object.freeze(timing));
       if (operation) { operation.currentPreparation = null; notify(); }
     }
@@ -1050,7 +1672,8 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
     let qianshiProgress = null;
     if (typeof qianshiProgressProvider === 'function') try {
       const value = await qianshiProgressProvider(source, { queryContext, hostSnapshot,
-        ...(selection ? { selectedEventIds: selection.eventIds ?? [], selectedMatterIds: selection.matterIds ?? [] } : {}) });
+        ...(selection ? { selectedEventIds: selection.eventIds ?? [], selectedMatterIds: selection.matterIds ?? [],
+          pendingHeader: selection.pendingHeader ?? QIANSHI_RECALL_PENDING_HEADER, scopeLine: selection.scopeLine ?? null } : {}) });
       const anchorMatches = value?.anchor?.headCheckpointId === source.headCheckpointId && value?.anchor?.narrativeGeneration === source.narrativeGeneration;
       if (anchorMatches) qianshiProgress = await sealQianshiProgress(value);
       const qianshiCandidates = anchorMatches && !selection && Array.isArray(value?.candidates) ? Object.freeze(clone(value.candidates)) : Object.freeze([]);
@@ -1060,12 +1683,72 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
     } catch (error) { logger?.warn?.('[qianqianjie] optional qianshi projection failed', { code: error?.code ?? error?.name ?? 'QQJ_QIANSHI_READ_FAILED' }); }
     return Object.freeze({ ...source, qianshiProgress, qianshiCandidates: Object.freeze([]) });
   }
+  async function refreshFrozenKnowledgeScope(receipt, snapshot, hostSnapshot, queryContext, operation) {
+    const ordinary = removeQianshiProgress(receipt.injectionText, receipt.qianshiProgress, receipt.timeDependencies);
+    const protectedText = readManualArtifactBlocks(ordinary, { preserveHeaders: true });
+    if (!protectedText.valid) return receipt;
+    const oldRule = ordinary.startsWith('<qqj_recalled_context>') && !protectedText.text.split('\n').some(line => line === RECALL_KNOWLEDGE_GUIDANCE || line === CSE_RECALL_KNOWLEDGE_BOUNDARY || line === RECALL_COMPACT_KNOWLEDGE_GUIDANCE);
+    let progress = receipt.qianshiProgress;
+    const oldProjection = progress && (progress.projectionVersion ?? 0) < QIANSHI_RECALL_PROJECTION_VERSION;
+    if (!oldRule && !oldProjection) return receipt;
+    if (oldProjection && typeof qianshiProgressProvider === 'function') {
+      const root = snapshot?.root?.chatId === receipt.chatId && snapshot.root.narrativeGeneration === receipt.narrativeGeneration ? snapshot.root : null;
+      const source = { status: 'ready', chatId: receipt.chatId, narrativeGeneration: receipt.narrativeGeneration,
+        headCheckpointId: root?.headCheckpointId ?? receipt.headCheckpointId };
+      advanceOperation(operation, 'qianshiProgress');
+      const refreshed = await attachQianshiProgress(source, queryContext, hostSnapshot, { eventIds: progress.eventIds,
+        matterIds: progress.matterIds, pendingHeader: qianshiRecallPendingHeader(progress.text), scopeLine: qianshiProgressScopeLine(progress) });
+      if (!refreshed.qianshiProgress || refreshed.qianshiProgress.projectionVersion >= QIANSHI_RECALL_PROJECTION_VERSION) progress = refreshed.qianshiProgress;
+    }
+    if (!oldRule && progress === receipt.qianshiProgress) return receipt;
+    const plan = receipt.timeDependencies?.renderPlan;
+    const totalBudget = receipt.stages?.estimatedTokenBudget ?? 8000;
+    const progressTokens = reservedQianshiTokenBudget(progress);
+    const updated = { ...receipt, qianshiProgress: progress, stages: receipt.stages ? { ...receipt.stages,
+      ...(progress ? { qianshiTokenBudget: progressTokens } : {}), estimatedTokenBudget: totalBudget } : null };
+    if (updated.stages && !progress) delete updated.stages.qianshiTokenBudget;
+    if (plan) {
+      updated.timeDependencies = { ...receipt.timeDependencies, renderPlan: { ...plan, limits: { ...plan.limits,
+        maxCharacters: Math.min(plan.limits.maxCharacters, Math.max(0, 32000 - qianshiBlock(progress).length - 2)),
+        estimatedTokenBudget: Math.min(plan.limits.estimatedTokenBudget, Math.max(0, totalBudget - progressTokens)) } } };
+      const entities = (plan.entityNames ?? []).map(([entityId, displayName]) => ({ entityId, displayName }));
+      const corrections = Object.fromEntries((receipt.timeDependencies.corrections ?? []).map(item => [item.key, item]));
+      return withoutStaleTime(updated, { entities }, { corrections, reminders: receipt.timeDependencies.reminders ?? [] }, null) ?? receipt;
+    }
+    let text = protectedText.text;
+    // Only the program's explicit recipient templates are rewritten in legacy receipts.
+    text = text.replace(/^- (?:AI #[^\n]+：|\[旧事\] )[^\n]*\[历史原文；时间未标注\][^\n]*$/gmu, value => {
+      const token = `\u0000qqj-raw-${protectedText.blocks.size}\u0000`; protectedText.blocks.set(token, value); return token;
+    });
+    if (oldRule) {
+      const boundaries = new Set(['人物状态记录：主体、态度对象、可见性。', LEGACY_CSE_RECALL_KNOWLEDGE_BOUNDARY, '任何 private 内容仅属于标明的主体，不代表其他人物知情。']);
+      text = text.split('\n').map((line, index) => index === 2 && boundaries.has(line) ? CSE_RECALL_KNOWLEDGE_BOUNDARY : line).join('\n')
+      .replace(/^\[已表达\/已共享信息\]$/gmu, '[已表达信息及接收范围]')
+      .replace(/^(- AI #\d+(?:（[^\n（）]*）)?)（([^\n（）]+) → ([^\n（）]+)）：/gmu, '$1：表达者：$2。接收者：$3。内容：');
+    }
+    for (const [token, literal] of protectedText.blocks) text = text.replace(token, () => literal);
+    let injectionText = appendQianshiProgress(text, progress, receipt.timeDependencies);
+    if (progress && (injectionText.length > 32000 || estimateRecallTokens(injectionText) > totalBudget)) {
+      progress = null; injectionText = text;
+      updated.qianshiProgress = null;
+      if (updated.stages) delete updated.stages.qianshiTokenBudget;
+      updated.skipReasons = [...new Set([...receipt.skipReasons, 'qianshiBudget'])];
+    }
+    if (oldRule && (injectionText.length > 32000 || estimateRecallTokens(injectionText) > totalBudget)) {
+      const boundaries = new Set(['人物状态记录：主体、态度对象、可见性。', LEGACY_CSE_RECALL_KNOWLEDGE_BOUNDARY, '任何 private 内容仅属于标明的主体，不代表其他人物知情。']);
+      text = protectedText.text.split('\n').map((line, index) => index === 2 && boundaries.has(line) ? RECALL_COMPACT_KNOWLEDGE_GUIDANCE : line).join('\n');
+      for (const [token, literal] of protectedText.blocks) text = text.replace(token, () => literal);
+      injectionText = appendQianshiProgress(text, progress, receipt.timeDependencies);
+    }
+    return { ...updated, injectionText, completionStatus: injectionText ? 'ready' : 'empty', stages: updated.stages
+      ? { ...updated.stages, estimatedTokenCount: estimateRecallTokens(injectionText) } : null };
+  }
   async function preparedSource(snapshot, sanitizerSnapshot, options = {}) {
-    let source = await basePreparedSource(snapshot, sanitizerSnapshot, options);
+    let source = options.preparedSource ?? await basePreparedSource(snapshot, sanitizerSnapshot, options);
     if (source?.status !== 'ready') return source;
     let timeProjection = null;
-    if (typeof timeProjectionProvider === 'function') try { if (options.operation) advanceOperation(options.operation, 'timeProjection'); timeProjection = await timeProjectionProvider(source); }
-    catch (error) { logger?.warn?.('[qianqianjie] optional time projection failed', { code: error?.code ?? error?.name ?? 'QQJ_TIME_READ_FAILED' }); }
+    if (typeof timeProjectionProvider === 'function') try { if (options.operation) advanceOperation(options.operation, 'timeProjection'); timeProjection = await waitForRecallOperation(timeProjectionProvider(source), options.operation); }
+    catch (error) { if (options.operation?.controller.signal.aborted) throw error; logger?.warn?.('[qianqianjie] optional time projection failed', { code: error?.code ?? error?.name ?? 'QQJ_TIME_READ_FAILED' }); }
     return Object.freeze({ ...source, timeProjection });
   }
   const notify = () => { const state = getState(); for (const listener of subscribers) { try { listener(state); } catch { /* listener isolation */ } } return state; };
@@ -1346,15 +2029,23 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
     return diagnostic;
   }
 
-  async function withoutDeletedQianshi(receipt) {
+  async function withoutDeletedQianshi(receipt, operation) {
     if (typeof qianshiDeletionProvider !== 'function' || !receipt.qianshiProgress
-      && !(receipt.timeDependencies?.reminders ?? []).some(item => item.qianshiRef)) return receipt;
-    const deletion = await qianshiDeletionProvider();
-    if (deletion.chatId !== receipt.chatId) throw Object.assign(new Error('当前聊天已变化。'), { code: 'V3_RECALL_CHAT_CHANGED' });
-    const deletedIds = new Set(deletion.events.map(event => event.eventId));
-    const witness = await qianshiDeletionWitness(receipt, deletion.events, fingerprint);
+      && !(receipt.timeDependencies?.reminders ?? []).some(item => item.qianshiRef)) return { receipt, unavailable: false };
+    let deletion, unavailable = false;
+    try {
+      deletion = await waitForRecallOperation(qianshiDeletionProvider(), operation);
+      if (!deletion || !Array.isArray(deletion.events)) throw new TypeError('千事删除状态不可用');
+    } catch (error) {
+      if (operation.controller.signal.aborted) throw error;
+      unavailable = true;
+    }
+    if (!unavailable && deletion.chatId !== receipt.chatId) throw Object.assign(new Error('当前聊天已变化。'), { code: 'V3_RECALL_CHAT_CHANGED' });
+    const deletedIds = new Set(unavailable ? receipt.qianshiProgress?.eventIds ?? [] : deletion.events.map(event => event.eventId));
+    const witness = unavailable ? [] : await qianshiDeletionWitness(receipt, deletion.events, fingerprint);
     const prior = new Map((receipt.qianshiDeletionWitness ?? []).map(value => [value.matterId, value.fingerprint]));
-    const affectedMatters = new Set();
+    const affectedMatters = new Set(unavailable ? [...(receipt.qianshiProgress?.matterIds ?? []),
+      ...(receipt.timeDependencies?.reminders ?? []).map(item => item.qianshiRef?.matterId).filter(Boolean)] : []);
     for (const value of witness) {
       if (prior.has(value.matterId) ? prior.get(value.matterId) !== value.fingerprint
         : deletion.events.some(event => event.matterId === value.matterId)) affectedMatters.add(value.matterId);
@@ -1364,41 +2055,65 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
     const matterIds = (oldQianshi?.matterIds ?? []).filter(id => !affectedMatters.has(id));
     const savedTime = receipt.timeDependencies;
     const reminders = (savedTime?.reminders ?? []).filter(item => !affectedMatters.has(item.qianshiRef?.matterId));
-    if (eventIds.length === (oldQianshi?.eventIds?.length ?? 0) && matterIds.length === (oldQianshi?.matterIds?.length ?? 0)
-      && reminders.length === (savedTime?.reminders?.length ?? 0)) return receipt;
-    // 只撤回明确删除涉及的行，不加入新材料、不重跑模型；普通摘要/CSE 与其余冻结材料逐字保留。
+    if (!unavailable && eventIds.length === (oldQianshi?.eventIds?.length ?? 0) && matterIds.length === (oldQianshi?.matterIds?.length ?? 0)
+      && reminders.length === (savedTime?.reminders?.length ?? 0)) return { receipt, unavailable: false };
+    // 已知删除仅撤对应行；读取未知仅撤本次千事及关联提醒，保其余冻结材料。
     let qianshi = null;
-    if (oldQianshi) {
-      const retainedText = oldQianshi.text.split(/\n\n/u).map(section => {
+    if (oldQianshi && !unavailable) {
+      const scopeLine = qianshiProgressScopeLine(oldQianshi);
+      const scopedPrefix = scopeLine ? `${scopeLine}\n\n` : '';
+      const bodyText = scopedPrefix && oldQianshi.text.startsWith(scopedPrefix) ? oldQianshi.text.slice(scopedPrefix.length) : oldQianshi.text;
+      const qianshiBody = bodyText.split(/\n\n/u).map(section => {
         const lines = section.split('\n'), ids = lines[0] === '[相关时间线]' ? oldQianshi.eventIds
-          : lines[0] === '[当前待接续]' ? oldQianshi.matterIds : null;
+          : qianshiRecallPendingHeader(lines[0], null) !== null ? oldQianshi.matterIds : null;
         if (!ids) return '';
         const kept = new Set(lines[0] === '[相关时间线]' ? eventIds : matterIds);
         const rows = lines.slice(1).filter((line, index) => kept.has(ids[index]));
         return rows.length ? [lines[0], ...rows].join('\n') : '';
       }).filter(Boolean).join('\n\n');
+      const retainedText = qianshiBody ? [scopeLine, qianshiBody].filter(Boolean).join('\n\n') : '';
       qianshi = await sealQianshiProgress({ ...oldQianshi, text: retainedText, eventIds, matterIds });
     }
     let ordinaryText = removeQianshiProgress(receipt.injectionText, oldQianshi, savedTime);
     const timeDependencies = savedTime?.mode === 'selected' ? { ...savedTime, reminders } : savedTime;
     if (reminders.length !== (savedTime?.reminders?.length ?? 0)) {
-      const timeBlock = rows => rows.length ? ['[时间参考（当前推测及预计/期限节点尚未获正文确认，不代表已经发生或完成）]',
-        ...rows.map(item => `- ${item.text}`)].join('\n') + '\n' : '';
-      const suffix = `${timeBlock(savedTime.reminders)}</qqj_recalled_context>`;
-      if (ordinaryText.endsWith(suffix)) ordinaryText = ordinaryText.slice(0, -suffix.length) + `${timeBlock(reminders)}</qqj_recalled_context>`;
+      const timeBlock = (rows, header) => rows.length ? [header, ...rows.map(item => `- ${item.text}`)].join('\n') + '\n' : '';
+      for (const header of ['[时间参考]', '[时间参考（当前推测及预计/期限节点尚未获正文确认，不代表已经发生或完成）]']) {
+        const suffix = `${timeBlock(savedTime.reminders, header)}</qqj_recalled_context>`;
+        if (ordinaryText.endsWith(suffix)) {
+          ordinaryText = ordinaryText.slice(0, -suffix.length) + `${timeBlock(reminders, header)}</qqj_recalled_context>`; break;
+        }
+      }
       if (ordinaryText === '<qqj_recalled_context>\n</qqj_recalled_context>') ordinaryText = '';
     }
     const injectionText = appendQianshiProgress(ordinaryText, qianshi, timeDependencies);
     const removedReminders = (savedTime?.reminders?.length ?? 0) - reminders.length;
-    const stages = receipt.stages ? { ...receipt.stages, estimatedTokenCount: estimateRecallTokens(injectionText),
+    const stages = receipt.stages ? { ...stagesWithQianshiBudget(stagesWithoutQianshi(receipt.stages, oldQianshi, injectionText), qianshi), estimatedTokenCount: estimateRecallTokens(injectionText),
       timeReminderCount: reminders.length, finalInjectionItemCount: Math.max(0, (receipt.stages.finalInjectionItemCount ?? 0) - removedReminders) } : null;
-    return { ...receipt, qianshiProgress: qianshi, timeDependencies, injectionText, stages,
-      completionStatus: injectionText ? 'ready' : 'empty', skipReasons: [...new Set([...receipt.skipReasons, 'qianshiManuallyDeleted'])] };
+    const next = { ...receipt, qianshiProgress: qianshi, timeDependencies, injectionText, stages,
+      completionStatus: injectionText ? 'ready' : 'empty', skipReasons: [...new Set([...receipt.skipReasons, unavailable ? 'optionalQianshiDeletionUnavailable' : 'qianshiManuallyDeleted'])] };
+    return { receipt: { ...next, receiptFingerprint: await fingerprint(JSON.stringify(receiptMaterial(next))) }, unavailable };
+  }
+
+  function fitReusedPrequel(operation, receipt, contextSize) {
+    const selected = operation.prequelSelection;
+    if (!selected?.injectionText || !receipt?.injectionText) return;
+    const budget = recallBudget(contextSize);
+    const remainingCharacters = Math.max(0, budget.totalCharacters - receipt.injectionText.length);
+    const remainingTokens = Math.max(0, budget.totalTokens - estimateRecallTokens(receipt.injectionText));
+    if (selected.estimatedCharacters <= remainingCharacters && selected.estimatedTokens <= remainingTokens) return;
+    operation.prequelSelection = selectPrequel({
+      text: operation.prequelSourceText,
+      queryContext: operation.queryContext,
+      contextSize,
+      maxCharacters: Math.min(selected.characterBudget, remainingCharacters),
+      maxTokens: Math.min(selected.tokenBudget, remainingTokens),
+    });
   }
 
   function commitFrozenReceiptIfCurrent({ operation, receipt, userIndex, hostGuard }) {
     if (operation.token !== epoch || operation.controller.signal.aborted) return { ok: false, reason: abortReason(operation) };
-    // 人工删除的撤回在此前完成；普通冻结复用不重读来源、时间投影或重选千事。
+    // 原选材料的人工操作在此前承接；此处同步核对宿主边界并注入冻结结果。
     // user 消息对象是生命周期边界；最后守卫与注入同步完成，迟到请求不能跨过提交点。
     const snapshot = hostAdapter.snapshot();
     const user = latestUser(snapshot);
@@ -1453,24 +2168,36 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       if (currentSource.rootVerified === false) { markVerificationFailure('rootVerification', 'sourceUnavailable'); return { ok: false, reason: 'sourceUnavailable' }; }
       if (currentSource.chatId !== source.chatId) return { ok: false, reason: 'chatChanged' };
       if (currentSource.narrativeGeneration !== source.narrativeGeneration) return { ok: false, reason: 'narrativeChanged' };
-      currentSource = Object.freeze({ ...currentSource, bodyMatch: await attachCoreBodyMatch(currentSource, operation.coreBodyWitness, before, operation.sanitizerOptions, fingerprint, recentBodyFloorLimit()) });
+      currentSource = Object.freeze({ ...currentSource, bodyMatch: await attachCoreBodyMatch(currentSource, operation.coreBodyWitness, before, operation.sanitizerOptions, fingerprint, recentBodyFloorLimit(), operation.locationReferenceSnapshot) });
+    }
+    const auxiliaryReceipt = refreshAuxiliaryReceipt(finalReceipt, currentSource, operation.queryContext);
+    if (auxiliaryReceipt !== finalReceipt) {
+      finalReceipt = auxiliaryReceipt;
+      injectionText = finalReceipt.injectionText;
+      selectedFloors = finalReceipt.selectedFloors;
+      selectedStates = finalReceipt.selectedStates;
+      selectedCseChanges = finalReceipt.selectedCseChanges;
+      selectedFloorsForValidation = finalReceipt.timeDependencies?.renderPlan?.floors ?? selectedFloorsForValidation;
+      timeDependencies = finalReceipt.timeDependencies;
     }
     if (!timeDependenciesValid(timeDependencies)) { markVerificationFailure('timeDependencies', 'invalid'); return { ok: false, reason: 'selectedRefsChanged' }; }
     if (timeDependencies.mode === 'projection' || timeDependencies.corrections.length || timeDependencies.reminders.length) {
       liveTime = currentSource.timeProjection;
       if (typeof timeProjectionProvider === 'function') {
-        try { advanceOperation(operation, 'timeProjection'); liveTime = await timeProjectionProvider(currentSource); }
-        catch (error) { liveTime = null; logger?.warn?.('[qianqianjie] optional time projection check failed', { code: error?.code ?? error?.name ?? 'QQJ_TIME_READ_FAILED' }); }
+        try { advanceOperation(operation, 'timeProjection'); liveTime = await waitForRecallOperation(timeProjectionProvider(currentSource), operation); }
+        catch (error) { if (operation.controller.signal.aborted) throw error; liveTime = null; logger?.warn?.('[qianqianjie] optional time projection check failed', { code: error?.code ?? error?.name ?? 'QQJ_TIME_READ_FAILED' }); }
       }
       if (!timeDependenciesCurrent(timeDependencies, liveTime)) {
-        finalReceipt = withoutStaleTime(receipt, currentSource, liveTime);
+        finalReceipt = withoutStaleTime(finalReceipt, currentSource, liveTime);
         if (!finalReceipt) { markVerificationFailure('timeDependencies', 'changed'); return { ok: false, reason: 'selectedRefsChanged' }; }
         injectionText = finalReceipt.injectionText;
       }
     }
     advanceOperation(operation, 'qianshiProgress');
     currentSource = await attachQianshiProgress(Object.freeze({ ...currentSource, timeProjection: liveTime ?? currentSource.timeProjection }), operation.queryContext, before,
-      { eventIds: finalReceipt.qianshiProgress?.eventIds ?? [], matterIds: finalReceipt.qianshiProgress?.matterIds ?? [] });
+      { eventIds: finalReceipt.qianshiProgress?.eventIds ?? [], matterIds: finalReceipt.qianshiProgress?.matterIds ?? [],
+        pendingHeader: qianshiRecallPendingHeader(finalReceipt.qianshiProgress?.text),
+        scopeLine: qianshiProgressScopeLine(finalReceipt.qianshiProgress) });
     if (!qianshiProgressCurrent(finalReceipt.qianshiProgress, currentSource.qianshiProgress)) {
       injectionText = removeQianshiProgress(injectionText, finalReceipt.qianshiProgress, finalReceipt.timeDependencies);
       finalReceipt = { ...finalReceipt, qianshiProgress: null, injectionText,
@@ -1484,7 +2211,7 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       return { ok: false, reason: 'selectedRefsChanged' };
     }
     const bodyGuardSanitizer = currentSanitizerOptions();
-    const selectedSourceGuards = await captureSelectedSourceGuards({ selectedFloors, selectedStates, selectedCseChanges }, currentSource, before, bodyGuardSanitizer, fingerprint);
+    const selectedSourceGuards = await captureSelectedSourceGuards({ selectedFloors, selectedStates, selectedCseChanges }, currentSource, before);
     if (selectedSourceGuards === null) { markVerificationFailure('sourceBodyGuard', 'changed'); return { ok: false, reason: 'selectedRefsChanged' }; }
     const coveredBodyGuards = await captureCoveredBodyGuards(source, currentSource, before, bodyGuardSanitizer, fingerprint);
     if (coveredBodyGuards === null) { markVerificationFailure('coveredBodyGuard', 'changed'); return { ok: false, reason: 'narrativeChanged' }; }
@@ -1560,7 +2287,8 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
     const lifecycle = generationQueue.find(value => value.token === null && value.type === type);
     if (lifecycle) lifecycle.token = token;
     const operation = { token, type, phase: 'input', step: 'input', lastCompletedStep: null, stepStarted: Date.now(), controller: new AbortController(), started: Date.now(), diagnostics: [],
-      requestDiagnosticId: enabled() && SUPPORTED_TYPES.has(type) ? lifecycle?.requestDiagnosticId ?? requestDiagnostic.start() : null };
+      requestDiagnosticId: enabled() && SUPPORTED_TYPES.has(type) ? lifecycle?.requestDiagnosticId ?? requestDiagnostic.start() : null,
+      transportBudget: { remaining: 3, used: 0 } };
     lastRecall = null; lastPrequel = null; lastRecallBinding = null; lastRecallReceiptOwner = null;
     active = operation; lastError = null; notify();
     const timings = {};
@@ -1573,7 +2301,7 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
     };
     const coreInput = Array.isArray(coreChat) ? coreChat : [];
     coreChat = null;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < (operation.transportBudget.totalAttempts ?? 2); attempt += 1) {
       for (const key of Object.keys(timings)) delete timings[key];
       const diagnostic = { attempt: attempt + 1, phase: 'input', pendingStep: 'input', lastCompletedStep: operation.lastCompletedStep, selectionStatus: 'notStarted', coverage: null, stages: null, selectorDiagnostic: null, started: Date.now() };
       operation.phase = 'input';
@@ -1590,9 +2318,18 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       operation.hostChatId = currentHostChatId(before);
       operation.userText = user.message.mes;
       operation.liveFrameKey = liveRecallFrameKey(before);
+      operation.sanitizerOptions = currentSanitizerOptions();
+      operation.locationReferenceSnapshot = captureLatestLocationReference(before, operation.sanitizerOptions, recentBodyFloorLimit(),
+        ['swipe', 'regenerate'].includes(type) ? user.index : undefined);
       notify();
       advanceOperation(operation, 'queryContext');
-      const queryContext = queryBuilder({ coreChat: coreInput, assistantTurns: 1 });
+      const canonicalByRaw = new Map(), canonicalAssistantByCoreIndex = new Map();
+      for (const message of buildRecallQueryFrame({coreChat:coreInput,assistantTurns:1}).messages.filter(value=>value.role==='assistant')) {
+        const raw = String(coreInput[message.index].mes ?? '').replace(/\r\n?/g,'\n');
+        const canonical = sanitizeMemoryContent(raw,operation.sanitizerOptions);
+        canonicalByRaw.set(raw,canonical); canonicalAssistantByCoreIndex.set(message.index,canonical);
+      }
+      const queryContext = queryBuilder({ coreChat: coreInput, assistantTurns: 1, canonicalAssistantByCoreIndex });
       operation.queryContext = queryContext;
       operation.prequelSourceText = currentPrequelText(before);
       advanceOperation(operation, 'prequelSelection');
@@ -1604,16 +2341,105 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       timings.inputMs = Date.now() - inputStarted;
       let candidate = null, candidateOwner = null;
       advanceOperation(operation, 'receiptValidation');
+      const placeWorkspaceDependency = `${operation.chatId}:0`;
       for (const value of receiptCandidates(user)) {
         const owner = value === sessionReceipt?.receipt ? sessionReceipt.owner : null;
-        const snapshot = await persistedReceiptValid(value, { chatId: operation.chatId, userIndex: user.index, userFingerprint, pluginVersion }, fingerprint);
-        if (snapshot) { candidate = snapshot; candidateOwner = owner; break; }
+        const snapshot = await persistedReceiptValid(value, { chatId: operation.chatId, userIndex: user.index, userFingerprint, pluginVersion, placeWorkspaceDependency }, fingerprint);
+        const locationDependencyMatches = snapshot?.schemaVersion >= 18
+          ? locationReferenceDependencyMatches(snapshot.locationReferenceDependency, operation.locationReferenceSnapshot)
+          : !operation.locationReferenceSnapshot?.values?.length;
+        if (snapshot && locationDependencyMatches) { candidate = snapshot; candidateOwner = owner; break; }
+      }
+      // Apply the no-old-history rule before a saved early receipt can restore its CSE block.
+      const earlyScope = operation.prequelSourceText.trim() ? null
+        : earlyBodyScope(before, coreInput, type, user.index, recentBodyFloorLimit(), operation.sanitizerOptions);
+      let earlyPreparedSource = null, earlyBodyWitness = null, earlySourceMs = 0;
+      if (earlyScope && (!candidate || candidate.coverage.stableThroughAssistantSeq <= earlyScope.maximumSourceSeq)) {
+        operation.phase = diagnostic.phase = 'source';
+        advanceOperation(operation, 'source');
+        const earlySourceStarted = Date.now();
+        earlyPreparedSource = await basePreparedSource(before, operation.sanitizerOptions, { fresh: attempt > 0, operation });
+        earlySourceMs = Date.now() - earlySourceStarted; timings.sourceMs = earlySourceMs;
+        if (earlyPreparedSource?.sourceReadAttempts) timings.sourceReadAttempts = clone(earlyPreparedSource.sourceReadAttempts);
+        const earlyError = technicalSourceError(earlyPreparedSource);
+        if (earlyError) throw earlyError;
+        if (earlyPreparedSource?.status === 'ready' && !earlyPreparedSource.migrationDescriptor
+          && earlyPreparedSource.coverage.stableThroughAssistantSeq <= earlyScope.maximumSourceSeq) {
+          advanceOperation(operation, 'bodyWitness');
+          earlyBodyWitness = await captureCoreBodyWitness(earlyScope.core, operation.sanitizerOptions, fingerprint, earlyScope.limit, canonicalByRaw);
+          // The replaced reply is neither prior history nor one of its N visible body slots.
+          const earlySnapshot = earlyScope.targetIndexes.size ? { ...before, chat: before.chat.map((message, index) => earlyScope.targetIndexes.has(index) ? null : message) } : before;
+          const matchedSource = { ...earlyPreparedSource, bodyMatch: await attachCoreBodyMatch(earlyPreparedSource, earlyBodyWitness, earlySnapshot,
+            operation.sanitizerOptions, fingerprint, earlyScope.limit, operation.locationReferenceSnapshot) };
+          if (sourceFitsEarlyBody(earlyPreparedSource, matchedSource, earlyScope, earlyBodyWitness)) {
+            const current = hostAdapter.snapshot(), currentUser = latestUser(current);
+            if (currentChatId(current) !== operation.chatId || currentHostChatId(current) !== operation.hostChatId) return finishStale(operation, timings, 'chatChanged');
+            if (currentUser?.message !== user.message || currentUser?.message?.mes !== operation.userText) return finishStale(operation, timings, 'userChanged');
+            if (liveRecallFrameKey(current) !== operation.liveFrameKey) return finishStale(operation, timings, 'narrativeChanged');
+            return finishSkipped(operation, 'recentBodyOnly', timings);
+          }
+        }
+      }
+      let manualReceiptChanged = false, manualSnapshot = null;
+      if (candidate && typeof identityProjectionProvider === 'function') {
+        const entityNames = new Map(candidate.timeDependencies?.renderPlan?.entityNames ?? []);
+        for (const place of candidate.selectedPlaces ?? []) if (!entityNames.has(place.placeEntityId)) {
+          entityNames.set(place.placeEntityId, place.text.split('：')[0]);
+        }
+        const placeIds = new Set([...(candidate.selectedPlaces ?? []).map(place => place.placeEntityId),
+          ...(candidate.timeDependencies?.renderPlan?.floors ?? []).flatMap(floor => floor.items.map(item => item.placeEntityId).filter(Boolean))]);
+        const auxiliarySource = { status: 'ready', chatId: candidate.chatId, narrativeGeneration: candidate.narrativeGeneration,
+          coverage: candidate.coverage, floorMemories: [], currentState: [], cseChanges: [],
+          entities: [...entityNames].map(([entityId, displayName]) => ({ entityId, displayName,
+            entityType: placeIds.has(entityId) ? 'place' : 'person', aliases: [] })),
+          placeWorkspace: null };
+        const fresh = await basePreparedSource(before, operation.sanitizerOptions, { operation, auxiliarySource });
+        if (fresh?.status === 'ready') {
+          const updated = refreshAuxiliaryReceipt(candidate, fresh, queryContext);
+          if (updated !== candidate) {
+            candidate = { ...updated, receiptFingerprint: await fingerprint(JSON.stringify(receiptMaterial(updated))) };
+            manualReceiptChanged = true;
+          }
+        }
+      }
+      if (candidate && typeof manualMemorySnapshot === 'function') {
+        manualSnapshot = manualMemorySnapshot();
+        const updated = refreshFrozenManualCse(refreshFrozenManualSummaries(candidate, manualSnapshot), manualSnapshot);
+        if (updated !== candidate) {
+          candidate = { ...updated, receiptFingerprint: await fingerprint(JSON.stringify(receiptMaterial(updated))) };
+          manualReceiptChanged = true;
+        }
+      }
+      if (candidate?.timeDependencies?.renderPlan && typeof timeProjectionProvider === 'function'
+        && selectedManualTimeScope(candidate.timeDependencies, null).length > 0) {
+        let source;
+        if (manualSnapshot?.root?.chatId === candidate.chatId) {
+          const subjects = new Map();
+          for (const state of candidate.selectedStates) {
+            const subject = subjects.get(state.subjectEntityId) ?? { subjectEntityId: state.subjectEntityId, core: [], adaptive: [], situational: [] };
+            (subject[state.layer] ?? subject.situational).push(state);
+            subjects.set(state.subjectEntityId, subject);
+          }
+          source = { status: 'ready', chatId: candidate.chatId, headCheckpointId: manualSnapshot.root.headCheckpointId,
+            rootRevision: manualSnapshot.rootRevision, narrativeGeneration: manualSnapshot.root.narrativeGeneration,
+            floorMemories: (manualSnapshot.floorMemories ?? []).map(memory => ({ ...memory, floorMemoryId: memory.id })),
+            currentState: [...subjects.values()], entities: (manualSnapshot.entities ?? []).map(entity => ({ ...entity, entityId: entity.id })),
+            identityProjection: manualSnapshot.identityProjection ?? null };
+        } else source = await basePreparedSource(before, operation.sanitizerOptions, { operation });
+        let projection = null;
+        try { advanceOperation(operation, 'timeProjection'); projection = await waitForRecallOperation(timeProjectionProvider(source), operation); }
+        catch (error) { if (operation.controller.signal.aborted) throw error; logger?.warn?.('[qianqianjie] frozen time projection unavailable', { code: error?.code ?? error?.name ?? 'QQJ_TIME_READ_FAILED' }); }
+        const updated = refreshFrozenManualTime(candidate, source, projection);
+        if (updated !== candidate) {
+          candidate = { ...updated, receiptFingerprint: await fingerprint(JSON.stringify(receiptMaterial(updated))) };
+          manualReceiptChanged = true;
+        }
       }
       if (candidate?.selectedFloors.some(value => value.rawWitnesses?.length || value.summaryWitnesses?.length)) {
         // 冻结复用不查询向量；原文见证及旧摘要回执仍按各自来源重新核验。
         advanceOperation(operation, 'receiptSourceVerification');
         const sourceStarted = Date.now();
-        const sanitizerSnapshot = currentSanitizerOptions();
+        const sanitizerSnapshot = operation.sanitizerOptions;
         const realtime = hasRealtimeOrigin();
         let fresh = null;
         // 仅借用根版本完全匹配的既有快照；未命中时继续原来源读取，不等待后台准备。
@@ -1653,13 +2479,37 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
         }
       }
       if (candidate) {
+        const scoped = await refreshFrozenKnowledgeScope(candidate, manualSnapshot, before, queryContext, operation);
+        if (scoped !== candidate) {
+          candidate = { ...scoped, receiptFingerprint: await fingerprint(JSON.stringify(receiptMaterial(scoped))) };
+          manualReceiptChanged = true;
+        }
         const commitStarted = Date.now();
         if (typeof qianshiDeletionProvider === 'function' && (candidate.qianshiProgress || (candidate.timeDependencies?.reminders ?? []).some(item => item.qianshiRef))) advanceOperation(operation, 'deletionWitness');
-        candidate = await withoutDeletedQianshi(candidate);
+        const deletion = await withoutDeletedQianshi(candidate, operation);
+        candidate = deletion.receipt;
+        if (deletion.unavailable) {
+          // This injection is temporary; retain the original signed selection for the next normal entry.
+          candidate = { ...candidate, receiptPersistence: 'sessionOnly' }; candidateOwner = null;
+        }
+        fitReusedPrequel(operation, candidate, contextSize);
         diagnostic.selectionStatus = 'receiptCandidate'; diagnostic.coverage = clone(candidate.coverage); diagnostic.stages = clone(candidate.stages); diagnostic.selectorDiagnostic = clone(candidate.selectorDiagnostic);
         operation.phase = diagnostic.phase = 'commit'; advanceOperation(operation, 'commitVerification');
         const committed = commitFrozenReceiptIfCurrent({ operation, receipt: candidate, userIndex: user.index, hostGuard });
         if (!committed.ok) return stopForFinalSafety(committed.reason);
+        if (manualReceiptChanged && !deletion.unavailable) {
+          const owner = Object.freeze({ chatId: operation.chatId, hostChatId: operation.hostChatId, userMessage: committed.user.message, userText: operation.userText });
+          const receiptPersistence = typeof committed.snapshot.context?.saveChat === 'function' ? 'saving' : 'sessionOnly';
+          candidate = Object.freeze({ ...candidate, receiptPersistence });
+          sessionReceipt = Object.freeze({ userMessage: committed.user.message, owner, receipt: candidate });
+          candidateOwner = owner;
+          if (receiptPersistence === 'saving') {
+            const receiptStarted = Date.now();
+            void persistReceipt(committed.snapshot, committed.user, candidate, (step, errorCode) => updateReceiptSave(owner, receiptStarted, step, errorCode))
+              .then(persistence => finishReceiptPersistence(owner, persistence, Date.now() - receiptStarted, sessionReceipt?.owner === owner ? sessionReceipt.receiptSaveDiagnostic : null))
+              .catch(error => logger?.warn?.('[qianqianjie] manual recall receipt save failed', { code: error?.code ?? error?.name }));
+          }
+        }
         timings.commitMs = Date.now() - commitStarted;
         timings.totalMs = Date.now() - operation.started;
         // 保存可能在复用核验的 await 中完成；读取同一 owner 的最新保存状态，避免重新显示 saving。
@@ -1674,10 +2524,10 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
         if (operation.prequelCommitted) lastPrequel = prequelState(operation);
         bindLastRecall(committed.snapshot, committed.user); lastError = null; active = null; notify(); return getState();
       }
-      const sanitizerSnapshot = currentSanitizerOptions();
+      const sanitizerSnapshot = operation.sanitizerOptions;
       advanceOperation(operation, 'bodyWitness');
       const [coreBodyWitness, baseQueryFingerprint] = await Promise.all([
-        captureCoreBodyWitness(coreInput, sanitizerSnapshot, fingerprint, recentBodyFloorLimit()),
+        earlyBodyWitness && earlyScope.core === coreInput ? earlyBodyWitness : captureCoreBodyWitness(coreInput, sanitizerSnapshot, fingerprint, recentBodyFloorLimit(), canonicalByRaw),
         fingerprint(queryContext.text),
       ]);
       operation.coreBodyWitness = coreBodyWitness;
@@ -1685,19 +2535,20 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       operation.phase = diagnostic.phase = 'source'; notify();
       advanceOperation(operation, 'source');
       const sourceStarted = Date.now();
-      const readSource = await preparedSource(before, sanitizerSnapshot, { fresh: attempt > 0, operation });
+      const readSource = await preparedSource(before, sanitizerSnapshot, { fresh: attempt > 0, operation, preparedSource: earlyPreparedSource });
       let source = readSource;
       if (readSource?.status === 'ready') {
         advanceOperation(operation, 'bodyWitness');
-        source = Object.freeze({ ...readSource, bodyMatch: await attachCoreBodyMatch(readSource, coreBodyWitness, before, sanitizerSnapshot, fingerprint, recentBodyFloorLimit()) });
+        source = Object.freeze({ ...readSource, bodyMatch: await attachCoreBodyMatch(readSource, coreBodyWitness, before, sanitizerSnapshot, fingerprint, recentBodyFloorLimit(), operation.locationReferenceSnapshot) });
       }
       if (source?.status === 'ready') { advanceOperation(operation, 'qianshiProgress'); source = await attachQianshiProgress(source, queryContext, before); }
-      timings.sourceMs = Date.now() - sourceStarted;
+      timings.sourceMs = earlySourceMs + Date.now() - sourceStarted;
       if (source?.sourceReadAttempts) timings.sourceReadAttempts = clone(source.sourceReadAttempts);
       if (source?.status === 'ready') diagnostic.coverage = clone(source.coverage);
       if (source.status !== 'ready') {
         // Technical source failures take the bounded retry path; a valid but uninitialized source can be skipped normally.
-        const reason = source.status === 'timeout' ? 'memoryPreparationTimeout'
+        const reason = source.status === 'uninitialized' ? 'uninitialized'
+          : source.status === 'timeout' ? 'memoryPreparationTimeout'
           : source.sourceReadAttempts?.exitPoint === 'memoryPreparationFailed' ? 'memoryPreparationFailed'
             : source.status === 'stale' ? 'sourceStale' : 'sourceUnavailable';
         const sourceError = technicalSourceError(source);
@@ -1731,8 +2582,9 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       const identityQueryFingerprint = hasIdentityProjection
         ? await fingerprint(JSON.stringify([prequelQueryFingerprint, projection]))
         : prequelQueryFingerprint;
+      const locationQueryFingerprint = await fingerprint(JSON.stringify([identityQueryFingerprint, operation.locationReferenceSnapshot]));
       const queryFingerprint = source.timeProjection?.fingerprint
-        ? await fingerprint(JSON.stringify([identityQueryFingerprint, source.timeProjection.fingerprint])) : identityQueryFingerprint;
+        ? await fingerprint(JSON.stringify([locationQueryFingerprint, source.timeProjection.fingerprint])) : locationQueryFingerprint;
       const afterSource = hostAdapter.snapshot();
       const afterUser = latestUser(afterSource);
       if (token !== epoch || operation.controller.signal.aborted) return finishStale(operation, timings);
@@ -1743,7 +2595,7 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       let selection;
       const initialQianshiCharacters = source.qianshiProgress?.text ? `\n\n${qianshiBlock(source.qianshiProgress)}`.length : 0;
       const initialQianshiTokens = reservedQianshiTokenBudget(source.qianshiProgress);
-      try { selection = await selectionRunner({ source, queryContext, contextSize, signal: operation.controller.signal,
+      try { selection = await selectionRunner({ source, queryContext, contextSize, signal: operation.controller.signal, transportBudget: operation.transportBudget,
         recentBodyFloorCount: normalizeAutoHideKeepAiCount(recentBodyFloorLimit()),
         reservedTokens: operation.prequelSelection.estimatedTokens + initialQianshiTokens,
         reservedCharacters: operation.prequelSelection.estimatedCharacters + initialQianshiCharacters,
@@ -1770,6 +2622,8 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
         userMessageIndex: user.index,
         userContentFingerprint: userFingerprint,
         queryFingerprint,
+        ...(source.identityProjection?.placeWorkspaceRevision || selection.manualPlaces?.length ? { placeWorkspaceDependency: source.placeWorkspaceDependency ?? `${source.chatId}:0`, selectedPlaces: clone(selection.manualPlaces ?? []) } : {}),
+        locationReferenceDependency: JSON.stringify(operation.locationReferenceSnapshot),
         bodyMatchFingerprint: source.bodyMatch.fingerprint,
         strategyVersion: RECALL_STRATEGY_VERSION,
         generationType: type,
@@ -1780,15 +2634,22 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
           stateId: value.stateId, sourceFloorId: value.sourceFloorId, sourceDeltaId: value.sourceDeltaId,
           subjectEntityId: value.subjectEntityId, subject: value.subject, layer: value.layer,
           towardEntityId: value.towardEntityId, toward: value.toward, text: value.text, reason: value.reason,
-          visibility: value.visibility, sourceAssistantSeq: value.sourceAssistantSeq, storylineId: value.storylineId,
+          ...cseQuantificationFields(value, value.layer),
+          visibility: value.visibility, ...(value.origin !== undefined ? { origin: value.origin } : {}),
+          sourceAssistantSeq: value.sourceAssistantSeq, storylineId: value.storylineId,
+        })),
+        selectedLocationReferences: (selection.locationReferences ?? []).map(value => ({
+          text: value.text, sourceFloorId: value.sourceFloorId ?? null, assistantSeq: value.assistantSeq ?? null,
+          hostLocator: value.hostLocator ? { messageIndex: value.hostLocator.messageIndex, swipeId: value.hostLocator.swipeId ?? null, selectedSwipeIndex: value.hostLocator.selectedSwipeIndex ?? null } : null,
         })),
         selectedCseChanges: (selection.cseChanges ?? []).map(value => ({
           deltaId: value.deltaId, floorId: value.floorId, assistantSeq: value.assistantSeq,
           subjectEntityId: value.subjectEntityId, subject: value.subject, layer: value.layer, action: value.action,
           storylineId: value.storylineId,
+          ...(value.origin === 'manual' ? { origin: 'manual' } : {}),
           relationEvidence: value.relationEvidence,
-          before: value.before ? { stateId: value.before.stateId, sourceFloorId: value.before.sourceFloorId, sourceDeltaId: value.before.sourceDeltaId, text: value.before.text, visibility: value.before.visibility, reason: value.before.reason, origin: value.before.origin, towardEntityId: value.before.towardEntityId, sourceAssistantSeq: value.before.sourceAssistantSeq } : null,
-          after: value.after ? { stateId: value.after.stateId, sourceFloorId: value.after.sourceFloorId, sourceDeltaId: value.after.sourceDeltaId, text: value.after.text, visibility: value.after.visibility, reason: value.after.reason, origin: value.after.origin, towardEntityId: value.after.towardEntityId, sourceAssistantSeq: value.after.sourceAssistantSeq } : null,
+          before: value.before ? { ...cseQuantificationFields(value.before, value.layer), stateId: value.before.stateId, sourceFloorId: value.before.sourceFloorId, sourceDeltaId: value.before.sourceDeltaId, text: value.before.text, visibility: value.before.visibility, reason: value.before.reason, origin: value.before.origin, towardEntityId: value.before.towardEntityId, toward: value.before.toward, sourceAssistantSeq: value.before.sourceAssistantSeq } : null,
+          after: value.after ? { ...cseQuantificationFields(value.after, value.layer), stateId: value.after.stateId, sourceFloorId: value.after.sourceFloorId, sourceDeltaId: value.after.sourceDeltaId, text: value.after.text, visibility: value.after.visibility, reason: value.after.reason, origin: value.after.origin, towardEntityId: value.after.towardEntityId, toward: value.after.toward, sourceAssistantSeq: value.after.sourceAssistantSeq } : null,
         })),
         storylines: (selection.storylines ?? []).map(value => ({ storylineId: value.storylineId, title: value.title, basis: value.basis })),
         selectorDiagnostic: selectorDiagnosticSnapshot(selection.selectorDiagnostic),
@@ -1817,31 +2678,46 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
         skipReasons: [...new Set([...(selection.skipReasons ?? []), ...partialReasons])],
         createdAt: nowIso(now),
       };
-      if (receiptBase.timeDependencies.mode === 'selected' && (receiptBase.timeDependencies.corrections.length || receiptBase.timeDependencies.reminders.length) && selection.limits) {
-        receiptBase.timeDependencies.renderPlan = { floors: selection.floors.map(({ floorId, floorMemoryId, assistantSeq, reasons, chronology, items }) => ({ floorId, floorMemoryId, assistantSeq, reasons: [...reasons], chronology: clone(chronology),
+      if (receiptBase.timeDependencies.mode === 'selected' && selection.limits && (typeof manualMemorySnapshot === 'function'
+        || selection.manualPlaces?.length || selection.floors.some(floor => floor.items.some(item => item.placeEntityId || item.kind === 'manualArtifact'))
+        || receiptBase.timeDependencies.corrections.length || receiptBase.timeDependencies.reminders.length)) {
+        receiptBase.timeDependencies.renderPlan = { entityNames: source.entities.map(entity => [entity.entityId, entity.displayName]), floors: selection.floors.map(({ floorId, floorMemoryId, assistantSeq, reasons, chronology, items }) => ({ floorId, floorMemoryId, assistantSeq, reasons: [...reasons], chronology: clone(chronology),
           items: items.map(({ rankScore, rankBranches, rankEntityBranches, ...item }) => clone(item)) })), limits: { maxCharacters: selection.limits.maxCharacters, estimatedTokenBudget: selection.limits.estimatedTokenBudget } };
+        const timeScope = selectedManualTimeScope(receiptBase.timeDependencies, source.timeProjection);
+        if (timeScope.length) receiptBase.timeDependencies.renderPlan.manualTimeItems = timeScope;
       }
       receiptBase.completionStatus = receiptBase.injectionText ? 'ready' : 'empty';
       diagnostic.selectionStatus = 'completed'; diagnostic.coverage = clone(receiptBase.coverage); diagnostic.stages = clone(receiptBase.stages); diagnostic.selectorDiagnostic = clone(receiptBase.selectorDiagnostic);
       const commitStarted = Date.now();
-      operation.phase = diagnostic.phase = 'commit';
-      advanceOperation(operation, 'commitVerification');
-      let committed;
-      try { committed = await commitPromptIfCurrent({ operation, source, receipt: receiptBase, selectedFloors: receiptBase.selectedFloors, selectedFloorsForValidation: selection.floors, selectedStates: receiptBase.selectedStates, selectedCseChanges: receiptBase.selectedCseChanges, timeDependencies: receiptBase.timeDependencies, userIndex: user.index, userFingerprint, hostGuard, injectionText: receiptBase.injectionText }); }
-      finally { timings.commitMs = Date.now() - commitStarted; }
-      if (!committed.ok) return stopForFinalSafety(committed.reason);
-      receiptBase = { ...committed.receipt, timings: receiptTimingSnapshot(timings) };
-      if (typeof qianshiDeletionProvider === 'function') { advanceOperation(operation, 'deletionWitness'); receiptBase.qianshiDeletionWitness = await qianshiDeletionWitness(receiptBase, source.qianshiDeletedEvents ?? [], fingerprint); }
-      diagnostic.stages = clone(receiptBase.stages);
-      diagnostic.selectorDiagnostic = clone(receiptBase.selectorDiagnostic);
+      let committed, sealedReceipt;
+      for (let commitAttempt = 0; commitAttempt < 2; commitAttempt += 1) {
+        try {
+          operation.phase = diagnostic.phase = 'commit';
+          advanceOperation(operation, 'commitVerification');
+          committed = await commitPromptIfCurrent({ operation, source, receipt: receiptBase, selectedFloors: receiptBase.selectedFloors, selectedFloorsForValidation: selection.floors, selectedStates: receiptBase.selectedStates, selectedCseChanges: receiptBase.selectedCseChanges, timeDependencies: receiptBase.timeDependencies, userIndex: user.index, userFingerprint, hostGuard, injectionText: receiptBase.injectionText });
+          if (!committed.ok) return stopForFinalSafety(committed.reason);
+          receiptBase = { ...committed.receipt, timings: receiptTimingSnapshot(timings) };
+          if (typeof qianshiDeletionProvider === 'function') { advanceOperation(operation, 'deletionWitness'); receiptBase.qianshiDeletionWitness = await qianshiDeletionWitness(receiptBase, source.qianshiDeletedEvents ?? [], fingerprint); }
+          diagnostic.stages = clone(receiptBase.stages);
+          diagnostic.selectorDiagnostic = clone(receiptBase.selectorDiagnostic);
+          if (token !== epoch || operation.controller.signal.aborted) return finishStale(operation, timings);
+          advanceOperation(operation, 'receiptSeal');
+          sealedReceipt = Object.freeze({ ...receiptBase, receiptFingerprint: await fingerprint(JSON.stringify(receiptMaterial(receiptBase))) });
+          break;
+        } catch (error) {
+          if (token !== epoch || operation.controller.signal.aborted) return finishStale(operation, timings);
+          if (error?.name === 'AbortError') throw error;
+          clearSlot(token);
+          operation.prequelCommitted = false;
+          lastPrequel = null;
+          if (commitAttempt === 1) throw error;
+        } finally { timings.commitMs = Date.now() - commitStarted; }
+      }
       if (partialReasons.length) {
         try { notifyUser?.({ kind: 'warning', text: receiptBase.injectionText
           ? '当前聊天仍有摘要或人物状态缺口；本轮已使用能确认归属的已保存记忆，正文继续生成。'
           : '当前聊天仍有摘要或人物状态缺口；本轮没有找到可注入的已保存记忆，正文继续生成。' }); } catch { /* notification must not affect recall */ }
       }
-      if (token !== epoch || operation.controller.signal.aborted) return finishStale(operation, timings);
-      advanceOperation(operation, 'receiptSeal');
-      const sealedReceipt = Object.freeze({ ...receiptBase, receiptFingerprint: await fingerprint(JSON.stringify(receiptMaterial(receiptBase))) });
       if (token !== epoch || operation.controller.signal.aborted) return finishStale(operation, timings);
       // 核验包括来源复核、删除见证和封签。准备完成立即放行，宿主原 saveChat 在后台完成。
       timings.commitMs = Date.now() - commitStarted;
@@ -1871,11 +2747,13 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       notify(); return getState();
       } catch (error) {
       if (token !== epoch || operation.controller.signal.aborted) return finishStale(operation, timings);
+      // 下游请求中断不代表宿主正文已停；有效轮次仍须走错误出口通知宿主停止。
       clearSlot(token);
       operation.prequelCommitted = false;
       lastPrequel = null;
       const taskMetadata = sanitizeTaskMetadata(error?.taskMetadata);
-      const safe = Object.freeze({ code: clean(error?.code ?? error?.name ?? 'V3_RECALL_FAILED', 120), message: clean(error?.message ?? '召回失败，已安全停止。', 500),
+      const requestAborted = error?.name === 'AbortError';
+      const safe = Object.freeze({ code: clean(requestAborted ? 'AbortError' : error?.code ?? error?.name ?? 'V3_RECALL_FAILED', 120), message: clean(error?.message ?? '召回失败，已安全停止。', 500),
         source: taskMetadata.source, sourceLabel: taskMetadata.sourceLabel, model: taskMetadata.model,
         sourceStage: error?.selectorDiagnostic?.sourceStage || taskMetadata.sourceStage || diagnostic.phase,
         httpStatus: Number.isSafeInteger(error?.httpStatus ?? error?.status) ? error.httpStatus ?? error.status : taskMetadata.httpStatus,
@@ -1883,8 +2761,12 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
         transportAttempts: Number.isSafeInteger(error?.transportAttempts ?? taskMetadata.transportAttempts) ? error.transportAttempts ?? taskMetadata.transportAttempts : null });
       if (error?.selectorDiagnostic) diagnostic.selectorDiagnostic = selectorDiagnosticSnapshot(error.selectorDiagnostic);
       diagnostic.error = safe; diagnostic.timings = clone({ ...timings, totalMs: Date.now() - diagnostic.started });
-      if (attempt === 0) {
-        try { notifyUser?.({ kind: 'warning', text: '记忆召回未完成，正在重试一次。' }); } catch { /* notification must not affect recall */ }
+      const status = error?.httpStatus ?? error?.status;
+      const nonRetryable = requestAborted
+        || ['QQJ_CONFIG', 'QQJ_PRESET_INVALID', 'QQJ_DISABLED', 'QQJ_AUTH', 'QQJ_NOT_FOUND', 'QQJ_REQUEST_FORMAT'].includes(error?.code)
+        || Number.isInteger(status) && status >= 400 && status < 500 && status !== 429;
+      if (!nonRetryable && diagnostic.selectionStatus !== 'completed' && attempt + 1 < (operation.transportBudget.totalAttempts ?? 2) && operation.transportBudget.remaining > 0) {
+        try { notifyUser?.({ kind: 'warning', text: '记忆召回未完成，正在重试。' }); } catch { /* notification must not affect recall */ }
         // 失败阶段留在本 attempt 的快照中；下一次重试从新步骤开始，不把失败误记为成功完成。
         operation.step = null; operation.stepStarted = null;
         continue;
@@ -1892,7 +2774,7 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       lastError = safe;
       lastRecall = Object.freeze({ status: 'error', userMessageIndex: operation.user?.index ?? null, generationType: type, coverage: null, selectedFloors: Object.freeze([]), selectedStates: Object.freeze([]), selectedCseChanges: Object.freeze([]), selectorDiagnostic: null, injectionText: '', reusedReceipt: false, restoredReceipt: false, receiptPersistence: 'none', stages: null, ...runtimeDiagnostic(operation, timings, true), skipReasons: Object.freeze(['error']), error: safe, createdAt: nowIso(now) });
       bindOperationRecall(operation);
-      try { notifyUser?.({ kind: 'warning', text: `记忆召回重试后仍失败，已停止正文生成：${publicErrorMessage({ code: safe.code, message: safe.message }, { fallback: '记忆召回失败，请稍后重试。' })}` }); } catch { /* notification must not affect recall */ }
+      try { notifyUser?.({ kind: 'warning', text: `记忆召回失败，已停止正文生成：${publicErrorMessage({ code: safe.code, message: safe.message }, { fallback: '记忆召回失败，请稍后重试。' })}` }); } catch { /* notification must not affect recall */ }
       active = null;
       if (typeof abort === 'function') abort(true);
       logger?.warn?.('[qianqianjie] V3 recall failed after retry', { code: safe.code }); notify(); return getState();
@@ -1930,7 +2812,7 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
     requestDiagnostic.clear();
     epoch += 1; active?.controller.abort(FINAL_REASONS.has(reason) ? reason : 'superseded'); active = null;
     // 人工删除撤在途注入，但保留首次选材回执；下一次重生只剔除明确删除材料。
-    if (reason !== 'qianshiManuallyDeleted') sessionReceipt = null;
+    if (!['qianshiManuallyDeleted', 'timeManuallyEdited'].includes(reason)) sessionReceipt = null;
     generationQueue.length = 0; stoppedEndDebt = 0; clearSlot();
     lastRecall = null; lastPrequel = null; lastRecallBinding = null; lastRecallReceiptOwner = null; lastError = null; notify();
   }
@@ -2040,7 +2922,7 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
       let receiptSnapshot = receipt.schemaVersion === RECALL_RECEIPT_SCHEMA_VERSION
         ? await persistedReceiptValid(receipt, { chatId, userIndex: user.index, userFingerprint: persistedUserFingerprint, pluginVersion }, fingerprint)
         : null;
-      if (!receiptSnapshot && [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, RECALL_RECEIPT_SCHEMA_VERSION].includes(receipt.schemaVersion)) {
+      if (!receiptSnapshot && [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, RECALL_RECEIPT_SCHEMA_VERSION].includes(receipt.schemaVersion)) {
         const historical = await historicalSignedReceiptValid(receipt, { chatId, userIndex: user.index, userFingerprint: persistedUserFingerprint }, fingerprint);
         if (historical) receiptSnapshot = Object.freeze({ ...stateFromReceipt(historical, { restoredReceipt: true }), legacyReadOnly: true });
       }
@@ -2067,5 +2949,5 @@ export function createV3RecallRuntime({ store, hostAdapter, generateUtilityTask 
 
   async function setEnabled(value) { enabledOverride = value === true; if (!enabledOverride) invalidate('disabled', 'runtimeDisabled'); return getState(); }
   function clearCurrent() { clearSlot(); lastRecall = null; lastPrequel = null; lastRecallBinding = null; lastRecallReceiptOwner = null; lastError = null; notify(); return getState(); }
-  return Object.freeze({ intercept, bind, setEnabled, clearCurrent, restorePersistedReceipt, getPrequel, savePrequel, getState, getPromptSnapshot, invalidate, subscribe(listener) { subscribers.add(listener); return () => subscribers.delete(listener); } });
+  return Object.freeze({ intercept, bind, setEnabled, clearCurrent, restorePersistedReceipt, getActivityState: () => ({ busy: active !== null, phase: active?.phase ?? null }), getPrequel, savePrequel, getState, getPromptSnapshot, invalidate, subscribe(listener) { subscribers.add(listener); return () => subscribers.delete(listener); } });
 }

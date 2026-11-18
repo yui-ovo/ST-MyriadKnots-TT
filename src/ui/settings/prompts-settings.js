@@ -5,46 +5,61 @@ import { DEFAULT_CSE_GUIDANCE } from '../../v3/cse-engine.js';
 import { DEFAULT_PROFILE_GUIDANCE } from '../../v3/people-workspace.js';
 import { BASE_PROCESSING_PROMPT } from '../../internal-processing-prompt.js';
 import { DEFAULT_WORLDBOOK_GUIDANCE } from '../../dynamic-worldbook-update.js';
+import { DEFAULT_AVATAR_PROMPT } from '../../avatar-generation.js';
 
-// 提示词与包裹符：字段 change 即存；业务指导可编辑，机器合同由运行时固定维护。
-export function createPromptsSettings({ settings, documentRef = globalThis.document, open = false, onToggle, onStoryClockChange } = {}) {
+// 长提示词在草稿弹窗内编辑，保存时一次写入；短设置仍即时生效。
+export function createPromptsSettings({ settings, documentRef = globalThis.document, open = false, onToggle, onStoryClockChange, customImpl = null, subscribeSettingsChange = null } = {}) {
   const { element, button, field, subDrawer } = createSettingsKit(documentRef);
   const { drawer, body } = subDrawer({ title: '提示词与包裹符', id: 'qqj-settings-prompts', open, onToggle });
   body.className += ' settings-drawer-list';
   const { drawer: wrapperDrawer, body: wrapperBody } = subDrawer({ title: '包裹符', id: 'qqj-settings-wrappers' });
   const current = settings.get();
 
-  const keepTags = element('input', 'settings-input'); keepTags.value = current.sourceKeepTags ?? 'content'; keepTags.placeholder = 'content';
-  const extraTags = element('input', 'settings-input'); extraTags.value = current.sourceExtraTags ?? ''; extraTags.placeholder = '如：think, reasoning, [[...]]';
+  const wrappers = settings.wrappers();
+  const keepTags = element('input', 'settings-input'); keepTags.value = wrappers.keepTags; keepTags.placeholder = 'content';
+  const extraTags = element('input', 'settings-input'); extraTags.value = wrappers.extraTags; extraTags.placeholder = '如：think, reasoning, [[...]]';
   const storyClockEnabled = element('input'); storyClockEnabled.type = 'checkbox'; storyClockEnabled.checked = current.storyClockEnabled !== false;
-  const storyClockPrompt = element('textarea', 'settings-input'); storyClockPrompt.value = current.storyClockPrompt ?? ''; storyClockPrompt.placeholder = '留空＝使用千千结内置默认时间戳提示词';
   const storyClockReferenceTags = element('input', 'settings-input'); storyClockReferenceTags.value = current.storyClockReferenceTags ?? ''; storyClockReferenceTags.placeholder = '填写成对标签名（可选）';
   const storyClockStatus = element('p', 'settings-result', onStoryClockChange?.({ readOnly: true })?.label ?? '时间戳状态会在下一次正文生成前刷新。');
   storyClockStatus.id = 'qqj-story-clock-status';
   const { drawer: storyClockDrawer, body: storyClockBody } = subDrawer({ title: '时间戳提示词', id: 'qqj-settings-story-clock' });
-  const summaryPrompt = element('textarea', 'settings-input'); summaryPrompt.value = current.summaryPrompt ?? ''; summaryPrompt.placeholder = '留空＝使用千千结内置默认摘要指导';
-  const csePrompt = element('textarea', 'settings-input'); csePrompt.value = current.csePrompt ?? ''; csePrompt.placeholder = '留空＝使用千千结内置默认 CSE 指导';
-  const profilePrompt = element('textarea', 'settings-input'); profilePrompt.value = current.profilePrompt ?? ''; profilePrompt.placeholder = '留空＝使用千千结内置默认人物资料指导';
-  const worldbookPrompt = element('textarea', 'settings-input'); worldbookPrompt.value = current.worldbookPrompt ?? ''; worldbookPrompt.placeholder = '留空＝使用内置世界书更新指导';
-  const processingPrompt = element('textarea', 'settings-input'); processingPrompt.value = current.processingPrompt ?? ''; processingPrompt.placeholder = '留空＝使用千千结内置默认破限提示词';
   const { drawer: processingDrawer, body: processingBody } = subDrawer({ title: '破限提示词', id: 'qqj-settings-processing-prompt' });
   const { drawer: summaryDrawer, body: summaryBody } = subDrawer({ title: '摘要内容指导', id: 'qqj-settings-summary-prompt' });
   const { drawer: cseDrawer, body: cseBody } = subDrawer({ title: 'CSE 内容指导', id: 'qqj-settings-cse-prompt' });
   const { drawer: profileDrawer, body: profileBody } = subDrawer({ title: '人物资料内容指导', id: 'qqj-settings-profile-prompt' });
   const { drawer: worldbookDrawer, body: worldbookBody } = subDrawer({ title: '世界书更新内容指导', id: 'qqj-settings-worldbook-prompt' });
+  const { drawer: avatarDrawer, body: avatarBody } = subDrawer({ title: '头像生图提示词', id: 'qqj-settings-avatar-prompt' });
 
-  keepTags.addEventListener('change', () => settings.update({ sourceKeepTags: keepTags.value }));
-  extraTags.addEventListener('change', () => settings.update({ sourceExtraTags: extraTags.value }));
+  keepTags.addEventListener('change', () => settings.updateWrappers({ keepTags: keepTags.value }));
+  extraTags.addEventListener('change', () => settings.updateWrappers({ extraTags: extraTags.value }));
+  const refreshWrappers = () => {
+    const value = settings.wrappers();
+    for (const [input, key] of [[keepTags, 'keepTags'], [extraTags, 'extraTags']]) {
+      if (documentRef.activeElement !== input && !input.matches?.(':focus')) input.value = value[key];
+    }
+  };
+  keepTags.addEventListener('blur', refreshWrappers); extraTags.addEventListener('blur', refreshWrappers);
+  const releaseSettings = subscribeSettingsChange?.(refreshWrappers);
   const refreshClock = () => {
     const result = onStoryClockChange?.() ?? null;
     storyClockStatus.textContent = result?.label ?? '时间戳状态会在下一次正文生成前刷新。';
   };
   storyClockEnabled.addEventListener('change', () => { settings.update({ storyClockEnabled: storyClockEnabled.checked }); refreshClock(); });
-  storyClockPrompt.addEventListener('change', () => { settings.update({ storyClockPrompt: storyClockPrompt.value }); refreshClock(); });
   storyClockReferenceTags.addEventListener('change', () => settings.update({ storyClockReferenceTags: storyClockReferenceTags.value }));
-  const loadDefault = button('载入默认再改', 'secondary-action', () => { storyClockPrompt.value = DEFAULT_MYKNOTS_STORY_CLOCK_PROMPT; settings.update({ storyClockPrompt: storyClockPrompt.value }); refreshClock(); });
-  const restoreDefault = button('恢复默认', 'secondary-action', () => { storyClockPrompt.value = ''; settings.update({ storyClockPrompt: '' }); refreshClock(); });
-  const clockActions = element('div', 'v3-foundation-actions'); clockActions.append(loadDefault, restoreDefault);
+  const promptDialog = (title, value, defaultText, onSave) => {
+    if (typeof customImpl !== 'function') return;
+    const panel = element('section', 'qqj-editor-dialog');
+    panel.append(element('p', 'qqj-editor-intro', '修改内容仅在保存后生效，取消不会更改当前提示词。'));
+    const group = element('section', 'qqj-editor-group'); group.append(element('h3', '', title));
+    const input = element('textarea', 'settings-input qqj-editor-textarea'); input.value = value; input.placeholder = '留空使用内置默认'; input.rows = 12;
+    const actions = element('div', 'qqj-editor-inline-actions');
+    actions.append(button('载入内置默认', 'secondary-action', () => { input.value = defaultText; }), button('恢复默认', 'secondary-action', () => { input.value = ''; }));
+    group.append(input, actions); panel.append(group);
+    void customImpl({ title: `编辑${title}`, content: panel, confirmText: '保存', cancelText: '取消', submit: async () => { await onSave(input.value); return true; } });
+  };
+  const promptButton = (bodyNode, title, key, defaultText, onSave) => {
+    bodyNode.append(button(`编辑${title}`, 'secondary-action', () => promptDialog(title, key === 'processingPrompt' ? settings.processingPrompt() : settings.get()[key] ?? '', defaultText, onSave)));
+  };
   const clockToggle = element('label', 'setting-switch'); clockToggle.append(storyClockEnabled, element('span', '', '启用正文时间戳'));
   storyClockBody.append(
     clockToggle,
@@ -52,28 +67,22 @@ export function createPromptsSettings({ settings, documentRef = globalThis.docum
     element('p', 'settings-hint', '默认 QQJ-start/end，也兼容 SDC 和旧 myknots 格式。自定义文本原样发送，请保留成对 start/end 及 date、weekday、time 字段。'),
     field('正文时间参考标签', storyClockReferenceTags),
     element('p', 'settings-hint', '额外时间标签名用逗号或换行分隔，留空关闭。标准时间戳优先；补读故事时间，不改变正文清洗，也不受生成开关影响。'),
-    field('完整自定义提示词', storyClockPrompt),
-    clockActions,
+    element('p', 'settings-hint', '完整提示词在弹窗中编辑；保存后生效。'),
+    button('编辑时间戳提示词', 'secondary-action', () => promptDialog('时间戳提示词', settings.get().storyClockPrompt ?? '', DEFAULT_MYKNOTS_STORY_CLOCK_PROMPT, async value => { settings.update({ storyClockPrompt: value }); refreshClock(); })),
   );
 
-  const promptEditor = ({ body: editorBody, control, key, defaultText, label, hint = '这里只改内容要求；输出结构、人物绑定和信息范围由程序维护。恢复默认会使用内置文本。' }) => {
-    control.addEventListener('change', () => settings.update({ [key]: control.value }));
-    const load = button('载入默认再改', 'secondary-action', () => { control.value = defaultText; settings.update({ [key]: control.value }); });
-    const restore = button('恢复默认', 'secondary-action', () => { control.value = ''; settings.update({ [key]: '' }); });
-    const actions = element('div', 'v3-foundation-actions'); actions.append(load, restore);
-    editorBody.append(
-      element('p', 'settings-hint', hint),
-      field(label, control),
-      actions,
-    );
+  const promptEditor = ({ body: editorBody, key, defaultText, label, hint = '这里只改内容要求；输出结构、人物绑定和信息范围由程序维护。恢复默认会使用内置文本。' }) => {
+    editorBody.append(element('p', 'settings-hint', hint));
+    promptButton(editorBody, label, key, defaultText, async text => settings.update({ [key]: text }));
   };
-  promptEditor({ body: processingBody, control: processingPrompt, key: 'processingPrompt', defaultText: BASE_PROCESSING_PROMPT, label: '破限提示词', hint: '用于摘要、双丝网、人物整理和动态世界书，位于任务指导之前。留空用默认；自定义文本原样发送，替换默认。' });
-  promptEditor({ body: summaryBody, control: summaryPrompt, key: 'summaryPrompt', defaultText: DEFAULT_EXTRACTOR_GUIDANCE, label: '摘要内容要求' });
-  promptEditor({ body: cseBody, control: csePrompt, key: 'csePrompt', defaultText: DEFAULT_CSE_GUIDANCE, label: 'CSE 推演要求' });
-  promptEditor({ body: profileBody, control: profilePrompt, key: 'profilePrompt', defaultText: DEFAULT_PROFILE_GUIDANCE, label: '人物资料整理要求' });
-  promptEditor({ body: worldbookBody, control: worldbookPrompt, key: 'worldbookPrompt', defaultText: DEFAULT_WORLDBOOK_GUIDANCE, label: '世界书更新要求', hint: '用记忆、对应进度的 CSE 和未隐藏对话核对已有设定，仅局部修订改变的事实，不扩写人物档案或复制当前状态。程序检查原文定位、权限与证据编号。前置处理提示词仍放在本指导之前；旧自定义指导可点恢复默认。' });
+  promptEditor({ body: processingBody, key: 'processingPrompt', defaultText: BASE_PROCESSING_PROMPT, label: '破限提示词', hint: '白鳥系列文字模型请求共用，保存后供下一次请求使用；留空使用内置默认；恢复默认清空草稿，保存后生效。' });
+  promptEditor({ body: summaryBody, key: 'summaryPrompt', defaultText: DEFAULT_EXTRACTOR_GUIDANCE, label: '摘要内容指导' });
+  promptEditor({ body: cseBody, key: 'csePrompt', defaultText: DEFAULT_CSE_GUIDANCE, label: 'CSE 内容指导' });
+  promptEditor({ body: profileBody, key: 'profilePrompt', defaultText: DEFAULT_PROFILE_GUIDANCE, label: '人物资料内容指导' });
+  promptEditor({ body: worldbookBody, key: 'worldbookPrompt', defaultText: DEFAULT_WORLDBOOK_GUIDANCE, label: '世界书更新内容指导', hint: '用记忆、对应进度的 CSE 和未隐藏对话核对已有设定，仅局部修订改变的事实。保存后供后续更新使用；留空使用默认。' });
+  promptEditor({ body: avatarBody, key: 'avatarPrompt', defaultText: DEFAULT_AVATAR_PROMPT, label: '头像生图提示词', hint: '单人头像构图，人物外貌来自柏宝绘角色库。保存后供后续生成使用；留空使用默认。' });
 
-  wrapperBody.append(field('保留包裹符', keepTags), field('清洗包裹符', extraTags));
+  wrapperBody.append(element('p', 'settings-hint', '白鳥系列插件全部共享'), field('保留包裹符', keepTags), field('清洗包裹符', extraTags));
   body.append(
     wrapperDrawer,
     storyClockDrawer,
@@ -81,7 +90,8 @@ export function createPromptsSettings({ settings, documentRef = globalThis.docum
     summaryDrawer,
     cseDrawer,
     profileDrawer,
+    avatarDrawer,
     worldbookDrawer,
   );
-  return { node: drawer };
+  return { node: drawer, dispose: () => releaseSettings?.() };
 }

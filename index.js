@@ -1,28 +1,39 @@
+import { startQianchuangMapCatalog } from './src/qianchuang-map-catalog.js';
+import { QIANCHUANG_MAP_ASSETS } from './src/qianchuang-map-assets.js';
+import { CITY_MAPS } from './src/ui/qianchuang-city-maps.js';
+import { filterPlaceFoundationSources, placeWorkspaceDependency } from './src/v3/place-foundation.js';
+import { captureQianchuangCharacterSources } from './src/place-worldbook-material.js';
+import { createPlaceWorkspaceStore } from './src/v3/place-workspace.js';
+import { normalizeIdentityProjection } from './src/v3/entity-identity.js';
 import { createVectorApiClient, resolveVectorConfig } from './src/vector-api.js';
 import { createVectorIndex } from './src/v3/vector-index.js';
 import { createVectorAutoUpdater } from './src/v3/vector-auto-update.js';
 import { readVectorSource } from './src/v3/vector-source-reader.js';
-import { user_avatar } from '/scripts/personas.js';
+import { user_avatar, getUserAvatar } from '/scripts/personas.js';
 import { power_user } from '/scripts/power-user.js';
-import { extension_settings, extensionNames } from '/scripts/extensions.js';
-import { is_send_press, saveSettingsDebounced } from '/script.js';
+import { extension_settings, extensionNames, extensionTypes } from '/scripts/extensions.js';
+import { is_send_press, saveSettingsDebounced, getRequestHeaders } from '/script.js';
+import * as hostScript from '/script.js';
 import { is_group_generating } from '/scripts/group-chats.js';
 import { loadWorldInfo, selected_world_info, world_info, world_info_case_sensitive, world_info_match_whole_words, world_names } from '/scripts/world-info.js';
-import { localforage } from '/lib.js';
+import { localforage, showdown, DOMPurify } from '/lib.js';
 import { getCurrentUserHandle } from '/scripts/user.js';
-import { version as pluginVersion } from './manifest.json';
+import { download as hostDownload } from '/scripts/utils.js';
+import { version as pluginVersion, update_notice as updateNoticePath } from './manifest.json';
 import { createBackendClient } from './src/backend-client.js';
-import { isTauriTavern } from './src/tauri-backend.js';
 import { createPrivateRecallDiagnostics } from './src/private-recall-diagnostics.js';
+import { createPluginUpdates } from './src/plugin-updates.js';
+import { createPluginActivity } from './src/plugin-activity.js';
 import { bootstrap } from './src/bootstrap.js';
 import { createSettingsStore } from './src/settings.js';
 import { createApiResolver, createApiTools, createTaskRouter } from './src/api-routing.js';
 import { createCompactApiClient } from './src/compact-api-client.js';
 import { createChatSession } from './src/chat-session.js';
 import { createChatIdentityCoordinator } from './src/chat-identity.js';
-import { createHostChatList } from './src/host-context.js';
+import { readHostState, cloneHostJsonMetadata, createHostChatList } from './src/host-context.js';
 import { createChatMemoryManagement } from './src/chat-memory-management.js';
 import { createStorageManagement } from './src/storage-management.js';
+import { createMemoryTransfer } from './src/memory-transfer.js';
 import { createPluginLifecycle } from './src/plugin-lifecycle.js';
 import { createSourcePermissionController } from './src/source-permission.js';
 import { captureTargetChatCoordinates, createHostAdapter } from './src/v3/host-adapter.js';
@@ -34,23 +45,36 @@ import { createV3MemoryRuntime } from './src/v3/memory-runtime.js';
 import { preparationFailureDiagnostic } from './src/v3/preparation-diagnostic.js';
 import { runHistoricalRebuildTask } from './src/v3/historical-rebuild-task.js';
 import { captureHistoricalRebuildSources as captureRebuildSources } from './src/v3/historical-rebuild-sources.js';
-import { persistMessageFloorAnchors, persistTargetChatIdentity } from './src/v3/message-floor-anchor.js';
+import { persistMessageFloorAnchors, persistTargetChatIdentity, readTargetChatFile } from './src/v3/message-floor-anchor.js';
 import { createV3RecallRuntime } from './src/v3/recall-runtime.js';
 import { createAutoHideController } from './src/v3/auto-hide.js';
 import { createPeopleWorkspaceStore, createPeopleWorkspaceRuntime, projectAnnualPeople } from './src/v3/people-workspace.js';
+import { createAvatarGenerator } from './src/avatar-generation.js';
+import { createAvatarImageStore } from './src/avatar-image-store.js';
 import { createChatBranchInitializer } from './src/v3/chat-branch-inheritance.js';
 import { copyLatestPeople } from './src/v3/chat-branch-inheritance.js';
 import { createChatMemoryMigration } from './src/chat-memory-migration.js';
 import { installPublicMemoryBridge } from './src/v3/public-memory-bridge.js';
+import { scanWorldInfo, createWorldInfoSourceCandidates } from './src/world-info-scanner.js';
 import { installPublicQianshiBridge } from './src/v3/public-qianshi-bridge.js';
 import { createMyKnotsStoryClockController, createStoryClockStatusProjection, extensionStoryClockState } from './src/story-clock.js';
 import { createInlineRenderer } from './src/ui/inline-renderer.js';
 import { normalizeStoryCalendar } from './src/v3/calendar-rules.js';
+
 import { createDynamicWorldbookRuntime } from './src/dynamic-worldbook-runtime.js';
-import { createMemoryTransfer } from './src/memory-transfer.js';
 import { installExtensionUpdateRefresh } from './src/extension-update-refresh.js';
 
+let memoryTransfer = null;
 const isGenerating = () => Boolean(is_send_press || is_group_generating);
+const isMemoryWorkBlocked = () => isGenerating() || memoryTransfer?.getState().active === true;
+const readMainGenerationState = () => {
+  try {
+    if (typeof hostScript.isGenerationInFlight !== 'function') return null;
+    const inFlight = hostScript.isGenerationInFlight();
+    if (typeof inFlight !== 'boolean') return null;
+    return inFlight || Boolean(is_group_generating) || memoryTransfer?.getState().active === true;
+  } catch { return null; }
+};
 const hostAdapter = createHostAdapter({ personaIdentifierProvider: () => user_avatar, worldInfoBindings: {
   loadWorldInfo,
   getSelectedWorldInfo: () => selected_world_info,
@@ -93,12 +117,14 @@ const announceStoryClockChange = () => {
   try { if (typeof globalThis.CustomEvent === 'function') globalThis.dispatchEvent?.(new globalThis.CustomEvent(STORY_CLOCK_COORDINATION_EVENT, { detail: { owner: 'myknots' } })); } catch { /* 宿主无 CustomEvent 时保持单插件行为 */ }
 };
 const refreshStoryClock = ({ readOnly = false, announce = false } = {}) => {
-  const result = projectStoryClockStatus({ readOnly });
-  if (announce) announceStoryClockChange();
-  return result;
+  try {
+    const result = projectStoryClockStatus({ readOnly });
+    if (announce) announceStoryClockChange();
+    return result;
+  } catch (error) { console.warn('[qianqianjie] 时间戳提示更新失败', error); }
 };
 globalThis.addEventListener?.(STORY_CLOCK_COORDINATION_EVENT, event => { if (event?.detail?.owner !== 'myknots') refreshStoryClock(); });
-const sanitizerOptions = () => ({ keepTags: settings.get().sourceKeepTags, extraTags: settings.get().sourceExtraTags });
+const sanitizerOptions = () => ({ ...settings.wrappers() });
 
 const backendClient = createBackendClient({ headers: () => hostContext()?.getRequestHeaders?.() ?? {} });
 let ui;
@@ -113,9 +139,10 @@ const clearPluginLifecycleFailure = () => { pluginLifecycleFailureRevision += 1;
 const clearPluginLifecycleFailureIfUnchanged = revision => {
   if (pluginLifecycleFailureRevision === revision) clearPluginLifecycleFailure();
 };
+const processingPrompt = () => settings.processingPrompt();
 const compactClient = createCompactApiClient({
   headers: () => hostContext()?.getRequestHeaders?.() ?? {},
-  onBusyChange: busy => ui?.fab?.setBusy?.(busy),
+  processingPrompt,
 });
 const apiResolver = createApiResolver({ settings });
 const taskRouter = createTaskRouter({
@@ -123,24 +150,40 @@ const taskRouter = createTaskRouter({
   compactClient,
   isEnabled: settings.isEnabled,
 });
-const apiTools = createApiTools({ resolver: apiResolver, compactClient, isEnabled: settings.isEnabled });
+const peopleTaskRouter = createTaskRouter({ resolver: apiResolver, compactClient, isEnabled: settings.isEnabled });
+const apiTools = createApiTools({ resolver: apiResolver, compactClient, processingPrompt, isEnabled: settings.isEnabled });
 const listHostChats = createHostChatList({ headers: () => hostContext()?.getRequestHeaders?.() ?? {} });
-const initializeChatBranch = createChatBranchInitializer({ client: backendClient, hostAdapter, vectorRuntimeProvider: () => vectorIndex, sanitizerOptions });
+const initializeChatBranch = createChatBranchInitializer({ client: backendClient, hostAdapter, vectorRuntimeProvider: () => vectorIndex,
+  coreRecordCacheProvider: () => coreRecordCache,
+  captureCalendar: chatId => settings.get().storyCalendars?.[chatId] ?? null,
+  persistCalendar: (chatId, calendar) => persistStoryCalendar(chatId, calendar),
+});
 const identityCoordinator = createChatIdentityCoordinator({ client: backendClient, freshUuid: newUuid, listHostChats, initializeBranch: initializeChatBranch,
+  readTargetFile: (raw, host, { signal }) => readTargetChatFile(captureTargetChatCoordinates({ context: raw, chatId: host.hostChatId }, {
+    hostChatId: host.hostChatId, characterLocator: host.characterAvatar,
+  }), { signal, readPhase: 'identityBeforeSave' }),
   persist: (raw, chatId, taskInputs, signal) => {
     if (!taskInputs?.target) throw Object.assign(new Error('固定聊天保存坐标不可用。'), { code: 'QQJ_TARGET_CHAT_DESCRIPTOR_REQUIRED' });
     return persistTargetChatIdentity({ coordinates: taskInputs.target, raw, snapshot: taskInputs, chatId, listHostChats, signal });
   },
 });
-const session = createChatSession({ contextProvider, isEnabled: settings.isEnabled, identityCoordinator, captureTaskInputs: ({ raw, host }) => {
+const session = createChatSession({ contextProvider, isEnabled: settings.isEnabled, identityCoordinator, onPrepared: ({ result }) => {
+  const revision = pluginLifecycleFailureRevision;
+  void v3MemoryRuntime.start({ preparedIdentity: result.identity }).then(() => {
+    if (session.getState().identity === result.identity && pluginLifecycleFailure?.phase === 'identityPrepare') clearPluginLifecycleFailureIfUnchanged(revision);
+  }).catch(error => recordPluginLifecycleFailure(error, 'identityPrepare'));
+}, captureTaskInputs: ({ raw, host, observeOnly = false }) => {
+  if (observeOnly) {
+    void v3MemoryRuntime.start({ preparationSnapshot: { chat: Array.isArray(raw.chat) ? raw.chat : [], identity: { hostChatId: host.hostChatId, characterLocator: host.characterAvatar, personaLocator: host.personaAvatar } } });
+    return null;
+  }
   const target = captureTargetChatCoordinates({ context: raw, chat: raw.chat, chatId: host.hostChatId, source: 'captured' }, {
     hostChatId: host.hostChatId, characterLocator: host.characterAvatar, personaLocator: host.personaAvatar,
   });
   return {
-    chat: structuredClone(Array.isArray(raw.chat) ? raw.chat : []),
-    chatMetadata: structuredClone(raw.chatMetadata ?? {}),
+    chat: cloneHostJsonMetadata(Array.isArray(raw.chat) ? raw.chat : []),
+    chatMetadata: cloneHostJsonMetadata(raw.chatMetadata ?? {}),
     target,
-    sanitizerOptions: Object.freeze({ ...sanitizerOptions() }),
   };
 } });
 // 设置页在禁用、未选聊天及身份准备期间仍须可打开；此时不读写聊天历法，保存仍走严格身份校验。
@@ -151,13 +194,20 @@ const calendarContextProvider = () => {
   return { chatId: owner.chatId, calendar: settings.get().storyCalendars[owner.chatId] ?? null };
 };
 // 历法设置按 QQJ 聊天身份保存；读取计算规则不依赖时间推演开关。
-const storyCalendarProvider = () => calendarContextProvider().calendar;
+const storyCalendarProvider = chatId => chatId ? settings.get().storyCalendars[chatId] ?? null : calendarContextProvider().calendar;
+const persistStoryCalendar = (targetChatId, calendar) => {
+  const previous = { ...(settings.get().storyCalendars ?? {}) };
+  if (Object.hasOwn(previous, targetChatId)) return previous[targetChatId] ?? null;
+  try { settings.update({ storyCalendars: { ...previous, [targetChatId]: calendar } }, { observeSaveFailure: true }); }
+  catch (error) { try { settings.update({ storyCalendars: previous }); } catch { /* restore in-memory settings if save scheduling failed */ } throw error; }
+  return settings.get().storyCalendars?.[targetChatId] ?? null;
+};
 const sourcePermissions = createSourcePermissionController({ settings, contextProvider });
 const summaryPrompt = () => settings.get().summaryPrompt;
 const csePrompt = () => settings.get().csePrompt;
 const profilePrompt = () => settings.get().profilePrompt;
-const processingPrompt = () => settings.get().processingPrompt;
-const coreRecordCache = isTauriTavern() ? null : createIndexedDbCoreRecordCache({ localForage: localforage, accountHandleProvider: getCurrentUserHandle });
+const coreRecordCache = settings.get().coreCacheEnabled === false
+  ? null : createIndexedDbCoreRecordCache({ localForage: localforage, accountHandleProvider: getCurrentUserHandle });
 const foundationStore = createFoundationStore({ client: backendClient, contextProvider: () => session.identity(), isEnabled: settings.isEnabled, coreRecordCache });
 const targetFoundationStore = identity => foundationStore.forIdentity(identity);
 const timeStore = createTimeStore({ client: backendClient });
@@ -165,7 +215,7 @@ const foundationRuntime = createFoundationRuntime({
   hostAdapter,
   store: foundationStore,
   contextProvider,
-  prepareSession: () => session.prepare(),
+  prepareSession: () => session.prepare({ entryPoint: 'sourcePrepare' }),
   deferChatChangeRefreshUntilPrepared: true,
   isEnabled: settings.isEnabled,
   sanitizerOptions,
@@ -173,13 +223,39 @@ const foundationRuntime = createFoundationRuntime({
   hasTimeFloorReference: (chatId, floorId) => timeStore.hasFloorReference(chatId, floorId),
 });
 const peopleWorkspaceStore = createPeopleWorkspaceStore({ client: backendClient });
+const placeWorkspaceStore = createPlaceWorkspaceStore({ client: backendClient });
 let peopleWorkspaceRuntime;
-const identityProjectionProvider = async identityValue => {
+const placeWorkspaceDependencyProvider = async () => { const identity=session.identity(),value=await placeWorkspaceStore.read(identity);return placeWorkspaceDependency(identity.chatId,value.revision,filterPlaceFoundationSources(value.data,{filterWorldInfoSources:sourcePermissions.filterWorldInfoSources})); };
+const identityProjectionProvider = async (identityValue, { includePlaces = true, allowUnavailable = false, allowUnavailablePlaces = false, onPartial = null } = {}) => {
   const identity = identityValue ?? session.identity();
   const state = peopleWorkspaceRuntime?.getState?.();
-  if (state?.chatId === identity.chatId) return peopleWorkspaceRuntime.getIdentityProjection();
-  return (await peopleWorkspaceStore.read(identity)).data ?? {};
+  const settled = {};
+  const project = () => normalizeIdentityProjection({ ...(settled.people?.status === 'fulfilled' ? settled.people.value : {}),
+    ...(settled.places?.status === 'fulfilled' ? settled.places.value : {}),
+    unavailableSources: ['people', ...(includePlaces ? ['places'] : [])].filter(kind => settled[kind]?.status !== 'fulfilled'),
+  });
+  const read = async (kind, task) => {
+    try {
+      const value = await task(); settled[kind] = { status: 'fulfilled', value };
+      if (allowUnavailable) onPartial?.(project());
+      return value;
+    } catch (error) { settled[kind] = { status: 'rejected' }; throw error; }
+  };
+  const [people, places] = await Promise.allSettled([
+    read('people', async () => state?.chatId === identity.chatId && state.status === 'ready' && !state.lastError
+      ? peopleWorkspaceRuntime.getIdentityProjection() : (await peopleWorkspaceStore.read(identity)).data),
+    includePlaces ? read('places', async () => {
+      const value = await placeWorkspaceStore.read(identity);
+      return { placeWorkspace: filterPlaceFoundationSources(value.data, { filterWorldInfoSources: sourcePermissions.filterWorldInfoSources }), placeWorkspaceRevision: value.revision };
+    }) : Promise.resolve(null),
+  ]);
+  if (!allowUnavailable) {
+    if (people.status === 'rejected') throw people.reason;
+    if (places.status === 'rejected' && !allowUnavailablePlaces) throw places.reason;
+  }
+  return project();
 };
+
 const vectorApi = createVectorApiClient({ headers: () => hostContext()?.getRequestHeaders?.() ?? {} });
 const vectorIndex = createVectorIndex({
   client: backendClient, api: vectorApi, configProvider: () => resolveVectorConfig(settings),
@@ -187,7 +263,7 @@ const vectorIndex = createVectorIndex({
   isEnabled: settings.isEnabled,
   sourceProvider: ({ targetIdentity }) => readVectorSource({
     store: createFoundationStore({ client: backendClient, contextProvider: () => targetIdentity, isEnabled: settings.isEnabled, coreRecordCache }),
-    targetIdentity, cachedReachable: foundationRuntime.getReachable(),
+    targetIdentity, getReachable: () => foundationRuntime.getReachable(),
   }),
 });
 let v3RecallRuntime;
@@ -197,7 +273,9 @@ const timeRuntime = createTimeRuntime({
   store: timeStore, foundationStore, hostAdapter, session,
   getReachable: () => foundationRuntime.getReachable(),
   getMemoryState: () => v3MemoryRuntime.getState(),
+  getMemoryActivityState: () => v3MemoryRuntime.getActivityState(),
   generateTimeTask: taskRouter.generateUtilityTask,
+  processingPrompt,
   annualSettingsProvider: () => {
     const reachable = foundationRuntime.getReachable(), state = peopleWorkspaceRuntime?.getState?.();
     if (!reachable?.baseline?.userPersona?.entityId || state?.status !== 'ready' || state.chatId !== session.identity().chatId) return { ready: false };
@@ -207,6 +285,7 @@ const timeRuntime = createTimeRuntime({
   sanitizerOptions,
   storyClockReferenceTags: () => settings.get().storyClockReferenceTags,
   isEnabled: () => settings.isEnabled() && settings.get().timeEvolutionEnabled === true,
+  onInvalidate: reason => { if (['manualTimeEdited', 'manualTimeDeleted'].includes(reason)) v3RecallRuntime?.invalidate('timeManuallyEdited'); },
 });
 const v3MemoryRuntime = createV3MemoryRuntime({
   storyCalendarProvider,
@@ -223,7 +302,8 @@ const v3MemoryRuntime = createV3MemoryRuntime({
   notifyUser: notification => notification?.action === 'openMemory'
     ? globalThis.toastr?.warning?.(notification.text, undefined, { timeOut: 12000, closeButton: true, onclick: () => ui?.openMemory?.() })
     : globalThis.toastr?.[notification?.kind]?.(notification?.text),
-  isMainGenerationActive: isGenerating,
+  isMainGenerationActive: isMemoryWorkBlocked,
+  readMainGenerationState,
   extractorPromptGuidance: summaryPrompt,
   csePromptGuidance: csePrompt,
   processingPrompt,
@@ -232,7 +312,14 @@ const v3MemoryRuntime = createV3MemoryRuntime({
   sanitizerOptions,
   persistAnchors: persistMessageFloorAnchors,
   identityProjectionProvider,
-  captureBusinessIdentity: () => session.identity(),
+  placeWorkspaceStore,
+  placeWorldInfoProvider: request=>qianchuangWorldInfoProvider(request),
+  onPlaceChanged: (chatId,change) => { if(change?.automatic!==true&&session.identity().chatId===chatId)v3RecallRuntime?.invalidate('placeEdited'); },
+  captureBusinessIdentity: options => {
+    if (!options?.allowUnprepared) return session.identity();
+    const host = readHostState(contextProvider());
+    return host.ok ? { chatId: host.chatId, hostChatId: host.hostChatId, characterLocator: host.characterAvatar, personaLocator: host.personaAvatar } : null;
+  },
   storeForIdentity: targetFoundationStore,
   onQianshiEventDeleted: () => v3RecallRuntime?.invalidate('qianshiManuallyDeleted'),
   qianshiExternalReferenceProvider: (targetChatId, targetReachable) => {
@@ -242,7 +329,7 @@ const v3MemoryRuntime = createV3MemoryRuntime({
   newUuid,
 });
 const vectorAutoUpdater = createVectorAutoUpdater({ memoryRuntime: v3MemoryRuntime, vectorRuntime: vectorIndex,
-  configProvider: () => resolveVectorConfig(settings), isEnabled: settings.isEnabled, isMainGenerationActive: isGenerating });
+  configProvider: () => resolveVectorConfig(settings), isEnabled: settings.isEnabled, isMainGenerationActive: isMemoryWorkBlocked });
 const vectorWakeListeners = [];
 const vectorWakeHost = hostContext();
 let vectorWakeTimer = null, vectorWakeDisposed = false;
@@ -278,15 +365,17 @@ v3RecallRuntime = createV3RecallRuntime({
   store: foundationStore,
   hostAdapter,
   generateUtilityTask: taskRouter.generateRecallTask,
+  processingPrompt,
   semanticProvider: options => vectorIndex.query(options),
   isEnabled: settings.isEnabled,
   memoryStatus: () => v3MemoryRuntime.getState(),
+  manualMemorySnapshot: () => foundationRuntime.getReachable(),
   prepareMemory: options => v3MemoryRuntime.prepareCurrent(options),
   realtimeOrigin: () => v3MemoryRuntime.allowsRealtimeTailFromEmpty(),
   recentBodyFloorLimit: () => settings.get().autoHideKeepAiCount,
   notifyUser: notification => globalThis.toastr?.[notification?.kind]?.(notification?.text),
   sanitizerOptions,
-  identityProjectionProvider,
+  identityProjectionProvider, placeWorkspaceDependencyProvider,
   timeProjectionProvider: source => timeRuntime.recallProjection(source),
   qianshiProgressProvider: async (source, context) => {
     // Selected Qianshi receipts replay saved IDs and do not consume current story time.
@@ -300,33 +389,53 @@ v3RecallRuntime = createV3RecallRuntime({
 // 本机私有开关启用后独立留存临时诊断；专用客户端不混入记忆存储计数，也不等待诊断写入。
 const privateRecallDiagnostics = createPrivateRecallDiagnostics({
   client: createBackendClient({ headers: () => hostContext()?.getRequestHeaders?.() ?? {}, timeoutMs: 5000 }),
-  recallRuntime: v3RecallRuntime, vectorRuntime: vectorIndex, isEnabled: settings.isEnabled,
+  recallRuntime: v3RecallRuntime, vectorRuntime: vectorIndex, session, isEnabled: settings.isEnabled,
+  memoryRuntime: v3MemoryRuntime, backendDiagnosticProvider: () => ({ ...backendClient.getDiagnosticSnapshot(), coreCache: {
+    ...(coreRecordCache?.getStats?.() ?? { available: false }), enabled: Boolean(coreRecordCache),
+  } }),
 });
 if (globalThis.location?.origin) void privateRecallDiagnostics.start();
 globalThis.addEventListener?.('beforeunload', privateRecallDiagnostics.dispose, { once: true });
 peopleWorkspaceRuntime = createPeopleWorkspaceRuntime({
   store: peopleWorkspaceStore,
+  sanitizerOptions,
   session,
   foundationRuntime,
   foundationStore,
   hostAdapter,
   memoryRuntime: v3MemoryRuntime,
-  generateUtilityTask: taskRouter.generateUtilityTask,
+  generateUtilityTask: peopleTaskRouter.generateUtilityTask,
   sourcePermissions,
   contextProvider,
   profilePromptGuidance: profilePrompt,
+  avatarGenerator: createAvatarGenerator(),
+  avatarImageStore: createAvatarImageStore({ headers: getRequestHeaders, uuid: newUuid }),
+  avatarPrompt: () => settings.get().avatarPrompt,
   processingPrompt,
   isEnabled: settings.isEnabled,
-  isMainGenerationActive: isGenerating,
+  isMainGenerationActive: isMemoryWorkBlocked,
 });
-peopleWorkspaceRuntime.subscribe?.(state => { if (state?.status === 'ready' && state.chatId === session.identity().chatId) void timeRuntime.runBatch({ chatId: state.chatId }); });
+let previousPeopleTimeState = peopleWorkspaceRuntime.getState?.() ?? null;
+peopleWorkspaceRuntime.subscribe?.(state => {
+  if (memoryTransfer?.getState().active) return;
+  const currentChatId = session.identity().chatId;
+  if (state?.status !== 'ready' || state.chatId !== currentChatId) {
+    if (previousPeopleTimeState?.chatId !== state?.chatId || state?.chatId !== currentChatId) previousPeopleTimeState = null;
+    return;
+  }
+  if (previousPeopleTimeState?.chatId === state.chatId && previousPeopleTimeState.revision === state.revision
+    && previousPeopleTimeState.people === state.people) return;
+  previousPeopleTimeState = state;
+  void timeRuntime.runBatch({ chatId: state.chatId });
+});
 const autoHideController = createAutoHideController({
   hostAdapter,
   memoryRuntime: v3MemoryRuntime,
   settings,
   notifyUser: notification => globalThis.toastr?.[notification?.kind]?.(notification?.text),
 });
-const captureHistoricalRebuildSources = snapshot => captureRebuildSources(snapshot, {
+const captureHistoricalRebuildSources = (snapshot, overrides = {}) => captureRebuildSources(snapshot, {
+  ...overrides,
   worldInfoBindings: hostAdapter.getWorldInfoBindings(),
   getCharacterLorebooks: () => globalThis.TavernHelper?.getCharLorebooks?.(),
   getGlobalSelection: () => globalThis.TavernHelper?.getLorebookSettings?.()?.selected_global_lorebooks,
@@ -347,7 +456,11 @@ const createHistoricalRebuild = options => runHistoricalRebuildTask({
   csePromptGuidance: csePrompt,
   processingPrompt,
   storyClockReferenceTags: () => settings.get().storyClockReferenceTags,
-  storyCalendarForChat: chatId => settings.get().storyCalendars?.[chatId] ?? null,
+  storyCalendarForChat: chatId => {
+    const calendars = settings.get().storyCalendars ?? {};
+    if (Object.hasOwn(calendars, chatId)) return calendars[chatId] ?? null;
+    return options.storyCalendar ? persistStoryCalendar(chatId, options.storyCalendar) : null;
+  },
   generateTimeTask: taskRouter.generateTimeTask,
   isTimeEvolutionEnabled: () => settings.isEnabled() && settings.get().timeEvolutionEnabled === true,
   filterWorldInfoSources: sourcePermissions.filterWorldInfoSources,
@@ -369,25 +482,34 @@ const chatMemoryManagement = createChatMemoryManagement({
   vectorRuntime: vectorIndex,
   timeRuntime,
   memoryMigration: createChatMemoryMigration({ client: backendClient, session, hostAdapter,
+    placeWorkspaceStore,
     sourceStoreForIdentity: targetFoundationStore, sanitizerOptions, listHostChats, freshUuid: newUuid,
     copyPeople: ({ sourceIdentity, targetIdentity, entities, sourceReachable }) => copyLatestPeople({ peopleStore: peopleWorkspaceStore,
       sourceIdentity, targetIdentity, entities, snapshotSourceIds: sourceReachable?.migrationDescriptor?.recordRefs?.peopleSnapshotIds ?? [], now: new Date().toISOString() }),
     copyTime: ({ sourceIdentity, targetIdentity, reachable }) => timeStore.copyPrefix(sourceIdentity.chatId, targetIdentity.chatId, reachable.floors, undefined, { migration: true }),
     copyVector: ({ sourceIdentity, targetIdentity, targetNarrativeGeneration, sourceReachable }) => vectorIndex.copyPrefix(sourceIdentity, targetIdentity, targetNarrativeGeneration, sourceReachable),
     captureStoryCalendar: sourceChatId => settings.get().storyCalendars[sourceChatId] ?? null,
-    persistStoryCalendar: (targetChatId, calendar) => {
-      const previous = { ...settings.get().storyCalendars };
-      try { settings.update({ storyCalendars: { ...previous, [targetChatId]: calendar } }, { observeSaveFailure: true }); }
-      catch (error) { try { settings.update({ storyCalendars: previous }); } catch { /* restore in-memory settings if save scheduling failed */ } throw error; }
-    },
+    persistStoryCalendar: (targetChatId, calendar) => persistStoryCalendar(targetChatId, calendar),
   }),
   autoHideController,
   coreRecordCache,
   captureHistoricalRebuildSources,
   freshUuid: newUuid,
   createHistoricalRebuild,
-  isMainGenerationActive: isGenerating,
+  isMainGenerationActive: isMemoryWorkBlocked,
 });
+const dynamicWorldbook = createDynamicWorldbookRuntime({
+  client: backendClient, hostAdapter, identityProvider: () => session.identity(),
+  memoryState: () => ({ ...v3MemoryRuntime.getState(), chatId: foundationRuntime.getReachable()?.root?.chatId }),
+  generateUpdate: taskRouter.generateWorldbookTask, generateSelect: taskRouter.generateRecallTask,
+  processingPrompt, updateGuidance: () => settings.get().worldbookPrompt,
+  isEnabled: settings.isEnabled, isGenerating: () => isMemoryWorkBlocked() || chatMemoryManagement.getActivityState().busy
+    || ['scanning', 'cleaning'].includes(storageManagement.getState().status), sanitizerOptions,
+  isBookAllowed: name => sourcePermissions.filterWorldInfoSources([{ sourceName: name }]).length > 0,
+  notifyUser: text => globalThis.toastr?.warning?.(text),
+});
+const unsubscribeDynamicWorldbook = v3MemoryRuntime.subscribe(() => dynamicWorldbook.wake());
+globalThis.addEventListener?.('beforeunload', () => { unsubscribeDynamicWorldbook(); dynamicWorldbook.dispose(); }, { once: true });
 const storageManagement = createStorageManagement({
   client: backendClient,
   store: foundationStore,
@@ -397,10 +519,41 @@ const storageManagement = createStorageManagement({
   memoryRuntime: v3MemoryRuntime,
   foundationRuntime,
   vectorRuntime: vectorIndex,
-  activitySources: [vectorIndex, foundationRuntime, v3RecallRuntime, peopleWorkspaceRuntime, timeRuntime, chatMemoryManagement],
+  activitySources: [vectorIndex, foundationRuntime, v3RecallRuntime, peopleWorkspaceRuntime, timeRuntime, chatMemoryManagement, dynamicWorldbook],
+  isEnabled: () => settings.isEnabled(),
   isBusy: () => {
-    const memory = v3MemoryRuntime.getState(), management = chatMemoryManagement.getState();
-    return Boolean(vectorIndex.getState().active || management.workBusy || management.status === 'deleting' || timeRuntime.getState().active || memory.qianshiHistoryActive);
+    const memory = v3MemoryRuntime.getActivityState(), management = chatMemoryManagement.getState();
+    return Boolean(dynamicWorldbook.getActivityState().busy || memoryTransfer?.getState().active || vectorIndex.getState().active || management.workBusy || management.status === 'deleting' || timeRuntime.getActivityState().active || memory.qianshiHistoryActive);
+  },
+});
+memoryTransfer = createMemoryTransfer({
+  client: backendClient,
+  sanitizerOptions,
+  session,
+  hostAdapter,
+  pluginVersion,
+  freshUuid: newUuid,
+  captureCalendar: chatId => settings.get().storyCalendars[chatId] ?? null,
+  persistCalendar: persistStoryCalendar,
+  isBusy: () => isGenerating() || dynamicWorldbook.getActivityState().busy || [session, foundationRuntime, v3MemoryRuntime, v3RecallRuntime,
+    peopleWorkspaceRuntime, vectorIndex, timeRuntime, chatMemoryManagement, storageManagement]
+    .some(runtime => runtime.getActivityState().busy),
+  quiesce: async () => {
+    dynamicWorldbook.abortAll();
+    v3MemoryRuntime.invalidate();
+    foundationRuntime.invalidate();
+    v3RecallRuntime.invalidate('memoryTransfer');
+    v3RecallRuntime.clearCurrent();
+    peopleWorkspaceRuntime.invalidate();
+    vectorIndex.abortAll();
+    await Promise.all([timeRuntime.stop(), autoHideController.stop()]);
+  },
+  onSettled: async ({ streaming = false } = {}) => {
+    const result = await session.prepare({ entryPoint: 'memoryTransfer' });
+    if (result.status !== 'ready' || streaming) return;
+    await v3MemoryRuntime.refreshStatus();
+    await peopleWorkspaceRuntime.refresh({ refreshMemory: false });
+    await timeRuntime.refreshStatus({ force: true });
   },
 });
 const publicMemoryBridgeMount = installPublicMemoryBridge({
@@ -414,6 +567,23 @@ const publicMemoryBridgeMount = installPublicMemoryBridge({
   isEnabled: settings.isEnabled,
   sanitizerOptions,
   identityProjectionProvider,
+  readWorldInfoProvider: async () => {
+    const catalog = await scanWorldInfo(contextProvider(), {
+      bindings: hostAdapter.getWorldInfoBindings(),
+      complete: true,
+      strict: true,
+      includeCatalog: false,
+      filterBookNames: names => sourcePermissions.filterWorldInfoSources(names.map(sourceName => ({ sourceName }))).map(source => source.sourceName),
+    });
+    return { status: 'ready', worldbook: catalog.entries.map(entry => ({
+      uid: entry.key,
+      comment: entry.comment,
+      keys: [...entry.primaryKeys, ...entry.secondaryKeys],
+      content: entry.content,
+      constant: entry.constant,
+      position: null,
+    })) };
+  },
 });
 const publicQianshiBridgeMount = installPublicQianshiBridge({ memoryRuntime: v3MemoryRuntime });
 globalThis.addEventListener?.('beforeunload', publicMemoryBridgeMount.cleanup, { once: true });
@@ -421,53 +591,25 @@ globalThis.addEventListener?.('beforeunload', publicQianshiBridgeMount.cleanup, 
 globalThis.addEventListener?.('beforeunload', autoHideController.dispose, { once: true });
 globalThis.addEventListener?.('beforeunload', inlineRenderer.destroy, { once: true });
 globalThis.addEventListener?.('beforeunload', storageManagement.dispose, { once: true });
-const dynamicWorldbook = createDynamicWorldbookRuntime({
-  client: backendClient, hostAdapter, identityProvider: () => session.identity(),
-  memoryState: () => ({ ...v3MemoryRuntime.getState(), chatId: foundationRuntime.getReachable()?.root?.chatId }),
-  generateUpdate: taskRouter.generateWorldbookTask, generateSelect: taskRouter.generateRecallTask,
-  processingPrompt, updateGuidance: () => settings.get().worldbookPrompt,
-  isEnabled: settings.isEnabled, isGenerating, sanitizerOptions,
-  isBookAllowed: name => sourcePermissions.filterWorldInfoSources([{ sourceName: name }]).length > 0,
-  notifyUser: text => globalThis.toastr?.warning?.(text),
-});
-const unsubscribeDynamicWorldbook = v3MemoryRuntime.subscribe(() => dynamicWorldbook.wake());
-globalThis.addEventListener?.('beforeunload', () => { unsubscribeDynamicWorldbook(); dynamicWorldbook.dispose(); }, { once: true });
 globalThis.qqj_v3_recall_interceptor = (coreChat, contextSize, abort, type) => dynamicWorldbook.intercept(v3RecallRuntime.intercept, coreChat, contextSize, abort, type);
-const memoryTransfer = createMemoryTransfer({ client: backendClient, session, hostAdapter, pluginVersion, freshUuid: newUuid,
-  isBusy: () => chatMemoryManagement.getState().workBusy || ['deleting', 'failed'].includes(chatMemoryManagement.getState().status)
-    || ['scanning', 'cleaning'].includes(storageManagement.getState().status) || timeRuntime.getState().active
-    || v3MemoryRuntime.getState().qianshiHistoryActive || dynamicWorldbook.getState().phase !== 'idle',
-  quiesce: async () => {
-    dynamicWorldbook.abortAll(); await autoHideController.stop();
-    await timeRuntime.stop();
-    v3MemoryRuntime.invalidate(); foundationRuntime.invalidate(); v3RecallRuntime.invalidate('memoryTransfer');
-    v3RecallRuntime.clearCurrent(); peopleWorkspaceRuntime.invalidate(); vectorIndex.abortAll();
-  },
-  onSettled: async () => {
-    session.invalidate({ cancelTask: true });
-    const result = await session.prepare();
-    if (result.status === 'ready') await v3MemoryRuntime.refreshStatus({ preferCached: false });
-  },
-  captureCalendar: chatId => settings.get().storyCalendars[chatId] ?? null,
-  persistCalendar: async (chatId, calendar) => {
-    settings.update({ storyCalendars: { ...settings.get().storyCalendars, [chatId]: calendar } }, { observeSaveFailure: true });
-  },
+// Static map preparation stays outside chat/model/storage work.
+const startQianchuangMaps = () => startQianchuangMapCatalog({ genericAssets: QIANCHUANG_MAP_ASSETS, cityAssets: CITY_MAPS,
+  sanitizeSvg: svg => DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } }),
 });
 const setAllEnabled = async enabled => {
   const diagnosticRevisionAtStart = pluginLifecycleFailureRevision;
-  try { refreshStoryClock({ announce: true }); }
-  catch (error) { try { error.qqjDiagnosticPhase = 'pluginEnable'; } catch {} throw error; }
+  refreshStoryClock({ announce: true });
   if (!enabled) {
-    inlineRenderer.setEnabled(false);
-    autoHideController.stop();
-    await timeRuntime.stop();
-    await peopleWorkspaceRuntime.setEnabled(false);
-    await v3RecallRuntime.setEnabled(false);
-    const v3Result = await v3MemoryRuntime.setEnabled(false);
-    const lifecycleResult = await lifecycle?.setEnabled(false);
+    const stopped = await Promise.allSettled([
+      () => inlineRenderer.setEnabled(false), () => autoHideController.stop(), () => timeRuntime.stop(),
+      () => peopleWorkspaceRuntime.setEnabled(false), () => v3RecallRuntime.setEnabled(false),
+      () => v3MemoryRuntime.setEnabled(false), () => lifecycle?.setEnabled(false),
+    ].map(stop => { try { return stop(); } catch (error) { return Promise.reject(error); } }));
+    for (const result of stopped) if (result.status === 'rejected') console.warn('[qianqianjie] 停止辅助任务失败', result.reason);
     clearPluginLifecycleFailureIfUnchanged(diagnosticRevisionAtStart);
-    return v3Result ?? lifecycleResult;
+    return stopped[5].value ?? stopped[6].value;
   }
+  startQianchuangMaps();
   inlineRenderer.setEnabled(true);
   if (globalThis.location?.origin) void privateRecallDiagnostics.start();
   const lifecycleResult = await lifecycle?.setEnabled(enabled);
@@ -475,9 +617,29 @@ const setAllEnabled = async enabled => {
   clearPluginLifecycleFailureIfUnchanged(diagnosticRevisionAtStart);
   return lifecycleResult;
 };
+const pluginUpdates = createPluginUpdates({ moduleUrl: import.meta.url, extensionTypes: () => extensionTypes, noticePath: updateNoticePath, headers: getRequestHeaders });
+const pluginActivity = createPluginActivity([session, v3RecallRuntime, foundationRuntime, v3MemoryRuntime, timeRuntime, peopleWorkspaceRuntime, vectorIndex, chatMemoryManagement, storageManagement, memoryTransfer, dynamicWorldbook, compactClient, vectorApi, pluginUpdates]);
+const qianchuangWorldInfoProvider = async ({chatId,organize=false}) => {
+  const isCurrent=()=>chatId && session.identity().chatId===chatId;
+  const stale=()=>Object.assign(new Error('当前聊天已变化。'),{code:'CHAT_SESSION_STALE'});
+  if(!isCurrent())throw stale();
+  const context=contextProvider(),macros={user:context.name1??'',char:context.name2??''};
+  const characterCardSources=organize?await captureQianchuangCharacterSources(context,session.identity().characterLocator):[];
+  const catalog=await scanWorldInfo(context,{bindings:hostAdapter.getWorldInfoBindings(),complete:true,strict:true,includeCatalog:false,
+    filterBookNames:names=>sourcePermissions.filterWorldInfoSources(names.map(sourceName=>({sourceName}))).map(source=>source.sourceName)});
+  if(!isCurrent())throw stale();
+  const candidates=await createWorldInfoSourceCandidates(catalog);
+  if(!isCurrent())throw stale();
+  return {chatId,candidates:sourcePermissions.filterCandidates({chatId,candidates}),macros,...(organize?{characterCardSources}:{})};
+};
+if (settings.isEnabled()) startQianchuangMaps();
 ui = bootstrap({
-  memoryTransfer,
   dynamicWorldbook,
+  userAvatarProvider: () => user_avatar ? getUserAvatar(user_avatar) : null,
+  moduleUrl: import.meta.url,
+  activity: pluginActivity,
+  pluginUpdates,
+  renderUpdateMarkdown: text => DOMPurify.sanitize(new showdown.Converter().makeHtml(text), { FORBID_TAGS: ['img', 'iframe', 'object', 'embed', 'style', 'form'], FORBID_ATTR: ['style'] }),
   settings,
   apiTools,
   vectorApi,
@@ -493,8 +655,8 @@ ui = bootstrap({
     if (!normalized) throw new Error('特殊年请填写不含数字的纪年名称，例如启航。');
     const owner = session.identity();
     if (!chatId || owner?.chatId !== chatId || owner.hostChatId && owner.hostChatId !== hostAdapter.snapshot().chatId) throw new Error('当前聊天已变化，请重新设置历法。');
-    const state = v3MemoryRuntime.getState();
-    if (state.memoryWorkBusy || state.activeExtraction || state.activeCse || state.qianshiHistoryActive || timeRuntime.getState().active) throw new Error('请等当前记忆任务完成后再设置历法。');
+    const state = v3MemoryRuntime.getActivityState();
+    if (memoryTransfer.getState().active || state.memoryWorkBusy || state.activeExtraction || state.activeCse || state.qianshiHistoryActive || timeRuntime.getActivityState().active) throw new Error('请等当前记忆任务完成后再设置历法。');
     const previous = settings.get().storyCalendars;
     try { settings.update({ storyCalendars: { ...previous, [chatId]: normalized } }, { observeSaveFailure: true }); }
     catch (error) { settings.update({ storyCalendars: previous }); throw error; }
@@ -503,6 +665,12 @@ ui = bootstrap({
     await timeRuntime.refreshStatus({ force: true });
   },
   timeRuntime,
+  subscribeSettingsChange: handler => {
+    const currentHost = hostContext(), eventName = currentHost?.eventTypes?.SETTINGS_UPDATED;
+    if (!eventName || !currentHost?.eventSource?.on) return () => {};
+    currentHost.eventSource.on(eventName, handler);
+    return () => currentHost.eventSource.removeListener?.(eventName, handler);
+  },
   subscribeDialogContextChange: handler => {
     const currentHost = hostContext();
     const eventName = currentHost?.eventTypes?.CHAT_CHANGED;
@@ -516,24 +684,31 @@ ui = bootstrap({
   v3FoundationRuntime: v3MemoryRuntime,
   v3RecallRuntime,
   peopleWorkspaceRuntime,
+  qianchuangWorldInfoProvider,
   chatMemoryManagement,
   storageManagement,
+  memoryTransfer,
+  hostDownload,
   sessionStateProvider: () => session.getState(),
   pluginDiagnosticProvider: () => pluginLifecycleFailure,
-  prepareSession: () => session.prepare(),
-  backendDiagnosticProvider: () => ({ ...backendClient.getDiagnosticSnapshot(), coreCache: coreRecordCache?.getStats?.() ?? { available: false } }),
+  prepareSession: () => session.prepare({ entryPoint: 'memoryManagement' }),
+  backendDiagnosticProvider: () => ({ ...backendClient.getDiagnosticSnapshot(), coreCache: {
+    ...(coreRecordCache?.getStats?.() ?? { available: false }), enabled: Boolean(coreRecordCache),
+  } }),
   pluginVersion,
   inlineRenderer,
   enableFab: true,
 });
 lifecycle = createPluginLifecycle({
   session,
-  aborters: [taskRouter, apiTools, peopleWorkspaceRuntime, vectorIndex, vectorApi, dynamicWorldbook],
+  aborters: [taskRouter, apiTools, peopleTaskRouter, peopleWorkspaceRuntime, vectorIndex, vectorApi, dynamicWorldbook],
+  contextAborters: [taskRouter, apiTools, vectorIndex, vectorApi, dynamicWorldbook],
   isEnabled: settings.isEnabled,
   getUi: () => ui,
   onPrepared: async ({ result, isCurrent, explicitEnable }) => {
     if (!isCurrent() && !explicitEnable) return;
-    await v3MemoryRuntime.start({ explicitEnable, targetIdentity: explicitEnable ? result.identity : null });
+    await v3MemoryRuntime.start({ explicitEnable, targetIdentity: explicitEnable ? result.identity : null,
+      ...(result.branchPrepared === true ? { reconcileFoundation: true } : {}) });
     if (!isCurrent()) return;
     await peopleWorkspaceRuntime.refresh({ refreshMemory: false });
   },
@@ -549,7 +724,7 @@ installExtensionUpdateRefresh({ moduleUrl: import.meta.url, isBusy: () => isGene
   || Boolean(memoryTransfer.getState().active) || chatMemoryManagement.getState().workBusy
   || Boolean(vectorIndex.getState().active)
   || ['scanning', 'cleaning'].includes(storageManagement.getState().status)
-  || dynamicWorldbook.getState().phase !== 'idle' });
+  || dynamicWorldbook.getActivityState().busy });
 void (async () => {
   const diagnosticRevisionAtStart = pluginLifecycleFailureRevision;
   try {
@@ -565,8 +740,19 @@ void (async () => {
     }
     refreshStoryClock({ announce: true });
     inlineRenderer.setEnabled(settings.isEnabled());
-    await lifecycle.start();
-    clearPluginLifecycleFailureIfUnchanged(diagnosticRevisionAtStart);
+    const start = async () => {
+      try {
+        await lifecycle.start();
+        clearPluginLifecycleFailureIfUnchanged(diagnosticRevisionAtStart);
+      } catch (error) {
+        recordPluginLifecycleFailure(error, 'startup');
+        console.warn('[qianqianjie] 身份或后端数据准备失败', error);
+      }
+    };
+    // APP_READY会向后加载的扩展回放；回调不让宿主等待千千结的后台准备。
+    if (host?.eventTypes?.APP_READY && typeof host?.eventSource?.once === 'function') {
+      host.eventSource.once(host.eventTypes.APP_READY, () => { void start(); });
+    } else void start();
   } catch (error) {
     recordPluginLifecycleFailure(error, 'startup');
     console.warn('[qianqianjie] 身份或后端数据准备失败', error);

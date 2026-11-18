@@ -1,18 +1,21 @@
 import html from './panel.html?raw';
 import css from './panel.css?inline';
+import { scrollbarCss } from './scrollbar-style.js';
 import { createPanelGeometryController } from './layout.js';
 import { createAppearanceController } from './appearance.js';
 import { createSettingsDrawer, createSettingsDrawerState } from './settings-drawer.js';
 import { createApiSettings } from './settings/api-settings.js';
+import { createVectorApiSettings } from './settings/vector-api-settings.js';
 import { createPromptsSettings } from './settings/prompts-settings.js';
 import { createAppearanceSettings } from './settings/appearance-settings.js';
 import { publicErrorMessage } from '../public-error.js';
-import { createScrollDiagnostics } from './scroll-diagnostics.js';
 import { openHelpGuide } from './help-guide.js';
 import { applyPluginEnabledImmediately } from '../settings.js';
-import { scaleCssFontSizes } from './font-scale.js';
+import { scaleCssFontSizes, scaleCssSpacing } from './font-scale.js';
+import { createPluginUpdatesView } from './plugin-updates-view.js';
+import { sharedUiCss } from './shared-ui-style.js';
+
 import { createDynamicWorldbookView } from './dynamic-worldbook-view.js';
-import { createMemoryTransferView } from './memory-transfer-view.js';
 
 const PUBLIC_API_EXAMPLE = `const bridge = globalThis.qqj_v3_public_bridge_v1;
 const status = bridge.getStatus();
@@ -31,23 +34,27 @@ if (snapshot.status === 'ready') {
   const people = snapshot.people.items;
 }`;
 
-const shellCss = ':host{position:fixed;inset:0;z-index:4000;width:100dvw;height:100dvh;pointer-events:none;background:transparent;text-shadow:none!important;isolation:isolate}:host([hidden]){display:none!important}.panel{position:fixed;top:80px;right:20px;width:360px;height:min(600px,85dvh);max-width:calc(100dvw - 40px);max-height:85dvh;display:grid;grid-template-rows:auto auto minmax(0,1fr) 24px;pointer-events:auto}.body{min-height:0;overflow-y:auto;scrollbar-gutter:stable;touch-action:pan-y}.tabs{overflow-x:auto;flex-wrap:nowrap}.tab{flex:0 0 auto}@media(max-width:640px){.panel{top:calc(20px + env(safe-area-inset-top,0px));left:50%;right:auto;transform:translateX(-50%);width:calc(100dvw - 20px);max-width:calc(100dvw - 20px);height:calc(100dvh - 40px - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px));max-height:none;grid-template-rows:auto auto minmax(0,1fr)}.panel-resize-handle{display:none}.tabs{scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}}';
+const shellCss = ':host{position:fixed;inset:0;z-index:4000;width:100dvw;height:100dvh;pointer-events:none;background:transparent;text-shadow:none!important;isolation:isolate}:host([hidden]){display:none!important}.panel{position:fixed;top:70px;right:20px;width:360px;height:600px;max-width:calc(100dvw - 20px);max-height:calc(100dvh - 20px);display:grid;grid-template-rows:auto auto minmax(0,1fr) 24px;pointer-events:auto}.body{min-height:0;overflow-y:auto;scrollbar-gutter:stable;touch-action:pan-y}.tabs{overflow-x:auto;flex-wrap:nowrap}.tab{flex:0 0 auto}@media(min-width:641px){:host{pointer-events:none}}@media(max-width:640px){.panel{top:calc(var(--qqj-panel-bounds-top,0px) + max(20px,env(safe-area-inset-top,0px)));left:calc(var(--qqj-panel-bounds-left,0px) + var(--qqj-panel-bounds-width,100dvw)/2);right:auto;transform:translateX(-50%);width:max(0px,calc(var(--qqj-panel-bounds-width,100dvw) - 20px));max-width:calc(var(--qqj-panel-bounds-width,100dvw) - 20px);height:max(0px,calc(var(--qqj-panel-bounds-height,100dvh) - max(40px,env(safe-area-inset-top,0px)) - max(40px,env(safe-area-inset-bottom,0px))));max-height:none;grid-template-rows:auto auto minmax(0,1fr)}.panel-resize-handle{display:none}.tabs{scrollbar-width:none}.tabs::-webkit-scrollbar{display:none}}';
 
 export function createPanel({
-  memoryTransfer,
   dynamicWorldbook,
   settings,
   apiTools,
   vectorApi,
   vectorIndex,
+  pluginUpdates,
+  renderUpdateMarkdown,
   v3FoundationView,
   peopleProfilesView,
   qianshiTimelineView,
+  qianchuangView,
   storageManagementView,
+  memoryTransferViewFactory,
   sourcePermissionView,
   onPluginEnabledChange,
   onPluginEnableFailure,
   onStoryClockChange,
+  subscribeSettingsChange,
   onAutoHideChange,
   onTimeEvolutionChange,
   calendarContextProvider = () => ({ chatId: null, calendar: null }),
@@ -70,6 +77,7 @@ export function createPanel({
   if (!qianshiTimelineView || ['mount', 'activate', 'deactivate'].some(name => typeof qianshiTimelineView[name] !== 'function')) {
     throw new TypeError('qianshiTimelineView 无效');
   }
+  if (!qianchuangView || ['mount', 'activate', 'deactivate'].some(name => typeof qianchuangView[name] !== 'function')) throw new TypeError('qianchuangView 无效');
   if (!storageManagementView || ['mount', 'activate', 'deactivate'].some(name => typeof storageManagementView[name] !== 'function')) {
     throw new TypeError('storageManagementView 无效');
   }
@@ -78,8 +86,11 @@ export function createPanel({
   host.hidden = true;
   host.setAttribute('aria-hidden', 'true');
   const root = host.attachShadow({ mode: 'open' });
-  root.innerHTML = `<style>${shellCss}\n${scaleCssFontSizes(css, '--qqj-ui-fixed-scale', true)}</style>${html}`;
+  root.innerHTML = `<style>${sharedUiCss}\n${scrollbarCss}\n${shellCss}\n${scaleCssSpacing(scaleCssFontSizes(css, '--qqj-ui-fixed-scale', true))}</style>${html}`;
   const panel = root.querySelector('.panel');
+  const setActivity = value => {
+    panel?.setAttribute?.('aria-busy', String(value.busy === true));
+  };
   const body = root.querySelector('.body');
   const view = root.querySelector('.view');
   const tabs = [...root.querySelectorAll('.tab')];
@@ -88,6 +99,7 @@ export function createPanel({
     dragHandle: root.querySelector('.topbar'),
     resizeHandle: root.querySelector('.panel-resize-handle'),
     viewport: documentRef.defaultView ?? globalThis,
+    documentRef,
   });
   let activeTab = 'profiles';
   let screen = 'content';
@@ -98,21 +110,21 @@ export function createPanel({
   const settingsDrawerState = createSettingsDrawerState();
   let apiEditingRole = 'analysis';
   let apiSettingsView = null;
-  let dynamicWorldbookView = null;
+  let vectorSettingsView = null;
+  let promptsSettingsView = null;
+  let updatesSettingsView = null;
   let memoryTransferView = null;
+  let dynamicWorldbookView = null;
   const scrollPositions = new Map();
   const themeButton = root.querySelector('.theme-btn');
   const fabToggleButton = root.querySelector('.fab-toggle-btn');
   let swipeGesture = null;
+  let backdropGesture = null;
   let settingsManagementError = null;
   let documentationFallbackText = '', documentationCopyFeedback = '';
-  const scrollDiagnostics = createScrollDiagnostics({
-    target: body,
-    getPage: () => screen === 'settings' ? 'settings' : activeTab,
-    windowRef: documentRef.defaultView ?? globalThis,
-    navigatorRef: documentRef.defaultView?.navigator ?? globalThis.navigator,
-  });
 
+
+  let dialogAppearanceRevision = 0;
   const syncHeader = appearance => {
     const mode = settings?.get?.().appearanceTheme ?? 'auto';
     const next = mode === 'auto' ? '日间' : mode === 'day' ? '夜间' : '跟随酒馆';
@@ -134,7 +146,13 @@ export function createPanel({
       fabToggleButton.setAttribute('aria-label', showFab ? '隐藏悬浮球' : '显示悬浮球');
       fabToggleButton.setAttribute('aria-pressed', String(showFab));
     }
-    dialog?.setAppearance?.(appearance);
+    const revision = ++dialogAppearanceRevision;
+    const applyDialogAppearance = () => {
+      const current = settings?.get?.() ?? {};
+      dialog?.setAppearance?.({ ...appearance, family: current.appearanceFontFamily ?? '', fontCssUrl: current.appearanceFontCssUrl ?? '' });
+    };
+    applyDialogAppearance();
+    Promise.resolve(appearance.fontReady).then(() => { if (revision === dialogAppearanceRevision) applyDialogAppearance(); });
     onAppearanceChange?.(appearance);
   };
   const appearance = createAppearanceController({ host, root, settings, documentRef, onChange: syncHeader });
@@ -169,12 +187,16 @@ export function createPanel({
     }
   };
   const unmountContent = () => {
-    memoryTransferView?.dispose(); memoryTransferView = null;
     dynamicWorldbookView?.dispose(); dynamicWorldbookView = null;
-    apiSettingsView?.dispose(); apiSettingsView = null;
+    memoryTransferView?.dispose(); memoryTransferView = null;
+    apiSettingsView?.dispose?.(); apiSettingsView = null;
+    vectorSettingsView?.dispose(); vectorSettingsView = null;
+    promptsSettingsView?.dispose(); promptsSettingsView = null;
+    updatesSettingsView?.dispose(); updatesSettingsView = null;
     v3FoundationView.deactivate();
     peopleProfilesView.deactivate();
     qianshiTimelineView.deactivate();
+    qianchuangView.deactivate();
     storageManagementView.deactivate();
     view.replaceChildren();
     mountedContentView = null;
@@ -209,6 +231,13 @@ export function createPanel({
       restoreScroll(activeTab);
       return qianshiTimelineView.activate();
     }
+    if (activeTab === 'qianchuang') {
+      if (mountedContentView !== 'qianchuang') {
+        unmountContent(); qianchuangView.mount(view); mountedContentView = 'qianchuang';
+      }
+      restoreScroll(activeTab);
+      return qianchuangView.activate();
+    }
     v3FoundationView.setPage?.(activeTab === 'people' ? 'people' : 'memories');
     if (mountedContentView !== 'foundation') {
       unmountContent(); v3FoundationView.mount(view); mountedContentView = 'foundation';
@@ -242,7 +271,6 @@ export function createPanel({
     if (focusSources) { settingsDrawerState.open('general'); settingsDrawerState.open('worldbook'); }
 
     const page = element('section', 'settings-page');
-    page.append(element('h2', '', '千千结设置'));
 
     // 总开关：standalone 主控，统管整个插件（含记忆自动提取）。
     const master = element('div', 'master-switch');
@@ -278,7 +306,14 @@ export function createPanel({
         enabledInput.disabled = false;
       }
     });
-    master.append(toggle, enabledResult);
+    const masterRow = element('div', 'master-switch-row');
+    masterRow.append(toggle);
+    if (pluginUpdates) {
+      updatesSettingsView = createPluginUpdatesView({ updates: pluginUpdates, dialog, documentRef, renderMarkdown: renderUpdateMarkdown });
+      masterRow.append(updatesSettingsView.controls);
+    }
+    master.append(masterRow, enabledResult);
+    if (updatesSettingsView) master.append(updatesSettingsView.feedback);
     page.append(master);
 
     const managementMount = element('div', 'qqj-settings-management');
@@ -296,35 +331,33 @@ export function createPanel({
     // 通用设置：世界书排除、提示词和外观即时保存；API 角色选择即时生效，配置编辑需点“保存设置”。
     const { drawer: general, body: generalBody } = groupOf('general', '通用设置');
     const api = createApiSettings({
-      settings, apiTools, vectorApi, vectorIndex, documentRef,
+      settings, apiTools, vectorIndex, documentRef,
       initialEditingRole: apiEditingRole, onEditingRoleChange: role => { apiEditingRole = role; },
       open: subOpen('api'), onToggle: subToggle('api'),
       advancedOpen: subOpen('api-advanced'), onAdvancedToggle: subToggle('api-advanced'),
-      vectorOpen: subOpen('api-vector'), onVectorToggle: subToggle('api-vector'),
       rerender: () => renderSettings(),
       isSevenDaysAvailable,
       confirmImpl: options => dialog?.confirm?.(options) ?? false,
       promptImpl: options => dialog?.prompt?.(options) ?? null,
+      customImpl: options => dialog?.custom?.(options) ?? Promise.resolve(null),
     });
     apiSettingsView = api;
+    const vector = createVectorApiSettings({ settings, vectorApi, vectorIndex, documentRef,
+      open: subOpen('vector'), onToggle: subToggle('vector') });
+    vectorSettingsView = vector;
     const worldbook = sourcePermissionView?.renderSettings?.({
       open: subOpen('worldbook'), onDrawerToggle: subToggle('worldbook'),
     });
-    const prompts = createPromptsSettings({ settings, documentRef, open: subOpen('prompts'), onToggle: subToggle('prompts'), onStoryClockChange });
+    const prompts = createPromptsSettings({ settings, documentRef, open: subOpen('prompts'), onToggle: subToggle('prompts'), onStoryClockChange, subscribeSettingsChange, customImpl: options => dialog?.custom?.(options) });
+    promptsSettingsView = prompts;
     const appearanceSettings = createAppearanceSettings({
       settings, documentRef, open: subOpen('appearance'), onToggle: subToggle('appearance'),
       applyAppearance: () => appearance.apply(),
     });
-    generalBody.append(api.node);
+    generalBody.append(api.node, vector.node);
     if (worldbook) generalBody.append(worldbook);
     generalBody.append(prompts.node, appearanceSettings.node);
     page.append(general);
-    if (memoryTransfer) {
-      memoryTransferView = createMemoryTransferView({ runtime: memoryTransfer, documentRef,
-        confirmImpl: options => dialog?.confirm?.(options) ?? false,
-        open: subOpen('memory-transfer'), onToggle: subToggle('memory-transfer') });
-      page.append(memoryTransferView.node);
-    }
     if (dynamicWorldbook) {
       dynamicWorldbookView = createDynamicWorldbookView({ runtime: dynamicWorldbook, settings, documentRef,
         confirmImpl: options => dialog?.confirm?.(options) ?? false,
@@ -370,7 +403,7 @@ export function createPanel({
     const autoHideInput = element('input'); autoHideInput.type = 'checkbox'; autoHideInput.checked = settings.get().autoHideEnabled === true;
     autoHideToggle.append(element('span', '', '自动隐藏'), autoHideInput);
     const keepRow = element('label', 'qqj-auto-hide-row');
-    keepRow.append(element('span', '', '保留最近 AI 楼数'));
+    keepRow.append(element('span', '', '保留历史 AI 楼数'));
     const keepInput = element('input', 'settings-input settings-num'); keepInput.type = 'number'; keepInput.min = '1'; keepInput.max = '50'; keepInput.step = '1'; keepInput.value = String(settings.get().autoHideKeepAiCount ?? 3);
     keepRow.append(keepInput);
     const autoHideResult = element('p', 'settings-result');
@@ -386,7 +419,7 @@ export function createPanel({
           autoHideResult.className = 'settings-result success';
           return;
         }
-        autoHideResult.textContent = current.autoHideEnabled ? `已开启；后续按最近 ${current.autoHideKeepAiCount} 个 AI 楼保留，已隐藏楼保持隐藏。` : '已关闭；由千千结隐藏的消息已恢复。';
+        autoHideResult.textContent = current.autoHideEnabled ? `已开启；后续保留最近 ${current.autoHideKeepAiCount} 个 AI 楼，并另留当前回复供重生成；已隐藏楼保持隐藏。` : '已关闭；由千千结隐藏的消息已恢复。';
         autoHideResult.className = 'settings-result success';
       } catch (error) {
         autoHideResult.textContent = `设置已保存，自动隐藏未完成：${publicErrorMessage(error, { fallback: '操作失败。' })}`;
@@ -441,12 +474,32 @@ export function createPanel({
       return changeCalendar(months);
     });
     prefixInput.addEventListener('change', () => changeCalendar(calendarInputs.find(({ input }) => input.checked)?.months ?? 12));
+    const coreCacheToggle = element('label', 'setting-switch');
+    coreCacheToggle.id = 'qqj-settings-core-cache';
+    const coreCacheInput = element('input'); coreCacheInput.type = 'checkbox'; coreCacheInput.checked = settings.get().coreCacheEnabled !== false;
+    coreCacheInput.setAttribute('aria-label', '浏览器缓存（IndexedDB）');
+    coreCacheToggle.append(element('span', '', '浏览器缓存（IndexedDB）'), coreCacheInput);
+    coreCacheToggle.addEventListener('click', event => event.stopPropagation());
+    const coreCacheHint = element('p', 'settings-hint', '关闭不会删除记忆，之后直接从正式存储读取，打开长聊天可能更慢。更改后整页刷新酒馆生效。');
+    const coreCacheResult = element('p', 'settings-result');
+    coreCacheResult.id = 'qqj-settings-core-cache-result';
+    coreCacheInput.addEventListener('change', () => {
+      settings.update({ coreCacheEnabled: coreCacheInput.checked });
+      coreCacheResult.textContent = '设置已修改；整页刷新酒馆后生效。';
+      coreCacheResult.className = 'settings-result success';
+    });
+    memoryBody.append(coreCacheToggle, coreCacheHint, coreCacheResult);
     const storageDrawer = createSettingsDrawer({
       documentRef, title: '存储管理', level: 'sub', id: 'qqj-settings-sub-storage', open: storageOpen,
       onToggle: open => { settingsDrawerState.set('storage', open); syncStorageActivation(); },
     });
     storageGroup = storageDrawer.drawer;
-    storageManagementView.mount(storageDrawer.body);
+    const storageMount = element('div');
+    storageManagementView.mount(storageMount);
+    storageDrawer.body.append(storageMount);
+    memoryTransferView = memoryTransferViewFactory?.({ open: settingsDrawerState.isOpen('memory-transfer', false),
+      onToggle: open => settingsDrawerState.set('memory-transfer', open) }) ?? null;
+    if (memoryTransferView) storageDrawer.body.append(memoryTransferView.node);
     memoryBody.append(autoHideToggle, keepRow, autoHideResult, calendarRow, prefixRow,
       element('p', 'settings-hint', '历法用于推算时间间隔，仅当前聊天生效。特殊年只填年份前的完整纪年名称，不填数字或“年”。'),
       element('p', 'settings-hint', '例：启航387年，填启航。'), calendarResult, storageGroup);
@@ -473,13 +526,14 @@ export function createPanel({
     copyExample.addEventListener('click', async () => { await copyPublicApiExample(); updateCopyResult(); });
     apiActions.append(element('span', '', 'API 接口'), copyExample);
     copyFeedback.setAttribute('role', 'status');
-    documentationBody.append(tutorialActions, apiActions, copyFeedback, fallbackHost);
+    documentationBody.append(tutorialActions, apiActions);
+    if (updatesSettingsView) documentationBody.append(updatesSettingsView.noticeRow);
+    documentationBody.append(copyFeedback, fallbackHost);
     updateCopyResult();
     page.append(documentationGroup);
 
-    v3FoundationView.mount(managementMount);
+    v3FoundationView.mount(managementMount, { page: 'management' });
     mountedContentView = 'foundation-settings';
-    v3FoundationView.setPage?.('management');
     view.append(page);
     if (enabled) void activateManagement();
     syncStorageActivation();
@@ -488,10 +542,10 @@ export function createPanel({
   }
 
   function show(nextTrigger) {
+    void pluginUpdates?.ensureChecked();
     trigger = nextTrigger ?? trigger;
     host.hidden = false;
     host.setAttribute('aria-hidden', 'false');
-    scrollDiagnostics.start();
     geometry.restore();
     let result = { status: 'ready' };
     if (screen === 'settings') renderSettings();
@@ -500,23 +554,43 @@ export function createPanel({
     return result;
   }
 
-  function close() {
+  function close({ restoreFocus = true } = {}) {
+    dynamicWorldbookView?.dispose(); dynamicWorldbookView = null;
+    memoryTransferView?.dispose(); memoryTransferView = null;
     rememberScroll();
     activationEpoch += 1;
-    apiSettingsView?.dispose(); apiSettingsView = null;
+    apiSettingsView?.dispose?.(); apiSettingsView = null;
+    vectorSettingsView?.dispose(); vectorSettingsView = null;
+    promptsSettingsView?.dispose(); promptsSettingsView = null;
+    updatesSettingsView?.dispose(); updatesSettingsView = null;
     v3FoundationView.deactivate();
     peopleProfilesView.deactivate();
     qianshiTimelineView.deactivate();
+    qianchuangView.deactivate();
     storageManagementView.deactivate();
     geometry.cancelGesture();
     swipeGesture = null;
-    scrollDiagnostics.stop();
+    backdropGesture = null;
     dialog?.closeAll?.();
     host.hidden = true;
     host.setAttribute('aria-hidden', 'true');
     const previous = trigger;
     trigger = null;
-    previous?.focus?.();
+    if (restoreFocus) previous?.focus?.();
+  }
+
+  function openVectorSettings() {
+    if (screen !== 'settings') return false;
+    settingsDrawerState.open('general');
+    settingsDrawerState.open('vector');
+    const general = view?.querySelector?.('#qqj-settings-group-general');
+    const vector = view?.querySelector?.('#qqj-settings-vector-api');
+    if (!general || !vector) return false;
+    // 直接展开已有节点，以保留未保存的 API 输入。
+    general.open = true; vector.open = true;
+    vector.scrollIntoView?.({ block: 'center' });
+    vector.querySelector?.('summary')?.focus?.();
+    return true;
   }
 
   function setEnabled(value) {
@@ -525,6 +599,7 @@ export function createPanel({
       activationEpoch += 1;
       v3FoundationView.deactivate();
       qianshiTimelineView.deactivate();
+    qianchuangView.deactivate();
       if (!host.hidden && screen === 'content') showStatus('千千结当前已关闭。设置仍可打开。');
     } else if (!host.hidden && screen === 'content') void activateFoundation().catch(() => showStatus('当前聊天暂时无法读取千结记忆。'));
     else if (!host.hidden && screen === 'settings') void activateManagement();
@@ -542,19 +617,65 @@ export function createPanel({
     if (!swipeGesture) return; const touch = point(event); if (!touch) return;
     swipeGesture.dx = touch.clientX - swipeGesture.x; swipeGesture.dy = touch.clientY - swipeGesture.y;
     if (!swipeGesture.horizontal && Math.abs(swipeGesture.dy) > Math.abs(swipeGesture.dx)) { swipeGesture = null; return; }
-    if (Math.abs(swipeGesture.dx) >= 12 && Math.abs(swipeGesture.dx) > Math.abs(swipeGesture.dy) * 1.35) { swipeGesture.horizontal = true; event.preventDefault?.(); scrollDiagnostics.markQqjSwipeIntercepted(); }
+    if (Math.abs(swipeGesture.dx) >= 12 && Math.abs(swipeGesture.dx) > Math.abs(swipeGesture.dy) * 1.35) { swipeGesture.horizontal = true; event.preventDefault?.(); }
   }, { passive: false });
   body?.addEventListener?.('touchend', event => {
     if (!swipeGesture) return; const touch = point(event); if (touch) { swipeGesture.dx = touch.clientX - swipeGesture.x; swipeGesture.dy = touch.clientY - swipeGesture.y; }
     const gesture = swipeGesture; swipeGesture = null;
     if (Math.abs(gesture.dx) < 60 || Math.abs(gesture.dx) <= Math.abs(gesture.dy) * 1.35) return;
     event.preventDefault?.();
-    scrollDiagnostics.markQqjSwipeIntercepted();
-    const swipeTabs = ['profiles', 'events', 'qianshi', 'people', 'settings'], current = screen === 'settings' ? 'settings' : activeTab, index = swipeTabs.indexOf(current), next = index + (gesture.dx < 0 ? 1 : -1);
+
+    const swipeTabs = ['profiles', 'events', 'qianshi', 'qianchuang', 'people', 'settings'], current = screen === 'settings' ? 'settings' : activeTab, index = swipeTabs.indexOf(current), next = index + (gesture.dx < 0 ? 1 : -1);
     if (next >= 0 && next < swipeTabs.length) selectTab(swipeTabs[next]);
   }, { passive: false });
   body?.addEventListener?.('touchcancel', () => { swipeGesture = null; }, { passive: true });
 
+  const isForeignWindow = event => {
+    const path = event.composedPath?.();
+    if (path?.includes(panel)) return false;
+    return path?.some(node => node?.matches?.('button,input,textarea,select,a[href],label,summary,[contenteditable]:not([contenteditable="false"]),[tabindex]:not([tabindex="-1"]),[role~="button"],[role~="link"],[role~="checkbox"],[role~="radio"],[role~="switch"],[role~="textbox"],dialog,[role~="dialog"],[role~="alertdialog"],[role~="menu"],[role~="listbox"],[role~="combobox"]')
+      || ['true', 'menu', 'listbox', 'tree', 'grid', 'dialog'].includes(node?.getAttribute?.('aria-haspopup'))
+      || typeof node?.popover === 'string' && node.matches?.(':popover-open')
+      || node?.nodeType === 11 && node.host !== host
+      && documentRef.defaultView?.getComputedStyle?.(node.host)?.position === 'fixed');
+  };
+  const isBackdrop = event => {
+    const path = event.composedPath?.();
+    const foreignWindow = path?.some(node => node !== panel && (node?.matches?.('dialog,[role~="dialog"],[role~="alertdialog"],[role~="menu"],[role~="listbox"],[role~="combobox"]')
+      || typeof node?.popover === 'string' && node.matches?.(':popover-open'))
+      || node?.nodeType === 11 && node.host !== host
+      && documentRef.defaultView?.getComputedStyle?.(node.host)?.position === 'fixed');
+    const inside = path?.includes(panel) ?? panel?.contains?.(event.target);
+    const rect = inside ? panel?.getBoundingClientRect?.() : null;
+    const outsidePoint = rect && (event.clientX < rect.left || event.clientX > rect.left + rect.width
+      || event.clientY < rect.top || event.clientY > rect.top + rect.height);
+    return mobile() && !host.hidden && !dialog?.hasActive?.() && !foreignWindow && (!inside || outsidePoint);
+  };
+  const moveBackdrop = event => {
+    if (backdropGesture?.id === event.pointerId && Math.hypot(event.clientX - backdropGesture.x, event.clientY - backdropGesture.y) > 5) backdropGesture.moved = true;
+  };
+  documentRef.addEventListener?.('pointerdown', event => {
+    backdropGesture = event.button === 0 && event.isPrimary !== false && isBackdrop(event)
+      ? { id: event.pointerId, x: event.clientX, y: event.clientY, up: false, moved: false } : null;
+  }, true);
+  documentRef.addEventListener?.('pointermove', moveBackdrop, true);
+  documentRef.addEventListener?.('pointerup', event => {
+    if (backdropGesture?.id !== event.pointerId) { backdropGesture = null; return; }
+    moveBackdrop(event);
+    backdropGesture.up = isBackdrop(event);
+  }, true);
+  documentRef.addEventListener?.('pointercancel', () => { backdropGesture = null; }, true);
+  documentRef.addEventListener?.('click', event => {
+    const outsideClick = backdropGesture?.up && !backdropGesture.moved && mobile() && !host.hidden && !dialog?.hasActive?.();
+    backdropGesture = null;
+    if (outsideClick) {
+      if (event.composedPath?.().includes(panel)) {
+        event.preventDefault?.();
+        event.stopImmediatePropagation?.();
+      }
+      close({ restoreFocus: false });
+    }
+  }, true);
   root.querySelector('.close')?.addEventListener('click', close);
   themeButton?.addEventListener('click', () => {
     const current = settings.get().appearanceTheme ?? 'auto';
@@ -567,13 +688,19 @@ export function createPanel({
     settings.update({ fabShow: showFab }); syncHeader(appearance.getState()); onFabShowChange?.(showFab);
   });
   tabs.forEach(tab => tab.addEventListener('click', () => selectTab(tab.dataset.tab)));
-  documentRef.addEventListener?.('keydown', event => { if (event.key !== 'Escape' || host.hidden) return; if (dialog?.hasActive?.()) { dialog.cancelTop(); event.preventDefault?.(); return; } close(); });
+  documentRef.addEventListener?.('keydown', event => {
+    if (event.key !== 'Escape' || host.hidden || event.defaultPrevented || event.isComposing) return;
+    if (isForeignWindow(event)) return;
+    if (dialog?.hasActive?.()) { dialog.cancelTop(); event.preventDefault?.(); return; }
+    close();
+  });
 
-  return Object.freeze({
+  return Object.freeze({ setActivity,
     host,
     root,
     show,
     openMemory(nextTrigger) { selectTab('events'); return show(nextTrigger); },
+    openVectorSettings,
     close,
     setEnabled,
     showStatus,
@@ -584,9 +711,9 @@ export function createPanel({
       if (host.hidden || screen !== 'content') return { status: 'closed' };
       v3FoundationView.deactivate();
       qianshiTimelineView.deactivate();
+    qianchuangView.deactivate();
       return activateFoundation();
     },
-    getUiDiagnostic: () => JSON.stringify(scrollDiagnostics.snapshot(), null, 2),
     getState: () => ({ enabled, activeTab, screen, open: !host.hidden }),
   });
 }

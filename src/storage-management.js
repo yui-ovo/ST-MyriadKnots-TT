@@ -1,4 +1,5 @@
 import { VECTOR_INDEX_ID, vectorRecordOwned } from './v3/vector-index.js';
+import { NAMESPACE } from './constants.js';
 import {
   validateFoundationCheckpoint,
   validateFoundationFloorContent,
@@ -38,6 +39,7 @@ const VALIDATOR_BY_TYPE = Object.freeze({
 });
 const AUTO_FLOOR_INTERVAL = 10;
 const CLASSIFICATION_BATCH_SIZE = 50;
+const TRASH_GC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const STORAGE_AUTO_RECORD_THRESHOLD = 100;
 export const STORAGE_AUTO_BYTE_THRESHOLD = 8 * 1024 * 1024;
 
@@ -90,53 +92,63 @@ function emptyBreakdown() {
   return { story: { count: 0, bytes: 0 }, people: { count: 0, bytes: 0 }, runtime: { count: 0, bytes: 0 } };
 }
 
-export async function classifyStorageRecords(records, reachable, chatId, { resumableVectorShardIds = [] } = {}) {
+function createStorageClassifier(reachable, chatId) {
   const activeIds = reachableRecordIds(reachable);
-  const resumableIds = new Set(resumableVectorShardIds);
-  for (const record of records) if (resumableIds.has(record?.recordId) && vectorRecordOwned(record)
-    && record.data.chatId === chatId && record.data.narrativeGeneration === reachable?.root?.narrativeGeneration
-    && record.recordId.startsWith('qqj-vector-shard-')) activeIds.add(record.recordId);
-  const manifest = records.find(record => record.recordId === VECTOR_INDEX_ID && vectorRecordOwned(record) && record.data.chatId === chatId && record.data.narrativeGeneration === reachable?.root?.narrativeGeneration);
-  if (manifest) { activeIds.add(VECTOR_INDEX_ID); for (const id of manifest.data.shardIds) activeIds.add(id); }
   const breakdown = { active: emptyBreakdown(), cleanup: emptyBreakdown() };
   const candidates = [];
   const totals = { count: 0, bytes: 0 };
   const active = { count: 0, bytes: 0 };
   const cleanup = { count: 0, bytes: 0 };
   const retained = { count: 0, bytes: 0 };
-  for (let index = 0; index < records.length; index += 1) {
-    const envelope = records[index];
-    const bytes = textBytes(envelope);
-    totals.count += 1; totals.bytes += bytes;
-    const vectorOwned = vectorRecordOwned(envelope) && envelope.data.chatId === chatId;
-    const classified = vectorOwned ? { type: 'vectorCache', category: 'runtime' } : await safeFoundationEnvelope(envelope, chatId);
-    if (activeIds.has(envelope?.recordId)) {
-      active.count += 1; active.bytes += bytes;
-      const safe = classified;
-      if (safe) {
-        breakdown.active[safe.category].count += 1;
-        breakdown.active[safe.category].bytes += bytes;
-      }
-    } else {
-      const safe = classified;
-      if (safe) {
+  let processed = 0;
+  return {
+    protectVectorRecords(records, resumableVectorShardIds = []) {
+      const resumableIds = new Set(resumableVectorShardIds);
+      for (const record of records) if (resumableIds.has(record?.recordId) && vectorRecordOwned(record)
+        && record.data.chatId === chatId && record.data.narrativeGeneration === reachable?.root?.narrativeGeneration
+        && record.recordId.startsWith('qqj-vector-shard-')) activeIds.add(record.recordId);
+      const manifest = records.find(record => record.recordId === VECTOR_INDEX_ID && vectorRecordOwned(record)
+        && record.data.chatId === chatId && record.data.narrativeGeneration === reachable?.root?.narrativeGeneration);
+      if (manifest) { activeIds.add(VECTOR_INDEX_ID); for (const id of manifest.data.shardIds) activeIds.add(id); }
+    },
+    async add(envelope, sourceIndex = processed) {
+      processed += 1;
+      const bytes = textBytes(envelope);
+      totals.count += 1; totals.bytes += bytes;
+      const vectorOwned = vectorRecordOwned(envelope) && envelope.data.chatId === chatId;
+      const classified = vectorOwned ? { type: 'vectorCache', category: 'runtime' } : await safeFoundationEnvelope(envelope, chatId);
+      if (activeIds.has(envelope?.recordId)) {
+        active.count += 1; active.bytes += bytes;
+        if (classified) {
+          breakdown.active[classified.category].count += 1;
+          breakdown.active[classified.category].bytes += bytes;
+        }
+      } else if (classified) {
         cleanup.count += 1; cleanup.bytes += bytes;
-        breakdown.cleanup[safe.category].count += 1;
-        breakdown.cleanup[safe.category].bytes += bytes;
-        candidates.push(Object.freeze({ recordId: envelope.recordId, revision: envelope.revision }));
+        breakdown.cleanup[classified.category].count += 1;
+        breakdown.cleanup[classified.category].bytes += bytes;
+        candidates.push({ sourceIndex, value: Object.freeze({ recordId: envelope.recordId, revision: envelope.revision }) });
       } else {
         // Unreachable is not proof of QQJ ownership; malformed or foreign records stay out of cleanup candidates.
         retained.count += 1; retained.bytes += bytes;
       }
-    }
-    if ((index + 1) % CLASSIFICATION_BATCH_SIZE === 0 && index + 1 < records.length) {
-      await new Promise(resolve => setTimeout(resolve, 0));
-    }
-  }
-  return Object.freeze({
-    stats: Object.freeze({ total: Object.freeze(totals), active: Object.freeze(active), cleanup: Object.freeze(cleanup), retained: Object.freeze(retained), breakdown: clone(breakdown) }),
-    candidates: Object.freeze(candidates),
-  });
+      if (processed % CLASSIFICATION_BATCH_SIZE === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    },
+    finish() {
+      candidates.sort((left, right) => left.sourceIndex - right.sourceIndex);
+      return Object.freeze({
+        stats: Object.freeze({ total: Object.freeze(totals), active: Object.freeze(active), cleanup: Object.freeze(cleanup), retained: Object.freeze(retained), breakdown: clone(breakdown) }),
+        candidates: Object.freeze(candidates.map(item => item.value)),
+      });
+    },
+  };
+}
+
+export async function classifyStorageRecords(records, reachable, chatId, { resumableVectorShardIds = [] } = {}) {
+  const classifier = createStorageClassifier(reachable, chatId);
+  classifier.protectVectorRecords(records, resumableVectorShardIds);
+  for (let index = 0; index < records.length; index += 1) await classifier.add(records[index], index);
+  return classifier.finish();
 }
 
 function sameIdentity(left, right) {
@@ -155,16 +167,23 @@ export function createStorageManagement({
   vectorRuntime = null,
   activitySources = [],
   isBusy = () => false,
+  isEnabled = () => true,
   logger = console,
 } = {}) {
   if (!client?.list || !client?.get || !client?.remove || !store?.readReachable
     || !session?.identity || !session?.suspend || !session?.resume || !session?.prepare || !session?.getState
-    || !hostAdapter?.snapshot || !settings?.get || !settings?.update || !memoryRuntime?.getState) {
+    || !hostAdapter?.snapshot || !settings?.get || !settings?.update || !memoryRuntime?.getActivityState) {
     throw new TypeError('当前聊天存储管理依赖无效');
   }
   let operation = null;
   let resultState = { status: 'idle', chatId: null, stats: null, lastResult: null, error: null, autoPending: false };
   let automaticCheck = null;
+  let trashGcCapability = null;
+  let trashGcCapabilityCheck = null;
+  let trashGcCheck = null;
+  let trashGcProgress = null;
+  let trashGcRetryAfter = 0;
+  let trashGcState = { status: 'idle', scanned: 0, deleted: 0, failed: 0, error: null, automatic: false };
   const automaticAttempts = new Map();
   let reusableAutomaticSnapshot = null;
   let disposed = false;
@@ -207,6 +226,7 @@ export function createStorageManagement({
       busy: workBusy(),
       autoEnabled: autoEnabled(),
       autoPending: sameChat && resultState.autoPending === true,
+      trashGc: Object.freeze({ ...trashGcState }),
     });
   };
   const notify = () => {
@@ -226,7 +246,7 @@ export function createStorageManagement({
   };
 
   const currentStableCount = identity => {
-    const state = memoryRuntime.getState();
+    const state = memoryRuntime.getActivityState();
     return state?.chatId === identity.chatId && Number.isSafeInteger(state.stableCount) ? state.stableCount : null;
   };
   const warmReachable = identity => {
@@ -246,9 +266,13 @@ export function createStorageManagement({
       && root.data?.narrativeGeneration === anchor.narrativeGeneration && root.data?.headCheckpointId === anchor.headCheckpointId
       && root.data?.sourceSnapshotFingerprint === anchor.sourceSnapshotFingerprint
     : anchor?.status === root?.status;
+  const withIdentityStore = async (identity, read) => {
+    const targetStore = store.forIdentity?.(identity) ?? store;
+    try { return await read(targetStore); }
+    finally { if (targetStore !== store) targetStore.release?.(); }
+  };
   async function currentRootAnchor(identity) {
-    const root = await store.readRoot();
-    assertCurrent(identity);
+    const root = await withIdentityStore(identity, targetStore => targetStore.readRoot());
     return root?.status === 'ready'
       ? Object.freeze({ status: 'ready', chatId: root.data.chatId, revision: root.revision,
         narrativeGeneration: root.data.narrativeGeneration, headCheckpointId: root.data.headCheckpointId,
@@ -262,55 +286,93 @@ export function createStorageManagement({
   };
   async function takeReusableAutomaticSnapshot(identity, stableCount) {
     const cached = reusableAutomaticSnapshot;
-    if (!cached || cached.stableCount !== stableCount || !sameIdentity(cached.identity, identity) || !inCurrentHost(identity)) return { snapshot: null, stale: false };
-    const root = await store.readRoot();
-    assertCurrent(identity);
+    if (!cached || cached.stableCount !== stableCount || !sameIdentity(cached.identity, identity)) return { snapshot: null, stale: false };
+    const root = await withIdentityStore(identity, targetStore => targetStore.readRoot());
     const matches = rootMatchesAnchor(root, cached.snapshot.anchor);
     reusableAutomaticSnapshot = null;
     return matches ? { snapshot: cached.snapshot, stale: false } : { snapshot: null, stale: true };
   }
 
-  async function scanSnapshot(identity) {
-    assertCurrent(identity);
-    let reachable = warmReachable(identity);
-    if (reachable && typeof store.readRoot === 'function') {
-      const root = await store.readRoot();
-      assertCurrent(identity);
-      if (root?.status !== 'ready' || root.revision !== reachable.rootRevision
-        || root.data?.chatId !== reachable.root.chatId
-        || root.data?.narrativeGeneration !== reachable.root.narrativeGeneration
-        || root.data?.headCheckpointId !== reachable.root.headCheckpointId
-        || root.data?.sourceSnapshotFingerprint !== reachable.root.sourceSnapshotFingerprint) reachable = null;
-    } else reachable = null;
-    if (!reachable) reachable = await store.readReachable({ mode: 'full' });
-    assertCurrent(identity);
-    const records = await client.list(`chat-${identity.chatId}`);
-    assertCurrent(identity);
-    if (!Array.isArray(records)) throw errorWith('QQJ_STORAGE_LIST_INVALID', '后端没有返回可核对的记录清单。');
-    if (reachable?.status === 'ready' && reachable.root?.chatId !== identity.chatId) {
-      throw errorWith('QQJ_STORAGE_ROOT_IDENTITY_MISMATCH', '当前基础数据身份无法安全核对，本次没有生成清理候选。');
-    }
-    if (reachable?.status !== 'ready' || !reachable.root || !reachable.root.headCheckpointId) {
-      const totals = records.reduce((sum, item) => ({ count: sum.count + 1, bytes: sum.bytes + textBytes(item) }), { count: 0, bytes: 0 });
-      return Object.freeze({ status: reachable?.status === 'uninitialized' ? 'uninitialized' : 'notReady', identity, stats: Object.freeze({ total: totals, active: { count: 0, bytes: 0 }, cleanup: { count: 0, bytes: 0 }, retained: totals, breakdown: { active: emptyBreakdown(), cleanup: emptyBreakdown() } }), candidates: Object.freeze([]), anchor: null });
-    }
-    const resumableVectorShardIds = await vectorRuntime?.getResumableShardIds?.(reachable, records) ?? [];
-    const classified = await classifyStorageRecords(records, reachable, identity.chatId, { resumableVectorShardIds });
-    return Object.freeze({
-      status: 'ready', identity, stats: classified.stats, candidates: classified.candidates,
-      anchor: Object.freeze({ status: 'ready', chatId: reachable.root.chatId, revision: reachable.rootRevision, headCheckpointId: reachable.root.headCheckpointId,
-        narrativeGeneration: reachable.root.narrativeGeneration, sourceSnapshotFingerprint: reachable.root.sourceSnapshotFingerprint }),
+  async function scanSnapshot(identity, { signal } = {}) {
+    const checkCancelled = () => { if (signal?.aborted) throw signal.reason; };
+    return withIdentityStore(identity, async targetStore => {
+      checkCancelled();
+      let reachable = warmReachable(identity);
+      if (reachable && typeof targetStore.readRoot === 'function') {
+        const root = await targetStore.readRoot();
+        checkCancelled();
+        if (root?.status !== 'ready' || root.revision !== reachable.rootRevision
+          || root.data?.chatId !== reachable.root.chatId
+          || root.data?.narrativeGeneration !== reachable.root.narrativeGeneration
+          || root.data?.headCheckpointId !== reachable.root.headCheckpointId
+          || root.data?.sourceSnapshotFingerprint !== reachable.root.sourceSnapshotFingerprint) reachable = null;
+      } else reachable = null;
+      if (!reachable) reachable = await targetStore.readReachable({ mode: 'full', signal });
+      checkCancelled();
+      if (reachable?.status === 'ready' && reachable.root?.chatId !== identity.chatId) {
+        throw errorWith('QQJ_STORAGE_ROOT_IDENTITY_MISMATCH', '当前基础数据身份无法安全核对，本次没有生成清理候选。');
+      }
+      if (reachable?.status !== 'ready' || !reachable.root || !reachable.root.headCheckpointId) {
+        const totals = { count: 0, bytes: 0 };
+        if (typeof client.iterRecords === 'function') {
+          for await (const item of client.iterRecords(`chat-${identity.chatId}`, { signal })) { checkCancelled(); totals.count += 1; totals.bytes += textBytes(item); }
+        } else {
+          const records = await client.list(`chat-${identity.chatId}`, { signal });
+          checkCancelled();
+          if (!Array.isArray(records)) throw errorWith('QQJ_STORAGE_LIST_INVALID', '后端没有返回可核对的记录清单。');
+          for (const item of records) { totals.count += 1; totals.bytes += textBytes(item); }
+        }
+        checkCancelled();
+        return Object.freeze({ status: reachable?.status === 'uninitialized' ? 'uninitialized' : 'notReady', identity, stats: Object.freeze({ total: totals, active: { count: 0, bytes: 0 }, cleanup: { count: 0, bytes: 0 }, retained: totals, breakdown: { active: emptyBreakdown(), cleanup: emptyBreakdown() } }), candidates: Object.freeze([]), anchor: null });
+      }
+      let classified;
+      if (typeof client.iterRecords === 'function') {
+        const classifier = createStorageClassifier(reachable, identity.chatId);
+        const vectorRecords = [];
+        let sourceIndex = 0;
+        for await (const record of client.iterRecords(`chat-${identity.chatId}`, { signal })) {
+          checkCancelled();
+          if (record?.recordId === VECTOR_INDEX_ID || String(record?.recordId ?? '').startsWith('qqj-vector-shard-')) vectorRecords.push({ record, sourceIndex });
+          else await classifier.add(record, sourceIndex);
+          sourceIndex += 1;
+        }
+        const vectorEnvelopes = vectorRecords.map(item => item.record);
+        const resumableVectorShardIds = await vectorRuntime?.getResumableShardIds?.(reachable, vectorEnvelopes) ?? [];
+        checkCancelled();
+        classifier.protectVectorRecords(vectorEnvelopes, resumableVectorShardIds);
+        for (const item of vectorRecords) { checkCancelled(); await classifier.add(item.record, item.sourceIndex); }
+        classified = classifier.finish();
+      } else {
+        const records = await client.list(`chat-${identity.chatId}`, { signal });
+        checkCancelled();
+        if (!Array.isArray(records)) throw errorWith('QQJ_STORAGE_LIST_INVALID', '后端没有返回可核对的记录清单。');
+        const resumableVectorShardIds = await vectorRuntime?.getResumableShardIds?.(reachable, records) ?? [];
+        checkCancelled();
+        classified = await classifyStorageRecords(records, reachable, identity.chatId, { resumableVectorShardIds });
+      }
+      checkCancelled();
+      return Object.freeze({
+        status: 'ready', identity, stats: classified.stats, candidates: classified.candidates,
+        anchor: Object.freeze({ status: 'ready', chatId: reachable.root.chatId, revision: reachable.rootRevision, headCheckpointId: reachable.root.headCheckpointId,
+          narrativeGeneration: reachable.root.narrativeGeneration, sourceSnapshotFingerprint: reachable.root.sourceSnapshotFingerprint }),
+      });
     });
   }
 
   async function scan() {
-    if (operation) return operation.promise;
-    const identity = capture();
+    let identity;
+    if (operation) {
+      if (operation.kind !== 'scanning' || !operation.controller) return operation.promise;
+      try { identity = capture(); } catch { return operation.promise; }
+      if (sameIdentity(identity, operation.identity)) return operation.promise;
+      operation.controller.abort(errorWith('QQJ_STORAGE_CHAT_CHANGED', '当前聊天已经变化，已停止旧聊天的存储统计。'));
+    }
+    identity ??= capture();
     const stableCount = currentStableCount(identity);
     reusableAutomaticSnapshot = null;
-    const current = { kind: 'scanning', identity, promise: null };
+    const current = { kind: 'scanning', identity, promise: null, controller: new AbortController() };
     operation = current; notify();
-    current.promise = scanSnapshot(identity).then(snapshot => {
+    current.promise = scanSnapshot(identity, { signal: current.controller.signal }).then(snapshot => {
       setResult(identity, { status: snapshot.status, stats: snapshot.stats, error: null, lastResult: null });
       rememberAutomaticSnapshot(identity, snapshot, stableCount);
       return snapshot;
@@ -322,9 +384,7 @@ export function createStorageManagement({
   }
 
   async function readRootUnderMaintenance(identity) {
-    assertCurrent(identity);
     const envelope = await client.get(`chat-${identity.chatId}`, 'v3-root');
-    assertCurrent(identity);
     if (!Number.isSafeInteger(envelope?.revision) || envelope.revision < 1) {
       throw errorWith('QQJ_STORAGE_ROOT_INVALID', '当前版本记录缺少可核对的 revision，本次没有删除。');
     }
@@ -351,14 +411,12 @@ export function createStorageManagement({
     async function worker() {
       while (!firstError) {
         try {
-          assertCurrent(identity);
           const index = cursor;
           if (index >= candidates.length) return;
           cursor += 1;
           const candidate = candidates[index];
           await client.removePermanent(collection, candidate.recordId, candidate.revision);
           deletedCount += 1;
-          assertCurrent(identity);
         } catch (error) {
           if (error?.status === 404) { convergedCount += 1; continue; }
           firstError ??= error;
@@ -376,16 +434,13 @@ export function createStorageManagement({
   async function cleanFromSnapshot(identity, snapshot, { automatic = false } = {}) {
     if (snapshot.status !== 'ready') return { status: snapshot.status, deletedCount: 0, convergedCount: 0, remainingCount: 0, automatic };
     if (!snapshot.candidates.length) return { status: 'completed', deletedCount: 0, convergedCount: 0, remainingCount: 0, automatic };
-    if (workBusy()) throw errorWith('QQJ_STORAGE_BUSY', '当前正在生成或处理千千结任务，请等待完成后再清理。');
+    if (inCurrentHost(identity) && workBusy()) throw errorWith('QQJ_STORAGE_BUSY', '当前正在生成或处理千千结任务，请等待完成后再清理。');
     let suspended = false, removed = null, lockedRootChanged = false, maintenanceError = null, releaseError = null;
     try {
-      session.suspend(identity.chatId);
-      suspended = true;
-      assertCurrent(identity);
+      if (inCurrentHost(identity)) { session.suspend(identity.chatId); suspended = true; }
       const before = await readRootUnderMaintenance(identity);
       if (!rootMatches(before, snapshot.anchor)) throw errorWith('QQJ_STORAGE_ROOT_CHANGED', '当前版本已在扫描后变化，本次没有删除；请刷新统计后重试。');
       removed = await removeCandidates(identity, snapshot.candidates);
-      assertCurrent(identity);
       try {
         const after = await readRootUnderMaintenance(identity);
         lockedRootChanged = !rootMatches(after, snapshot.anchor);
@@ -399,10 +454,8 @@ export function createStorageManagement({
     }
     if (!removed) throw maintenanceError ?? releaseError ?? errorWith('QQJ_STORAGE_CLEANUP_FAILED', '清理没有开始。');
     let refreshed = null, refreshError = null;
-    if (!hostMatches(identity)) throw errorWith('QQJ_STORAGE_CHAT_CHANGED', '当前聊天已经变化，未操作其他聊天的数据。');
     if (releaseError) refreshError = releaseError;
     else {
-      assertCurrent(identity);
       try { refreshed = await scanSnapshot(identity); }
       catch (error) { refreshError = error; }
     }
@@ -445,9 +498,118 @@ export function createStorageManagement({
     const next = { ...progress(), [chatId]: Math.max(0, Math.floor(Number(stableCount) || 0)) };
     settings.update({ storageAutoCleanupProgress: next });
   };
+  async function readTrashGcCapability({ retry = false } = {}) {
+    if (retry && (trashGcCapability === 'error' || trashGcCapability === false)) trashGcCapability = null;
+    if (trashGcCapability !== null) return trashGcCapability;
+    if (!client?.collectExpiredTrash || typeof client?.health !== 'function') {
+      trashGcCapability = false;
+      return false;
+    }
+    if (!trashGcCapabilityCheck) trashGcCapabilityCheck = (async () => {
+      try {
+        const health = await client.health();
+        trashGcCapability = health?.capabilities?.trashGc === true;
+        return trashGcCapability;
+      } catch (error) {
+        if (error?.status === 404) {
+          trashGcCapability = false;
+          const unsupported = errorWith('QQJ_TRASH_GC_UNSUPPORTED', '回收站尚未清理；请更新白鳥数据后端并重启酒馆。');
+          trashGcState = { ...trashGcState, status: 'unsupported', error: unsupported, automatic: true };
+          notify();
+          return false;
+        }
+        trashGcCapability = 'error';
+        trashGcState = { ...trashGcState, status: 'error', error, automatic: true };
+        notify();
+        return 'error';
+      } finally { trashGcCapabilityCheck = null; }
+    })();
+    return trashGcCapabilityCheck;
+  }
+  async function collectExpiredTrash({ automatic = false } = {}) {
+    if (trashGcCheck) return trashGcCheck;
+    if (automatic && trashGcCapability === false) return { status: 'unsupported', deleted: 0 };
+    if (automatic) {
+      if (disposed || !isEnabled?.()) return { status: 'idle', deleted: 0 };
+      const completedAt = Date.parse(settings.get().storageTrashGcLastCompletedAt);
+      if (Number.isFinite(completedAt) && Date.now() - completedAt < TRASH_GC_INTERVAL_MS) return { status: 'idle', deleted: 0 };
+      if (Date.now() < trashGcRetryAfter) return { status: 'pending', deleted: 0 };
+    }
+    if (workBusy() || operation) {
+      trashGcState = { ...trashGcState, status: 'pending', automatic, error: null };
+      notify();
+      return { status: 'pending', deleted: 0 };
+    }
+    const current = { kind: 'trashGc', identity: (() => { try { return currentIdentity(); } catch { return null; } })(), promise: null };
+    operation = current;
+    trashGcState = { ...trashGcState, status: 'checking', error: null, automatic };
+    notify();
+    current.promise = (async () => {
+      const capability = await readTrashGcCapability({ retry: !automatic || (trashGcCapability === 'error' && Date.now() >= trashGcRetryAfter) });
+      if (capability === false) {
+        const error = errorWith('QQJ_TRASH_GC_UNSUPPORTED', '回收站尚未清理；请更新白鳥数据后端并重启酒馆。');
+        trashGcProgress = null;
+        trashGcRetryAfter = Date.now() + TRASH_GC_INTERVAL_MS;
+        trashGcState = { ...trashGcState, status: 'unsupported', error, automatic };
+        return { status: 'unsupported', deleted: 0, error };
+      }
+      if (capability === 'error') {
+        const error = trashGcState.error ?? errorWith('QQJ_TRASH_GC_HEALTH_FAILED', '无法确认后端回收站清理能力。');
+        trashGcRetryAfter = Date.now() + TRASH_GC_INTERVAL_MS;
+        return { status: 'error', deleted: 0, error };
+      }
+      trashGcProgress ??= { cursor: null, scanned: 0, deleted: 0, failed: 0 };
+      trashGcState = { status: 'running', ...trashGcProgress, error: null, automatic };
+      let complete = false;
+      while (!complete) {
+        const page = await client.collectExpiredTrash(NAMESPACE, { limit: 32, cursor: trashGcProgress.cursor });
+        if (!page || !Number.isSafeInteger(page.scanned) || page.scanned < 0
+          || !Number.isSafeInteger(page.deleted) || page.deleted < 0
+          || !Number.isSafeInteger(page.failed) || page.failed < 0 || typeof page.complete !== 'boolean'
+          || (!page.complete && (!page.nextCursor || JSON.stringify(page.nextCursor) === JSON.stringify(trashGcProgress.cursor)))) {
+          throw errorWith('QQJ_TRASH_GC_RESPONSE_INVALID', '后端回收站清理没有返回有效进度。');
+        }
+        trashGcProgress = { cursor: page.complete ? null : page.nextCursor,
+          scanned: trashGcProgress.scanned + page.scanned, deleted: trashGcProgress.deleted + page.deleted,
+          failed: trashGcProgress.failed + page.failed };
+        trashGcState = { status: 'running', ...trashGcProgress, error: null, automatic };
+        notify();
+        complete = page.complete;
+        if (!complete && (disposed || !isEnabled?.() || workBusy())) {
+          trashGcState = { status: 'pending', ...trashGcProgress, error: null, automatic };
+          return { status: 'pending', ...trashGcProgress };
+        }
+      }
+      const result = { ...trashGcProgress };
+      trashGcProgress = null;
+      if (result.failed) {
+        trashGcRetryAfter = Date.now() + TRASH_GC_INTERVAL_MS;
+        trashGcState = { status: 'partial', ...result, error: errorWith('QQJ_TRASH_GC_PARTIAL', '部分回收站记录未能核验或清理；可在存储管理中手动重试。'), automatic };
+        return { status: 'partial', ...result, error: trashGcState.error };
+      }
+      settings.update({ storageTrashGcLastCompletedAt: new Date().toISOString() });
+      trashGcRetryAfter = 0;
+      trashGcState = { status: 'completed', ...result, error: null, automatic };
+      return { status: 'completed', ...result };
+    })().catch(error => {
+      trashGcRetryAfter = Date.now() + TRASH_GC_INTERVAL_MS;
+      trashGcState = { status: 'error', ...(trashGcProgress ?? { scanned: 0, deleted: 0, failed: 0 }), error, automatic };
+      return { status: 'error', ...trashGcProgress, error };
+    }).finally(() => {
+      if (operation === current) operation = null;
+      notify();
+      scheduleAutomatic();
+    });
+    trashGcCheck = current.promise.finally(() => { trashGcCheck = null; });
+    return trashGcCheck;
+  }
   async function checkAutomatic() {
+    if (disposed) return;
+    if (isEnabled?.()) await collectExpiredTrash({ automatic: true });
     if (disposed || !autoEnabled() || automaticCheck) return;
-    const memory = memoryRuntime.getState();
+    const memory = memoryRuntime.getActivityState();
+    // Coverage can still be zero after the current chat identity is available.
+    if (memory?.memorySnapshotStatus !== 'ready' || memory.memorySyncStatus === 'syncing') return;
     if (!memory?.chatId || !Number.isSafeInteger(memory.stableCount) || memory.stableCount < 0) return;
     const identity = (() => { try { return capture(); } catch { return null; } })();
     if (!identity || identity.chatId !== memory.chatId) return;
@@ -513,7 +675,12 @@ export function createStorageManagement({
     }).finally(() => { automaticCheck = null; notify(); });
   }
   const scheduleAutomatic = () => { void Promise.resolve().then(checkAutomatic); };
-  const activity = () => { notify(); scheduleAutomatic(); };
+  const activity = () => {
+    if (operation?.kind === 'scanning' && operation.controller && !hostMatches(operation.identity)) {
+      operation.controller.abort(errorWith('QQJ_STORAGE_CHAT_CHANGED', '当前聊天已经变化，已停止旧聊天的存储统计。'));
+    }
+    notify(); scheduleAutomatic();
+  };
   const unsubscribers = [...new Set([memoryRuntime, ...activitySources])]
     .map(source => typeof source?.subscribe === 'function' ? source.subscribe(activity) : null).filter(Boolean);
 
@@ -523,7 +690,7 @@ export function createStorageManagement({
       throw errorWith('QQJ_STORAGE_AUTO_SCAN_REQUIRED', '请先刷新并查看当前聊天的存储统计，再开启自动清理。');
     }
     settings.update({ storageAutoCleanupEnabled: enabled === true });
-    if (enabled === true) updateProgress(identity.chatId, memoryRuntime.getState()?.stableCount ?? 0);
+    if (enabled === true) updateProgress(identity.chatId, memoryRuntime.getActivityState()?.stableCount ?? 0);
     setResult(identity, { autoPending: false });
     return scopedState();
   }
@@ -532,7 +699,9 @@ export function createStorageManagement({
   return Object.freeze({
     scan,
     cleanup,
+    collectExpiredTrash() { return collectExpiredTrash({ automatic: false }); },
     setAutoEnabled,
+    getActivityState: () => ({ busy: Boolean(operation) || trashGcState.status === 'checking', phase: operation?.kind ?? (trashGcState.status === 'checking' ? 'cleaning' : null) }),
     getState: scopedState,
     subscribe(listener) { if (typeof listener !== 'function') throw new TypeError('存储管理 listener 无效'); subscribers.add(listener); return () => subscribers.delete(listener); },
     dispose() { disposed = true; for (const unsubscribe of unsubscribers) unsubscribe(); subscribers.clear(); },

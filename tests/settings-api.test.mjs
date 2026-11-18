@@ -1,14 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { applyPluginEnabledImmediately, createSettingsStore, DEFAULT_SETTINGS, normalizeAutoHideKeepAiCount, normalizeAutoMemoryBatchSize } from '../src/settings.js';
+import { BASE_PROCESSING_PROMPT } from '../src/shared-processing-prompt.js';
 import { createApiResolver, createApiTools, createTaskRouter } from '../src/api-routing.js';
 
 const configured = (name, id, key = 'TEST_KEY') => ({ id, name, url: 'https://api.example.test/v1', key, model: 'test-model', excludeParams: [], timeoutSec: 30, stream: false });
 const setup = extensionSettings => {
   let saves = 0;
   const settings = createSettingsStore({ extensionSettings, save: () => { saves += 1; }, now: () => 1, random: () => 0.5 });
-  return { settings, saves: () => saves };
+  // Other setting tests count writes after the one-time shared initialization.
+  const initializationSaves=saves;
+  return { settings, saves: () => saves-initializationSaves };
 };
 
 test('世界书默认跟随分析而不是摘要，独立预设冻结在途配置且不改变其他角色', async () => {
@@ -118,26 +123,50 @@ test('记忆提取周期固定为 1，旧配置与更新请求都不能继续生
   assert.equal(normalizeAutoMemoryBatchSize(1), 1);
   assert.equal(normalizeAutoMemoryBatchSize(20), 1);
   for (const invalid of [undefined, null, 0, 21, 1.5, 'abc']) assert.equal(normalizeAutoMemoryBatchSize(invalid), 1);
+  assert.equal(saves(), 0, '读取与规范化默认值不触发保存');
   settings.update({ autoMemoryEnabled: true, autoMemoryBatchSize: 20 });
   assert.equal('autoMemoryEnabled' in extensionSettings.qianqianjie, false);
   assert.equal(extensionSettings.qianqianjie.autoMemoryBatchSize, 1);
-  assert.equal(saves(), 1);
+  assert.equal(saves(), 1, '一次设置更新只保存一次');
 
   settings.update({ autoMemoryBatchSize: 2 });
   assert.equal(settings.get().autoMemoryBatchSize, 1);
 });
 
-test('自动隐藏默认关闭并保留最近 3 个 AI 楼，数量只接受合理正整数', () => {
+test('自动隐藏默认开启并保留最近 3 个 AI 楼，已有明确关闭保持且读取不保存', () => {
   const extensionSettings = {};
   const { settings, saves } = setup(extensionSettings);
-  assert.equal(settings.get().autoHideEnabled, false);
+  assert.equal(settings.get().autoHideEnabled, true);
   assert.equal(settings.get().autoHideKeepAiCount, 3);
+  assert.equal(saves(), 0, '新设置读取不额外保存');
+  const oldMissing = setup({ qianqianjie: { pluginEnabled: true } });
+  assert.equal(oldMissing.settings.get().autoHideEnabled, true, '旧配置缺字段时采用开启默认');
+  assert.equal(oldMissing.saves(), 0);
+  const oldDisabled = setup({ qianqianjie: { autoHideEnabled: false, autoHideKeepAiCount: 7 } });
+  assert.equal(oldDisabled.settings.get().autoHideEnabled, false, '已保存的明确关闭不被默认值覆盖');
+  assert.equal(oldDisabled.settings.get().autoHideKeepAiCount, 7);
+  assert.equal(oldDisabled.saves(), 0);
   assert.equal(normalizeAutoHideKeepAiCount(1), 1); assert.equal(normalizeAutoHideKeepAiCount(50), 50);
   for (const invalid of [undefined, null, 0, 51, 2.5, 'abc']) assert.equal(normalizeAutoHideKeepAiCount(invalid), 3);
   settings.update({ autoHideEnabled: true, autoHideKeepAiCount: 7 });
   assert.equal(settings.get().autoHideEnabled, true); assert.equal(settings.get().autoHideKeepAiCount, 7); assert.equal(saves(), 1);
   settings.update({ autoHideKeepAiCount: -2 });
   assert.equal(settings.get().autoHideKeepAiCount, 3);
+});
+
+test('浏览器记忆缓存默认开启并通过现有设置持久化，旧配置读取保持开启', () => {
+  const extensionSettings = { qianqianjie: { pluginEnabled: false } };
+  const { settings, saves } = setup(extensionSettings);
+  assert.equal(settings.get().coreCacheEnabled, true);
+  settings.update({ coreCacheEnabled: false });
+  assert.equal(extensionSettings.qianqianjie.coreCacheEnabled, false);
+  assert.equal(settings.get().coreCacheEnabled, false);
+  assert.equal(saves(), 1);
+  const reloaded = createSettingsStore({ extensionSettings, save() {} });
+  assert.equal(reloaded.get().coreCacheEnabled, false, '重建设置store仍读到已修改值');
+  reloaded.update({ coreCacheEnabled: true });
+  assert.equal(extensionSettings.qianqianjie.coreCacheEnabled, true);
+  assert.equal(reloaded.get().coreCacheEnabled, true);
 });
 
 test('楼层召回与记忆卡片默认显示，分别持久化且旧设置继续按默认显示', () => {
@@ -153,19 +182,39 @@ test('楼层召回与记忆卡片默认显示，分别持久化且旧设置继�
   assert.equal(saves(), 2);
 });
 
-test('存储自动清理默认关闭，只保存合法的逐聊天稳定楼进度', () => {
+test('存储维护进度只保存合法的逐聊天楼号与完整回收站检查时间', () => {
   const extensionSettings = {};
   const { settings, saves } = setup(extensionSettings);
-  assert.equal(settings.get().storageAutoCleanupEnabled, false);
+  assert.equal(settings.get().storageAutoCleanupEnabled, true);
   assert.deepEqual(settings.get().storageAutoCleanupProgress, {});
+  assert.equal(settings.get().storageTrashGcLastCompletedAt, '');
   settings.update({ storageAutoCleanupEnabled: true, storageAutoCleanupProgress: {
     '123e4567-e89b-42d3-a456-426614174000': 20,
     invalid: 10,
     '223e4567-e89b-42d3-a456-426614174000': -1,
-  } });
+  }, storageTrashGcLastCompletedAt: '2026-10-16T08:00:00.000Z' });
   assert.equal(settings.get().storageAutoCleanupEnabled, true);
   assert.deepEqual(settings.get().storageAutoCleanupProgress, { '123e4567-e89b-42d3-a456-426614174000': 20 });
+  assert.equal(settings.get().storageTrashGcLastCompletedAt, '2026-10-16T08:00:00.000Z');
+  settings.update({ storageTrashGcLastCompletedAt: 'invalid' });
+  assert.equal(settings.get().storageTrashGcLastCompletedAt, '');
+  assert.equal(saves(), 2);
+});
+
+test('自动清理新建及旧缺字段默认开启，已保存关闭在重载后保持，读取不另存设置', () => {
+  for (const extensionSettings of [{}, { qianqianjie: {} }, { qianqianjie: { storageAutoCleanupEnabled: false } }]) {
+    const expected = extensionSettings.qianqianjie?.storageAutoCleanupEnabled !== false;
+    const { settings, saves } = setup(extensionSettings);
+    assert.equal(settings.get().storageAutoCleanupEnabled, expected);
+    assert.equal(settings.get().storageAutoCleanupEnabled, expected);
+    assert.equal(saves(), 0, '补缺默认值和读取不会额外保存');
+  }
+  const extensionSettings = {}, { settings, saves } = setup(extensionSettings);
+  settings.update({ storageAutoCleanupEnabled: false });
   assert.equal(saves(), 1);
+  const reloaded = setup(extensionSettings);
+  assert.equal(reloaded.settings.get().storageAutoCleanupEnabled, false);
+  assert.equal(reloaded.saves(), 0);
 });
 
 test('旧千事重要覆盖设置读取时保持原样，但不再进入默认值或更新接口', () => {
@@ -187,11 +236,11 @@ test('时间戳功能默认开启，参考标签独立规范化，五类自定�
   const { settings } = setup(extensionSettings);
   assert.equal(settings.get().storyClockEnabled, true); assert.equal(settings.get().storyClockPrompt, '');
   assert.equal(settings.get().storyClockReferenceTags, '');
-  assert.equal(settings.get().processingPrompt, ''); assert.equal(settings.get().summaryPrompt, ''); assert.equal(settings.get().csePrompt, ''); assert.equal(settings.get().profilePrompt, '');
+  assert.equal(settings.processingPrompt(), BASE_PROCESSING_PROMPT); assert.equal(settings.get().summaryPrompt, ''); assert.equal(settings.get().csePrompt, ''); assert.equal(settings.get().profilePrompt, '');
   settings.update({ storyClockEnabled: false, storyClockPrompt: '  原样换行\n', storyClockReferenceTags: ' TI，时标\nti\n[[...]] ', processingPrompt: '  破限原样\n', summaryPrompt: '  摘要要求\n', csePrompt: '  CSE 要求\n', profilePrompt: '  人物资料要求\n' });
   assert.equal(settings.get().storyClockEnabled, false); assert.equal(settings.get().storyClockPrompt, '  原样换行\n');
   assert.equal(settings.get().storyClockReferenceTags, 'TI,时标');
-  assert.equal(settings.get().processingPrompt, '  破限原样\n'); assert.equal(settings.get().summaryPrompt, '  摘要要求\n'); assert.equal(settings.get().csePrompt, '  CSE 要求\n'); assert.equal(settings.get().profilePrompt, '  人物资料要求\n');
+  assert.equal(settings.processingPrompt(), '  破限原样\n'); assert.equal(settings.get().summaryPrompt, '  摘要要求\n'); assert.equal(settings.get().csePrompt, '  CSE 要求\n'); assert.equal(settings.get().profilePrompt, '  人物资料要求\n');
 });
 
 test('悬浮球偏好默认显示并独立持久化', () => {
@@ -214,7 +263,7 @@ test('剔除包裹符设置保留标签名与字面起止符混合配置', () =>
   const extensionSettings = {};
   const { settings } = setup(extensionSettings);
   settings.update({ sourceExtraTags: ' THINK，[[...]]\nreasoning ' });
-  assert.equal(settings.get().sourceExtraTags, 'think,[[...]],reasoning');
+  assert.equal(settings.wrappers().extraTags, 'think,[[...]],reasoning');
 });
 
 test('总开关 change 立即持久化并调用运行时；运行时失败时恢复原真值', async () => {
@@ -267,6 +316,7 @@ test('总开关快速连续切换与面板重建共用顺序，最后选择获�
 
 test('总开关可检测的同步保存调度失败会恢复原值，不谎报已保存', async () => {
   const extensionSettings = {};
+  extensionSettings['schedule-planner']={processingPrompt:''};
   const settings = createSettingsStore({ extensionSettings, save: () => { throw new Error('宿主保存调度失败'); } });
   assert.equal(settings.isEnabled(), true);
   await assert.rejects(applyPluginEnabledImmediately({ settings, enabled: false }), /宿主保存调度失败/);
@@ -319,7 +369,7 @@ test('千千结主配置独立，显式预设从共享池即时解析；失效�
   assert.equal(calls, 0); assert.equal(settings.get().selectedSevenDaysPresetId, selected.id);
 });
 
-test('只双向共享 schedule-planner 预设池；千千结主配置与两边用途保持独立', async () => {
+test('只双向共享 schedule-planner 预设池；千千结主配置与两边用途保持独立', async t => {
   const keep = { ...configured('保留', 'keep'), vendor: { nested: true } };
   const target = { ...configured('待改', 'target'), targetUnknown: 'KEEP_ME' };
   const extensionSettings = { qianqianjie: { apiUrl: 'https://qqj.old/v1', apiKey: 'QQJ_OLD', apiModel: 'qqj-old', summaryPresetId: 'keep' }, 'schedule-planner': { apiUrl: 'https://main.old/v1', apiKey: 'OLD', apiModel: 'old', apiPresetActiveId: 'keep', utilityPresetId: 'target', apiPresets: [keep, target], unknownTop: { keep: true } } };
@@ -330,20 +380,33 @@ test('只双向共享 schedule-planner 预设池；千千结主配置与两边�
   assert.equal(extensionSettings['schedule-planner'].apiUrl, 'https://main.old/v1'); assert.equal(extensionSettings['schedule-planner'].apiPresetActiveId, 'keep'); assert.equal(extensionSettings['schedule-planner'].utilityPresetId, 'target');
   assert.equal(settings.mainConfig().url, 'https://qqj.new/v1'); assert.equal(settings.summaryPresetId(), 'keep');
 
-  const source = await readFile(new URL('../../ST-SevenDaysCal/runtime/settings.js', import.meta.url), 'utf8');
-  globalThis.__QQJ_SEVEN_TEST_SETTINGS__ = extensionSettings; globalThis.__QQJ_SEVEN_TEST_SAVES__ = 0;
-  const executable = source
-    .replace("import { extension_settings } from '../../../../extensions.js';", 'const extension_settings = globalThis.__QQJ_SEVEN_TEST_SETTINGS__;')
-    .replace("import { saveSettingsDebounced } from '../../../../../script.js';", 'const saveSettingsDebounced = () => { globalThis.__QQJ_SEVEN_TEST_SAVES__ += 1; };');
-  const seven = await import(`data:text/javascript;base64,${Buffer.from(executable).toString('base64')}`);
-  assert.deepEqual(seven.loadCfg(), { url: 'https://main.old/v1', key: 'OLD', model: 'old', excludeParams: [], timeoutSec: 180, stream: false, spAdditionalParams: '' });
-  assert.deepEqual(seven.loadApiPresets().find(item => item.id === 'target'), extensionSettings['schedule-planner'].apiPresets[1]);
-  seven.upsertApiPreset('构画侧已改', { url: 'https://seven.changed/v1', key: 'SEVEN_KEY', model: 'seven-model', excludeParams: ['top_p'], timeoutSec: 88, stream: false }, 'target');
-  assert.deepEqual(settings.sharedPresets().find(item => item.id === 'target'), { id: 'target', name: '构画侧已改', url: 'https://seven.changed/v1', key: 'SEVEN_KEY', model: 'seven-model', excludeParams: ['top_p'], timeoutSec: 88, stream: false, targetUnknown: 'KEEP_ME' });
-  settings.renameSharedPreset('target', '千千结改名'); assert.equal(seven.loadApiPresets().find(item => item.id === 'target').name, '千千结改名');
-  settings.deleteSharedPreset('target'); assert.equal(seven.loadApiPresets().some(item => item.id === 'target'), false); assert.deepEqual(seven.loadApiPresets()[0], keep);
-  assert.equal(extensionSettings['schedule-planner'].utilityPresetId, 'target'); assert.equal(extensionSettings['schedule-planner'].apiPresetActiveId, 'target', '构画自己编辑预设时仍可维护自己的活动指针');
-  delete globalThis.__QQJ_SEVEN_TEST_SETTINGS__; delete globalThis.__QQJ_SEVEN_TEST_SAVES__;
+  await t.test('构画真实设置模块与千千结双向共享预设', async t => {
+    const configuredRoot = process.env.QQJ_SEVEN_DAYS_CAL_ROOT;
+    const sourceUrl = configuredRoot ? pathToFileURL(resolve(configuredRoot, 'runtime/settings.js'))
+      : new URL('../../ST-SevenDaysCal/runtime/settings.js', import.meta.url);
+    let source;
+    try { source = await readFile(sourceUrl, 'utf8'); }
+    catch (error) {
+      if (error.code !== 'ENOENT' || configuredRoot) throw error;
+      t.skip('可选跨插件集成需要 ST-SevenDaysCal 源码；可用 QQJ_SEVEN_DAYS_CAL_ROOT 指定目录。');
+      return;
+    }
+    globalThis.__QQJ_SEVEN_TEST_SETTINGS__ = extensionSettings; globalThis.__QQJ_SEVEN_TEST_SAVES__ = 0;
+    t.after(() => { delete globalThis.__QQJ_SEVEN_TEST_SETTINGS__; delete globalThis.__QQJ_SEVEN_TEST_SAVES__; });
+    const executable = source
+      .replace("'../utils/shared-processing-prompt.js'", JSON.stringify(new URL('../utils/shared-processing-prompt.js', sourceUrl).href))
+      .replace("'../utils/shared-body-wrappers.js'", JSON.stringify(new URL('../utils/shared-body-wrappers.js', sourceUrl).href))
+      .replace("import { extension_settings } from '../../../../extensions.js';", 'const extension_settings = globalThis.__QQJ_SEVEN_TEST_SETTINGS__;')
+      .replace("import { saveSettingsDebounced } from '../../../../../script.js';", 'const saveSettingsDebounced = () => { globalThis.__QQJ_SEVEN_TEST_SAVES__ += 1; };');
+    const seven = await import(`data:text/javascript;base64,${Buffer.from(executable).toString('base64')}`);
+    assert.deepEqual(seven.loadCfg(), { url: 'https://main.old/v1', key: 'OLD', model: 'old', excludeParams: [], timeoutSec: 180, stream: false, spAdditionalParams: '' });
+    assert.deepEqual(seven.loadApiPresets().find(item => item.id === 'target'), extensionSettings['schedule-planner'].apiPresets[1]);
+    seven.upsertApiPreset('构画侧已改', { url: 'https://seven.changed/v1', key: 'SEVEN_KEY', model: 'seven-model', excludeParams: ['top_p'], timeoutSec: 88, stream: false }, 'target');
+    assert.deepEqual(settings.sharedPresets().find(item => item.id === 'target'), { id: 'target', name: '构画侧已改', url: 'https://seven.changed/v1', key: 'SEVEN_KEY', model: 'seven-model', excludeParams: ['top_p'], timeoutSec: 88, stream: false, targetUnknown: 'KEEP_ME' });
+    settings.renameSharedPreset('target', '千千结改名'); assert.equal(seven.loadApiPresets().find(item => item.id === 'target').name, '千千结改名');
+    settings.deleteSharedPreset('target'); assert.equal(seven.loadApiPresets().some(item => item.id === 'target'), false); assert.deepEqual(seven.loadApiPresets()[0], keep);
+    assert.equal(extensionSettings['schedule-planner'].utilityPresetId, 'target'); assert.equal(extensionSettings['schedule-planner'].apiPresetActiveId, 'target', '构画自己编辑预设时仍可维护自己的活动指针');
+  });
 });
 
 test('记忆任务路由冻结本次配置，下一次才读取变化且在途可中止', async () => {
@@ -709,4 +772,105 @@ test('副任务沿用统一 disabled 与 external signal 守卫', async () => {
   await assert.rejects(pending, error => error.name === 'AbortError');
   assert.equal(calls, 1);
   assert.equal(router.getActiveCount(), 0);
+});
+
+test('共享破限缺键只初始化一次，显式空值保持原样且旧局部自定义不再回灌',()=>{const extensionSettings={qianqianjie:{processingPrompt:'旧QQJ生效全文'},'schedule-planner':{unknown:true}};let saves=0;const settings=createSettingsStore({extensionSettings,save(){saves++;}});assert.equal(saves,1);assert.equal(settings.processingPrompt(),'旧QQJ生效全文');settings.update({processingPrompt:''});assert.equal(extensionSettings['schedule-planner'].processingPrompt,'');extensionSettings.qianqianjie.processingPrompt='旧值不回灌';const reloaded=createSettingsStore({extensionSettings,save(){saves++;}});assert.equal(reloaded.processingPrompt(),'');assert.equal(extensionSettings['schedule-planner'].unknown,true);assert.equal(saves,2);assert.ok(BASE_PROCESSING_PROMPT);});
+
+test('人物独立router复用同resolver与client，按实际派发读配置并保持signal和全量取消', async () => {
+  const extensionSettings = { qianqianjie: { summaryPresetId: 'utility' }, 'schedule-planner': { apiPresets: [configured('副', 'utility', 'FIRST')] } };
+  const { settings } = setup(extensionSettings), resolver = createApiResolver({ settings }), calls = [], releases = [];
+  const compactClient = { generateTask: options => new Promise((resolve, reject) => { calls.push(options); releases.push(() => options.signal.aborted ? reject(new DOMException('Aborted', 'AbortError')) : resolve({ jsonData: {} })); }) };
+  const common = { resolver, compactClient, isEnabled: settings.isEnabled };
+  const shared = createTaskRouter(common), people = createTaskRouter(common);
+  const original = shared.generateUtilityTask({}).then(value => ({ value }), error => ({ error }));
+  const first = people.generateUtilityTask({});
+  assert.equal(shared.getActiveCount(), 1); assert.equal(people.getActiveCount(), 1);
+  shared.abortAll(); releases[0](); releases[1]();
+  assert.equal((await original).error.name, 'AbortError'); await first;
+  assert.equal(calls[1].signal.aborted, false);
+  extensionSettings['schedule-planner'].apiPresets[0].key = 'SECOND';
+  const controller = new AbortController(), pending = people.generateUtilityTask({ signal: controller.signal });
+  assert.equal(calls[2].config.key, 'SECOND'); assert.equal(calls[1].config.key, 'FIRST');
+  controller.abort(); releases[2](); await assert.rejects(pending, { name: 'AbortError' });
+  const stopped = people.generateUtilityTask({}); people.abortAll(); releases[3]();
+  await assert.rejects(stopped, { name: 'AbortError' });
+  assert.equal(people.getActiveCount(), 0); assert.equal(shared.getActiveCount(), 0);
+});
+
+test('API编辑器显式等待保存失败，回退自己参数且新建不遗留重复预设，旧同步调用不变', async () => {
+  let fail = false;
+  const data = { 'schedule-planner': { marker: true, apiPresets: [{ id: 'p', name: '旧名', url: 'https://old.test', key: 'old', model: 'old', vendor: 1 }] } };
+  const settings = createSettingsStore({ extensionSettings: data, save: () => fail ? Promise.reject(Error('异步保存失败')) : undefined });
+  settings.get();const before = structuredClone(data);fail = true;
+  await assert.rejects(async () => settings.upsertSharedPreset('新名', { url: 'https://new.test', key: 'new', model: 'new' }, 'p', { observeSaveFailure: true, requireExisting: true }), /异步保存失败/);
+  assert.deepEqual(data, before);
+  await assert.rejects(async () => settings.upsertSharedPreset('新增', { url: 'https://new.test', key: 'new', model: 'new' }, '', { observeSaveFailure: true }), /异步保存失败/);assert.deepEqual(data, before);
+  await assert.rejects(async () => settings.saveMainConfig({ url: 'https://new.test', key: 'new', model: 'new' }, { observeSaveFailure: true }), /异步保存失败/);assert.deepEqual(data, before);
+  fail = false;const id=settings.upsertSharedPreset('旧同步', { url: 'https://new.test', key: 'new', model: 'new' });assert.equal(typeof id,'string');
+  const count=settings.sharedPresets().length;
+  assert.throws(()=>settings.upsertSharedPreset('不复活', {}, 'missing', { requireExisting: true }), /不存在|失效/);assert.equal(settings.sharedPresets().length,count);
+});
+
+test('API保存失败只撤回本次字段或新增项，不覆盖期间其它预设和目标新改动', async () => {
+  const data = { 'schedule-planner': { apiPresets: [{ id: 'p', name: '原名', url: 'https://old.test', key: 'key', model: 'old', vendor: 1 }] } };
+  let mode='init';
+  const settings=createSettingsStore({extensionSettings:data,save(){
+    if(mode==='init')return;
+    const list=data['schedule-planner'].apiPresets;
+    if(mode==='edit'){const p=list.find(p=>p.id==='p');p.url='https://other.test';p.late=true;}
+    list.push({id:'other-'+mode,name:'外部新增'});return Promise.reject(Error('保存失败'));
+  }});
+  settings.get();mode='edit';
+  await assert.rejects(async()=>settings.upsertSharedPreset('已改', {url:'https://draft.test',key:'key',model:'draft'},'p',{observeSaveFailure:true}),/保存失败/);
+  const p=data['schedule-planner'].apiPresets.find(p=>p.id==='p');assert.equal(p.name,'原名');assert.equal(p.model,'old');assert.equal(p.url,'https://other.test');assert.equal(p.late,true);assert.ok(data['schedule-planner'].apiPresets.some(p=>p.id==='other-edit'));
+  mode='new';await assert.rejects(async()=>settings.upsertSharedPreset('本轮新增',{url:'https://new.test',key:'key',model:'new'},'',{observeSaveFailure:true}),/保存失败/);
+  assert.deepEqual(data['schedule-planner'].apiPresets.map(p=>p.id),['p','other-edit','other-new']);
+});
+
+
+test('连接重试配置缺省不回写，零值贯通主配置、共享用途与失败回滚', async () => {
+  const data = {}, { settings } = setup(data);
+  settings.saveMainConfig(configured('主', 'main'));
+  const before = structuredClone(data); settings.mainConfig(); settings.sharedPresets();
+  assert.deepEqual(data, before); assert.equal(Object.hasOwn(settings.get(), 'apiQianqianjieRetryCount'), false);
+  settings.saveMainConfig({ ...settings.mainConfig(), qqjRetryCount: 0 });
+  assert.equal(settings.mainConfig().qqjRetryCount, 0);
+  const id = settings.upsertSharedPreset('连接', { ...configured('连接', 'p'), qqjRetryCount: 4 }, 'p');
+  data['schedule-planner'].apiPresets[0].unknown = { keep: true };
+  settings.update({ apiMode: 'seven-preset', selectedSevenDaysPresetId: id, summaryPresetId: id, recallPresetId: id });
+  const resolver = createApiResolver({ settings });
+  for (const route of [resolver.resolve(), resolver.resolveUtility(), resolver.resolveRecall()]) assert.equal(route.config.qqjRetryCount, 4);
+  settings.upsertSharedPreset('连接', { ...settings.sharedPresets()[0], qqjRetryCount: 0 }, id);
+  assert.equal(resolver.resolveRecall().config.qqjRetryCount, 0); assert.deepEqual(settings.sharedPresets()[0].unknown, { keep: true });
+  const original = structuredClone(data);
+  const failing = createSettingsStore({ extensionSettings: data, save: () => { throw Error('save failed'); } });
+  assert.throws(() => failing.upsertSharedPreset('连接', { ...failing.sharedPresets()[0], qqjRetryCount: 2 }, id, { observeSaveFailure: true }));
+  assert.deepEqual(data, original);
+});
+
+test('同一逻辑预算固定连接与次数，后续正常任务读新连接', async () => {
+  const data = {}, { settings } = setup(data);
+  settings.saveMainConfig({ ...configured('主', 'main'), qqjRetryCount: 4 });
+  const { createCompactApiClient } = await import('../src/compact-api-client.js'); const bodies = [];
+  const client = createCompactApiClient({ fetchImpl: async (_path, options) => { bodies.push(JSON.parse(options.body)); return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '尚待编译' } }] }) }; } });
+  const router = createTaskRouter({ resolver: createApiResolver({ settings }), compactClient: client });
+  const budget = { remaining: 3, used: 0 };
+  await router.generateAnalysisTask({ taskMessages: [], parseMode: 'semantic', transportBudget: budget });
+  settings.saveMainConfig({ ...settings.mainConfig(), model: 'new-model', qqjRetryCount: 0 });
+  for (let i = 0; i < 4; i++) await router.generateAnalysisTask({ taskMessages: [], parseMode: 'semantic', transportBudget: budget });
+  assert.deepEqual(bodies.map(body => body.model), Array(5).fill('test-model')); assert.equal(budget.remaining, 0); assert.equal(budget.used, 5);
+  await assert.rejects(router.generateAnalysisTask({ taskMessages: [], transportBudget: budget })); assert.equal(bodies.length, 5);
+  await router.generateAnalysisTask({ taskMessages: [], parseMode: 'semantic' }); assert.equal(bodies.at(-1).model, 'new-model');
+});
+
+test('并发正常任务各自使用连接重试额度，缺省字段的失败保存恢复缺省身份', async () => {
+ let save=()=>{};const data={};const settings=createSettingsStore({extensionSettings:data,save:()=>save()});
+ settings.saveMainConfig(configured('主','main'));const before=structuredClone(data);save=()=>{throw Error('save failed');};
+ assert.throws(()=>settings.saveMainConfig({...settings.mainConfig(),qqjRetryCount:0},{observeSaveFailure:true}));assert.deepEqual(data,before);assert.equal(Object.hasOwn(settings.get(),'apiQianqianjieRetryCount'),false);save=()=>{};
+ settings.saveMainConfig({...settings.mainConfig(),qqjRetryCount:2});
+ const {createCompactApiClient}=await import('../src/compact-api-client.js');let release,started;const gate=new Promise(r=>{release=r;}),ready=new Promise(r=>{started=r;}),calls=[];
+ const client=createCompactApiClient({retryWait:async()=>{},fetchImpl:async(_path,options)=>{const body=JSON.parse(options.body);calls.push(body.model);if(calls.length===1){started();await gate;return{ok:false,status:503,text:async()=>''};}if(body.model==='new-model')return{ok:false,status:503,text:async()=>''};return{ok:true,status:200,json:async()=>({choices:[{message:{content:'{"ok":true}'}}]})};}});
+ const router=createTaskRouter({resolver:createApiResolver({settings}),compactClient:client});const first=router.generateAnalysisTask({taskMessages:[]});await ready;
+ settings.saveMainConfig({...settings.mainConfig(),model:'new-model',qqjRetryCount:0});await assert.rejects(router.generateAnalysisTask({taskMessages:[]}));release();await first;
+ assert.deepEqual(calls,['test-model','new-model','test-model']);
 });

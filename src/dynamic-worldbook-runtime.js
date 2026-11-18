@@ -463,8 +463,8 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
   async function intercept(recall, coreChat, contextSize, abort, type) {
     let aborted = false;
     const stop = (...args) => { aborted = true; abort(...args); };
-    await recall(coreChat, contextSize, stop, type);
-    if (aborted) return;
+    const result = await recall(coreChat, contextSize, stop, type);
+    if (aborted) return result;
     try { await prepare(type); }
     catch (error) {
       plan = null;
@@ -472,8 +472,9 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       lastSelection = { selected: [], status: `已退回原世界书：${error.message}` };
       notifyUser(`动态世界书本轮未启用：${error.message}`); emit();
     }
+    return result;
   }
-  return { getState, refresh, initialize, classify, configure, edit, update, prepare, apply, intercept, wake, bind, abortAll,
+  return { getState, getActivityState: () => ({ busy: phase !== 'idle', phase: phase !== 'idle' ? 'worldbook' : null }), refresh, initialize, classify, configure, edit, update, prepare, apply, intercept, wake, bind, abortAll,
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     dispose() { disposed = true; abortAll(); bindings.forEach(fn => fn()); listeners.clear(); } };
 }

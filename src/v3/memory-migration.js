@@ -5,7 +5,7 @@ import { validateFoundationCheckpoint, validateFoundationFloor, validateFoundati
 import { validateBaselineRecord, validateCseGraph, validateCurrentStateRecord, validateStateDeltaRecord } from './cse-schema.js';
 import { validateEntityRecord, validateFloorMemory } from './memory-schema.js';
 import { replayCurrentState } from './cse-engine.js';
-import { createMigrationDescriptor, migrationDescriptorRecordKey, migrationPartition, partitionScannedCandidates, validateMigrationDescriptor } from './migration-prefix.js';
+import { createMigrationDescriptor, migrationPartition, partitionScannedCandidates, validateMigrationDescriptor } from './migration-prefix.js';
 
 const emptyIndexManifest = () => ({ floor: [], entity: [], event: [], claim: [], knowledge: [], episode: [], thread: [], state: [], anchor: [], reverseRef: [] });
 const hash = async value => `sha256:${await sha256(JSON.stringify(value))}`;
@@ -18,19 +18,12 @@ const timestamp = value => {
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 
 async function saveRecords(store, records) {
-  let cursor = 0, failure = null;
-  async function worker() {
-    while (!failure) {
-      const index = cursor++;
-      if (index >= records.length) return;
-      try {
-        const result = await store.putRecord(records[index]);
-        if (!['saved', 'reused'].includes(result.status)) fail('V3_MIGRATION_RECORD_WRITE_FAILED');
-      } catch (error) { failure ??= error; }
-    }
+  for (let offset = 0; offset < records.length; offset += 64) {
+    const batch = records.slice(offset, offset + 64);
+    const results = await store.putRecords(batch);
+    if (!Array.isArray(results) || results.length !== batch.length
+      || results.some(result => !['saved', 'reused'].includes(result.status))) fail('V3_MIGRATION_RECORD_WRITE_FAILED');
   }
-  await Promise.all(Array.from({ length: Math.min(4, records.length) }, () => worker()));
-  if (failure) throw failure;
 }
 
 export function selectCompletedCarriedAliases({ reachable, carried = [], sourceCandidates = [], newUuid }) {
@@ -62,7 +55,7 @@ export function selectCompletedCarriedAliases({ reachable, carried = [], sourceC
 export async function initializeMigrationGraph({ store, sourceIdentity, targetIdentity, sourceReachable, carriedAliases = [], targetChat = [],
   carriedSummary = null, summarySources = [], sourcePrequelSnapshots = [], sourceCalendarSnapshots = [], sourceTimeHeadSnapshots = [], timeBatchIds = [], vectorShardIds = [], peopleWorkspaceId = null, peopleSnapshotIds = [],
   sanitizerOptions = {}, now = () => new Date(), newUuid }) {
-  if (!store?.readReachable || !store?.putRecord || !store?.commitRoot || !sourceReachable?.root || sourceReachable.status !== 'ready'
+  if (!store?.readReachable || !store?.putRecords || !store?.commitRoot || !sourceReachable?.root || sourceReachable.status !== 'ready'
     || sourceReachable.root.chatId !== sourceIdentity?.chatId || targetIdentity?.chatId === sourceIdentity.chatId) fail('V3_MIGRATION_SOURCE_NOT_READY');
   const current = await store.readReachable({ mode: 'full' });
   if (current.status !== 'uninitialized') fail('V3_MIGRATION_TARGET_NOT_EMPTY');
@@ -133,6 +126,8 @@ export async function initializeMigrationGraph({ store, sourceIdentity, targetId
       seed.exactAnchors = (seed.exactAnchors ?? []).map(item => ({ ...item,
         ...(item.floorId ? { floorId: carriedLiveFloor.id } : {}),
         ...(item.sourceFloorId ? { sourceFloorId: carriedLiveFloor.id } : {}) }));
+      // The frozen original still owns these facts and their source/replacement identities.
+      delete seed.spatialFacts;
       // 千事事件仍由冻结楼唯一持有；B 的 live 摘要保留可用语义证据，不复制旧事件身份。
       seed.qianshiDelta = { schemaVersion: 1, status: 'empty', reason: null, compiledAt: createdAt,
         candidateStats: { count: 0, characters: 0 }, events: [], relations: [] };

@@ -9,10 +9,12 @@ async function loadBootstrap(overrides = {}) {
   const entry = new SourceTextModule(source, { context, identifier: new URL('../src/bootstrap.js', import.meta.url).href });
   const factories = {
     './ui/panel.js': { createPanel: () => null },
+    './ui/memory-transfer-view.js': { createMemoryTransferView: () => null },
     './ui/fab.js': { createFab: () => ({ host: null }) },
     './ui/wand-entry.js': { installWandEntry() {} },
     './ui/source-permission-view.js': { createSourcePermissionView: () => null },
     './ui/v3-foundation-view.js': { createV3FoundationView: () => null },
+    './ui/qianchuang-view.js': { createQianchuangView: () => null },
     './ui/people-profiles-view.js': { createPeopleProfilesView: () => null },
     './ui/qianshi-timeline-view.js': { createQianshiTimelineView: () => null },
     './ui/storage-management-view.js': { createStorageManagementView: () => ({ mount() {}, activate: async () => ({ status: 'ready' }), deactivate() {} }) },
@@ -42,8 +44,8 @@ async function harness(result) {
   const instance = bootstrap({
     settings: { isEnabled: () => true },
     v3FoundationViewFactory: () => ({ ...stubView(), deactivate() { deactivations.foundation += 1; } }),
-    peopleProfilesViewFactory: stubView,
-    peopleWorkspaceRuntime: { getState: () => ({ status: 'ready' }) },
+    peopleProfilesViewFactory: stubView, qianchuangViewFactory: stubView,
+    qianchuangViewFactory: stubView, peopleWorkspaceRuntime: { getState: () => ({ status: 'ready' }) },
     documentRef: { activeElement: null, getElementById: () => null, createElement: () => ({}), body: { append() {} } },
     panelFactory: () => panel,
     wandInstaller() {},
@@ -64,14 +66,16 @@ test('bootstrap 保留 transient stale 时的已挂载面板，disabled 仍显�
 });
 
 test('bootstrap 只挂载一个悬浮球，点击切换面板且总开关同步显隐', async () => {
-  let fabOptions, foundationOptions, peopleOptions, qianshiOptions, storageOptions, panelOptions, shows = 0, closes = 0; const appended = [], bodyAppended = [], fabAppearances = [], inlineAppearances = [];
+  let fabOptions, foundationOptions, peopleOptions, qianshiOptions, windowOptions, storageOptions, panelOptions, shows = 0, closes = 0; const appended = [], bodyAppended = [], fabAppearances = [], inlineAppearances = [];
   const fabHost = { style: {} };
   const dialogHost = { id: 'dialog-host' };
   const bootstrap = await loadBootstrap({ './ui/fab.js': { createFab: options => { fabOptions = options; return { host: fabHost, setBusy() {}, setAppearance(value) { fabAppearances.push(value); } }; } } });
   const dayAppearance = { mode: 'auto', effectiveTheme: 'day', palette: { knot: '#b63745', line: '#dce2e5' } };
-  const panel = { host: { hidden: true }, show() { shows += 1; this.host.hidden = false; return { status: 'ready' }; }, close() { closes += 1; this.host.hidden = true; }, setEnabled() {}, refresh: async () => ({ status: 'ready' }), getUiDiagnostic: () => '{"schemaVersion":1}', syncAppearance: () => dayAppearance };
+  let vectorSettingsOpened = 0;
+  const panel = { host: { hidden: true }, show() { shows += 1; this.host.hidden = false; return { status: 'ready' }; }, close() { closes += 1; this.host.hidden = true; }, setEnabled() {}, openVectorSettings() { vectorSettingsOpened += 1; }, refresh: async () => ({ status: 'ready' }), syncAppearance: () => dayAppearance };
   const stubView = () => ({ mount() {}, activate: async () => ({ status: 'ready' }), deactivate() {} });
   const current = { fabShow: true };
+  const userAvatarProvider=()=>'/User Avatars/live.png';
   let sessionReads = 0; const sessionStateProvider = () => { sessionReads += 1; return { status: 'preparing' }; };
   const prepareSession = async () => ({ status: 'ready' });
   const isSevenDaysLedgerInjectionEnabled = () => true;
@@ -81,8 +85,8 @@ test('bootstrap 只挂载一个悬浮球，点击切换面板且总开关同步�
   const instance = bootstrap({
     settings: { isEnabled: () => true, get: () => current }, enableFab: true,
     vectorApi, vectorIndex,
-    sessionStateProvider, prepareSession, backendDiagnosticProvider, isSevenDaysLedgerInjectionEnabled, timeRuntime, v3FoundationRuntime: memoryRuntime, pluginVersion: '0.1.9-test',
-    v3FoundationViewFactory: options => { foundationOptions = options; return stubView(); }, peopleProfilesViewFactory: options => { peopleOptions = options; return stubView(); }, qianshiTimelineViewFactory: options => { qianshiOptions = options; return stubView(); }, peopleWorkspaceRuntime: { getState: () => ({}) },
+    sessionStateProvider, prepareSession, userAvatarProvider, backendDiagnosticProvider, isSevenDaysLedgerInjectionEnabled, timeRuntime, v3FoundationRuntime: memoryRuntime, pluginVersion: '0.1.9-test',
+    v3FoundationViewFactory: options => { foundationOptions = options; return stubView(); }, peopleProfilesViewFactory: options => { peopleOptions = options; return stubView(); }, qianshiTimelineViewFactory: options => { qianshiOptions = options; return stubView(); }, qianchuangViewFactory: options => { windowOptions=options;return stubView(); }, qianchuangWorldInfoProvider: async()=>({chatId:'test',candidates:[]}), peopleWorkspaceRuntime: { getState: () => ({}) },
     documentRef: { activeElement: null, defaultView: {}, getElementById: () => null, createElement: () => ({}), documentElement: { append: node => appended.push(node) }, body: { append: node => bodyAppended.push(node) } },
     inlineRenderer: { setAppearance(value) { inlineAppearances.push(value); } },
     storageManagement: { getState() {}, scan() {}, cleanup() {}, setAutoEnabled() {}, subscribe() {} },
@@ -94,6 +98,7 @@ test('bootstrap 只挂载一个悬浮球，点击切换面板且总开关同步�
   assert.equal(peopleOptions.dialog.host, dialogHost, '千人头像裁剪应复用 QQJ 弹窗管理器');
   assert.equal(peopleOptions.sessionStateProvider, sessionStateProvider);
   assert.equal(peopleOptions.prepareSession, prepareSession);
+  assert.equal(windowOptions.userAvatarProvider,userAvatarProvider);
   assert.equal(qianshiOptions.runtime, memoryRuntime, '千事必须直接复用完整 memory runtime 快照与现有订阅');
   assert.equal(Object.hasOwn(qianshiOptions, 'settings'), false, '千事时间线不再接收重要标记设置接口');
   assert.equal(panelOptions.qianshiTimelineView.activate instanceof Function, true);
@@ -102,11 +107,14 @@ test('bootstrap 只挂载一个悬浮球，点击切换面板且总开关同步�
   assert.equal(storageOptions.manager.getState instanceof Function, true);
   assert.equal(panelOptions.timeRuntime, undefined); assert.equal(panelOptions.memoryRuntime, undefined);
   assert.equal(foundationOptions.timeRuntime, timeRuntime); assert.equal(foundationOptions.runtime, memoryRuntime);
-  assert.deepEqual(bodyAppended, [panel.host, fabHost]); assert.equal(typeof fabOptions.onClick, 'function'); assert.equal(typeof foundationOptions.infoImpl, 'function'); assert.equal(await foundationOptions.chooseImpl({}), 'chosen');
+  assert.equal(typeof foundationOptions.onOpenVectorSettings, 'function'); foundationOptions.onOpenVectorSettings(); assert.equal(vectorSettingsOpened, 1, 'bootstrap 将记忆管理链接接到现有向量设置导航');
+  assert.equal(foundationOptions.prepareSession, prepareSession, 'foundation/管理入口应使用生产身份准备函数');
+  assert.deepEqual(bodyAppended, [panel.host, fabHost]); assert.equal(typeof fabOptions.onClick, 'function'); assert.equal(typeof foundationOptions.infoImpl, 'function'); assert.equal(typeof foundationOptions.cancelDialogImpl, 'function'); assert.equal(await foundationOptions.chooseImpl({}), 'chosen');
   assert.equal(foundationOptions.sessionStateProvider, sessionStateProvider); assert.deepEqual(foundationOptions.sessionStateProvider(), { status: 'preparing' }); assert.equal(sessionReads, 1);
   assert.equal(foundationOptions.backendDiagnosticProvider, backendDiagnosticProvider); assert.equal(backendReads, 0); assert.deepEqual(foundationOptions.backendDiagnosticProvider(), { sinceClientCreatedRequestCounts: { get: 2, put: 1, delete: 0 } }); assert.equal(backendReads, 1);
   assert.equal(foundationOptions.pluginVersion, '0.1.9-test');
-  assert.equal(foundationOptions.uiDiagnosticProvider(), '{"schemaVersion":1}', '只读provider应在panel创建后导出界面诊断且不触发TDZ');
+  assert.equal(Object.hasOwn(windowOptions,'worldInfoProvider'),false,'地点界面统一消费runtime有效图，不单独读取世界书');
+  assert.equal(Object.hasOwn(foundationOptions,'uiDiagnosticProvider'),false);
   assert.deepEqual(fabAppearances, [dayAppearance]); assert.deepEqual(inlineAppearances, [dayAppearance]);
   const nightAppearance = { mode: 'auto', effectiveTheme: 'night', palette: { knot: '#d9707a', line: '#2b363b' } };
   panelOptions.onAppearanceChange(nightAppearance);
@@ -115,4 +123,28 @@ test('bootstrap 只挂载一个悬浮球，点击切换面板且总开关同步�
   await fabOptions.onClick({ currentTarget: fabHost }); assert.equal(closes, 1); assert.equal(panel.host.hidden, true);
   instance.setEnabled(false); assert.equal(fabHost.style.display, 'none'); instance.setEnabled(true); assert.equal(fabHost.style.display, '');
   current.fabShow = false; instance.setEnabled(true); assert.equal(fabHost.style.display, 'none', '悬浮球独立开关应与插件总开关共同决定显示');
+});
+
+test('bootstrap 工作指示同源更新悬浮球与窗口忙态，隐藏悬浮球不停止订阅', async () => {
+  const bootstrap = await loadBootstrap();
+  let listener, current = { busy: false, copy: '' };
+  const fabStates = [], panelStates = [], viewStates = [];
+  const stubView = () => ({ mount() {}, activate: async () => ({ status: 'ready' }), deactivate() {} });
+  const activity = { getState: () => current, subscribe(fn) { listener = fn; return () => {}; } };
+  const panel = { host: { hidden: true }, setEnabled() {}, setActivity(value) { panelStates.push(value); }, syncAppearance() {}, show() {}, close() {} };
+  bootstrap({ settings: { isEnabled: () => true, get: () => ({ fabShow: false }) }, activity,
+    documentRef: { createElement: () => ({}), getElementById: () => null, body: { append() {} }, defaultView: {} },
+    panelFactory: () => panel, enableFab: true,
+    fabFactory: () => ({ host: { style: {} }, setBusy(value) { fabStates.push(value); } }),
+    v3FoundationViewFactory: () => ({ ...stubView(), setActivity(value) { viewStates.push(value); } }), peopleProfilesViewFactory: stubView, qianchuangViewFactory: stubView,
+    wandInstaller() {},
+  });
+  assert.equal(typeof listener, 'function');
+  current = { busy: true, copy: '正在保存记忆' }; listener(current);
+  assert.equal(fabStates.at(-1), true);
+  assert.equal(panelStates.at(-1).copy, '正在保存记忆');
+  assert.equal(viewStates.at(-1).busy, true);
+  current = { busy: false, copy: '' }; listener(current);
+  assert.equal(fabStates.at(-1), false);
+  assert.equal(panelStates.at(-1).busy, false);
 });

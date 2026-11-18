@@ -1,8 +1,14 @@
-import { parseJsonWithSymbolRepair, repairJsonWithUniqueMissingObjectClose } from './json-symbol-repair.js';
-import { parseAdditionalParams } from './settings.js';
 import { describeCompletionResponse, redactProviderErrorText } from './completion-diagnostic.js';
+import { createActivitySignal } from './plugin-activity.js';
+import { withBaseProcessingPrompt } from './internal-processing-prompt.js';
+import { getSharedProcessingPrompt, prependProcessingPrompt, resolveSharedProcessingPrompt } from './shared-processing-prompt.js';
+import { sha256 } from './identity.js';
+import { normalizeFinishReason, parseJsonWithSymbolRepair, repairJsonWithUniqueMissingObjectClose } from './json-symbol-repair.js';
+import { normalizeRetryCount, parseAdditionalParams } from './settings.js';
+import { stripMemoryTagBlocks } from './memory-content-sanitizer.js';
 
 const PROTECTED_BODY_KEYS = new Set(['chat_completion_source', 'reverse_proxy', 'proxy_password', 'model', 'messages', 'json_schema']);
+const REASONING_MODEL = /^(?:openai\/)?(?:gpt-[56]|o[134])(?:$|[.-])/iu;
 const DEFAULT_MODEL = 'gpt-4o-mini';
 const DEFAULT_TIMEOUT = 180;
 const HTTP_ERROR_BODY_LIMIT = 4096;
@@ -16,6 +22,16 @@ export function normalizeApiUrl(value) {
   return url;
 }
 
+function applyOutputTokenLimit(body, additional, maxTokens, excludedParams) {
+  let field = 'max_tokens';
+  if (Object.hasOwn(additional, 'max_completion_tokens')) field = 'max_completion_tokens';
+  else if (!Object.hasOwn(additional, 'max_tokens') && REASONING_MODEL.test(String(body.model).trim())) field = 'max_completion_tokens';
+  const otherField = field === 'max_completion_tokens' ? 'max_tokens' : 'max_completion_tokens';
+  delete body[otherField];
+  delete additional[otherField];
+  if (!Object.hasOwn(additional, field) && !excludedParams.has(field)) body[field] = maxTokens;
+}
+
 const timeoutSeconds = value => {
   const number = Number(value);
   return Number.isInteger(number) && number >= 5 && number <= 600 ? number : DEFAULT_TIMEOUT;
@@ -27,11 +43,6 @@ const FORMAT_STAGES = Object.freeze({
   'completion-json': 'completion_json',
   'output-truncated': 'output_truncated',
 });
-const normalizeFinishReason = value => {
-  const reason = String(value ?? '').trim().toLowerCase();
-  if (!reason) return '';
-  return ['stop', 'length', 'max_tokens', 'content_filter', 'tool_calls', 'function_call'].includes(reason) ? reason : 'other';
-};
 const truncatedFinishReason = value => ['length', 'max_tokens'].includes(normalizeFinishReason(value));
 const safeError = (code, status = 0, details = {}) => {
   const messages = {
@@ -47,6 +58,7 @@ const safeError = (code, status = 0, details = {}) => {
     format: '模型返回的 JSON 格式无效',
     models: '接口没有返回可用模型',
     unsupported: '当前响应格式不受支持',
+    upstream: 'API 请求失败，上游返回了错误。',
     'request-format': 'API 请求参数或响应格式与当前网关不兼容',
     'http-response-json': 'API 响应不是合法 JSON',
     'stream-event-json': '流式响应事件不是合法 JSON',
@@ -103,35 +115,78 @@ const providerMessageTemplate = value => {
   return '上游错误详情已隐藏';
 };
 
-async function readLimitedErrorText(response, maximum = HTTP_ERROR_BODY_LIMIT) {
-  // 错误正文仅用于诊断；正文读取和取消异常尽量忽略。
+function providerErrorDetails(candidate, secrets = []) {
+  const object = candidate && typeof candidate === 'object' && !Array.isArray(candidate) ? candidate : null;
+  const fields = {
+    code: safeProviderIdentifier(object?.code, secrets),
+    status: safeProviderIdentifier(object?.status, secrets),
+    type: safeProviderIdentifier(object?.type, secrets),
+    message: providerMessageTemplate(object ? object.message : candidate),
+  };
+  const compact = Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== null));
+  return Object.keys(compact).length ? Object.freeze(compact) : null;
+}
+
+function throwResponseError(data, secrets = []) {
+  try { return classifyResponseError(data, secrets); }
+  catch (error) {
+    const raw = typeof data?.error === 'string' ? data.error : data?.error?.message ?? data?.message;
+    Object.defineProperty(error, 'providerErrorDetails', { value: redactProviderErrorText(raw, secrets) || '接口只返回了错误标记，没有附带错误说明。', configurable: true });
+    error.responseDiagnostic = describeCompletionResponse(data);
+    throw error;
+  }
+}
+function classifyResponseError(data, secrets = []) {
+  if (!data || typeof data !== 'object' || Array.isArray(data) || !Object.hasOwn(data, 'error') || !data.error) return;
+  const candidate = typeof data.error === 'object' && !Array.isArray(data.error) ? data.error : data;
+  const providerError = providerErrorDetails(typeof data.error === 'string' ? data.error : candidate, secrets);
+  const status = [candidate.status, candidate.code, data.status].find(value => (typeof value === 'number' || typeof value === 'string') && /^[45]\d\d$/u.test(String(value)));
+  if (status !== undefined) throw mapHttpError(Number(status), providerError);
+  // 原生宿主可能只保留 statusText；分类不将其推断成真实 HTTP 状态。
+  const identifiers = [candidate.code, candidate.status, candidate.type].filter(value => typeof value === 'string').map(value => value.trim().toLowerCase().replace(/[ -]/gu, '_'));
+  const message = String(typeof data.error === 'string' ? data.error : candidate.message ?? '').trim();
+  const matches = (identifier, text) => identifiers.some(value => identifier.test(value)) || text.test(message);
+  const code = matches(/^(?:unauthorized|unauthenticated|forbidden|authentication_error|invalid_api_key|incorrect_api_key|permission_denied)$/u, /^(?:unauthori[sz]ed|forbidden)\b|(?:invalid|incorrect)\s+(?:api[ _-]*)?key\b|authentication (?:failed|error)\b/iu) ? 'auth'
+    : matches(/^(?:rate_limit_exceeded|rate_limit_error|too_many_requests|resource_exhausted|insufficient_quota)$/u, /^too many requests\b|\brate[ _-]?limit(?:ed| exceeded)?\b/iu) ? 'rate-limit'
+      : matches(/^(?:bad_request|invalid_argument|invalid_request_error|unprocessable_entity)$/u, /^bad request\b|\binvalid (?:argument|request|parameter|field)\b|\bjson[_ -]?schema\b|\bresponse[_ -]?format\b/iu) ? 'request-format'
+        : matches(/^(?:not_found|model_not_found|resource_not_found)$/u, /^not found\b|\bmodel\b.{0,80}\bnot found\b/iu) ? 'not-found'
+          : matches(/^(?:internal|internal_server_error|server_error|service_unavailable|overloaded_error)$/u, /^(?:internal server error|bad gateway|service unavailable|gateway timeout)\b/iu) ? 'server' : 'upstream';
+  throw safeError(code, 0, providerError ? { providerError } : {});
+}
+
+async function readLimitedErrorText(response, maximum = HTTP_ERROR_BODY_LIMIT, signal) {
+  // 错误正文只补充诊断，读取沿原请求取消；清理不等待宿主关闭连接。
   const reader = response?.body?.getReader?.();
   if (reader) {
-    const decoder = new TextDecoder(); let text = '';
+    const decoder = new TextDecoder(); let text = '', eof = false;
     try {
       while (text.length < maximum) {
-        const { done, value } = await reader.read();
-        if (done) { text += decoder.decode(); break; }
+        const { done, value } = await abortable(() => reader.read(), signal);
+        if (done) { eof = true; text += decoder.decode(); break; }
         if (!value) continue;
         const remaining = maximum - text.length;
         const chunk = typeof value.subarray === 'function' ? value.subarray(0, remaining) : value;
         text += decoder.decode(chunk, { stream: true });
-        if (text.length >= maximum || chunk.length < value.length) { try { await reader.cancel?.(); } catch {} break; }
+        if (text.length >= maximum || chunk.length < value.length) break;
       }
       return text.slice(0, maximum);
     } catch { return text.slice(0, maximum); }
+    finally {
+      if (!eof) try { Promise.resolve(reader.cancel?.()).catch(() => {}); } catch {}
+      try { reader.releaseLock?.(); } catch { /* 宿主可能仍持有原生读取。 */ }
+    }
   }
   if (typeof response?.text === 'function') {
-    try { return String(await response.text()).slice(0, maximum); } catch {}
+    try { return String(await abortable(() => response.text(), signal)).slice(0, maximum); } catch {}
   }
   if (typeof response?.json === 'function') {
-    try { return JSON.stringify(await response.json()).slice(0, maximum); } catch {}
+    try { return JSON.stringify(await abortable(() => response.json(), signal)).slice(0, maximum); } catch {}
   }
   return '';
 }
 
-async function readProviderError(response, secrets = []) {
-  const text = (await readLimitedErrorText(response)).trim();
+async function readProviderError(response, secrets = [], signal) {
+  const text = (await readLimitedErrorText(response, HTTP_ERROR_BODY_LIMIT, signal)).trim();
   if (!text) return null;
   let candidate = null;
   let malformedJson = false;
@@ -140,36 +195,10 @@ async function readProviderError(response, secrets = []) {
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) candidate = parsed.error && typeof parsed.error === 'object' && !Array.isArray(parsed.error) ? parsed.error : parsed;
   } catch { malformedJson = /^[{[]/u.test(text); }
   if (malformedJson) return Object.freeze({ message: '上游返回了无法安全解析的错误 JSON' });
-  const providerError = candidate ? {
-    code: safeProviderIdentifier(candidate.code, secrets),
-    status: safeProviderIdentifier(candidate.status, secrets),
-    message: providerMessageTemplate(candidate.message),
-  } : { code: null, status: null, message: providerMessageTemplate(text) };
-  const compact = Object.fromEntries(Object.entries(providerError).filter(([, value]) => value !== null));
-  return Object.keys(compact).length ? Object.freeze(compact) : null;
+  return providerErrorDetails(candidate ?? text, secrets);
 }
 
-function rejectProviderError(data, { secrets = [], httpStatus = 0 } = {}) {
-  if (data?.error == null || data.error === false || data.error === '') return;
-  const candidate = typeof data.error === 'object' && !Array.isArray(data.error) ? data.error : data;
-  const providerError = Object.fromEntries(Object.entries({
-    code: safeProviderIdentifier(candidate.code, secrets),
-    status: safeProviderIdentifier(candidate.status, secrets),
-    type: safeProviderIdentifier(candidate.type, secrets),
-    message: providerMessageTemplate(typeof data.error === 'string' ? data.error : candidate.message),
-  }).filter(([, value]) => value !== null));
-  const error = safeError('provider-error', httpStatus, { providerError });
-  const rawMessage = typeof data.error === 'string' ? data.error : candidate.message;
-  error.providerErrorDetails = redactProviderErrorText(rawMessage, secrets)
-    || '接口只返回了错误标记，没有附带错误说明。';
-  if (providerError.message && providerError.message !== '上游错误详情已隐藏') error.message = `接口返回错误：${providerError.message}`;
-  else error.message = '接口返回错误，请在详细诊断中展开“接口错误原文”查看。';
-  error.responseDiagnostic = describeCompletionResponse(data);
-  throw error;
-}
-
-function completionDetails(data, diagnosticContext) {
-  rejectProviderError(data, diagnosticContext);
+function completionDetails(data) {
   const finishReason = normalizeFinishReason(data?.choices?.[0]?.finish_reason);
   if (truncatedFinishReason(finishReason)) throw safeError('output-truncated', 0, { finishReason });
   const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? data?.content ?? '';
@@ -180,8 +209,6 @@ function completionDetails(data, diagnosticContext) {
   }
   return { text, finishReason };
 }
-
-export function extractCompletion(data) { return completionDetails(data).text; }
 
 export function balancedObjects(text) {
   const candidates = []; let objectDepth = 0, arrayDepth = 0, start = -1, quoted = false, escaped = false, unclosed = false;
@@ -216,7 +243,11 @@ export function parseJsonOutput(value, { finishReason } = {}) {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;
   const normalizedFinishReason = normalizeFinishReason(finishReason);
   if (truncatedFinishReason(normalizedFinishReason)) throw safeError('output-truncated', 0, { finishReason: normalizedFinishReason });
-  const text = String(value ?? '').trim();
+  let text = String(value ?? '').trim();
+  const leadingThought = /^<(think|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/\1\s*>/iu;
+  for (let prefix; (prefix = text.match(leadingThought));) {
+    text = (stripMemoryTagBlocks(prefix[0], [prefix[1]]) + text.slice(prefix[0].length)).trim();
+  }
   const failCompletion = () => { throw safeError('completion-json', 0, { finishReason: normalizedFinishReason }); };
   const parseObject = (candidate, { repair = false } = {}) => {
     if (!repair) {
@@ -278,12 +309,12 @@ function abortable(task, signal) {
 }
 
 async function readSseResponse(response, { requireSse = false, signal, secrets = [] } = {}) {
-  const diagnosticContext = { secrets, httpStatus: response.status };
   const reader = response.body?.getReader?.();
   if (!reader) {
     if (requireSse) throw safeError('stream-protocol');
     let data; try { data = await abortable(() => response.json(), signal); } catch (error) { if (signal?.aborted || error?.name === 'AbortError') throw abortError(); throw safeError('http-response-json'); }
-    return completionDetails(data, diagnosticContext);
+    throwResponseError(data, secrets);
+    return completionDetails(data);
   }
   const decoder = new TextDecoder(); let buffer = '', output = '', event = [], finishReason = '', sawDataLine = false, complete = false, eof = false;
   let responseDiagnostic = { eventCount: 0 };
@@ -301,7 +332,7 @@ async function readSseResponse(response, { requireSse = false, signal, secrets =
       reasoningPresent: responseDiagnostic.reasoningPresent === true || shape.reasoningPresent,
       refusalPresent: responseDiagnostic.refusalPresent === true || shape.refusalPresent,
       toolCallsPresent: responseDiagnostic.toolCallsPresent === true || shape.toolCallsPresent };
-    try { rejectProviderError(value, diagnosticContext); }
+    try { throwResponseError(value, secrets); }
     catch (error) { error.responseDiagnostic = responseDiagnostic; throw error; }
     const currentFinishReason = normalizeFinishReason(value?.choices?.[0]?.finish_reason);
     if (currentFinishReason) finishReason = currentFinishReason;
@@ -333,13 +364,12 @@ async function readSseResponse(response, { requireSse = false, signal, secrets =
   return { text: output.trim(), finishReason };
 }
 
-export async function readSseContent(response) { return (await readSseResponse(response)).text; }
-
 function wait(ms, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(abortError());
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(abortError()); }, { once: true });
+    const onAbort = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); reject(abortError()); };
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -347,18 +377,38 @@ function linkedController(signal, timeoutSec, timeoutMs) {
   const controller = new AbortController(); let timedOut = false;
   const onAbort = () => controller.abort();
   if (signal?.aborted) controller.abort(); else signal?.addEventListener?.('abort', onAbort, { once: true });
-  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs(timeoutSeconds(timeoutSec)));
-  return { controller, timedOut: () => timedOut, cleanup: () => { clearTimeout(timer); signal?.removeEventListener?.('abort', onAbort); } };
+  const deadlineMs = timeoutMs(timeoutSeconds(timeoutSec));
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, deadlineMs);
+  return { controller, timeoutMs: deadlineMs, timedOut: () => timedOut, cleanup: () => { clearTimeout(timer); signal?.removeEventListener?.('abort', onAbort); } };
 }
 
-export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryWait = wait, timeoutMs = seconds => seconds * 1000, onBusyChange = () => {} } = {}) {
+function requestProgress(budget, phase, patch = {}) {
+  const value = budget?.diagnostic;
+  if (!value) return;
+  if (value.phase !== phase) { value.phase = phase; value.phaseStartedAt = Date.now(); }
+  Object.assign(value, patch);
+}
+function requestFailure(budget, error, cancelled = false) {
+  const value = budget?.diagnostic;
+  if (!value) return;
+  const code = /^(?:QQJ|V3|CHAT_SESSION|QIANSHI)_[A-Z0-9_]{1,80}$/.test(error?.code ?? '') ? error.code : null;
+  const name = ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError'].includes(error?.name) ? error.name : null;
+  const status = error?.httpStatus ?? error?.status;
+  const failure = { code, name, httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null, at: Date.now() };
+  Object.assign(value, { outcome: cancelled ? 'cancelled' : 'failed', error: failure, endedAt: Date.now(), attemptEndedAt: Date.now() });
+  if (!cancelled) value.lastAttemptError = { ...failure, attempt: budget.used, phase: value.phase };
+}
+
+export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryWait = wait, timeoutMs = seconds => seconds * 1000, onBusyChange = () => {}, processingPrompt = () => getSharedProcessingPrompt((globalThis.SillyTavern ?? globalThis.Luker)?.getContext?.()?.extensionSettings) } = {}) {
   if (fetchImpl !== undefined && typeof fetchImpl !== 'function') throw new Error('fetch 不可用');
   let activeRequests = 0;
+  const activity = createActivitySignal(() => ({ busy: activeRequests > 0, phase: activeRequests > 0 ? 'request' : null }));
   const changeBusy = delta => {
     const wasBusy = activeRequests > 0;
     activeRequests = Math.max(0, activeRequests + delta);
     const busy = activeRequests > 0;
     if (busy === wasBusy) return;
+    activity.notifyActivity();
     try { onBusyChange(busy); } catch { /* UI 状态不能影响请求 */ }
   };
   const resolveFetch = () => {
@@ -366,8 +416,11 @@ export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryW
     if (typeof current !== 'function') throw new Error('fetch 不可用');
     return current;
   };
-  const request = async ({ path, body, config, signal, stream = false, retries = 2, transportBudget = null }) => {
+  const request = async ({ path, body, config, signal, stream = false, retries = null, transportBudget = null }) => {
     if (!config?.url || !config?.key) throw safeError('config');
+    const retryCount = normalizeRetryCount(config.qqjRetryCount) ?? 2;
+    retries = Math.min(retries ?? retryCount, retryCount);
+    transportBudget ??= { remaining: retryCount + 1, used: 0 };
     changeBusy(1);
     try {
       let attempt = 0;
@@ -382,31 +435,43 @@ export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryW
           transportBudget.used += 1;
         }
         const linked = linkedController(signal, config.timeoutSec, timeoutMs);
+        requestProgress(transportBudget, 'fetch', { attemptStartedAt: Date.now(), attemptEndedAt: null, timeoutMs: linked.timeoutMs, outcome: 'running', error: null, endedAt: null });
         try {
           const response = await abortable(() => resolveFetch()(path, { method: 'POST', headers: { ...headers(), 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: linked.controller.signal }), linked.controller.signal);
           if (!response.ok) {
             if ((response.status === 429 || response.status >= 500) && attempt < retries && retryAvailable()) {
+              requestFailure(transportBudget, mapHttpError(response.status));
+              try { Promise.resolve(response.body?.cancel?.()).catch(() => {}); } catch {}
               attempt += 1; linked.cleanup(); await retryWait(Math.min(400 * 2 ** attempt, 2000), signal); continue;
             }
-            throw mapHttpError(response.status, await abortable(() => readProviderError(response, [config.key, config.url, normalizeApiUrl(config.url)]), linked.controller.signal));
+            requestProgress(transportBudget, 'responseBody');
+            let providerError = null;
+            try { providerError = await abortable(() => readProviderError(response, [config.key, config.url, normalizeApiUrl(config.url)], linked.controller.signal), linked.controller.signal); }
+            catch { if (signal?.aborted) throw abortError(); }
+            throw mapHttpError(response.status, providerError);
           }
+          const secrets = [config.key, config.url, normalizeApiUrl(config.url)];
           if (stream) {
             const contentType = String(response.headers?.get?.('content-type') ?? '').split(';', 1)[0].trim().toLowerCase();
             // Streaming stays on SSE unless the server explicitly labels its response as JSON.
             if (contentType === 'application/json' || contentType.endsWith('+json')) {
+              requestProgress(transportBudget, 'responseBody');
               let data; try { data = await abortable(() => response.json(), linked.controller.signal); } catch (error) { if (linked.controller.signal.aborted || error?.name === 'AbortError') throw abortError(); throw safeError('http-response-json'); }
-              return completionDetails(data, { secrets: [config.key, config.url, normalizeApiUrl(config.url)], httpStatus: response.status });
+              throwResponseError(data, secrets);
+              return completionDetails(data);
             }
-            return await abortable(() => readSseResponse(response, { requireSse: contentType === 'text/event-stream', signal: linked.controller.signal, secrets: [config.key, config.url, normalizeApiUrl(config.url)] }), linked.controller.signal);
+            requestProgress(transportBudget, 'sseBody');
+            return await abortable(() => readSseResponse(response, { requireSse: contentType === 'text/event-stream', signal: linked.controller.signal, secrets }), linked.controller.signal);
           }
-          let data;
-          try { data = await abortable(() => response.json(), linked.controller.signal); } catch (error) { if (linked.controller.signal.aborted || error?.name === 'AbortError') throw abortError(); throw safeError('http-response-json'); }
-          rejectProviderError(data, { secrets: [config.key, config.url, normalizeApiUrl(config.url)], httpStatus: response.status });
+          requestProgress(transportBudget, 'responseBody');
+          let data; try { data = await abortable(() => response.json(), linked.controller.signal); } catch (error) { if (linked.controller.signal.aborted || error?.name === 'AbortError') throw abortError(); throw safeError('http-response-json'); }
+          throwResponseError(data, secrets);
           return data;
         } catch (error) {
-          if (linked.timedOut()) throw safeError('timeout');
-          if (signal?.aborted || error?.name === 'AbortError') throw abortError();
-          if (error instanceof TypeError && attempt < retries && retryAvailable()) {
+          if (linked.timedOut() && !error?.httpStatus) error = safeError('timeout');
+          if (signal?.aborted || error?.name === 'AbortError') { requestFailure(transportBudget, abortError(), true); throw abortError(); }
+          requestFailure(transportBudget, error);
+          if ((error instanceof TypeError || error?.code === 'QQJ_TIMEOUT' || error?.retryableRecognitionFormat === true) && attempt < retries && retryAvailable()) {
             attempt += 1; linked.cleanup(); await retryWait(Math.min(400 * 2 ** attempt, 2000), signal); continue;
           }
           if (error instanceof TypeError) throw safeError('network');
@@ -419,28 +484,38 @@ export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryW
     }
   };
   const generateTask = async ({ config, taskMessages, jsonSchema, signal, maxTokens = 12000, temperature = 0.2, systemPrompt, transportBudget = null, parseMode = 'strict' } = {}) => {
+    transportBudget ??= { remaining: 1 + (normalizeRetryCount(config?.qqjRetryCount) ?? 2), used: 0 };
+    requestProgress(transportBudget, 'preparing', { outcome: 'running', error: null, endedAt: null, attemptStartedAt: null, attemptEndedAt: null, timeoutMs: null });
     const compactMessages = [
       { role: 'system', content: typeof systemPrompt === 'string' && systemPrompt.trim()
         ? systemPrompt.trim()
         : 'Process only the supplied task input. Return only JSON matching the requested schema.' },
       ...(Array.isArray(taskMessages) ? taskMessages : []).filter(message => ['system', 'user'].includes(message?.role) && typeof message.content === 'string').map(message => ({ role: message.role, content: message.content })),
     ];
+    const prefix = resolveSharedProcessingPrompt(processingPrompt());
+    compactMessages[0].content = prependProcessingPrompt(compactMessages[0].content, prefix);
+    const processingPromptFingerprint = `sha256:${await sha256(prefix)}`;
+    const systemPromptFingerprint = `sha256:${await sha256(compactMessages[0].content)}`;
     const configuredValue = config?.qqjTemperature;
     const configuredTemperature = configuredValue === null || configuredValue === undefined || typeof configuredValue === 'string' && configuredValue.trim() === ''
       ? null : typeof configuredValue === 'number' || typeof configuredValue === 'string' ? Number(configuredValue) : NaN;
-    const requestTemperature = Number.isFinite(configuredTemperature) && configuredTemperature >= 0 && configuredTemperature <= 2
-      ? configuredTemperature : temperature;
+    const hasConfiguredTemperature = Number.isFinite(configuredTemperature) && configuredTemperature >= 0 && configuredTemperature <= 2;
+    const requestTemperature = hasConfiguredTemperature ? configuredTemperature : temperature;
     const body = {
       chat_completion_source: 'openai', reverse_proxy: normalizeApiUrl(config?.url), proxy_password: config?.key,
       model: config?.model || DEFAULT_MODEL, messages: compactMessages, stream: config?.stream === true,
-      temperature: requestTemperature, max_tokens: maxTokens,
+      temperature: requestTemperature,
     };
     if (jsonSchema) body.json_schema = { name: jsonSchema.name || 'qianqianjie_task', value: jsonSchema.value || jsonSchema.schema, strict: jsonSchema.strict !== false };
     const additional = parseAdditionalParams(config?.qqjAdditionalParams);
+    const excludedParams = new Set();
     for (const item of config?.excludeParams || []) {
       const key = String(item).trim();
-      if (key && !PROTECTED_BODY_KEYS.has(key)) { delete body[key]; delete additional[key]; }
+      if (key && !PROTECTED_BODY_KEYS.has(key)) { excludedParams.add(key); delete body[key]; delete additional[key]; }
     }
+    applyOutputTokenLimit(body, additional, maxTokens, excludedParams);
+    if (REASONING_MODEL.test(String(body.model).trim()) && additional.reasoning_effort !== 'none'
+      && !hasConfiguredTemperature && !Object.hasOwn(additional, 'temperature')) delete body.temperature;
     if (Object.keys(additional).length) {
       // OpenAI 宿主通道只转发白名单；自定义通道的 JSON/YAML 扩展才会真正传给上游。
       // 凭证明确覆盖宿主自定义 Key，任务材料与 schema 保持原样，空配置仍走原通道。
@@ -450,21 +525,24 @@ export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryW
       body.custom_include_body = JSON.stringify(additional);
       delete body.reverse_proxy; delete body.proxy_password;
     }
-    let response;
-    try {
-      response = await request({ path: '/api/backends/chat-completions/generate', body, config, signal, stream: body.stream === true, transportBudget });
-    } catch (error) {
-      if (error && (typeof error === 'object' || typeof error === 'function') && transportBudget) error.transportAttempts = transportBudget.used;
-      throw error;
+    for (;;) {
+      try {
+        const response = await request({ path: '/api/backends/chat-completions/generate', body, config, signal, stream: body.stream === true, transportBudget });
+        const completion = body.stream === true && typeof response?.text === 'string' ? response : completionDetails(response);
+        const payload = parseMode === 'semantic'
+          ? { textData: completion.text }
+          : { jsonData: parseJsonOutput(completion.text, { finishReason: completion.finishReason }) };
+        return { ...payload, taskMetadata: { processingPromptFingerprint, systemPromptFingerprint, ...(completion.finishReason ? { finishReason: completion.finishReason } : {}), transportAttempts: transportBudget.used } };
+      } catch (error) {
+        if (signal?.aborted || error?.name === 'AbortError') throw abortError();
+        if ((error?.code === 'QQJ_EMPTY' || error?.retryableRecognitionFormat === true) && transportBudget.remaining > 0) continue;
+        if (error && (typeof error === 'object' || typeof error === 'function')) error.transportAttempts = transportBudget.used;
+        throw error;
+      }
     }
-    const completion = body.stream === true && typeof response?.text === 'string' ? response : completionDetails(response);
-    const payload = parseMode === 'semantic'
-      ? { textData: completion.text }
-      : { jsonData: parseJsonOutput(completion.text, { finishReason: completion.finishReason }) };
-    return { ...payload, taskMetadata: { ...(completion.finishReason ? { finishReason: completion.finishReason } : {}), ...(transportBudget ? { transportAttempts: transportBudget.used } : {}) } };
   };
-  const testConnection = async ({ config, signal } = {}) => {
-    await generateTask({ config, systemPrompt: 'This is a plain-text connection check. Reply with a short confirmation.', taskMessages: [{ role: 'user', content: 'Reply with OK.' }], signal, temperature: 0, parseMode: 'semantic' });
+  const testConnection = async ({ config, signal, processingPrompt = '' } = {}) => {
+    await generateTask({ config, systemPrompt: withBaseProcessingPrompt('This is a plain-text connection check. Reply with a short confirmation.', processingPrompt), taskMessages: [{ role: 'user', content: 'Reply with OK.' }], signal, temperature: 0, parseMode: 'semantic' });
     return { ok: true, model: config?.model || DEFAULT_MODEL };
   };
   const fetchModels = async ({ config, signal } = {}) => {
@@ -475,7 +553,7 @@ export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryW
     if (!models.length) throw safeError('models');
     return [...new Set(models)];
   };
-  return { generateTask, testConnection, fetchModels };
+  return { generateTask, testConnection, fetchModels, getActivityState: activity.getActivityState, subscribeActivity: activity.subscribeActivity };
 }
 
 export { PROTECTED_BODY_KEYS };

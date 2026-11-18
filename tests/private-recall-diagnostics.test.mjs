@@ -282,3 +282,148 @@ test('准备诊断只保有限子阶段枚举和数字，每attempt最多两条�
   assert.equal(waiting.active.currentPreparation.status, 'inProgress');
   assert.doesNotMatch(JSON.stringify(result), /SECRET|"url":|"source":|"error":"/u);
 });
+
+
+test('私有身份失败沿现有订阅与四项槽保留，后续idle不会覆盖且关闭policy不采集', async t => {
+  const { createChatSession } = await import('../src/chat-session.js');
+  const { readTargetChat } = await import('../src/v3/message-floor-anchor.js');
+  const id = '123e4567-e89b-42d3-a456-426614174000';
+  const raw = { chatId: '合成聊天', characterId: 0, characters: [{ avatar: 'person.png', name: '人物' }], userAvatar: 'user.png', chatMetadata: { qianqianjie: { chatId: id } }, chat: [] };
+  const session = createChatSession({ contextProvider: () => raw,
+    identityCoordinator: { prepare: () => readTargetChat({ chatId: id, hostChatId: raw.chatId, characterName: '人物', avatarUrl: 'person.png' }, {
+      fetchImpl: async () => ({ ok: true, json: async () => [{ chat_metadata: { otherPlugin: 'SECRET' } }, { mes: 'SECRET' }] }) }) } });
+  const h = harness({ session }); t.after(h.channel.dispose);
+  await h.channel.start(); await h.channel.flush();
+  const before = h.writes.length;
+  await assert.rejects(session.prepare({ entryPoint: 'startup' }));
+  await h.channel.flush();
+  assert.ok(h.writes.length > before, '真实session settled活动订阅触发采集');
+  assert.equal(h.writes.at(-1).data.events.at(-1).data.identity.status, 'error');
+  assert.equal(h.writes.at(-1).data.failures.find(item => item.kind === 'identity').identity.preparationFailure.identityRead.reason, 'identityMissing');
+  session.invalidate(); h.channel.capture(); await h.channel.flush();
+  assert.equal(h.writes.at(-1).data.events.at(-1).data.identity.status, 'idle');
+  assert.equal(h.writes.at(-1).data.failures.filter(item => item.kind === 'identity').length, 1);
+  assert.doesNotMatch(JSON.stringify(h.writes), /SECRET|otherPlugin|requestHeaders|chat_metadata/u);
+  const off = harness({ session, policy: { enabled: false } }); t.after(off.channel.dispose);
+  assert.equal(await off.channel.start(), false); off.channel.capture(); assert.equal(await off.channel.flush(), false); assert.equal(off.writes.length, 0);
+});
+
+test('分支失败具体楼沿session订阅进入私有诊断原有identity槽', async t => {
+  const { createChatSession } = await import('../src/chat-session.js');
+  const branchMatch = { reason: 'markerRejected', candidateIndex: 3, floorIndex: 3, assistantSeq: 4,
+    messageIndex: 8, markerStatus: 'foreign', inheritedFloors: 3, sourceFloorCount: 6, candidateCount: 8 };
+  const id = '123e4567-e89b-42d3-a456-426614174000';
+  const raw = { chatId: '合成分支', characterId: 0, characters: [{ avatar: 'person.png', name: '人物' }], userAvatar: 'user.png', chatMetadata: { qianqianjie: { chatId: id } }, chat: [] };
+  const session = createChatSession({ contextProvider: () => raw, identityCoordinator: { prepare() {
+    throw Object.assign(new Error('SECRET'), { code: 'V3_BRANCH_FLOOR_MATCH_INVALID', branchMatch: { ...branchMatch, body: 'SECRET' } });
+  } } });
+  const h = harness({ session }); t.after(h.channel.dispose);
+  await h.channel.start();
+  await assert.rejects(session.prepare({ entryPoint: 'startup' })); await h.channel.flush();
+  assert.deepEqual(h.writes.at(-1).data.events.at(-1).data.identity.preparationFailure.branchMatch, branchMatch);
+  assert.deepEqual(h.writes.at(-1).data.failures.find(item => item.kind === 'identity').identity.preparationFailure.branchMatch, branchMatch);
+  assert.doesNotMatch(JSON.stringify(h.writes), /SECRET/u);
+});
+
+test('实际目标归属比较失败沿原私有身份槽保留有限差异，宿主回复变化不冒充归属错误', async t => {
+  const { createChatSession } = await import('../src/chat-session.js');
+  const { assertCapturedBranchTargetMatches } = await import('../src/v3/message-floor-anchor.js');
+  const chatId = '123e4567-e89b-42d3-a456-426614174000', targetId = '223e4567-e89b-42d3-a456-426614174000';
+  const raw = { chatId: '合成目标差异', characterId: 0, characters: [{ name: '人物', avatar: 'person.png' }], userAvatar: 'user.png',
+    chatMetadata: { qianqianjie: { schemaVersion: 2, chatId } }, chat: [{ is_user: false, mes: 'SECRET_BODY', swipes: ['SECRET_BODY', 'SECRET_ALT'], swipe_id: 0 }] };
+  const persisted = structuredClone(raw.chat); persisted[0].swipe_id = 1;
+  assert.doesNotThrow(() => assertCapturedBranchTargetMatches({ chat: raw.chat, chatMetadata: raw.chatMetadata },
+    { chat: persisted, header: { chat_metadata: raw.chatMetadata } }, chatId, targetId), '原生选中回复由宿主决定，诊断只记录真实QQJ归属冲突');
+  persisted[0].extra = { qianqianjie_memory_excluded: true };
+  const session = createChatSession({ contextProvider: () => raw, identityCoordinator: { prepare() {
+    assertCapturedBranchTargetMatches({ chat: raw.chat, chatMetadata: raw.chatMetadata },
+      { chat: persisted, header: { chat_metadata: raw.chatMetadata } }, chatId, targetId);
+  } } });
+  const h = harness({ session }); t.after(h.channel.dispose); await h.channel.start();
+  await assert.rejects(session.prepare({ entryPoint: 'sourcePrepare' })); await h.channel.flush();
+  const difference = { reason: 'message', messageIndex: 0, capturedCount: 1, persistedCount: 1, fields: ['ownership'] };
+  assert.deepEqual(h.writes.at(-1).data.events.at(-1).data.identity.preparationFailure.branchTargetDifference, difference);
+  assert.deepEqual(h.writes.at(-1).data.failures.find(item => item.kind === 'identity').identity.preparationFailure.branchTargetDifference, difference);
+  assert.doesNotMatch(JSON.stringify(h.writes), /SECRET|swipes/u);
+});
+
+test('无新召回时memory失败自动进入原槽，白名单/去重/清错后保失败并解除订阅', async t => {
+ const memoryListeners=new Set();let reads=0;
+ let memory={chatId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',lastExtractorError:null,extractorRequest:null};
+ const memoryRuntime={getState(){assert.fail('后台poll不能装配memory全历史');},getDiagnosticState(){reads++;return memory;},subscribeActivity(fn){memoryListeners.add(fn);return()=>memoryListeners.delete(fn);}};
+ const h=harness({memoryRuntime,backendDiagnosticProvider:()=>({latestRead:{sequence:9,method:'GET',recordType:'checkpoint',outcome:'success',elapsedMs:29,completedAt:'2026-10-29T12:35:36.018Z',url:'SECRET',backendMessage:'SECRET'},lastFailure:{method:'PUT',recordType:'memoryTransferRollback',code:'BACKEND_TIMEOUT',httpStatus:504,elapsedMs:15000,headers:'SECRET'}})});t.after(h.channel.dispose);
+ h.change({recallStatus:'idle'});await h.channel.start();await h.channel.flush();
+ memory={...memory,lastExtractorError:{runId:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',floorId:'cccccccc-cccc-4ccc-8ccc-cccccccccccc',phase:'stale',code:'V3_MEMORY_PREFIX_CHANGED',attempts:1,message:'SECRET BODY https://private.invalid',prefixDifference:{categories:['identityProjection','SECRET'],assistantSeqs:[2],relatedFloorCount:0,truncated:false,raw:'SECRET'}},extractorRequest:{runId:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',phase:'saving',outcome:'failed',startedAt:1000,endedAt:2000,elapsedMs:1000,attempts:1,fromAssistantSeq:2,toAssistantSeq:2,prompt:'SECRET'}};
+ for(const fn of memoryListeners)fn();await h.channel.flush();
+ const saved=h.writes.at(-1).data,event=saved.events.at(-1).data;
+ assert.equal(event.memory?.lastExtractorError?.code,'V3_MEMORY_PREFIX_CHANGED');assert.deepEqual(event.memory.lastExtractorError.prefixDifference.categories,['identityProjection']);assert.equal(event.memory.extractorRequest.phase,'saving');assert.equal(event.backend.latestRead.recordType,'checkpoint');assert.equal(event.backend.lastFailure.recordType,'memoryTransferRollback');
+ assert.equal(saved.failures.filter(item=>item.kind==='memory').length,1);assert.doesNotMatch(JSON.stringify(saved),/SECRET|private\.invalid|prompt|headers/u);
+ const events=saved.events.length;h.channel.capture();h.channel.capture();await h.channel.flush();assert.equal(h.writes.at(-1).data.events.length,events,'poll不重复登记同一失败');
+ memory={...memory,lastExtractorError:{...memory.lastExtractorError,phase:'retryableError'}};for(const fn of memoryListeners)fn();await h.channel.flush();assert.equal(h.writes.at(-1).data.events.at(-1).data.memory.lastExtractorError.phase,'retryableError','真实persistFailure阶段保留');
+ memory={...memory,extractorRequest:{runId:'dddddddd-dddd-4ddd-8ddd-dddddddddddd',phase:'responseBody',outcome:'running',startedAt:3000}};for(const fn of memoryListeners)fn();await h.channel.flush();
+ assert.equal(h.writes.at(-1).data.events.at(-1).data.memory.extractorRequest.phase,'responseBody');assert.equal(h.writes.at(-1).data.failures.filter(item=>item.kind==='memory').length,1,'新请求不能把留存旧错误登记成新失败');assert.equal(h.writes.at(-1).data.failures.find(item=>item.kind==='memory').memory.extractorRequest.startedAt,1000,'新请求不覆盖旧失败请求时长');
+ memory={...memory,lastExtractorError:null};for(const fn of memoryListeners)fn();h.change({recallStatus:'ready',lastRecall:{status:'ready'}});await h.channel.flush();assert.equal(h.writes.at(-1).data.failures.filter(item=>item.kind==='memory').length,1,'正常刷新或召回不抹旧失败');
+ memory={...memory,lastAutomationError:{code:'BACKEND_TIMEOUT',phase:'foundation',lastFailedAt:'2026-10-29T13:00:00.000Z'}};for(const fn of memoryListeners)fn();await h.channel.flush();assert.equal(h.writes.at(-1).data.failures.filter(item=>item.kind==='memory').length,2,'外层新失败与旧摘要失败各自保留');assert.equal(h.writes.at(-1).data.failures.find(item=>item.failureSource==='lastAutomationError').memory.lastAutomationError.phase,'foundation');
+ assert.ok(reads>0);h.channel.dispose();assert.equal(memoryListeners.size,0);
+});
+
+test('CSE失败独立进入原私有槽并保当次后端行与请求归因',async t=>{
+ const listeners=new Set(),run='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',floor='cccccccc-cccc-4ccc-8ccc-cccccccccccc';let memory={chatId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',lastCseError:null};
+ let backend={latestRead:{recordType:'root',method:'GET',outcome:'failure',code:'BACKEND_NETWORK',sequence:1},lastFailure:{recordType:'root',method:'GET',outcome:'failure',code:'BACKEND_NETWORK',sequence:1}};
+ const h=harness({memoryRuntime:{getDiagnosticState:()=>memory,subscribeActivity(fn){listeners.add(fn);return()=>listeners.delete(fn);}},backendDiagnosticProvider:()=>backend});t.after(h.channel.dispose);await h.channel.start();
+ memory={...memory,lastCseError:{code:'BACKEND_NETWORK',phase:'retryableError',runId:run,floorId:floor,count:1,lastFailedAt:'2026-10-29T15:32:18.142Z',message:'SECRET'},cseRequest:{runId:run,phase:'saving',startedAt:1000,endedAt:2000,attempts:1,outcome:'failed'}};for(const fn of listeners)fn();await h.channel.flush();
+ let failures=h.writes.at(-1).data.failures.filter(v=>v.failureSource==='lastCseError');assert.equal(failures.length,1);assert.equal(failures[0].memory.lastCseError.count,1);assert.equal(failures[0].memory.cseRequest.startedAt,1000);assert.equal(failures[0].backend.latestRead.recordType,'root');assert.doesNotMatch(JSON.stringify(h.writes),/SECRET/);
+ backend={latestRead:{recordType:'checkpoint',method:'GET',outcome:'success',sequence:2},lastFailure:backend.lastFailure};memory={...memory,cseRequest:{runId:'dddddddd-dddd-4ddd-8ddd-dddddddddddd',phase:'fetch',startedAt:3000,outcome:'running'}};for(const fn of listeners)fn();await h.channel.flush();failures=h.writes.at(-1).data.failures.filter(v=>v.failureSource==='lastCseError');assert.equal(failures.length,1);assert.equal(failures[0].memory.cseRequest.startedAt,1000);assert.equal(failures[0].backend.latestRead.recordType,'root');
+});
+
+test('277私有启动计时仅捕获同域固定资源、白名单marks和有限数字', async t => {
+  const origin = 'https://neutral.invalid';
+  let resources = Array.from({ length: 10 }, (_, i) => ({ name: `${origin}/script.js?key=SECRET-${i}`, startTime: i,
+    fetchStart: i, requestStart: i + 1, responseStart: i + 2, responseEnd: i + 3, duration: 3, transferSize: 100, encodedBodySize: 90, decodedBodySize: 120, secret: 'SECRET' }));
+  resources.push({ ...resources[0], name: 'https://foreign.invalid/script.js?SECRET' },
+    { ...resources[0], name: `${origin}/api/private-story?SECRET` },
+    { ...resources[0], name: `${origin}/scripts/extensions/third-party/ST-QianQianJie/dist/qqj-app.js?v=SECRET`, duration: Infinity, transferSize: -1, decodedBodySize: 'SECRET' });
+  const performanceRef = { timeOrigin: 1790000000000, getEntriesByType(type) {
+    return type === 'navigation' ? [{ responseEnd: 100, domInteractive: 200, domContentLoadedEventStart: 300, loadEventStart: NaN, name: 'SECRET' }]
+      : type === 'resource' ? resources : [{ name: '[init] start', startTime: 30 }, { name: '[init] batch2 done', startTime: 300 }, { name: '[init] getSettings done', startTime: 350 }, { name: '[init] loader hidden', startTime: 380 }, { name: 'SECRET mark', startTime: 400 }];
+  } };
+  const h = harness({ performanceRef, documentRef: { location: { origin } } }); t.after(h.channel.dispose);
+  await h.channel.start(); await h.channel.flush();
+  let startup = h.writes.at(-1).data.events.at(-1).data.startup;
+  assert.equal(startup.timeOrigin, 1790000000000); assert.equal(startup.navigation.responseEnd, 100); assert.equal(startup.navigation.loadEventStart, null);
+  assert.deepEqual(startup.resources.filter(row => row.kind === 'hostScript').map(row => row.startTime), [9]);
+  assert.ok(startup.resources.length <= 8); assert.ok(startup.marks.length <= 8);
+  const bundle = startup.resources.find(row => row.kind === 'qqjBundle');
+  assert.equal(bundle.duration, null); assert.equal(bundle.transferSize, null); assert.equal(bundle.decodedBodySize, null);
+  assert.deepEqual(startup.marks, [{ name: '[init] start', startTime: 30 }, { name: '[init] batch2 done', startTime: 300 }, { name: '[init] getSettings done', startTime: 350 }, { name: '[init] loader hidden', startTime: 380 }]);
+  assert.doesNotMatch(JSON.stringify(h.writes), /SECRET|neutral\.invalid|foreign\.invalid|https:|requestUrl|entryType/u);
+  const count = h.writes.length; h.channel.capture(); assert.equal(await h.channel.flush(), false); assert.equal(h.writes.length, count);
+  resources = [...resources, { ...resources[0], name: `${origin}/scripts/extensions.js`, startTime: 500 }];
+  h.channel.capture(); await h.channel.flush(); startup = h.writes.at(-1).data.events.at(-1).data.startup;
+  assert.equal(startup.resources.find(row => row.kind === 'hostExtensions').startTime, 500);
+});
+
+test('277私有开关禁用不读performance，缺失或异常计时返回null', async t => {
+  let reads = 0;
+  const performanceRef = { getEntriesByType() { reads++; throw Error('SECRET'); } };
+  for (const options of [{ initiallyEnabled: false }, { policy: { enabled: false } }]) {
+    const h = harness({ ...options, performanceRef, backendDiagnosticProvider: () => assert.fail('禁用私有策略不能读缓存stats') }); t.after(h.channel.dispose);
+    assert.equal(await h.channel.start(), false); h.channel.capture(); assert.equal(await h.channel.flush(), false);
+  }
+  assert.equal(reads, 0);
+  for (const performanceRef of [null, { getEntriesByType() { throw Error('SECRET'); } }]) {
+    const h = harness({ performanceRef }); t.after(h.channel.dispose); await h.channel.start(); await h.channel.flush();
+    assert.equal(h.writes[0].data.events[0].data.startup, null); assert.doesNotMatch(JSON.stringify(h.writes), /SECRET/);
+  }
+});
+
+test('277后端私有投影只取已有缓存布尔值与有限计数', () => {
+  const backendState = { coreCache: { available: true, enabled: false, hits: 4, misses: 5, writes: 6, writeFailures: 0,
+    corruptions: 1, evictedRecords: 2, estimatedBytes: 91000000, credentials: 'SECRET' } };
+  const data = projectPrivateRecallDiagnostic(fixture(), null, { backendState });
+  assert.deepEqual(data.backend.coreCache, { available: true, enabled: false, hits: 4, misses: 5, writes: 6, writeFailures: 0, corruptions: 1, evictedRecords: 2, estimatedBytes: 91000000 });
+  backendState.coreCache.hits = Infinity; backendState.coreCache.available = 'SECRET';
+  const invalid = projectPrivateRecallDiagnostic(fixture(), null, { backendState });
+  assert.equal(invalid.backend.coreCache.hits, null); assert.equal(invalid.backend.coreCache.available, null);
+  assert.doesNotMatch(JSON.stringify(invalid), /SECRET|credentials/);
+});

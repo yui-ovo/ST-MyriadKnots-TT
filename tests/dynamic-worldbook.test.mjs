@@ -51,9 +51,11 @@ async function fixture(t, overrides = {}) {
       }
     }
     if (!overrides.apiTransport) return result;
-    const compactClient = createCompactApiClient({ fetchImpl: async () => new Response(JSON.stringify({
+    const compactClient = createCompactApiClient({ processingPrompt: () => overrides.processing ?? '', fetchImpl: async (_, options) => {
+      overrides.transportRequests?.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({
       choices: [{ message: { content: '```json\n' + JSON.stringify(result.jsonData) + '\n```' }, finish_reason: 'stop' }],
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } }) });
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }); } });
     const route = () => ({ kind: 'independent', config: { url: 'https://example.invalid/v1', key: 'test', model: 'test' } });
     const router = createTaskRouter({ compactClient, resolver: { resolve: route, resolveUtility: route, resolveRecall: route } });
     return router.generateUtilityTask(request);
@@ -97,16 +99,27 @@ test('raw local edit response updates only its anchor and saves full before/afte
   assert.equal(f.book.entries[1].content, '甲住在旧公寓。');
 });
 
+test('worldbook interception preserves upstream recall receipts and generation aborts', async t => {
+  const f = await fixture(t), receipt = { reused: true, lastRecall: { status: 'ready' } };
+  assert.equal(await f.runtime.intercept(async () => receipt, [], 1000, () => assert.fail('unexpected abort'), 'normal'), receipt);
+  const count = f.selections; let stopped = false;
+  const aborted = await f.runtime.intercept(async (_chat, _size, abort) => { abort(true); return receipt; }, [], 1000, () => { stopped = true; }, 'normal');
+  assert.equal(aborted, receipt); assert.equal(stopped, true); assert.equal(f.selections, count);
+});
+
 test('update combines memory, historical CSE and all visible completed dialogue with prompt ordering', async t => {
-  const requests = [];
-  const f = await fixture(t, { processing: 'PREFIX_MARKER', guidance: 'GUIDANCE_MARKER', update: request => { requests.push(request); return { jsonData: { changes: [] } }; } });
+  const requests = [], transportRequests = [];
+  const f = await fixture(t, { apiTransport: true, transportRequests, processing: 'PREFIX_MARKER', guidance: 'GUIDANCE_MARKER', update: request => { requests.push(request); return { jsonData: { changes: [] } }; } });
   f.context.chat[0].is_system = true;
   f.context.chat[0].mes = 'HIDDEN_BODY';
   f.setState({ cseSubjects: [{ displayName: 'FUTURE_STATE_NOT_ALLOWED' }], floors: [0, 2].map(messageIndex => ({ status: 'ready', messageIndex, summary: `MEMORY_${messageIndex}`,
     cse: { status: 'ready', record: { endStateSubjects: [{ subjectEntityId: 'person', displayName: '甲', core: [], adaptive: [], situational: [{ text: `STATE_AT_${messageIndex}`, visibility: 'private' }] }] } } })) });
   await f.runtime.update({ manual: true });
   const input = JSON.parse(requests[0].taskMessages[0].content);
-  assert.match(requests[0].systemPrompt, /^PREFIX_MARKER\n\nGUIDANCE_MARKER/);
+  assert.match(requests[0].systemPrompt, /^GUIDANCE_MARKER/);
+  const sent = transportRequests.find(request => request.messages[0].content.includes('GUIDANCE_MARKER')).messages[0].content;
+  assert.match(sent, /^PREFIX_MARKER\n\nGUIDANCE_MARKER/);
+  assert.equal(sent.split('PREFIX_MARKER').length - 1, 1);
   assert.match(requests[0].systemPrompt, /固定输出与权限要求/);
   assert.ok(input.sources.some(s => s.id === 'memory:0' && s.text === 'MEMORY_0'));
   assert.deepEqual(input.sources.filter(s => s.kind === 'dialogue').map(s => [s.floors[0], s.role]), [[1, 'user'], [2, 'assistant']]);

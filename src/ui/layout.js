@@ -10,7 +10,9 @@ const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, v
 const viewportSize = (width, height) => ({ width: Math.max(0, Number(width) || 0), height: Math.max(0, Number(height) || 0) });
 
 export function mobilePanelRect(width, height, safeTop = 0, safeBottom = 0) {
-  return { left: 10, width: Math.max(0, width - 20), right: 10, top: 20 + safeTop, height: Math.max(0, height - 40 - safeTop - safeBottom), bottom: 20 + safeBottom };
+  const verticalMargins = Math.max(40, safeTop) + Math.max(40, safeBottom);
+  const top = Math.max(20, safeTop), bottom = verticalMargins - top;
+  return { left: 10, width: Math.max(0, width - 20), right: 10, top, height: Math.max(0, height - top - bottom), bottom };
 }
 
 export function desktopPanelSize(width, height, saved = null) {
@@ -20,8 +22,7 @@ export function desktopPanelSize(width, height, saved = null) {
   const minimumWidth = Math.min(PANEL_MIN_WIDTH, maximumWidth);
   const minimumHeight = Math.min(PANEL_MIN_HEIGHT, maximumHeight);
   const preferredWidth = finite(saved?.width) && Number(saved.width) > 0 ? Number(saved.width) : 360;
-  const defaultHeight = Math.min(600, Math.max(0, viewport.height * 0.85));
-  const preferredHeight = finite(saved?.height) && Number(saved.height) > 0 ? Number(saved.height) : defaultHeight;
+  const preferredHeight = finite(saved?.height) && Number(saved.height) > 0 ? Number(saved.height) : 600;
   return {
     width: clamp(preferredWidth, minimumWidth, maximumWidth),
     height: clamp(preferredHeight, minimumHeight, maximumHeight),
@@ -41,7 +42,7 @@ export function desktopPanelPosition(width, height, panelWidth, panelHeight, sav
   const minimumTop = Math.min(PANEL_SAFETY_MARGIN, availableY);
   const maximumTop = Math.max(minimumTop, availableY - PANEL_SAFETY_MARGIN);
   const defaultLeft = clamp(availableX - 20, minimumLeft, maximumLeft);
-  const defaultTop = clamp(80, minimumTop, maximumTop);
+  const defaultTop = clamp(70, minimumTop, maximumTop);
   return {
     left: clamp(finite(saved?.left) ? Number(saved.left) : defaultLeft, minimumLeft, maximumLeft),
     top: clamp(finite(saved?.top) ? Number(saved.top) : defaultTop, minimumTop, maximumTop),
@@ -73,7 +74,17 @@ export function createPanelGeometryController({ panel, dragHandle, resizeHandle,
   let queuedPoint = null;
 
   const isDesktop = () => Number(viewport?.innerWidth) >= DESKTOP_PANEL_BREAKPOINT;
-  const dimensions = () => viewportSize(viewport?.innerWidth, viewport?.innerHeight);
+  const dimensions = () => {
+    const visual = viewport?.visualViewport;
+    const view = { left: Number(visual?.offsetLeft) || 0, top: Number(visual?.offsetTop) || 0,
+      ...viewportSize(Number(visual?.width) > 0 ? visual.width : viewport?.innerWidth, Number(visual?.height) > 0 ? visual.height : viewport?.innerHeight) };
+    return view;
+  };
+  const positionInView = (view, width, height, saved = null) => {
+    const position = desktopPanelPosition(view.width, view.height, width, height, saved
+      ? { left: saved.left - view.left, top: saved.top - view.top } : null);
+    return { left: position.left + view.left, top: position.top + view.top };
+  };
   const writePreference = (key, value) => {
     try { storage?.setItem?.(key, JSON.stringify(value)); } catch { /* UI preference failures must not break the panel. */ }
   };
@@ -84,7 +95,7 @@ export function createPanelGeometryController({ panel, dragHandle, resizeHandle,
   const applyDrag = point => {
     if (!gesture || gesture.kind !== 'drag') return;
     const size = panelRect(panel), view = dimensions();
-    const position = desktopPanelPosition(view.width, view.height, size.width, size.height, {
+    const position = positionInView(view, size.width, size.height, {
       left: gesture.left + point.x - gesture.startX,
       top: gesture.top + point.y - gesture.startY,
     });
@@ -93,8 +104,8 @@ export function createPanelGeometryController({ panel, dragHandle, resizeHandle,
   const applyResize = point => {
     if (!gesture || gesture.kind !== 'resize') return;
     const view = dimensions();
-    const maximumWidth = Math.max(0, view.width - gesture.left - PANEL_SAFETY_MARGIN);
-    const maximumHeight = Math.max(0, view.height - gesture.top - PANEL_SAFETY_MARGIN);
+    const maximumWidth = Math.max(0, view.left + view.width - gesture.left - PANEL_SAFETY_MARGIN);
+    const maximumHeight = Math.max(0, view.top + view.height - gesture.top - PANEL_SAFETY_MARGIN);
     const minimumWidth = Math.min(PANEL_MIN_WIDTH, maximumWidth);
     const minimumHeight = Math.min(PANEL_MIN_HEIGHT, maximumHeight);
     const width = clamp(gesture.width + point.x - gesture.startX, minimumWidth, maximumWidth);
@@ -162,7 +173,7 @@ export function createPanelGeometryController({ panel, dragHandle, resizeHandle,
     if (!isDesktop() || !validPrimaryPointer(event)) return;
     event?.preventDefault?.(); event?.stopPropagation?.();
     const point = pointOf(event), rect = panelRect(panel), view = dimensions();
-    const position = desktopPanelPosition(view.width, view.height, rect.width, rect.height, rect);
+    const position = positionInView(view, rect.width, rect.height, rect);
     panel.style.left = `${position.left}px`; panel.style.top = `${position.top}px`; panel.style.right = 'auto';
     gesture = { kind: 'resize', surface: resizeHandle, pointerId: event?.pointerId, startX: point.x, startY: point.y, left: position.left, top: position.top, width: rect.width, height: rect.height };
     panel.style.willChange = 'width, height'; panel?.classList?.add?.('is-gesturing'); capture(resizeHandle, event);
@@ -178,28 +189,43 @@ export function createPanelGeometryController({ panel, dragHandle, resizeHandle,
   const restore = () => {
     finish();
     if (!panel) return;
-    if (!isDesktop()) {
+    const desktop = isDesktop();
+    const host = panel.getRootNode?.().host;
+    if (host) {
+      // 手机零原点保留原 fixed 层级，非零原点沿既有补偿。
+      host.style.transform = desktop ? 'translate(0px, 0px)' : '';
+      const origin = host.getBoundingClientRect();
+      if (desktop || origin.left !== 0 || origin.top !== 0) {
+        host.style.transform = `translate(${-origin.left}px, ${-origin.top}px)`;
+      }
+    }
+    const view = dimensions();
+    for (const property of ['left', 'top', 'width', 'height']) panel.style.setProperty(`--qqj-panel-bounds-${property}`, `${view[property]}px`);
+    if (!desktop) {
       for (const property of ['left', 'top', 'right', 'bottom', 'width', 'height', 'maxWidth', 'maxHeight', 'transform', 'willChange']) panel.style[property] = '';
       return;
     }
-    const view = dimensions(), savedSize = readPreference(storage, PANEL_SIZE_KEY);
+    const savedSize = readPreference(storage, PANEL_SIZE_KEY);
     const size = desktopPanelSize(view.width, view.height, savedSize);
     panel.style.width = `${size.width}px`; panel.style.height = `${size.height}px`; panel.style.maxWidth = `${size.maxWidth}px`; panel.style.maxHeight = `${size.maxHeight}px`;
     panel.style.bottom = 'auto'; panel.style.transform = 'none';
     const savedPosition = readPreference(storage, PANEL_POSITION_KEY);
-    const position = desktopPanelPosition(view.width, view.height, size.width, size.height, savedPosition);
+    const position = positionInView(view, size.width, size.height, savedPosition);
     panel.style.top = `${position.top}px`;
-    if (savedPosition && finite(savedPosition.left) && finite(savedPosition.top)) {
-      panel.style.left = `${position.left}px`; panel.style.right = 'auto';
-    } else {
-      panel.style.left = ''; panel.style.right = `${Math.max(0, view.width - position.left - size.width)}px`;
-    }
+    panel.style.left = `${position.left}px`; panel.style.right = 'auto';
   };
-  const onViewportChange = () => restore();
+  const onViewportChange = event => {
+    const focused = panel?.getRootNode?.()?.activeElement;
+    const editing = focused?.isContentEditable || !focused?.readOnly && (focused?.tagName === 'TEXTAREA'
+      || focused?.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'email', 'password', 'number'].includes(focused.type));
+    if (!isDesktop() && event?.type !== 'orientationchange' && panel?.contains?.(focused) && editing) return;
+    restore();
+  };
   const bindings = [
     [dragHandle, 'pointerdown', onDragDown], [dragHandle, 'pointermove', onDragMove], [dragHandle, 'pointerup', onPointerUp], [dragHandle, 'pointercancel', onPointerCancel], [dragHandle, 'lostpointercapture', onPointerCancel],
     [resizeHandle, 'pointerdown', onResizeDown], [resizeHandle, 'pointermove', onResizeMove], [resizeHandle, 'pointerup', onPointerUp], [resizeHandle, 'pointercancel', onPointerCancel], [resizeHandle, 'lostpointercapture', onPointerCancel],
-    [viewport, 'resize', onViewportChange], [viewport, 'orientationchange', onViewportChange],
+    [viewport, 'resize', onViewportChange], [viewport, 'scroll', onViewportChange], [viewport, 'orientationchange', onViewportChange],
+    [viewport?.visualViewport, 'resize', onViewportChange], [viewport?.visualViewport, 'scroll', onViewportChange],
   ];
   for (const [target, name, listener] of bindings) target?.addEventListener?.(name, listener);
   restore();

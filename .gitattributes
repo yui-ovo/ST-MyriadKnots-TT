@@ -1,0 +1,3 @@
+# Map catalog integrity and bundle cache keys use exact file bytes on all hosts.
+assets/**/*.svg text eol=lf
+dist/*.js text eol=lf

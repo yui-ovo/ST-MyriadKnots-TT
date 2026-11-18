@@ -32,6 +32,50 @@ test('切换聊天只刷新页面身份，不取消已有业务任务；消息�
   assert.equal(refreshes, 1);
 });
 
+test('宿主逐监听await时，CHAT_CHANGED后台慢准备不阻塞后续失效通知', async () => {
+  const callbacks = [], calls = [], preparation = deferred();
+  const ready = { status: 'ready', identity: { chatId: 'branch-target' } };
+  const lifecycle = createPluginLifecycle({
+    session: { prepare() { calls.push('prepare'); return preparation.promise; }, invalidate() { calls.push('session:invalidate'); } },
+    onPrepared: ({ result }) => calls.push(`loaded:${result.identity.chatId}`),
+  });
+  lifecycle.bind({ eventSource: { on: (_name, handler) => callbacks.push(handler) }, eventTypes: { CHAT_CHANGED: 'chat' } });
+  callbacks.push(() => { calls.push('foundation:invalidate'); });
+  let listenerResult;
+  const emitting = (async () => {
+    for (const [index, handler] of callbacks.entries()) {
+      const value = handler();
+      if (index === 0) listenerResult = value;
+      await value;
+    }
+  })();
+  try {
+    await waitFor(() => calls.includes('prepare'), '后台准备未启动');
+    assert.equal(listenerResult, undefined, '宿主监听不返回后台准备Promise');
+    assert.equal(calls.includes('foundation:invalidate'), true, '慢准备仍在进行时后续失效通知已执行');
+    assert.equal(calls.some(call => call.startsWith('loaded:')), false);
+  } finally { preparation.resolve(ready); await emitting; }
+  await waitFor(() => calls.includes('loaded:branch-target'), '后台完成后未续接目标加载');
+});
+
+test('公开onChatChanged仍返回可等待的原准备Promise和目标结果', async () => {
+  const preparation = deferred(), calls = [];
+  const ready = { status: 'ready', identity: { chatId: 'direct-target' } };
+  const lifecycle = createPluginLifecycle({
+    session: { prepare: () => preparation.promise, invalidate: () => calls.push('invalidate') },
+    onPrepared: ({ result }) => calls.push(`loaded:${result.identity.chatId}`),
+  });
+  const pending = lifecycle.onChatChanged();
+  assert.equal(typeof pending?.then, 'function');
+  let settled = false;
+  void pending.then(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, '直接调用仍等身份准备完成');
+  preparation.resolve(ready);
+  assert.equal(await pending, ready);
+  assert.deepEqual(calls, ['invalidate', 'loaded:direct-target']);
+});
+
 test('禁用立即 invalidate 全链；重新启用只准备身份与刷新 UI', async () => {
   let enabled = true;
   const calls = [];
@@ -99,7 +143,7 @@ test('身份 snapshot 前置复制失败保留原始错误类型、步骤与安�
   const context = { characterId: 0, groupId: null, chatId: 'host-chat', characters: [{ avatar: 'char.png' }], userAvatar: 'persona.png',
     chatMetadata: { qianqianjie: { schemaVersion: 1, chatId: '123e4567-e89b-42d3-a456-426614174000' } }, chat: [() => 'cannot clone'] };
   const session = createChatSession({ contextProvider: () => context,
-    identityCoordinator: { prepare: async () => context.chatMetadata.qianqianjie.chatId },
+    identityCoordinator: { prepare: async (_raw, _host, { getTaskInputs }) => { getTaskInputs(); return context.chatMetadata.qianqianjie.chatId; } },
     captureTaskInputs: ({ raw }) => structuredClone(raw.chat) });
   await assert.rejects(session.prepare(), error => error.name === 'DataCloneError');
   const state = session.getState();
@@ -274,4 +318,31 @@ test('初始身份失败不启动读取，后续有效 CHAT_CHANGED 可恢复；
   await waitFor(() => warnings.some(args => String(args[0]).includes('后台加载失败')), '恢复后的后台错误未独立记录');
   assert.equal(attempts, 2);
   assert.equal((await lifecycle.prepare({ refresh: false })).status, 'ready', '后台失败不能把 session ready 伪装成身份失败');
+});
+
+
+test('身份准备将现有启动与人物事件入口传给会话诊断，不改变事件准备流程', async () => {
+  const entries = [], handlers = new Map();
+  let enabled = true;
+  const lifecycle = createPluginLifecycle({ isEnabled: () => enabled, session: { prepare: async options => { entries.push(options.entryPoint); return { status: 'ready' }; }, invalidate() {} } });
+  lifecycle.bind({ eventSource: { on: (name, callback) => handlers.set(name, callback) }, eventTypes: { CHAT_CHANGED: 'chat', PERSONA_CHANGED: 'persona' } });
+  await lifecycle.start();
+  handlers.get('chat')(); await new Promise(resolve => setImmediate(resolve));
+  handlers.get('persona')(); await new Promise(resolve => setImmediate(resolve));
+  enabled = false; await lifecycle.setEnabled(false);
+  enabled = true; await lifecycle.setEnabled(true);
+  assert.deepEqual(entries, ['startup', 'chatChanged', 'personaChanged', 'pluginEnable']);
+});
+
+test('人物固定任务与上下文aborters分离，Persona改名只取消原其它任务而禁用仍全量', async () => {
+  const calls = []; let enabled = true;
+  const shared = { abortAll() { calls.push('shared'); } }, peopleRouter = { abortAll() { calls.push('people-router'); } }, people = { invalidate() { calls.push('people'); } };
+  const lifecycle = createPluginLifecycle({ session: { prepare: async () => ({ status: 'ready' }), invalidate() { calls.push('session'); }, renameCharacter: async () => ({ status: 'ready' }) },
+    aborters: [shared, peopleRouter, people], contextAborters: [shared], isEnabled: () => enabled, logger: { warn() {} } });
+  lifecycle.onIdentityChange(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ['shared', 'session']); calls.length = 0;
+  await lifecycle.onCharacterRenamed('old', 'new'); assert.deepEqual(calls, ['shared', 'session']); calls.length = 0;
+  await lifecycle.onChatChanged(); assert.deepEqual(calls, ['session']); calls.length = 0;
+  enabled = false; await lifecycle.setEnabled(false);
+  assert.deepEqual(calls, ['shared', 'people-router', 'people', 'session']);
 });

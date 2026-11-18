@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createChatMemoryManagement, CHAT_RECALL_RECEIPT_KEY } from '../src/chat-memory-management.js';
 import { createChatSession } from '../src/chat-session.js';
+import { createChatIdentityCoordinator } from '../src/chat-identity.js';
 import { MESSAGE_FLOOR_ANCHOR_KEY } from '../src/v3/message-floor-anchor.js';
 import { createFoundationStore } from '../src/v3/foundation-store.js';
 import { createFoundationRuntime } from '../src/v3/foundation-runtime.js';
@@ -14,11 +15,15 @@ import { persistMessageFloorAnchors } from '../src/v3/message-floor-anchor.js';
 import { captureHistoricalRebuildSources } from '../src/v3/historical-rebuild-sources.js';
 import { EXTRACTOR_SYSTEM_PROMPT } from '../src/v3/extractor.js';
 import { CSE_SYSTEM_PROMPT } from '../src/v3/cse-engine.js';
+import { projectTime } from '../src/v3/time-engine.js';
+import { createCompactApiClient } from '../src/compact-api-client.js';
+import { createPluginActivity } from '../src/plugin-activity.js';
+import { createPeopleWorkspaceStore } from '../src/v3/people-workspace.js';
 
 const CHAT_ID = '123e4567-e89b-42d3-a456-426614174000';
 const OTHER_ID = '223e4567-e89b-42d3-a456-426614174000';
 
-function fixture({ failRemove = null, holdRemove = null, failSaveChat = false, silentSaveChatFailure = false, failSaveMetadata = false, busy = false, prepareHook = null, removeHook = null, rebuildHook = null, migrationPrefix = false, memoryMigration = null } = {}) {
+function fixture({ failBinding = false, failRemove = null, holdRemove = null, failSaveChat = false, silentSaveChatFailure = false, failSaveMetadata = false, busy = false, prepareHook = null, removeHook = null, afterHostSaveHook = null, rebuildHook = null, migrationPrefix = false, memoryMigration = null, memoryActivity = null, mainGenerationActive = false, memoryState = null } = {}) {
   const records = new Map([
     [`chat-${CHAT_ID}/floor-a`, { recordId: 'floor-a', revision: 2, data: { kind: 'floor' } }],
     [`chat-${CHAT_ID}/orphan-old`, { recordId: 'orphan-old', revision: 5, data: { kind: 'old-version' } }],
@@ -33,7 +38,7 @@ function fixture({ failRemove = null, holdRemove = null, failSaveChat = false, s
   let removeFailure = failRemove, saveChatFailure = failSaveChat, saveMetadataFailure = failSaveMetadata;
   const client = {
     async list(collection) { calls.push(['list', collection]); return [...records.entries()].filter(([key]) => key.startsWith(`${collection}/`)).map(([, value]) => structuredClone(value)); },
-    async get(collection, recordId) { calls.push(['get', collection, recordId]); const value = records.get(`${collection}/${recordId}`); if (!value) throw Object.assign(new Error('missing'), { status: 404 }); return structuredClone(value); },
+    async get(collection, recordId) { calls.push(['get', collection, recordId]); if (failBinding && collection === 'chat-identity-bindings') throw new Error('辅助目录读取失败'); const value = records.get(`${collection}/${recordId}`); if (!value) throw Object.assign(new Error('missing'), { status: 404 }); return structuredClone(value); },
     async remove(collection, recordId, revision) {
       calls.push(['remove', collection, recordId, revision]);
       await removeHook?.(collection, recordId);
@@ -77,9 +82,9 @@ function fixture({ failRemove = null, holdRemove = null, failSaveChat = false, s
     suspend(chatId) { assert.equal(chatId, CHAT_ID); calls.push(['suspend', chatId]); suspended = true; return { status: 'suspended', identity }; },
     resume(chatId) { assert.equal(chatId, CHAT_ID); calls.push(['resume', chatId]); suspended = false; return true; },
   };
-  const state = { memoryWorkBusy: busy };
+  const state = memoryActivity ?? { memoryWorkBusy: busy };
   const runtime = name => ({ getState: () => state, getReachable: () => migrationPrefix ? { root: { chatId: CHAT_ID }, migrationDescriptor: { id: 'archive-prefix' } } : null, invalidate() { invalidated.push(name); } });
-  const memoryRuntime = { async startHistoricalRebuild() { const chatId = context.chatMetadata.qianqianjie.chatId; calls.push(['history', chatId]); records.set(`chat-${chatId}/v3-root`, { recordId: 'v3-root', revision: 1, data: { chatId } }); return { status: 'ready', chatId }; }, getState: () => ({ ...state, chatId: CHAT_ID }), invalidate(options) { memoryInvalidations.push(options); invalidated.push('memory'); } };
+  const memoryRuntime = { async startHistoricalRebuild() { const chatId = context.chatMetadata.qianqianjie.chatId; calls.push(['history', chatId]); records.set(`chat-${chatId}/v3-root`, { recordId: 'v3-root', revision: 1, data: { chatId } }); return { status: 'ready', chatId }; }, getState: () => memoryState ?? ({ ...state, chatId: CHAT_ID }), getActivityState: () => state, invalidate(options) { memoryInvalidations.push(options); invalidated.push('memory'); } };
   const recallRuntime = { getState: () => ({}), invalidate() { invalidated.push('recall'); }, clearCurrent() { invalidated.push('recall-clear'); } };
   const peopleRuntime = { getState: () => ({}), invalidate() { invalidated.push('people'); } };
   const timeRuntime = { async stop() { calls.push(['stopTime']); }, async authorizeHistory() { calls.push(['timeHistory', context.chatMetadata.qianqianjie.chatId]); } };
@@ -92,6 +97,7 @@ function fixture({ failRemove = null, holdRemove = null, failSaveChat = false, s
       if (silentSaveChatFailure) { silentSaveChatFailure = false; return { ok: true, json: async () => ({}) }; }
       persistedMetadata = structuredClone(body.chat[0].chat_metadata);
       persistedMessages = cloneMessages(body.chat.slice(1));
+      await afterHostSaveHook?.({ context, metadata: persistedMetadata, messages: persistedMessages });
       return { ok: true, json: async () => ({}) };
     }
     return { ok: true, json: async () => [{ chat_metadata: structuredClone(persistedMetadata) }, ...cloneMessages(persistedMessages)] };
@@ -107,8 +113,10 @@ function fixture({ failRemove = null, holdRemove = null, failSaveChat = false, s
     calls.push(['history', chatId]);
     return { status: 'ready', chatId };
   };
-  const manager = createChatMemoryManagement({ client, session, hostAdapter, foundationRuntime: runtime('foundation'), memoryRuntime, recallRuntime, peopleRuntime, timeRuntime, memoryMigration, autoHideController, isMainGenerationActive: () => false, fetchImpl, coreRecordCache: { async invalidateIdentity(identity) { calls.push(['invalidateCache', identity.chatId]); } }, createHistoricalRebuild, logger: { warn() {} } });
-  return { manager, records, calls, invalidated, memoryInvalidations, context, user, hidden, malformedHidden, manualHidden, receipt, floorMarker, identity, releaseHeld };
+  const manager = createChatMemoryManagement({ client, session, hostAdapter, foundationRuntime: runtime('foundation'), memoryRuntime, recallRuntime, peopleRuntime, timeRuntime, memoryMigration, autoHideController, isMainGenerationActive: () => mainGenerationActive, fetchImpl, coreRecordCache: { async invalidateIdentity(identity) { calls.push(['invalidateCache', identity.chatId]); } }, createHistoricalRebuild, logger: { warn() {} } });
+  return { manager, client, hostAdapter, fetchImpl, records, calls, invalidated, memoryInvalidations, context, user, hidden, malformedHidden, manualHidden, receipt, floorMarker, identity, releaseHeld,
+    updatePersistedHost({ metadata, messages }) { if (metadata) persistedMetadata = structuredClone(metadata); if (messages) persistedMessages = cloneMessages(messages); },
+    readPersistedHost() { return [{ chat_metadata: structuredClone(persistedMetadata) }, ...cloneMessages(persistedMessages)]; } };
 }
 
 function cloneMessages(messages) { return structuredClone(messages); }
@@ -122,8 +130,10 @@ test('搬家启动立即通知管理器busy状态，结束后再通知完成', a
   const pending = f.manager.migrateCurrent();
   assert.equal(f.manager.getState().migrationState.status, 'migrating');
   assert.equal(f.manager.getState().workBusy, true);
+  assert.deepEqual(f.manager.getActivityState(), { busy: true, phase: 'migrating' });
   assert.equal(states.at(-1).migrationState.status, 'migrating', '异步搬家运行前立即通知UI重绘');
   status = 'completed'; release({ status: 'completed' }); await pending;
+  assert.equal(f.manager.getActivityState().busy, false);
   assert.equal(states.at(-1).migrationState.status, 'completed', '搬家结束仍通知最终状态');
 });
 
@@ -196,12 +206,115 @@ test('迁移档完全重构保留冻结图和宿主身份，历史任务在原�
     return { rebuildStatus: 'caughtUp', chatId: CHAT_ID };
   } });
   const before = [...f.records.keys()].filter(key => key.startsWith(`chat-${CHAT_ID}/`)).sort();
-  const result = await f.manager.fullRebuild(CHAT_ID);
+  const pending = f.manager.fullRebuild(CHAT_ID);
+  assert.deepEqual(f.manager.getActivityState(), { busy: true, phase: 'preparing' }, '宿主读取准备不冒充摘要提取');
+  const result = await pending;
+  assert.equal(f.manager.getActivityState().busy, false);
   const after = [...f.records.keys()].filter(key => key.startsWith(`chat-${CHAT_ID}/`)).sort();
   assert.equal(result.chatId, CHAT_ID);
   assert.deepEqual(after, before, '不删除迁移归档图中的root、楼或descriptor');
   assert.equal(f.calls.some(call => call[0] === 'remove' || call[0] === 'list'), false);
   assert.equal(f.calls.some(call => call[0] === 'suspend'), false);
+});
+
+test('原生与Luker真实session重构只暂停一次并完成删除、历史任务和身份恢复', async () => {
+  for (const hostName of ['SillyTavern', 'Luker']) {
+    const oldChatId = hostName === 'SillyTavern' ? CHAT_ID : OTHER_ID;
+    const rebuiltChatId = hostName === 'SillyTavern' ? '423e4567-e89b-42d3-a456-426614174001' : '523e4567-e89b-42d3-a456-426614174002';
+    const context = {
+      chatId: `synthetic-${hostName}-chat`, characterId: 0, characterAvatar: 'synthetic-character.png', userAvatar: 'synthetic-persona.png',
+      name1: '虚构用户', name2: '虚构角色', characters: [{ name: '虚构角色', avatar: 'synthetic-character.png', data: {} }],
+      chatMetadata: { qianqianjie: { schemaVersion: 2, chatId: oldChatId }, otherPlugin: { retained: true, transient: () => 'not stored' } },
+      chat: [{ is_user: true, is_system: false, mes: '中性测试用户消息' }, { is_user: false, is_system: false, mes: '中性测试回复' }],
+      getRequestHeaders: () => ({ 'x-test-host': hostName }),
+      async saveChatMetadata() { return true; },
+    };
+    let persisted = [{ chat_metadata: JSON.parse(JSON.stringify(context.chatMetadata)) }, ...structuredClone(context.chat)];
+    const records = new Map();
+    const backendCalls = [], sessionCalls = [], taskCalls = [], hostCalls = [];
+    const missing = () => Object.assign(new Error('synthetic record missing'), { status: 404 });
+    const client = {
+      async get(collection, recordId) {
+        backendCalls.push(['get', collection, recordId]);
+        const value = records.get(`${collection}/${recordId}`);
+        if (!value) throw missing();
+        return structuredClone(value);
+      },
+      async put(collection, recordId, data, expectedRevision) {
+        const key = `${collection}/${recordId}`, previous = records.get(key);
+        if ((previous?.revision ?? 0) !== expectedRevision) throw Object.assign(new Error('synthetic CAS conflict'), { status: 409 });
+        const envelope = { recordId, revision: expectedRevision + 1, data: structuredClone(data) };
+        records.set(key, envelope); return structuredClone(envelope);
+      },
+      async list(collection) {
+        backendCalls.push(['list', collection]);
+        return [...records.entries()].filter(([key]) => key.startsWith(`${collection}/`)).map(([, value]) => structuredClone(value));
+      },
+      async remove(collection, recordId, revision) {
+        backendCalls.push(['remove', collection, recordId, revision]);
+        const key = `${collection}/${recordId}`, value = records.get(key);
+        if (!value) throw missing();
+        assert.equal(value.revision, revision);
+        records.delete(key);
+      },
+    };
+    const globalRef = { [hostName]: { getContext: () => context } };
+    const hostAdapter = createHostAdapter({ globalRef });
+    assert.equal(hostAdapter.snapshot().source, hostName);
+    const coordinator = createChatIdentityCoordinator({ client, now: () => new Date('2026-10-12T00:00:00.000Z') });
+    const realSession = createChatSession({ contextProvider: () => context, identityCoordinator: coordinator });
+    const session = {
+      async prepare(...args) { const value = await realSession.prepare(...args); sessionCalls.push(['prepare', realSession.getState().status]); return value; },
+      identity(...args) { return realSession.identity(...args); },
+      suspend(...args) { sessionCalls.push(['suspend', realSession.getState().status]); return realSession.suspend(...args); },
+      resume(...args) { const value = realSession.resume(...args); sessionCalls.push(['resume', realSession.getState().status]); return value; },
+      getState: realSession.getState,
+    };
+    const initial = await session.prepare();
+    assert.equal(initial.status, 'ready');
+    assert.equal(initial.identity.chatId, oldChatId);
+    records.set(`chat-${oldChatId}/v3-root`, { recordId: 'v3-root', revision: 1, data: { chatId: oldChatId } });
+    records.set(`chat-${oldChatId}/v3-people-workspace`, { recordId: 'v3-people-workspace', revision: 1, data: { chatId: oldChatId } });
+    const fetchImpl = async (url, request) => {
+      const body = JSON.parse(request.body); hostCalls.push([url, body.file_name]);
+      if (url.endsWith('/save')) {
+        persisted = structuredClone(body.chat);
+        return { ok: true, json: async () => ({}) };
+      }
+      return { ok: true, json: async () => structuredClone(persisted) };
+    };
+    const inertRuntime = { getState: () => ({}), getReachable: () => null, invalidate() {} };
+    const manager = createChatMemoryManagement({
+      client, session, hostAdapter, foundationRuntime: inertRuntime,
+      memoryRuntime: { ...inertRuntime, async startHistoricalRebuild() {} },
+      recallRuntime: { ...inertRuntime, clearCurrent() {} }, peopleRuntime: inertRuntime,
+      timeRuntime: { async stop() {}, async authorizeHistory() {} }, autoHideController: { async stop() {} },
+      fetchImpl, isMainGenerationActive: () => false, logger: { warn() {} },
+      freshUuid: () => rebuiltChatId,
+      createHistoricalRebuild: async options => {
+        taskCalls.push({ chatId: options.identity.chatId, host: hostName, sourceCount: options.sourceContext ? 1 : 0 });
+        persisted[0].chat_metadata.qianqianjie = { schemaVersion: 2, chatId: rebuiltChatId };
+        return { rebuildStatus: 'caughtUp', chatId: rebuiltChatId };
+      },
+    });
+    const result = await manager.fullRebuild(oldChatId);
+    assert.equal(result.chatId, rebuiltChatId);
+    assert.equal(result.rebuildStatus, 'caughtUp');
+    assert.deepEqual(sessionCalls.filter(([method]) => method === 'suspend'), [['suspend', 'ready']], `${hostName}只从ready状态暂停一次`);
+    assert.equal(sessionCalls.filter(([method]) => method === 'resume').length, 1, `${hostName}清理成功后恢复原身份生命周期`);
+    assert.equal(taskCalls.length, 1, `${hostName}删除成功后进入历史任务`);
+    assert.ok(backendCalls.some(([method, collection]) => method === 'list' && collection === `chat-${oldChatId}`));
+    assert.ok(backendCalls.some(([method, collection, recordId]) => method === 'remove' && collection === `chat-${oldChatId}` && recordId === 'v3-root'));
+    assert.equal(records.has(`chat-${oldChatId}/v3-root`), false);
+    assert.equal(persisted[0].chat_metadata.qianqianjie.chatId, rebuiltChatId);
+    assert.equal(context.chatMetadata.qianqianjie.chatId, rebuiltChatId);
+    assert.equal(context.chatMetadata.otherPlugin.retained, true, `${hostName}重构接管保留可持久化的其他插件metadata`);
+    assert.equal(realSession.getState().status, 'ready');
+    assert.equal(session.identity().chatId, rebuiltChatId);
+    assert.equal(manager.getState().status, 'idle');
+    assert.equal(manager.getState().error, null);
+    assert.ok(hostCalls.length >= 4, `${hostName}通过固定宿主读写入口完成清理和身份读回`);
+  }
 });
 
 test('完全重构删除失败不生成，续删完成后沿开始时的目标创建新身份', async () => {
@@ -230,6 +343,247 @@ test('完全重构任务转发真实进度与暂停，暂停后复用同一目�
   assert.equal(starts, 1, '继续按钮调用同一历史任务实例，不新删后端或重开另一task');
   assert.equal(completed.rebuildStatus, 'caughtUp');
   assert.equal(f.records.has(`chat-${OTHER_ID}/v3-root`), true);
+});
+
+test('完全重构以control当前终态结算，迟到的旧partial返回不覆盖完成通知', async () => {
+  const old = Object.freeze({ rebuildStatus: 'partial', chatId: OTHER_ID, rememberedCount: 4, stableCount: 5,
+    rebuildCompletedCount: 2, rebuildTotalCount: 5, unprocessedCount: 1, csePendingCount: 2 });
+  const completed = Object.freeze({ ...old, rebuildStatus: 'caughtUp', rememberedCount: 5,
+    rebuildCompletedCount: 5, unprocessedCount: 0, csePendingCount: 0 });
+  let state = old, listener;
+  const control = { getState: () => state, subscribe(callback) { listener = callback; return () => { listener = null; }; } };
+  const f = fixture({ rebuildHook: async options => {
+    options.onTaskControl(control);
+    state = completed; listener(state);
+    return old;
+  } });
+  const notifications = [];
+  f.manager.subscribe(snapshot => notifications.push(snapshot));
+  const result = await f.manager.fullRebuild(CHAT_ID);
+  assert.equal(result.rebuildStatus, 'caughtUp');
+  assert.equal(result.rememberedCount, 5);
+  const lastProgress = notifications.filter(snapshot => snapshot.rebuildState).at(-1).rebuildState;
+  assert.equal(lastProgress.rebuildStatus, 'caughtUp');
+  assert.equal(lastProgress.rebuildCompletedCount, 5);
+  assert.equal(f.manager.getState().rebuildState, null, '完成后释放旧任务，允许重新开始完全重构');
+  assert.equal(f.manager.getState().workBusy, false);
+});
+
+test('管理状态读取control当前快照，保留固定目标的新partial进度而不按计数取大', async () => {
+  let state = Object.freeze({ rebuildStatus: 'partial', chatId: OTHER_ID, rememberedCount: 4,
+    rebuildCompletedCount: 4, rebuildTotalCount: 5 });
+  const control = { getState: () => state, subscribe: () => () => {} };
+  const f = fixture({ rebuildHook: async options => { options.onTaskControl(control); return state; } });
+  await f.manager.fullRebuild(CHAT_ID);
+  state = Object.freeze({ ...state, rememberedCount: 3, rebuildCompletedCount: 2 });
+  assert.equal(f.manager.getState().rebuildState.rememberedCount, 3);
+  assert.equal(f.manager.getState().rebuildState.rebuildCompletedCount, 2);
+  assert.equal(f.manager.getState().rebuildState.rebuildTotalCount, 5);
+});
+
+test('管理已结束任务刷新为waitingRealtime时释放覆盖层，paused固定目标继续保留', async () => {
+  let state = { rebuildStatus: 'paused', chatId: OTHER_ID, rebuildCompletedCount: 2, rebuildTotalCount: 5 };
+  let unsubscribed = 0;
+  const control = { getState: () => state, subscribe: () => () => { unsubscribed += 1; } };
+  const f = fixture({ rebuildHook: async options => { options.onTaskControl(control); return state; } });
+  await f.manager.fullRebuild(CHAT_ID);
+  assert.equal(f.manager.getState().rebuildState.rebuildTotalCount, 5);
+  assert.equal(unsubscribed, 0);
+  state = { ...state, rebuildStatus: 'waitingRealtime' };
+  assert.equal(f.manager.getState().rebuildState, null);
+  assert.equal(f.manager.getState().workBusy, false);
+  assert.equal(unsubscribed, 1);
+});
+
+test('完全重构接回等待中采用control更新终态', async () => {
+  const rebuiltChatId = '323e4567-e89b-42d3-a456-426614174000';
+  let state = { rebuildStatus: 'partial', chatId: rebuiltChatId, rebuildCompletedCount: 2, rebuildTotalCount: 5 };
+  let listener, enteredAdoption, finishAdoption;
+  const adopting = new Promise(resolve => { enteredAdoption = resolve; });
+  const adoption = new Promise(resolve => { finishAdoption = resolve; });
+  const control = { getState: () => state, subscribe(callback) { listener = callback; return () => { listener = null; }; } };
+  const f = fixture({ prepareHook: async () => { enteredAdoption(); await adoption; }, rebuildHook: async (options, context) => {
+    context.chatMetadata.qianqianjie = { schemaVersion: 2, chatId: rebuiltChatId };
+    await context.saveChatMetadata();
+    options.onTaskControl(control);
+    return state;
+  } });
+  const pending = f.manager.fullRebuild(CHAT_ID);
+  await adopting;
+  state = { ...state, rebuildStatus: 'caughtUp', rebuildCompletedCount: 5 };
+  listener(state);
+  finishAdoption();
+  const result = await pending;
+  assert.equal(result.rebuildStatus, 'caughtUp');
+  assert.equal(result.chatId, rebuiltChatId);
+  assert.equal(f.manager.getState().rebuildState, null);
+});
+
+test('完全重构切到其他聊天后迟到终态只结算原目标', async () => {
+  const rebuiltChatId = '323e4567-e89b-42d3-a456-426614174000';
+  const old = { rebuildStatus: 'partial', chatId: rebuiltChatId, rebuildCompletedCount: 2, rebuildTotalCount: 5 };
+  let state = old, listener, enteredFactory, releaseFactory;
+  const started = new Promise(resolve => { enteredFactory = resolve; });
+  const held = new Promise(resolve => { releaseFactory = resolve; });
+  const control = { getState: () => state, subscribe(callback) { listener = callback; return () => { listener = null; }; } };
+  const f = fixture({ rebuildHook: async (options, context) => {
+    context.chatMetadata.qianqianjie = { schemaVersion: 2, chatId: rebuiltChatId };
+    await context.saveChatMetadata();
+    options.onTaskControl(control);
+    enteredFactory(); await held;
+    return old;
+  } });
+  const pending = f.manager.fullRebuild(CHAT_ID);
+  await started;
+  f.context.chatId = 'other-host';
+  f.context.chatMetadata = { qianqianjie: { schemaVersion: 2, chatId: OTHER_ID }, otherPlugin: { keep: 'new-chat' } };
+  f.context.chat = [{ is_user: false, mes: '其他聊天正文', extra: { otherPlugin: true } }];
+  const otherChat = structuredClone({ metadata: f.context.chatMetadata, chat: f.context.chat });
+  state = { ...old, rebuildStatus: 'caughtUp', rebuildCompletedCount: 5 };
+  listener(state);
+  assert.equal(f.manager.getState().rebuildState, null, '迟到任务进度不显示在新聊天');
+  releaseFactory();
+  const result = await pending;
+  assert.equal(result.rebuildStatus, 'caughtUp');
+  assert.equal(result.chatId, rebuiltChatId);
+  assert.deepEqual({ metadata: f.context.chatMetadata, chat: f.context.chat }, otherChat);
+  assert.equal(f.calls.some(call => call[0] === 'prepare'), false);
+});
+
+test('只有同目标已就绪主快照可结束settled partial，暂停失败及运行中任务保原control', async t => {
+  const rebuiltChatId = '323e4567-e89b-42d3-a456-426614174000';
+  const completed = { chatId: rebuiltChatId, narrativeGeneration: 'generation-a', status: 'ready', foundationStatus: 'ready',
+    memorySnapshotStatus: 'ready', memorySyncStatus: 'idle', rebuildStatus: 'caughtUp', rebuildHasActionableWork: false };
+  const scenarios = [
+    { name: '同目标当前已追平', patch: {}, released: true },
+    { name: '同目标等待新楼', patch: { rebuildStatus: 'waitingRealtime' }, released: true },
+    { name: '另一聊天', patch: { chatId: OTHER_ID }, released: false },
+    { name: '另一代际', patch: { narrativeGeneration: 'generation-b' }, released: false },
+    { name: '主runtime仍在运行', patch: { status: 'running' }, released: false },
+    { name: '主runtime记忆仍忙', patch: { memoryWorkBusy: true }, released: false },
+    { name: '主runtime手动重提尚在运行', patch: { activeExtraction: { phase: 'extracting' } }, released: false },
+    { name: '主runtime人物分析尚在运行', patch: { activeCse: { phase: 'analyzingCse' } }, released: false },
+    { name: '主快照未读入', patch: { memorySnapshotStatus: 'syncing' }, released: false },
+    { name: '主快照仍在同步', patch: { memorySyncStatus: 'syncing' }, released: false },
+    { name: '来源尚待核对', patch: { foundationStatus: 'needsReview' }, released: false },
+    { name: '主快照仍有待办', patch: { rebuildHasActionableWork: true }, released: false },
+    { name: '原任务暂停', taskStatus: 'paused', patch: {}, released: false },
+    { name: '原任务失败', taskStatus: 'failed', patch: {}, released: false },
+  ];
+  for (const scenario of scenarios) await t.test(scenario.name, async () => {
+    const state = { ...completed, rebuildStatus: scenario.taskStatus ?? 'partial', rebuildHasActionableWork: true };
+    const memoryState = { ...state };
+    const control = { getState: () => state, subscribe: () => () => {} };
+    const f = fixture({ memoryState, rebuildHook: async (options, context) => {
+      context.chatMetadata.qianqianjie = { schemaVersion: 2, chatId: rebuiltChatId };
+      await context.saveChatMetadata();
+      options.onTaskControl(control); return state;
+    } });
+    await f.manager.fullRebuild(CHAT_ID);
+    Object.assign(memoryState, completed, scenario.patch);
+    assert.equal(f.manager.getState().rebuildState === null, scenario.released);
+  });
+});
+
+test('历史任务尚未返回时保留独立partial进度，结束后才接用同目标完整主快照', async () => {
+  const rebuiltChatId = '323e4567-e89b-42d3-a456-426614174000';
+  const memoryState = { chatId: rebuiltChatId, status: 'ready', foundationStatus: 'ready', memorySnapshotStatus: 'ready',
+    memorySyncStatus: 'idle', rebuildStatus: 'caughtUp', rebuildHasActionableWork: false };
+  const state = { ...memoryState, rebuildStatus: 'partial', rebuildHasActionableWork: true, rebuildCompletedCount: 2, rebuildTotalCount: 5 };
+  let enteredFactory, releaseFactory;
+  const started = new Promise(resolve => { enteredFactory = resolve; });
+  const held = new Promise(resolve => { releaseFactory = resolve; });
+  const control = { getState: () => state, subscribe: () => () => {} };
+  const f = fixture({ memoryState, rebuildHook: async (options, context) => {
+    context.chatMetadata.qianqianjie = { schemaVersion: 2, chatId: rebuiltChatId };
+    await context.saveChatMetadata();
+    options.onTaskControl(control);
+    enteredFactory(); await held;
+    return state;
+  } });
+  const pending = f.manager.fullRebuild(CHAT_ID);
+  await started;
+  assert.equal(f.manager.getState().workBusy, true);
+  assert.equal(f.manager.getState().rebuildState.rebuildStatus, 'partial');
+  assert.equal(f.manager.getState().rebuildState.rebuildTotalCount, 5);
+  releaseFactory();
+  assert.equal((await pending).rebuildStatus, 'caughtUp');
+  assert.equal(f.manager.getState().rebuildState, null);
+});
+
+test('partial完全重构继续只调用同一control并保留原aggregate和目标，不重复清理或创建任务', async () => {
+  let state = Object.freeze({ rebuildStatus: 'partial', chatId: OTHER_ID, rebuildCompletedCount: 2, rebuildTotalCount: 5 });
+  let listener, starts = 0, factories = 0;
+  const control = {
+    getState: () => state,
+    subscribe(callback) { listener = callback; return () => { listener = null; }; },
+    async start(options) {
+      assert.deepEqual(options, { aggregate: true });
+      starts += 1;
+      state = Object.freeze({ ...state, rebuildStatus: 'caughtUp', rebuildCompletedCount: 5 });
+      listener?.(state);
+      return state;
+    },
+  };
+  const f = fixture({ rebuildHook: async options => { factories += 1; options.onTaskControl(control); return state; } });
+  await f.manager.fullRebuild(CHAT_ID, { aggregate: true });
+  const cleanupCount = f.calls.filter(call => ['remove', 'hostSave'].includes(call[0])).length;
+  const result = await f.manager.fullRebuild(CHAT_ID, { aggregate: false });
+  assert.equal(result.rebuildStatus, 'caughtUp');
+  assert.equal(result.chatId, OTHER_ID);
+  assert.equal(starts, 1);
+  assert.equal(factories, 1);
+  assert.equal(f.calls.filter(call => ['remove', 'hostSave'].includes(call[0])).length, cleanupCount);
+});
+
+test('暂停、失败和partial原任务续跑都等待真实主生成或记忆工作结束', async t => {
+  for (const status of ['paused', 'failed', 'partial']) await t.test(status, async () => {
+    const memoryActivity = { mainGenerationActive: false, memoryWorkBusy: false };
+    let state = { rebuildStatus: status, chatId: OTHER_ID }, starts = 0;
+    const control = { getState: () => state, subscribe: () => () => {}, async start() {
+      starts += 1; state = { ...state, rebuildStatus: 'caughtUp' }; return state;
+    } };
+    const f = fixture({ memoryActivity, rebuildHook: async options => { options.onTaskControl(control); return state; } });
+    await f.manager.fullRebuild(CHAT_ID);
+    for (const busyKey of ['mainGenerationActive', 'memoryWorkBusy']) {
+      memoryActivity[busyKey] = true;
+      assert.equal(f.manager.getState().workBusy, true);
+      await assert.rejects(f.manager.fullRebuild(CHAT_ID), error => error.code === 'QQJ_REBUILD_BUSY');
+      assert.equal(starts, 0);
+      memoryActivity[busyKey] = false;
+    }
+    assert.equal((await f.manager.fullRebuild(CHAT_ID)).rebuildStatus, 'caughtUp');
+    assert.equal(starts, 1);
+  });
+});
+
+test('无control旧任务工厂保留其返回状态并释放已完成任务', async () => {
+  const f = fixture();
+  const result = await f.manager.fullRebuild(CHAT_ID);
+  assert.equal(result.status, 'ready');
+  assert.equal(result.chatId, '323e4567-e89b-42d3-a456-426614174000');
+  assert.equal(f.manager.getState().rebuildState, null);
+  assert.equal(f.manager.getState().workBusy, false);
+});
+
+test('管理busy优先复用memory已解析主生成状态，缺字段才沿旧宿主回调', async t => {
+  const scenarios = [
+    { name: '解析idle覆盖残留raw true', memory: { mainGenerationActive: false }, raw: true, blocked: false },
+    { name: '解析active仍阻拦', memory: { mainGenerationActive: true }, raw: false, blocked: true },
+    { name: '旧宿主缺字段沿raw true', memory: {}, raw: true, blocked: true },
+    { name: '旧宿主缺字段沿raw false', memory: {}, raw: false, blocked: false },
+    { name: '真实记忆任务仍阻拦', memory: { mainGenerationActive: false, memoryWorkBusy: true }, raw: false, blocked: true },
+    { name: '真实提取仍阻拦', memory: { mainGenerationActive: false, activeExtraction: { phase: 'extracting' } }, raw: false, blocked: true },
+  ];
+  for (const scenario of scenarios) await t.test(scenario.name, async () => {
+    const f = fixture({ memoryActivity: scenario.memory, mainGenerationActive: scenario.raw });
+    assert.equal(f.manager.getState().workBusy, scenario.blocked);
+    if (scenario.blocked) {
+      await assert.rejects(f.manager.fullRebuild(CHAT_ID), error => error.code === 'QQJ_REBUILD_BUSY');
+      await assert.rejects(f.manager.deleteCurrent(), error => error.code === 'QQJ_DELETE_BUSY');
+      assert.equal(f.calls.some(call => ['remove', 'hostSave'].includes(call[0])), false);
+    } else assert.equal((await f.manager.fullRebuild(CHAT_ID)).status, 'ready');
+  });
 });
 
 test('按实际revision删除全collection后root和binding，并保留正文、他插件字段与人工隐藏边界', async () => {
@@ -264,6 +618,61 @@ test('按实际revision删除全collection后root和binding，并保留正文、
   assert.ok(f.invalidated.includes('memory') && f.invalidated.includes('foundation') && f.invalidated.includes('recall') && f.invalidated.includes('people'));
   assert.deepEqual(f.memoryInvalidations, [{ deletedChatId: CHAT_ID }], '删除目标的记忆投影按A身份失效');
   assert.equal(f.calls.at(-1)[0], 'resume');
+});
+
+test('删除期间其他插件只更新显示元数据时保留最新宿主字段并完成千千结清理', async () => {
+  let changed = false;
+  const f = fixture({ removeHook: async () => {
+    if (changed) return;
+    changed = true;
+    f.context.chatMetadata.otherPlugin = { keep: '最新header' };
+    f.user.extra.otherPlugin = { keep: '最新message' };
+    f.user.swipe_info[0].extra.otherPlugin = { keep: '最新swipe' };
+    // The host file is the save authority; the live context reflects the same extension update.
+    f.updatePersistedHost({ metadata: f.context.chatMetadata, messages: f.context.chat });
+  } });
+  const result = await f.manager.deleteCurrent();
+  assert.equal(result.status, 'completed');
+  const saved = f.calls.find(call => call[0] === 'hostSave')[2].chat;
+  assert.deepEqual(saved[0].chat_metadata.otherPlugin, { keep: '最新header' });
+  assert.deepEqual(saved[1].extra.otherPlugin, { keep: '最新message' });
+  assert.deepEqual(saved[1].swipe_info[0].extra.otherPlugin, { keep: '最新swipe' });
+  assert.equal(saved[0].chat_metadata.qianqianjie, undefined);
+  assert.equal(saved[1].extra[CHAT_RECALL_RECEIPT_KEY], undefined);
+  assert.deepEqual(f.context.chatMetadata.otherPlugin, { keep: '最新header' });
+  assert.deepEqual(f.user.extra.otherPlugin, { keep: '最新message' });
+  assert.deepEqual(f.user.swipe_info[0].extra.otherPlugin, { keep: '最新swipe' });
+});
+
+test('删除保存后宿主正文回复和其它显示字段变化仍按QQJ结果接回', async () => {
+  let changed = false;
+  const f = fixture({ afterHostSaveHook: async ({ metadata, messages }) => {
+    if (changed) return;
+    changed = true;
+    metadata.otherPlugin = { keep: '保存后更新' };
+    messages[0].extra.otherPlugin = { keep: '保存后更新' };
+    messages[0].mes = '宿主保存后的新正文';
+    messages[0].swipes = ['旧候选', '宿主保存后的新正文']; messages[0].swipe_id = 1;
+    f.user.mes = '页面继续编辑的正文';
+  } });
+  const result = await f.manager.deleteCurrent();
+  assert.equal(result.status, 'completed');
+  const persisted = f.readPersistedHost();
+  assert.equal(persisted[0].chat_metadata.otherPlugin.keep, '保存后更新');
+  assert.equal(persisted[1].extra.otherPlugin.keep, '保存后更新');
+  assert.equal(persisted[0].chat_metadata.qianqianjie, undefined);
+  assert.equal(persisted[1].extra[CHAT_RECALL_RECEIPT_KEY], undefined);
+});
+
+test('删除期间正文变化以最新文件为基底，仅清理QQJ字段', async () => {
+  const f = fixture({ removeHook: async () => {
+    f.user.mes = '用户刚编辑的正文';
+    f.updatePersistedHost({ metadata: f.context.chatMetadata, messages: f.context.chat });
+  } });
+  assert.equal((await f.manager.deleteCurrent()).status, 'completed');
+  assert.equal(f.user.mes, '用户刚编辑的正文');
+  assert.equal(f.calls.some(call => call[0] === 'hostSave'), true);
+  assert.equal(f.user.extra[MESSAGE_FLOOR_ANCHOR_KEY], undefined);
 });
 
 test('revision冲突不覆盖并保留捕获UUID，重试重新list后删完剩余记录', async () => {
@@ -326,6 +735,101 @@ test('A目标删除在途切到B仍完成A的目标保存，不阻断或改写B�
   assert.deepEqual(f.context.chatMetadata, { qianqianjie: { schemaVersion: 2, chatId: OTHER_ID } }, '当前B展示元数据没有接收A清理结果');
 });
 
+test('独立历史重构owner等待真实compact请求时忙，成功失败暂停及请求取消后自然归闲', async t => {
+  for (const outcome of ['success', 'error', 'pause', 'cancel']) await t.test(outcome, async () => {
+    const f = fixture();
+    f.context.name1 = '原目标用户';
+    f.context.chat = [{ is_user: false, is_system: false, mes: '原目标回复。' }, { is_user: true, is_system: false, mes: '确认稳定', send_date: 'confirm-owner' }];
+    f.updatePersistedHost({ messages: f.context.chat });
+    const session = createChatSession({ contextProvider: () => f.context });
+    assert.equal((await session.prepare()).identity.chatId, CHAT_ID);
+    const client = { ...f.client, async put(collection, recordId, data, expectedRevision) {
+      const key = `${collection}/${recordId}`, previous = f.records.get(key);
+      assert.equal(previous?.revision ?? 0, expectedRevision);
+      const envelope = { recordId, revision: expectedRevision + 1, data: structuredClone(data) };
+      f.records.set(key, envelope); return structuredClone(envelope);
+    } };
+    const store = createFoundationStore({ client, contextProvider: () => session.identity() });
+    const foundation = createFoundationRuntime({ hostAdapter: f.hostAdapter, store, contextProvider: () => f.context, logger: { warn() {} } });
+    const memory = createV3MemoryRuntime({ foundationRuntime: foundation, store, hostAdapter: f.hostAdapter,
+      generateAnalysisTask: () => { throw new Error('基础memory不得消费独立任务请求'); },
+      generateUtilityTask: () => { throw new Error('基础memory不得消费独立任务请求'); }, logger: { warn() {} } });
+    const workspaceStore = createPeopleWorkspaceStore({ client });
+    let requestStarted, releaseRequest, rejectRequest, networkSignal, taskControl, uuid = 0;
+    const started = new Promise(resolve => { requestStarted = resolve; });
+    const gate = new Promise((resolve, reject) => { releaseRequest = resolve; rejectRequest = reject; });
+    const requestTasks = [], providerTargets = [], projectionWindows = [];
+    const compact = createCompactApiClient({ fetchImpl: async (_url, options) => {
+      const body = JSON.parse(options.body), task = JSON.parse(body.messages.at(-1).content).task;
+      requestTasks.push(task);
+      if (requestTasks.length === 1) { networkSignal = options.signal; requestStarted(); await gate; }
+      if (outcome === 'error') return { ok: false, status: 400, json: async () => ({ error: { code: 'fixture_request_error' } }) };
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify(task === 'extractFloorSemantics'
+        ? { summary: '固定目标历史摘要' } : { noMaterialChange: true }) }, finish_reason: 'stop' }] }) };
+    } });
+    const generate = options => compact.generateTask({ ...options, config: { url: 'https://offline.test', key: 'fixture', model: 'fixture' } });
+    const manager = createChatMemoryManagement({ client, session, hostAdapter: f.hostAdapter,
+      foundationRuntime: foundation, memoryRuntime: memory, autoHideController: { async stop() {} }, fetchImpl: f.fetchImpl,
+      createHistoricalRebuild: options => runHistoricalRebuildTask({ ...options, client, fetchImpl: f.fetchImpl,
+        newUuid: () => `${(++uuid + 30).toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`,
+        scanCandidates: scanAssistantCandidates, persistAnchors: persistMessageFloorAnchors,
+        generateAnalysisTask: generate, generateUtilityTask: generate, automationSettings: () => ({ enabled: false, batchSize: 1 }),
+        identityProjectionProvider: async identity => {
+          providerTargets.push(identity);
+          let frontendError = null;
+          try { session.identity(); } catch (error) { frontendError = error.code; }
+          projectionWindows.push({ frontendStatus: session.getState().status, frontendError,
+            hostChatId: f.context.chatId, hostQqjId: f.context.chatMetadata.qianqianjie?.chatId ?? null,
+            providerChatId: identity?.chatId ?? null });
+          return (await workspaceStore.read(identity ?? session.identity())).data;
+        }, onTaskControl: control => { taskControl = control; options.onTaskControl(control); }, logger: { warn() {} } }), logger: { warn() {} } });
+    const activity = createPluginActivity([session, foundation, memory, manager, compact]), changes = [];
+    activity.subscribe(state => changes.push(state));
+    const resultPromise = manager.fullRebuild(CHAT_ID);
+    await Promise.race([started, resultPromise.then(result => { throw new Error(`独立任务未派发：${JSON.stringify(result)}`); })]);
+    assert.equal(memory.getActivityState().busy, false, '基础runtime没有运行独立历史任务');
+    assert.equal(memory.getState().activeExtraction, null);
+    assert.equal(compact.getActivityState().busy, true);
+    assert.equal(manager.getActivityState().busy, true);
+    assert.equal(taskControl.getState().activeExtraction.phase, 'extracting');
+    assert.equal(activity.getState().busy, true);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(activity.getState().busy, true, '未完成的真实请求不能强清忙碌状态');
+    assert.ok(providerTargets.every(identity => identity?.chatId === taskControl.getState().chatId));
+    assert.deepEqual(projectionWindows[0], { frontendStatus: 'idle', frontendError: 'CHAT_SESSION_NOT_READY',
+      hostChatId: 'host-chat', hostQqjId: null, providerChatId: taskControl.getState().chatId },
+    '普通完全重构不切聊：清理live头并resume后，前台暂不可用，但固定来源provider仍读取原目标');
+    if (outcome === 'pause') {
+      await taskControl.pause();
+      assert.equal(networkSignal.aborted, true, '现有暂停入口确实取消compact关联请求');
+    } else if (outcome === 'cancel') rejectRequest(new DOMException('offline fetch aborted', 'AbortError'));
+    else releaseRequest();
+    const settled = await resultPromise;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled.rebuildStatus, outcome === 'success' ? 'caughtUp' : outcome === 'pause' ? 'paused' : 'failed');
+    assert.equal(compact.getActivityState().busy, false);
+    assert.equal(manager.getActivityState().busy, false);
+    assert.equal(manager.getState().workBusy, false);
+    const historical = taskControl.getState();
+    for (const key of ['activeMemoryWork', 'activeExtraction', 'activeAutoMemory', 'activeCse']) assert.equal(historical[key], null, key);
+    assert.equal(historical.memoryWorkBusy, false);
+    await new Promise(resolve => {
+      let unsubscribe = null;
+      const finish = () => { if (memory.getActivityState().busy) return; unsubscribe?.(); resolve(); };
+      unsubscribe = memory.subscribeActivity(finish); finish();
+    });
+    assert.equal(memory.getActivityState().busy, false);
+    assert.equal(activity.getState().busy, false, JSON.stringify(changes));
+    assert.equal(changes.at(-1).busy, false, '依现有notify自然熄灯，不手工重采或强清聚合');
+    assert.equal(requestTasks.length, outcome === 'success' ? 2 : 1);
+    console.log(JSON.stringify({ historicalOwner: { outcome, projectionWindow: projectionWindows[0],
+      rebuildStatus: settled.rebuildStatus, requestCount: requestTasks.length,
+      frontendStatus: session.getState().status, baseBusy: memory.getActivityState().busy,
+      managerBusy: manager.getActivityState().busy, compactBusy: compact.getActivityState().busy, pluginBusy: activity.getState().busy } }));
+    activity.dispose();
+  });
+});
+
 test('真实历史重构完整完成与暂停续跑均接回A身份、消息锚点和共享覆盖', async () => {
  for (const pauseAndResume of [true, false]) {
   let persistedMetadata = { qianqianjie: { schemaVersion: 2, chatId: CHAT_ID }, world_info: ['聊天世界书'] }, nextId = OTHER_ID, prepareCalls = 0;
@@ -359,13 +863,17 @@ test('真实历史重构完整完成与暂停续跑均接回A身份、消息锚�
   const store = createFoundationStore({ client, contextProvider: () => session.identity() });
   const foundation = createFoundationRuntime({ hostAdapter, store, contextProvider: () => context, prepareSession: () => session.prepare(), now: () => new Date('2026-09-14T00:00:00.000Z'), logger: { warn() {} } });
   const requests = [];
-  let historicalTaskControl = null, firstExtractorPending = true, signalFirstExtractor, releaseFirstExtractor;
+  let historicalTaskControl = null, firstExtractorPending = true, changedLiveDisplayAfterSave = false, signalFirstExtractor, releaseFirstExtractor;
   const firstExtractorStarted = new Promise(resolve => { signalFirstExtractor = resolve; });
   const firstExtractorGate = new Promise(resolve => { releaseFirstExtractor = resolve; });
   const utility = async options => {
     requests.push(options);
     if (firstExtractorPending && options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) {
       firstExtractorPending = false;
+      persistedMetadata.otherPluginDisplay = { theme: '最新header显示字段' };
+      persistedMessages[1].extra.otherPluginDisplay = { label: '最新message显示字段' };
+      context.chatMetadata.otherPluginDisplay = structuredClone(persistedMetadata.otherPluginDisplay);
+      context.chat[1].extra.otherPluginDisplay = structuredClone(persistedMessages[1].extra.otherPluginDisplay);
       signalFirstExtractor();
       if (pauseAndResume) await firstExtractorGate;
     }
@@ -380,6 +888,12 @@ test('真实历史重构完整完成与暂停续跑均接回A身份、消息锚�
     if (url.endsWith('/save')) {
       persistedMetadata = structuredClone(body.chat[0].chat_metadata);
       persistedMessages = structuredClone(body.chat.slice(1));
+      if (!firstExtractorPending && !changedLiveDisplayAfterSave) {
+        changedLiveDisplayAfterSave = true;
+        context.chatMetadata.otherPluginDisplay = { theme: '保存后更新的live字段' };
+        context.chat[1].extra.otherPluginDisplay = { label: '保存后更新的live字段' };
+        context.chat[1].mes = '页面新正文不阻断QQJ重构结果接回';
+      }
     }
     return { ok: true, json: async () => [{ chat_metadata: structuredClone(persistedMetadata) }, ...structuredClone(persistedMessages)] };
   };
@@ -390,28 +904,35 @@ test('真实历史重构完整完成与暂停续跑均接回A身份、消息锚�
     return `423e4567-e89b-42d3-a456-4266141740${String(uuidSequence).padStart(2, '0')}`;
   };
   const books = Object.fromEntries(['角色世界书', '人格世界书', '聊天世界书', '附加世界书', '全局世界书'].map(name => [name, { entries: { 1: { uid: 1, constant: true, content: `${name}的绑定正文` } } }]));
-  const calendarReads = [];
+  const calendarReads = [], sourceCalendarReads = [], storyCalendars = { [CHAT_ID]: { months: 4, prefix: '启航' } };
   const manager = createChatMemoryManagement({ client, session, hostAdapter, foundationRuntime: foundation, memoryRuntime: memory, recallRuntime: { getState: () => ({}), invalidate() {}, clearCurrent() {} }, peopleRuntime: { getState: () => ({}), invalidate() {} }, autoHideController, fetchImpl,
-    captureHistoricalRebuildSources: snapshot => captureHistoricalRebuildSources(snapshot, {
+    captureHistoricalRebuildSources: (snapshot, overrides) => captureHistoricalRebuildSources(snapshot, {
+      ...overrides,
       worldInfoBindings: { getSelectedWorldInfo: () => ['全局世界书'], getWorldInfoSettings: () => ({ charLore: [{ name: 'char', extraBooks: ['附加世界书'] }] }), getWorldInfoNames: () => Object.keys(books), getDefaultCaseSensitive: () => false, getDefaultMatchWholeWords: () => false },
       getCharacterLorebooks: () => ({ primary: '角色世界书', additional: ['附加世界书'] }), getGlobalSelection: () => ['全局世界书'],
       loadWorldInfo: async name => books[name] ?? null,
+      calendarForChat: chatId => { sourceCalendarReads.push(chatId); return storyCalendars[chatId] ?? null; },
     }),
     freshUuid,
-    createHistoricalRebuild: options => runHistoricalRebuildTask({
-    ...options, storyCalendarForChat: chatId => { calendarReads.push(chatId); return chatId === nextId ? { timezone: 'UTC' } : null; },
+    createHistoricalRebuild: options => {
+    assert.deepEqual(sourceCalendarReads, [CHAT_ID]);
+    assert.deepEqual(options.storyCalendar, { months: 4, prefix: '启航' });
+    return runHistoricalRebuildTask({
+    ...options, storyCalendarForChat: chatId => {
+      calendarReads.push(chatId);
+      if (Object.hasOwn(storyCalendars, chatId)) return storyCalendars[chatId];
+      if (options.storyCalendar) storyCalendars[chatId] = structuredClone(options.storyCalendar);
+      return storyCalendars[chatId] ?? null;
+    },
     onTaskControl: control => { historicalTaskControl = control; options.onTaskControl?.(control); }, client, fetchImpl, isEnabled: true, newUuid: freshUuid, sanitizerOptions: () => ({}), scanCandidates: scanAssistantCandidates,
     generateUtilityTask: utility, generateAnalysisTask: utility, automationSettings: () => ({ enabled: false, batchSize: 1 }),
     extractorPromptGuidance: () => '', csePromptGuidance: () => '', processingPrompt: () => '', storyClockReferenceTags: () => '',
     filterWorldInfoSources: sources => sources, persistAnchors: persistMessageFloorAnchors, logger: { warn() {} },
-  }) });
-  assert.equal((await manager.deleteCurrent()).status, 'completed');
-  assert.equal([...records.keys()].some(key => key.startsWith(`chat-${CHAT_ID}/`)), false, '未知旧记录、workspace与time均无活动残留');
-  assert.equal(context.chatMetadata.qianqianjie, undefined);
-  assert.equal(session.getState().status, 'idle');
-  assert.equal(prepareCalls, 0, '删除完成前未创建替代身份');
+  }); } });
   const rebuildPromise = manager.fullRebuild(null);
   await firstExtractorStarted;
+  assert.equal([...records.keys()].some(key => key.startsWith(`chat-${CHAT_ID}/`)), false, '重构在处理新楼前清理旧root、workspace与time记录');
+  assert.equal(context.chatMetadata.qianqianjie, undefined, '身份只在目标文件保存后接回当前展示');
   assert.equal(persistedMetadata.qianqianjie.chatId, nextId, '进入实际提取调用前原A文件已持久化任务UUID');
   assert.ok(historicalTaskControl?.getState && historicalTaskControl?.subscribe && historicalTaskControl?.pause && historicalTaskControl?.start,
     '真实任务工厂向既有管理入口提供自身进度、暂停与续跑控制');
@@ -435,13 +956,19 @@ test('真实历史重构完整完成与暂停续跑均接回A身份、消息锚�
   assert.equal(rebuilt.chatId, nextId);
   assert.equal(rebuilt.rebuildStatus, 'caughtUp');
   assert.deepEqual(calendarReads, [nextId], '新UUID只读取该目标自己的既有历法；无设置时与普通新身份provider一致');
+  assert.deepEqual(storyCalendars[nextId], { months: 4, prefix: '启航' }, '完全重构把开始时旧身份的历法保存到新身份');
+  assert.equal(projectTime('春20日', null, { calendar: storyCalendars[nextId] }).calendar.months, 4, '同一时间解析入口按新身份历法识别四月制');
   assert.equal(context.chatMetadata.qianqianjie.chatId, nextId, '完成后只将目标A结果接回仍显示的A上下文');
   assert.equal(prepareCalls, 0, '任务身份由固定目标 identity coordinator认领，不调用页面的legacy ensure');
-  assert.equal(context.chat[1].mes, '旧回复仍保留');
+  assert.equal(context.chat[1].mes, '页面新正文不阻断QQJ重构结果接回');
   assert.equal(context.chat[0].is_system, false);
   assert.equal(context.chat[1].is_system, false);
   assert.equal(context.chat[0].extra.qianqianjieAutoHide, undefined);
   assert.equal(context.chat[1].extra.qianqianjieAutoHide, undefined);
+  assert.deepEqual(persistedMetadata.otherPluginDisplay, { theme: '最新header显示字段' }, '重构保存保留其他插件最新header显示字段');
+  assert.deepEqual(persistedMessages[1].extra.otherPluginDisplay, { label: '最新message显示字段' }, '重构保存保留其他插件最新message显示字段');
+  assert.deepEqual(context.chatMetadata.otherPluginDisplay, { theme: '保存后更新的live字段' }, '接回live上下文时保留最新的其他插件header显示字段');
+  assert.deepEqual(context.chat[1].extra.otherPluginDisplay, { label: '保存后更新的live字段' }, '任务保存后更新的live显示字段不会被持久读回覆盖');
   const rebuiltGraph = await store.readReachable();
   assert.deepEqual(context.chat[1].extra[MESSAGE_FLOOR_ANCHOR_KEY], { schemaVersion: 1, chatId: nextId, floorId: rebuiltGraph.floors[0].id }, '重构锚点只绑定新身份，不保留旧身份标记');
   assert.equal(rebuilt.rememberedCount, 1);
@@ -464,4 +991,73 @@ test('真实历史重构完整完成与暂停续跑均接回A身份、消息锚�
   assert.deepEqual(extractorPayload.precedingUserInput.map(item => item.content), ['原隐藏 USER'], '恢复后的 USER 必须重新进入前置输入来源');
   assert.ok(records.has(`chat-${nextId}/v3-root`), '删除旧标识后新身份可从保留正文正常初始化，不再落入 foreign marker');
  }
+});
+
+
+test('辅助目录失败不阻断已完成图删除与文件QQJ字段清理', async () => {
+  const f = fixture({ failBinding: true });
+  const result = await f.manager.deleteCurrent();
+  assert.equal(result.status, 'completed');
+  assert.equal(f.readPersistedHost()[0].chat_metadata.qianqianjie, undefined);
+  assert.equal([...f.records.keys()].some(key => key.startsWith(`chat-${CHAT_ID}/`)), false);
+  assert.ok(f.records.has(`chat-${OTHER_ID}/v3-root`));
+  assert.deepEqual(f.context.chatMetadata.otherPlugin, { keep: true });
+});
+
+test('重构固定材料与QQJ保存读回分开：宿主新正文可读回，后续写入仍核原材料且自有锚失败不通过', async () => {
+  for (const mode of ['nativeReadback', 'materialChanged', 'markerMissing', 'http']) {
+    const records = new Map(), target = { chatId: CHAT_ID, hostChatId: 'fixed-rebuild', characterLocator: 'char.png', characterName: '角色', avatarUrl: 'char.png', requestHeaders: {} };
+    const chat = [{ is_user: false, is_system: false, mes: '固定取材正文' }, { is_user: true, mes: '确认', send_date: 'confirm' }];
+    const cleaned = { header: { chat_metadata: {} }, chat: structuredClone(chat) };
+    let file = structuredClone(cleaned), saves = 0, modelCalls = 0, sequence = 100, caught = null, result;
+    const modelMaterials = [];
+    const client = {
+      async get(collection, key) { const value = records.get(`${collection}/${key}`); if (!value) throw Object.assign(new Error('missing'), { status: 404 }); return structuredClone(value); },
+      async put(collection, key, data, revision) { const id = `${collection}/${key}`, previous = records.get(id); assert.equal(previous?.revision ?? 0, revision); const value = { revision: revision + 1, data: structuredClone(data) }; records.set(id, value); return structuredClone(value); },
+    };
+    const fetchImpl = async (url, options) => {
+      if (url.endsWith('/save')) {
+        saves++;
+        if (mode === 'http') return { ok: false, status: 500 };
+        const body = JSON.parse(options.body); file = { header: body.chat[0], chat: body.chat.slice(1) };
+        const anchored = Boolean(file.chat[0].extra?.[MESSAGE_FLOOR_ANCHOR_KEY]);
+        if (mode === 'nativeReadback' && anchored || mode === 'materialChanged') file.chat[0].mes = '宿主保存后更新正文';
+        if (mode === 'markerMissing' && anchored) delete file.chat[0].extra[MESSAGE_FLOOR_ANCHOR_KEY];
+      }
+      return { ok: true, json: async () => [structuredClone(file.header), ...structuredClone(file.chat)] };
+    };
+    const generate = async options => { modelCalls++; if (options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT) modelMaterials.push(JSON.parse(options.taskMessages[0].content).payload.canonicalContent); return { jsonData: options.systemPrompt === EXTRACTOR_SYSTEM_PROMPT ? { summary: '固定材料摘要' } : { noMaterialChange: true } }; };
+    try {
+      result = await runHistoricalRebuildTask({ identity: { hostChatId: target.hostChatId, chatId: CHAT_ID, characterLocator: 'char.png', personaLocator: 'persona.png' }, target,
+        cleanedChat: cleaned, sourceContext: { name1: '用户', name2: '角色', characterId: 0, characters: [{ name: '角色', avatar: 'char.png' }], userAvatar: 'persona.png' },
+        sourceUserIdentity: { personaIdentifier: 'persona.png' }, client, fetchImpl,
+        newUuid: () => `${(++sequence).toString(16).padStart(8, '0')}-1111-4111-8111-111111111111`,
+        generateUtilityTask: generate, generateAnalysisTask: generate, persistAnchors: persistMessageFloorAnchors, logger: { warn() {} },
+      });
+    } catch (error) { caught = error; }
+    console.log(JSON.stringify({ rebuildSaveFixture: { mode, saves, modelCalls, errorCode: caught?.code ?? null, status: result?.status, rebuildStatus: result?.rebuildStatus, lastError: result?.lastExtractorError?.code } }));
+    if (mode === 'nativeReadback') {
+      assert.equal(caught, null); assert.equal(result.rememberedCount, 1); assert.equal(file.chat[0].mes, '宿主保存后更新正文');
+      assert.ok(file.chat[0].extra[MESSAGE_FLOOR_ANCHOR_KEY]); assert.equal(modelCalls, 2);
+    } else if (mode === 'materialChanged') {
+      assert.equal(modelCalls, 2, '原任务仍只处理已经捕获的固定材料');
+      assert.equal(saves, 1, '下一次实际材料核对失败，不能写新锚到错位正文');
+      assert.equal(caught?.code ?? result?.lastExtractorError?.code, 'QQJ_REBUILD_TARGET_CONFLICT');
+      assert.deepEqual(modelMaterials, ['固定取材正文']);
+    } else if (mode === 'markerMissing') {
+      assert.equal(modelCalls, 2); assert.equal(caught?.code ?? result?.lastExtractorError?.code, 'QQJ_REBUILD_TARGET_VERIFY_FAILED');
+      assert.equal(file.chat[0].extra?.[MESSAGE_FLOOR_ANCHOR_KEY], undefined);
+    } else assert.equal(caught?.code, 'QQJ_REBUILD_TARGET_SAVE_FAILED');
+  }
+});
+
+test('整档删除沿既有记录枚举清地点人工资料并清投影缓存',async()=>{const f=fixture();f.records.set(`chat-${CHAT_ID}/v3-place-workspace`,{recordId:'v3-place-workspace',revision:1,data:{schemaVersion:1,kind:'qqj-v3-place-workspace',chatId:CHAT_ID,placesByEntityId:{},deletionsByEntityId:{}}});await f.manager.deleteCurrent();assert.equal([...f.records.keys()].some(key=>key.startsWith(`chat-${CHAT_ID}/`)),false);assert.ok(f.records.has(`chat-${OTHER_ID}/v3-root`));assert.deepEqual(f.memoryInvalidations,[{deletedChatId:CHAT_ID}]);});
+
+test('328删除文件已存丢回执原继续承接清理结果，拒绝后来新归属',async t=>{
+ for(const changed of [false,true])await t.test(changed?'后来新身份':'完成原删除',async()=>{
+  let lose=true;const f=fixture({afterHostSaveHook(){if(lose){lose=false;throw Object.assign(Error('lost'),{code:'BACKEND_NETWORK'});}}});
+  await assert.rejects(f.manager.deleteCurrent(),{code:'BACKEND_NETWORK'});assert.equal(f.readPersistedHost()[0].chat_metadata.qianqianjie,undefined);
+  if(changed){const metadata=f.readPersistedHost()[0].chat_metadata;metadata.qianqianjie={schemaVersion:2,chatId:OTHER_ID};f.updatePersistedHost({metadata});await assert.rejects(f.manager.deleteCurrent());assert.equal(f.readPersistedHost()[0].chat_metadata.qianqianjie.chatId,OTHER_ID);}
+  else{const before=f.calls.filter(x=>x[0]==='hostSave').length;assert.equal((await f.manager.deleteCurrent()).status,'completed');assert.equal(f.calls.filter(x=>x[0]==='hostSave').length,before);assert.equal(f.context.chatMetadata.qianqianjie,undefined);assert.ok(f.calls.some(x=>x[0]==='resume'));assert.equal(f.manager.getState().status,'completed');}
+ });
 });

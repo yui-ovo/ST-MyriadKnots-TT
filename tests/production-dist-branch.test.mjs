@@ -74,8 +74,9 @@ function cseReply(options, text, reason) {
   return { jsonData: { subjects: trackedSubjects.map(({ name }) => ({ subject: name, situational: [{ text, visibility: 'observable', reason }] })) }, taskMetadata: { source: 'test', sourceLabel: '测试', model: 'seed' } };
 }
 
-test('候选生产 bundle 经真实 CHAT_CHANGED 初始化同角色副本，目标 ready/root 可读且模型调用为零', async () => {
+for (const targetCalendar of [undefined, null, { months: 12, prefix: '人工历' }]) test(`候选生产 bundle 经真实 CHAT_CHANGED 继承历法且保目标人工值（${targetCalendar === undefined ? '继承' : targetCalendar === null ? '旧空值按设置归一' : '人工历'}）`, async () => {
   const backend = createRecordBackend();
+  const calendarSettings = { qianqianjie: { pluginEnabled: true, storyCalendars: { [SOURCE]: { months: 4, prefix: '测试历' } } }, 'schedule-planner': {} };
   let activeHost = hostChat('原聊天', SOURCE, [user('开始'), assistant('公共 A'), user('继续 A')]);
   const hostFiles = new Map([['原聊天', { header: { chat_metadata: structuredClone(activeHost.chatMetadata) }, chat: structuredClone(activeHost.chat) }]]);
   const seedHostAdapter = createHostAdapter({ globalRef: { SillyTavern: { getContext: () => activeHost } } });
@@ -100,6 +101,12 @@ test('候选生产 bundle 经真实 CHAT_CHANGED 初始化同角色副本，目�
   await sourceMemory.start();
   await sourceMemory.startHistoricalRebuild();
   await waitFor(() => ['caughtUp', 'waitingRealtime'].includes(sourceMemory.getState().rebuildStatus) && !sourceMemory.getState().activeAutoMemory, '源图准备失败');
+  const sourceReachable = await sourceStore.readReachable();
+  for (const floor of sourceReachable.floors) {
+    const message = activeHost.chat[floor.hostLocator.messageIndex];
+    message.extra = { ...message.extra, qianqianjie_floor: { schemaVersion: 1, chatId: SOURCE, floorId: floor.id } };
+  }
+  hostFiles.set('原聊天', { header: { chat_metadata: structuredClone(activeHost.chatMetadata) }, chat: structuredClone(activeHost.chat) });
   backend.records.set(`${CHAT_IDENTITY_COLLECTION}/binding-${SOURCE}`, {
     revision: 1,
     data: {
@@ -153,6 +160,9 @@ test('候选生产 bundle 经真实 CHAT_CHANGED 初始化同角色副本，目�
       candidateAiCalls += 1;
       throw new Error('候选分支不得调用模型');
     }
+    if (path === '/api/plugins/st-bainiaodata/v1/health') {
+      return response(200, { ok: true, api: { current: 1, supported: [1] }, capabilities: { records: true, optimisticRevision: true, recordBatchRead: false, recordIdList: false } });
+    }
     const prefix = '/api/plugins/st-bainiaodata/v1/records/qianqianjie/';
     if (!path.startsWith(prefix)) return response(404, {});
     const parts = path.slice(prefix.length).split('/').map(decodeURIComponent);
@@ -163,6 +173,9 @@ test('候选生产 bundle 经真实 CHAT_CHANGED 初始化同角色副本，目�
     if (options.method === 'PUT') {
       const body = JSON.parse(options.body);
       if ((previous?.revision ?? 0) !== body.expectedRevision) return response(409, {});
+      if (parts[0].startsWith('chat-') && parts[0] !== `chat-${SOURCE}` && parts[1] === 'v3-root' && targetCalendar !== undefined) {
+        calendarSettings.qianqianjie.storyCalendars[body.data.chatId] = structuredClone(targetCalendar);
+      }
       const revision = (previous?.revision ?? 0) + 1;
       backend.records.set(mapKey, { revision, data: structuredClone(body.data) });
       return response(200, envelope(body.data, revision));
@@ -185,12 +198,13 @@ test('候选生产 bundle 经真实 CHAT_CHANGED 初始化同角色副本，目�
     const path = fileURLToPath(identifier);
     const hostPath = new URL(identifier).pathname.replace(new RegExp('^/[A-Za-z]:'), '');
     let module;
-    if (hostPath === '/scripts/personas.js') module = synthetic(identifier, { user_avatar: 'persona.png' });
+    if (hostPath === '/scripts/personas.js') module = synthetic(identifier, { user_avatar: 'persona.png', getUserAvatar: name => '/User Avatars/' + name });
+    else if (hostPath === '/scripts/utils.js') module = synthetic(identifier, { download: async () => assert.fail('分支初始化不应下载文件') });
     else if (hostPath === '/scripts/user.js') module = synthetic(identifier, { getCurrentUserHandle: () => 'isolated-test-user' });
-    else if (hostPath === '/lib.js') module = synthetic(identifier, { localforage: { INDEXEDDB: 'INDEXEDDB', createInstance: () => ({ async ready() {}, async getItem() { return null; }, async setItem() {}, async removeItem() {}, async keys() { return []; } }) } });
+    else if (hostPath === '/lib.js') module = synthetic(identifier, { showdown: { Converter: class { makeHtml(value) { return value; } } }, DOMPurify: { sanitize: value => value }, localforage: { INDEXEDDB: 'INDEXEDDB', createInstance: () => ({ async ready() {}, async getItem() { return null; }, async setItem() {}, async removeItem() {}, async keys() { return []; } }) } });
     else if (hostPath === '/scripts/power-user.js') module = synthetic(identifier, { power_user: { persona_description: '调查员' } });
-    else if (hostPath === '/scripts/extensions.js') module = synthetic(identifier, { extension_settings: { qianqianjie: { pluginEnabled: true }, 'schedule-planner': {} }, extensionNames: [] });
-    else if (hostPath === '/script.js') module = synthetic(identifier, { is_send_press: false, saveSettingsDebounced() {} });
+    else if (hostPath === '/scripts/extensions.js') module = synthetic(identifier, { extension_settings: calendarSettings, extensionNames: [], extensionTypes: { 'third-party/ST-QianQianJie': 'local' } });
+    else if (hostPath === '/script.js') module = synthetic(identifier, { is_send_press: false, saveSettingsDebounced() {}, getRequestHeaders: () => ({}) });
     else if (hostPath === '/scripts/group-chats.js') module = synthetic(identifier, { is_group_generating: false });
     else if (hostPath === '/scripts/world-info.js') module = synthetic(identifier, { loadWorldInfo: async () => null, selected_world_info: [], world_info: {}, world_info_case_sensitive: false, world_info_match_whole_words: false, world_names: [] });
     else module = new SourceTextModule(await readFile(path, 'utf8'), { context, identifier });
@@ -203,12 +217,15 @@ test('候选生产 bundle 经真实 CHAT_CHANGED 初始化同角色副本，目�
   await entry.evaluate();
   await waitFor(() => (listeners.get(eventTypes.CHAT_CHANGED)?.length ?? 0) > 0, '候选入口未注册 CHAT_CHANGED');
 
-  activeHost = hostChat('复制聊天', SOURCE, [user('开始'), assistant('公共 A')]);
+  const sourceHost = activeHost;
+  activeHost = hostChat('复制聊天', SOURCE, structuredClone(sourceHost.chat.slice(0, 2)));
+  activeHost.chatMetadata = structuredClone(sourceHost.chatMetadata);
   hostFiles.set('复制聊天', { header: { chat_metadata: structuredClone(activeHost.chatMetadata) }, chat: structuredClone(activeHost.chat) });
   activeHost.eventTypes = eventTypes;
   activeHost.eventSource = eventSource;
   activeHost.generateTask = async () => { hostAiCalls += 1; throw new Error('候选分支不得调用模型'); };
-  for (const handler of listeners.get(eventTypes.CHAT_CHANGED) ?? []) handler();
+  // The host awaits each listener before invoking the next one.
+  for (const handler of listeners.get(eventTypes.CHAT_CHANGED) ?? []) await handler();
 
   let targetBinding;
   await waitFor(() => {
@@ -221,6 +238,23 @@ test('候选生产 bundle 经真实 CHAT_CHANGED 初始化同角色副本，目�
   assert.equal(target.status, 'ready');
   assert.equal(target.floorMemories[0].summary.aiText, '公共 A 摘要');
   assert.equal(activeHost.chatMetadata.qianqianjie.chatId, targetChatId);
+  assert.equal(calendarSettings.qianqianjie.storyCalendars[targetChatId]?.months ?? null, targetCalendar == null ? 4 : targetCalendar.months);
+  assert.equal(calendarSettings.qianqianjie.storyCalendars[targetChatId]?.prefix ?? null, targetCalendar == null ? '测试历' : targetCalendar.prefix);
+  assert.equal(calendarSettings.qianqianjie.storyCalendars[SOURCE].months, 4);
+  assert.equal(calendarSettings.qianqianjie.storyCalendars[SOURCE].prefix, '测试历');
   assert.equal(candidateAiCalls + hostAiCalls, 0);
   assert.equal(snapshotSource(backend.records), sourceBefore);
+  const bridge = context.qqj_qianshi_backend_v1;
+  assert.ok(bridge, '生产入口已安装公开千事状态');
+  await waitFor(() => bridge.getStatus().status === 'ready', '分支存档已就绪，但当前页面未完成记忆加载');
+  const currentRoot = await createFoundationStore({ client: backend.client, contextProvider: () => identity('复制聊天', targetChatId) }).readRoot();
+  assert.equal(currentRoot.status, 'ready');
+  assert.equal(currentRoot.data.chatId, targetChatId);
+  const status = bridge.getStatus();
+  assert.equal(status.anchor.narrativeGeneration, currentRoot.data.narrativeGeneration);
+  assert.equal(status.anchor.headCheckpointId, currentRoot.data.headCheckpointId);
+  assert.equal(status.anchor.rootRevision, currentRoot.revision);
+  assert.equal(bridge.getSnapshot().identity.qqjChatId, targetChatId, '页面读取目标分支，不能仍显示源档');
+  assert.equal(candidateAiCalls + hostAiCalls, 0, '页面加载完成也不调用模型');
+  assert.equal(snapshotSource(backend.records), sourceBefore, '页面加载不改源档');
 });

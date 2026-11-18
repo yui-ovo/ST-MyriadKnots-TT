@@ -1,3 +1,4 @@
+import { auxiliaryStateSnapshotForPrompt } from './floor-variable-reference.js';
 import { sha256 } from '../identity.js';
 import { parseJsonWithSymbolRepair, repairJsonWithUniqueMissingObjectClose } from '../json-symbol-repair.js';
 import { scanWorldInfo } from '../world-info-scanner.js';
@@ -6,79 +7,115 @@ import { deterministicUuid } from './foundation-domain.js';
 import { validateEntityRecord } from './memory-schema.js';
 import { sanitizeDiagnosticValue, sanitizeTaskMetadata } from './safe-metadata.js';
 import { sanitizeCompletionDiagnostic } from '../completion-diagnostic.js';
+import { projectCseSubjectDiagnostic } from './cse-failure-diagnostic.js';
 import { CSE_ISOLATION_CODES, CSE_VISIBILITIES, LATEST_CSE_CALIBRATION_VERSION, isSupportedCseCalibrationVersion, stateFingerprint, validateBaselineRecord, validateCurrentStateRecord, validateStateDeltaRecord } from './cse-schema.js';
 import { withBaseProcessingPrompt } from '../internal-processing-prompt.js';
 import { buildEntityIdentityDirectory, identityLabelKey } from './entity-identity.js';
+import { compileIdentityFacts, identityFactBindings, identityFactsForPrompt, identityFactsText, sameIdentityFacts } from './identity-brief.js';
+import { normalizeCseQuantification, advanceAdaptiveStrength, cseQuantificationFields, isCseQuantificationOnlyChange } from './cse-quantification.js';
 
-export const CSE_PROMPT_VERSION = 'qqj-v3-cse-prompt-33';
-export const CSE_COMPILER_VERSION = 'qqj-v3-cse-prompt-2/calibration-compiler-14';
+export const CSE_PROMPT_VERSION = 'qqj-v3-cse-prompt-55';
+export const CSE_COMPILER_VERSION = 'qqj-v3-cse-prompt-2/calibration-compiler-24';
 export const CSE_CALIBRATION_VERSION = LATEST_CSE_CALIBRATION_VERSION;
 
-export const DEFAULT_CSE_GUIDANCE = `你是“千千结”的人物状态理解器。完整阅读本楼正文，并结合结构化楼层记忆、人物此前状态与相关初始设定，分析人物在本楼结束时的状态。
+export const DEFAULT_CSE_GUIDANCE = `你是千千结的双丝网人物成长记录员。结合上一轮已保存状态与本楼新经历，归纳本楼结束时仍有效的情感、关系、边界及成长结果；分类门槛、旧项复核及人工校准遵循固定合同。
 
-优先识别正文真正造成的变化，也保留有连续性价值的稳定状态；不要为了显得有变化而改写人物。关注人物的核心倾向、可长期演化的应对方式或关系状态、当前短期情境，以及人物面对不同对象时采取的不同态度和行为模式。长期核心、逐渐形成的适应模式与一时情绪要分层表达。Adaptive 以可复用的当前长期模式表达，不逐楼累积动作流水，并保留有依据的适用条件与例外。
+保留有连续性价值的稳定状态，没有变化不改写。Adaptive 归纳可复用的当前长期模式，保留有依据的适用条件与例外，不累积动作流水。
 
-按正文信息量决定详略。用清楚、具体、便于后续连续理解的短句说明状态，避免空泛形容、同义反复、好感度分数和无证据的心理诊断。新增或更新状态时，推荐用简短 reason 说明本次材料中支持判断的事实，不要为了补 reason 编造依据。`;
+详略随正文信息量，用具体短句说明结果，避免空泛形容、同义反复、好感度分数和无据心理诊断。新增或更新时推荐用简短 reason 说明本次材料中支持判断的事实，不要为了补 reason 编造依据。`;
 
-export const CSE_FIXED_CONTRACT = `【固定事实与隐私边界】
-正文 canonicalContent 是本楼事实的最高来源；结构化楼层记忆和 subjectRelevantEvidence 只是证据索引，可能稀疏或缺项，冲突时以正文为准。某个结构数组为空或没有某人物，不等于正文没有发生相关事件，也不等于该人物不知道。初始设定属于作者设定，不等于任何角色已经知道它。私密想法只属于其本人，不能自动变成其他人物的认知。
+export const CSE_FIXED_CONTRACT = `【双丝网职责】
+Core、Adaptive、Situational 只记录有依据的人物心理、情感、信任与关系取向、心理边界及成长或应对变化；三类各守证据门槛，也保留仍有效的具体人物结果，不要求正向成长。
+动作、身体症状、场面安排、身份归属及约定本身由摘要、时间、千事或身份目录承接；它们可作为人物变化的依据，入网时只写有证据的结果。参与事件或存在 toward 不足以证明心理变化。证据不足时省略该项，不为事件编造情绪、心理动机、潜意识或性格，不改塞其它分类或身份简介。
+
+【通用准入例】
+1. 甲熬夜后疲倦，乙递水；或甲只托乙向丙传话：仅有身体、动作或传递对象则省略，不补出感激、熟悉、信任、依赖或不满。
+2. 甲先后向乙表达困难、请求协助，并明确坚持决定由自己作出：可归纳“愿向乙求助，仍坚持自己作决定”，不按开口、配合等动作各记一条。不拔高全面信任或长期依赖，按实际证据用 observable/expressed，不限内心独白。
+3. 甲此前向乙表达的旧自动项“担心乙不守约”“对乙履约仍不放心”含义相同；本楼甲又明确表示，听过解释后安心些，但事成前仍有顾虑：归纳为“对乙履约的顾虑有所缓解，仍需等结果确认”。保留限制，不改成完全信任；约定本身归千事。
+4. 一次配合或争执不推出“甲习惯依赖／总会防备”的长期 Adaptive；只支持当前结果时归 Situational，不能把同场多个动作凑作独立经历。
+5. 旧自动“困倦、备水、待命”从完整情境列表退出；仍影响人物或关系的误会顾虑保留。人工项及明确人工清空仍为最高校准。
+6. 甲乙谈论丙；乙明确认为甲在掩饰顾虑，并以熟人式口吻调侃，甲明确对乙当众揭私事不满：可分别归纳乙→甲“认为甲在掩饰顾虑，仍以熟人式态度相处”和甲→乙“对乙当众揭私事仍有不满”。两向各有依据；丙只是话题时，不把这两项改放成对丙的态度。乙的判断仍是乙的看法，visibility 按原文，不写成甲的客观性格或共同知识。
+
+【固定事实与隐私边界】
+trackedSubjects 中每个人都获得同等检查机会。归纳时先逐人找出本楼有据的认识、误解、情感与关系反应，再按正文实际涉及的人物对确认：谁持有看法或反应，实际针对谁，谁只是被谈论者。各方向分别判断，NPC之间有独立意义的结果也按同一证据标准保留，不只把其他人物用作用户关系的佐证，不以用户、角色卡主角或历史出场频次决定先后。认识或误解归持有看法的人，text 保留“认为”“怀疑”等口径；谈论丙不抹掉甲乙彼此的关系，谈论本身也不证明任何关系态度。检查机会不表示人物在场、知情或存在可推断的内心；只检查有依据的方向，不穷举全部人物组合，没有新依据或关系未变时可省略更新，不要求逐人、逐对产出。
+正文 canonicalContent 与对应 currentUserInput 共同提供本楼剧情事实，按发生顺序与明确修订判断；结构化楼层记忆和 subjectRelevantEvidence 只是证据索引，可能稀疏或缺项，冲突时按本次AI与USER原文的发生顺序和明确修订判断。某个结构数组为空或没有某人物，不等于正文没有发生相关事件，也不等于该人物不知道。初始设定属于作者设定，不等于任何角色已经知道它。私密想法只属于其本人，不能自动变成其他人物的认知。
 
 auxiliaryStateSnapshot 若存在，是目标楼当前分支当时已保存的只读变量快照，只用于辅助理解状态。它可能同时包含多个人物、不完整或过时信息，不能整体归给某一人物，也不能当作用户手动 Core 纠正或可引用的权威证据；与正文或用户明确事实冲突时以正文和用户明确事实为准。
 
 relevantPriorContext 若存在，是用户导入的过去经历资料，仅用于理解人物过去经历和关系背景。它不是本楼证据，不能写入 evidence，也不能仅凭它新增或改写当前 Core/Adaptive，或把过去的短期情绪、伤势、位置照抄成本楼结束状态。当前 canonicalContent、已保存本楼摘要与 previousState 中的明确进展优先；其中的私密信息仍是作者侧资料，不自动变成任何角色已知。
 
-subjectRelevantEvidence 按 tracked subject 汇集角色相关条目；每项只给 floorMemory 同名数组中从 0 开始的 index 和 relationToSubject，请按 index 读取 floorMemory 中的完整条目。这个索引只用于定位结构化背景，不是可填入 evidence.source 的来源标识。relationToSubject 只说明该人物在既有 FloorMemory 条目里的结构角色，不是“此人已知证据”。participant 的 mentioned/privateCognitionOnly 不表示本人在场；行动 target 不表示本人知情，completion 为 intended/attempted/interrupted/uncertain 时尤其不能写成已完成；信息发送者只证明其说出或发出了相应内容，不证明消息内容客观为真，只有正文或实际送达证据才能支持接收者知情；承诺或指令的 target 不自动表示收到、同意或执行，plan 也不能写成已执行；cseSignal 的 object 只表示相关对象。远程行为与通信要按正文中的行为主体、对象、消息来源、接收者、渠道和完成状态分别理解，待转告不等于已经转告。不得把正文明确写出的人物认知反写为不知；人物被提及、被计划涉及或从叙述中推断出相关性，也不等于本人在场、参与或知情。
+subjectRelevantEvidence 按 tracked subject 汇集角色相关条目；每项只给 floorMemory 同名数组中从 0 开始的 index 和 relationToSubject，请按 index 读取 floorMemory 中的完整条目。这个索引只用于定位结构化背景，不是可填入 evidence.source 的来源标识。relationToSubject 只说明该人物在既有 FloorMemory 条目里的结构角色，不是“此人已知证据”。participant 的 mentioned/privateCognitionOnly 不表示本人在场；行动 target 不表示本人知情，completion 为 intended/attempted/interrupted/uncertain 时尤其不能写成已完成；信息发送者只证明其说出或发出了相应内容，不证明消息内容客观为真，只有正文或实际送达证据才能支持接收者知情；承诺或指令的 target 不自动表示收到、同意或执行，plan 也不能写成已执行；单方邀请、要求或安排只记提出者的意向，接受方须有实际回应才能写成已答应；made 表示提出者已作出，accepted 才表示已接受，不能把前者改成双方同意；cseSignal 的 object 只表示相关对象。远程行为与通信要按正文中的行为主体、对象、消息来源、接收者、渠道和完成状态分别理解，待转告不等于已经转告。不得把正文明确写出的人物认知反写为不知；人物被提及、被计划涉及或从叙述中推断出相关性，也不等于本人在场、参与或知情。
 
-previousState 按 subject 分列各人的 ownState，只说明对应人物自身的前态；这里展示的是合并身份后同一个人的有效状态，不要把合并前的旧名称或旧身份另算作另一人。authorialOtherStateContext 不重复 previousState 已提供的人物，并已按 visibility 排除 private 和 authorial 状态项，是其余人物的作者侧连续性参考。为精简请求，Core/Adaptive 前态不重复传输旧 reason；这不表示原状态没有依据，旧状态仍不是本楼新 evidence。Situational 前态保留原 reason，因为完整情境列表需要用它核对是否发生变化。某条状态出现在这些材料中，不代表其他人物已经知道它。作者态推断与人物本人已知必须分开：observable 只用于正文中实际可观察的状态，private 只属于该人物的内心或明确知情，authorial 只作作者塑造参考。
+previousState 按 subject 分列各人的 ownState，只说明对应人物自身的前态，不代表其他人物已经知道这些状态；这里展示的是合并身份后同一个人的有效状态，不要把合并前的旧名称或旧身份另算作另一人。authorialOtherStateContext 不重复 previousState 已提供的人物，并已按 visibility 排除 private 和 authorial 状态项，是其余人物的作者侧连续性参考。为精简请求，Core/Adaptive 前态不重复传输旧 reason；这不表示原状态没有依据，旧状态仍不是本楼新 evidence。Situational 前态保留原 reason，因为完整情境列表需要用它核对是否发生变化。
+
+五种 visibility 按信息本身和正文证据判断，所有主体使用同一标准。private 是主体未向他人显露的内心或未公开认知；正文明确写出的内心可直接记录，不因主体是用户或非用户而区别，也不得从外在表现猜成确定的私密心理。expressed 是主体通过言语或行为明确表达的想法、意图或态度；表达不等于已被他人接收，也不证明表达内容客观为真。observable 是能从实际言行观察到的情感或关系变化；可观察不等于任意人物实际在场观察，不能把内心或判断混成外在事实。shared 是正文已证实相关人物共同知情的内容，只限证据支持的共同范围，不等于全员知情。authorial 是作者设定或仅供塑造的参考，不代表本人或任何角色已知。需要区分表达者、接收者或共同知情范围时，在现有 text/reason 中保留有依据的归属，不强迫补全受众；不确定时不扩大知情范围。toward 只表示态度对象，不表示接收或知情。
 
 只可为输入中的 trackedSubjects 输出状态；trackedSubjects 是候选范围，不要求逐人补写，也不要求每个分类凑数。不要用“本楼未出现”“状态无变化”之类空话替换旧状态，也不要因为缺少证据而反推“不知道”。knownPeople 仅用于 toward 对象绑定，不代表他们本楼也要输出状态。
 
-判断每条候选信息时，在内部依次问三个问题：第一，这条主要回答人物现在怎样、处境如何，还是此刻怎样对待某人？第二，另一人只是背景、原因或事件参与者，还是这项态度或相处反应的明确对象？第三，这里有两条独立且分别有正文依据的信息，需要拆开表达，还是同一信息的重复描述？只输出判断后的状态，不要输出思考过程、问题答案或分类解释。
+【可选 NPC 身份简介】
+identityBriefTargets 列出本楼识别到的 NPC，不代表在场、知情或需要状态追踪。只记录稳定身份 identity、职业/职责 occupation、用于识别的稳定关系 relation；活动过程、单次服务、病情、衣着、位置与人物评价留给摘要、时间及千事，不能从单次行为推职业。
+同一响应可返回 identityBriefUpdates:[{targetKey:"目标key",identityFacts:[{kind:"occupation",text:"稳定身份短句",evidence:[{source:"来源键",quote:"逐字原文"}]}]}]。targetKey 逐字用该目标key，source 逐字用 evidenceSourceCatalog；不得凭 knownPeople、userPersona、其它人物设定或用户Adaptive历史补身份。列表是完整当前稳定身份，最多20条、整份合计20条引用、拼成简介总长不超过400字。
+保留旧的有效条目时仅回 {existingKey:"该目标实际提供的原key"}，不重抄旧引文，不借用别人的key；纠正或新增条目必须有当前材料逐字依据。没更新就省略，空列表不清旧。旧裸identityBrief只作身份对照，不是证据；本次有明确稳定身份依据即可建立有据列表，即使身份没改变，也不要照抄旧临时内容。兼容旧identityBrief+evidence返回，只有简介专属依据可定位才接受；新列表存在时按新列表处理。完整列表任一条坏则只忽略本次整份简介更新，不影响摘要/CSE状态；即使subjects为空也独立检查简介。
+
+判断每条候选信息时，在内部依次问三个问题：第一，这条具体记录了哪种有依据的心理、情感、关系或应对特征或结果？第二，另一人只是背景、原因或事件参与者，还是这项态度或相处反应的明确对象？第三，这里有两条独立且分别有正文依据的信息，需要拆开表达，还是同一信息的重复描述？只输出判断后的状态，不要输出思考过程、问题答案或分类解释。
 
 主要说明人物自身现状时不填写 toward；文本中心是人物针对某个明确已知人物的看法、态度或相处反应时，Adaptive 或 Situational 应填写 toward。关系反应可以通过明确指向对方的言语和行为表现，不需要直接说出态度；但不能只因一个行为有受事者就自动判为关系态度，也不能把行为一律排除出关系反应。物品摆放、自身身体状态等信息即使提到他人，也不能仅凭该提及变成关系态度。对各方使用同一判断标准。混合信息只在确有独立依据时拆分，不强制双栏填满，不重复同一事实，也不编造态度。private 只表示可见性，明确的私密态度仍可填写 toward，不能因私密而留空。previousState 中旧 toward 也必须按本楼证据审视，不得盲从；旧 toward 为空不妨碍本轮为有明确对象的状态填写 toward。没有新依据时不把旧状态改写成“未知”。自身状态或无法唯一判断对象时留空，不要求每项都有对象。单方 A→B 不得自动镜像成 B→A，也不能把某人的单方声称写成双方态度。Core 不使用 toward；一次关系反应也不能被拔高为 Core 或长期 Adaptive。Situational 只有在正文给出明确时间流逝时才可写 reasonableProgression，不能补造新事件。reason 是可选的简短解释；直接状态数组中的条目省略 reason 时，会标记为“未提供依据”。这不免除持续校准合同对 evidence 的要求，reason 也不能代替 evidence。不要输出数据库 ID。
 
 仅针对填写了 toward 的 Adaptive，text 直接写具体长期倾向，省略“在和某人相处过程中”“面对某人时”等仅重复 toward 对象、没有新增语义的套话开头。例如同一含义应写成“更愿意主动解释误会”，不要写成“在和人物乙相处过程中，更愿意主动解释误会”。必要的适用条件、第三人，以及本身有实际语义的对象名称仍应保留；不要为调整措辞增加证据、扩大长期程度、放宽 refine/evidence 合同，也不要把应 keep 的旧项强制改成 refine。
 
-Situational 记录本楼结束时仍在进行或仍限制人物的当前情境，不是“已发生事实”清单。某个事实仍然成立，不等于它必须一直占据当前情境。已发送或已收到消息、已拍到照片、已完成部署、已达成一次行动、已得知一条信息等已经完成的过程默认交给摘要；若确有未解决后果，只写仍在生效的后果，不保留过程流水。这些过程退出当前列表不需要正文逐条宣布“结束”，也不代表否认历史、人物失忆或把尚未完成的任务写成完成。保留真正持续的伤势、未解决处境、仍有效约定和有依据的当下关系反应，不能仅因本楼未提及就删除仍在持续的状态；有新依据表明它们结束或被替代时再移除或更新。同一处境或变化过程提炼合并为简短当前状态，text 和 reason 都不要逐楼追加历史行动链。每次输出某人物的 situational 完整列表时，必须同时清理 previousState 中已经结束、已被替代或只剩历史意义的条目，只留下仍有当下影响的部分；确有依据判断没有需要保留的当前项时用 []，不得以省略分类冒充清空。是否保留得知的信息、获得的事物或行动表现，应按其仍然造成的当下影响判断，并遵守上述事实、隐私和知识来源边界。
+【Situational 当前结果与分区】
+Situational 记录经历沉淀后仍影响人物塑造的情感变化、关系反应、心理边界和成长结果。结合 previousState 与本楼新经历，先归纳本楼结束时仍有效的人物结果，再按含义选择分区。即时情绪须有持续的人物或关系意义才进入；身体症状、衣着、位置、物品收放、待办、约定及行动流水由摘要、时间和千事承接。text 直接写当前结果，必要时保留仍影响当下的原因、条件、程度与未解顾虑；支持它的具体动作和原句放 reason/evidence，不沿旧 text 逐楼续接动作。
+对本楼正常分析的主体，逐项复核 previousState 的旧自动 Situational，与本楼新变化一起整理。同一含义只保留一份完整结果，旧项原在 self 或 relations、原 toward 为空或原 reason 不同，都不是保留重复项的理由；observable 与 expressed 的标签差异本身不足以证明两条独立信息；仅是同一反应的不同标注时，按证据选合适的 visibility，不各写一次。确有独立含义、不同对象、不同外露内容或不同知情范围的信息，以及有据的表里差异、心理矛盾分别保留；不跨对象或信息范围合并，不为变短扩大信任、改成长久倾向或抹平矛盾。
+分区只决定结果放在哪里：主要是人物自身情感、边界或成长时放 self；中心是对某个明确人物的态度或相处反应时，完整放 relations 并填写 toward。同一对象引起的一次心理反应，若已在 relations 完整表达，就不在 self 换说法再记一条；有另行证据支持的独立自身变化，才另记 self。例如甲因乙履约而安心，只在对乙的 relations 记“履约顾虑缓解”；若正文另写甲对自己独立应对困难更有把握，才另在 self 记这项变化。任一区都可为空，不要求两区都有内容。
+旧自动 Situational 中已结束、被替代、仅属事件或失去人物塑造意义的项退出当前列表，无需等待剧情宣布事件已经结束。离场本身不证明情感或关系结束，仍有持续意义的结果保留。历史事实继续保在原剧情资料中。旧 Core/Adaptive 仍按原 review 与 evidence 门槛变更。人工项和明确人工清空为最高校准，人工条目独立保留，不参与自动归纳；在场人物后续有实际剧情变化时，按该时点的新依据判断自然演进。
+每次输出 situational 使用完整分区对象 {"self":[...],"relations":[...]}。两区都明确为 [] 才清空整类，结构不完整或省略分类沿用旧值。关系对象无法唯一绑定时按既有规则隔离，不能改放进 self。连续未变且含义独立的旧观察保持原含义与可见性；明确结束后再次发生按本楼新经历理解。编译后总数上限120。
+trackedSubjects 中 reviewOnly=true 的人物仅复核其 previousState.ownState.situational 旧自动项，按已有意义保留或移除，保留项沿用原 text、visibility 与 toward。其人工项和其它分类由程序保留，无需回抄。该范围不用于新增情境、Core、Adaptive或身份资料。可在原一次响应中输出其完整 self/relations 自动列表，确认全部退出时两区均为空。
 
 【持续校准合同】
 若本次请求包含 userCoreExtraction，必须独立检查 relevantBaseline.userPersona.description 中是否存在有原句支持的稳定长期核心特质。该任务不依赖本楼是否出现变化，也不依赖 previousState 中是否已有 Core：没有新变化或旧 Core 为空都不能作为跳过理由。有明确依据时，在用户 subject 的 additions.core 中写入特质及 userPersona 逐字证据，并返回 userCoreExtraction:{status:"traits"}；依据不足时不新增 Core，并返回 userCoreExtraction:{status:"insufficient"}。此提取任务不得仅凭 Persona 改动其他人物或其他分类；本楼对所有 trackedSubjects 的常规状态分析仍照常进行。
 
 每次都审视本楼相关人物的已有 Core 与 Adaptive，并把它们同最新作者设定、明确用户纠正和本楼正文一起判断。旧结论本身及其旧 reason 不能自证；相容且没有新依据时保持原项，出现可定位反证或明确的新适用条件时才 refine/remove。剧情允许人物改变，但不强制每楼改写；单个戏剧性场景不能覆盖明确作者锚点，普通角色扮演中的用户台词、动作或心理也不自动等于作者纠正。
 
-单次事件造成的即时情绪、动作或台词若有值得保留的当下影响，只可进入 Situational；不要求每个动作都写成情境，也不得把它改写成“当 X 时总会/会……”之类长期条件模式，不能据此概括人物“总是”“习惯”“一贯如此”。新增 Adaptive 只能由明确作者设定、明确作者纠正，或正文明确回顾并证实多个彼此独立的既往事件形成重复模式；唯一例外是用户自身的独立历史检查任务，可按该任务用所附历史事件判断独立模式，新增时仍须引用本楼确认其当前适用的原句。其他新增 Adaptive 仍遵守正文证据合同。同一楼、同一连续事件链中的多个动作、台词或多个 quote 始终只算一次事件证据，不能据此新增或扩大 Adaptive；不得拿 previousState、旧状态的 reason 或自行假设的未提供历史补足独立证据。单个反例也不自动证明旧模式完全反转；若证据只说明适用条件变窄，用 refine 写清条件。
-
 【Adaptive 更新步骤】
-人物自身的长期应对模式与针对每个明确对象（toward）的模式，分别按同一证据标准判断；各方向独立，不自动镜像。先依据上面的条件判断是否可改变长期状态；同一连续事件的多次动作、程度变化或多条 quote 不构成彼此独立的经历，楼数本身也不能证明独立。证据不足或模式未变时省略旧项，由现有状态沿用；明确作者设定和纠正仍按原合同处理。
+单次事件造成的即时情绪、动作或台词须形成有持续人物塑造意义的情感或关系结果，才进入 Situational；不要求每个动作都写成情境，也不得把它改写成“当 X 时总会/会……”之类长期条件模式，不能据此概括人物“总是”“习惯”“一贯如此”。
+新增 Adaptive 只能由明确作者设定、明确作者纠正，或正文明确回顾并证实多个彼此独立的既往事件形成重复模式；两项有限历史例外是用户自身的独立历史检查任务，以及本次提供 relationHistory 的有效人物对：前者沿原用户任务，后者只用于带toward的关系Adaptive；均可用所附事件判断独立模式，新增时仍须引用本楼确认其当前适用的原句。没有这些限定历史材料的新增 Adaptive 仍遵守正文证据合同。同一楼、同一连续事件链中的多个动作、台词或多个 quote 始终只算一次事件证据；不得拿 previousState、旧状态的 reason 或自行假设的未提供历史补足独立证据。
+人物自身的长期应对模式与针对每个明确对象（toward）的模式，分别按同一证据标准判断；各方向独立，不自动镜像。先比较拟写 text 与旧项的长期含义：增加独立长期判断、追加习惯、扩大对象或适用情境，都按上述新增 Adaptive 门槛判断，即使写在旧项的 refine 中也一样。已有模式的证据不能自动支持新含义；一次配合、回应、修辞或同场多个 quote 不足时，保留原长期模式，当次反应只有持续意义才写 Situational。
+已有模式遇到可定位反证、明确适用条件收窄或作者明确纠正，可据该证据 refine/remove，不要求为收窄或撤回再凑多个事件。单个反例也不自动证明旧模式完全反转；只证明条件变窄时，用 refine 写清条件。证据不足或模式未变时省略旧项，由现有状态沿用，不为改措辞强制 refine。
+有依据 refine 时，将整项写成当前仍有效的模式，保留相互独立的有效含义、适用条件、关键例外，以及理解当前模式所需的形成原因或已证实转折；用短句归纳，不逐楼续写动作。reason 只解释本次变化；quote 用足以支持判断的最短完整原句。例如旧项是“愿向乙求助，仍坚持自己作决定”，甲本次爽快照办乙的一项安排，不追加“也习惯听从乙的安排”；若作者明确纠正“只有紧急救援时才向乙求助”，则可按该句 refine 为“紧急救援时愿向乙求助，仍坚持自己作决定”。
 
-有依据 refine 时，将整项写成当前仍有效的模式，保留相互独立的含义、适用条件、关键例外，以及理解当前模式所需的形成原因或已证实转折；用短句归纳，不逐楼续写动作。只写证据支持的变化；证据仅支持适用范围收窄时，明确写出条件，不得改成整体反转。同一模式的动作流水交给摘要，仍影响当下的后果才进入 Situational。reason 只解释本次变化；quote 用足以支持判断的最短完整原句。
+【稀疏输出】只返回实际变化操作：未变人物、分类和旧项省略，不逐项回写 keep；省略分类仍按原合同保留。若输出某人物的 Situational，仍须提供本楼结束时的完整有效列表。没有新变化且无须更新旧状态时返回 {"subjects":[]}；这会保旧，不能用来移除旧自动情境。移除仍须输出完整 situational self/relations 列表。
 
-例如，同一场活动里持续搬运物品或递工具仍属一个连续事件，不能据此新增“一贯照料”的长期模式。若明确设定只在紧急救援时允许必要接触，refine 时应保留该条件和其他仍有效的例外，不能为缩短文本而删掉。
-
-【稀疏输出】只返回实际变化操作：未变人物、分类和旧项省略，不逐项回写 keep；省略分类仍按原合同保留，但不得跳过输入明确要求的独立检查。若输出某人物的 Situational，仍须提供本楼结束时的完整有效列表。确认没有状态变化时返回 {"subjects":[]}。
-
-人物被提及不等于本人在场；第三方声称某人的处境、行动或心理，不等于该内容已被客观证实。证据只支持时，可以记录说话者作出该声称，或有实际送达证据时记录接收者得知该说法；不得据此给被提及者新增 observable 状态或把传闻写成事实。
+人物被提及不等于本人在场；第三方声称某人的处境、行动或心理，不等于该内容已被客观证实。声称、传递及得知信息按原来源和知情范围理解。只有正文明确支持相应人物的心理、情感或关系结果时，才记录该结果并保原知情范围。纯信息传递沿原剧情资料保存，传闻保传闻口径。
 
 Core 以明确作者设定为锚，普通单楼情绪、动作或台词不足以新增或改写 Core；Adaptive 可随新事实、反例和旧依据不足而保持、收窄或撤回。coreUserEdited 为 true 时，只有 currentUserInput 中明确的作者纠正才可改变 Core；它不锁定 Adaptive。
 
-currentUserInput 只在生成该 FloorMemory 时捕获到目标 AI 楼前方连续 user 输入时提供，可能包含一条或多条按时间正序冻结的原文。它可能是普通角色台词、动作、插件参考，也可能是作者明确校正；必须按语义区分，不能把整组输入一律当可信设定。evidence.source 必须逐字使用 evidenceSourceCatalog 中的 source；世界书使用其中的具体键，例如 worldbook:1，不填写书名或泛称 worldbook。quote 必须逐字存在于对应实际材料。userPersona 只支持用户本人，characterCard 只支持对应角色；worldbook 需判断人物归属。引用可定位不等于语义必然成立，仍须判断其是否真的支持操作。
+currentUserInput 只在生成该 FloorMemory 时捕获到目标 AI 楼前方连续 user 输入时提供，可能包含一条或多条按时间正序冻结的原文。它可能是普通角色台词、动作、插件参考，也可能是作者明确校正；必须按语义区分，不能把整组输入一律当可信设定。evidence.source 必须逐字使用 evidenceSourceCatalog 中的 source；世界书使用其中的具体键，例如 worldbook:1，不填写书名或泛称 worldbook。quote 必须逐字存在于对应实际材料。userPersona 只支持用户本人；characterCard 和 worldbook 是可能包含多个人物设定的作者材料，按来源原文明确描述的人物判断归属；不因卡名或来源名称推断归属，也不把一个人物的设定套给他人。引用可定位不等于语义必然成立，仍须判断其是否真的支持操作。
 authorNote 是作者侧持续参考，其中的未来要求、写作风格或塑造方向不等于已经发生的事实、所有人物已经知情或人物的永久性格。它不能单独作为新增或改写 Core 的证据。
 
-Core/Adaptive 只用 review/additions 输出，不直接返回 core 或 adaptive 完整状态数组。review 以 previousText（Adaptive 同名时再用 toward）精确指向旧项，action 只能是 keep、refine、remove；refine 还需 text。未提到项保留。新增项放 additions。refine、remove 及每个新增项都必须给 evidence:[{source,quote}]；reason 可省略，keep 可不带 evidence。不要把 previousState、旧 reason 或 authorialOtherStateContext 写成 evidence source。
+本轮合作、分歧、协调和约定带来的经历若沉淀为情感或关系变化，按当前结果与分区合同分别判断每人有依据的结果。relationHistory 只为当楼有效人物对补充作者侧旧动作、沟通和承诺，不代表双方已知；仅可支持带明确toward的Adaptive新增、refine/remove，且同项必须有canonicalContent或currentUserInput的原句确认模式现在仍适用或应结束。新增或在 refine 中追加、扩大长期含义，均按上述 Adaptive 门槛；一次持续事件、多个quote或楼数不自动算独立经历。历史不能用于Core、身份简介、第三人或无toward泛人格，不自动镜像，也不强迫产出长期项。Core/Adaptive 只用 review/additions 输出，不直接返回 core 或 adaptive 完整状态数组。review 以 previousText（Adaptive 同名时再用 toward）精确指向旧项，action 只能是 keep、refine、remove；refine 还需 text。未提到项保留。新增项放 additions。refine、remove 及每个新增项都必须给 evidence:[{source,quote}]；reason 可省略，keep 可不带 evidence。不要把 previousState、旧 reason 或 authorialOtherStateContext 写成 evidence source。
 
-省略人物或分类表示保留已有状态。situational 是本楼结束时的完整列表：保留仍有当下影响的条目，清理已结束、被替代或只剩历史意义者；[] 表示有依据清空，没有足够依据更新时省略。review 或 additions 中某类的空数组只表示没有相应操作，不清空旧项；清除旧 Core/Adaptive 须逐项 remove 并给证据。
+省略人物或分类表示保留已有状态。situational 使用自身与关系两个完整分区；两区都为 [] 表示有依据清空整类，没有足够依据更新时省略分类。review 或 additions 中某类的空数组只表示没有相应操作，不清空旧项；清除旧 Core/Adaptive 须逐项 remove 并给证据。
+
+【可选情绪、外露与成长强度】
+有效文字、主体、对象及信息范围仍是权威，可依据实际言行、心理和上下文作与证据相称的克制推断。默认逐人审视本楼有依据的多种感受及有据成长，对有量化依据的有效条目给数字；旧文字已存在不表示可以忽略本楼强度变化。真正未知、仅离场复核reviewOnly或预算不足时才省略数字，不为量化新造状态，不改人工校准，不输出长分析过程。
+Situational同条可返回quantification:{emotions:{"亲近":65,"担忧":45},expression:20}。维度仅亲近、满足、兴奋、松弛、期待、担忧、恐惧、失望、悲伤、不满、反感、羞怯、愧疚、嫉妒；每项0—100、至多一位小数，独立强度不合计100，省略是未知而非0，不要求凑齐14项或非零。取本楼结束时仍有效的感受，去留和回落按本次原文；不按楼数自动递增。
+expression是该条当前感受或态度在言行中的外露程度，0—100、至多一位小数；0表示未显露，省略是未知。它与emotions独立可选，依据实际言行和叙述判断，不由情绪分数换算，不替代visibility或知情范围；私密内心即使强烈，也不能因此成为他人已知。
+text/reason简洁写本楼结束时的当前结果、实际对象、触发原因及仍保留的顾虑，结合既有人格与适用条件呈现多种情绪如何牵制，不只取最高分、不相减成净好感、不据分数指定固定动作或关系阶段。只有已提供且含义、对象和条件可比的前后状态才概括变化，缺数值不能当0或臆造轨迹；保持当前结果归纳与去重合同。
+例如甲见乙平安归来，亲近65但仍因其冒险不满45，可以愿意照顾仍明确反对再冒险；甲担忧80却克制未表露，expression可为0，按实际叙述保private，不能把乙写成已经看穿。强颜欢笑不等于内心满足；先担忧后释然按楼末仍有效感受记录，变化原因有据时写入原text/reason。
+Adaptive合法新增或review条目可加quantification:{strength:70}，只表示该条有条件长期倾向的目标强度，不是整个人格比例、好感度或置信度。只有有新证据的refine才能推进已知强度；程序从本楼之前的旧值按round1(S+clamp(0.2*(T-S),-5,5))接纳。keep不累计，仅可为未知旧值登记初值。一次接受关心不扩大为普遍信任；持续经历或明确转折的成长保对象、条件和矛盾。Core不评分，不能用数值绕过文字和原证据门槛。
 
 返回一个实际分析结果的 JSON 对象。确无需要输出的状态变化时，返回 {"subjects":[]}；不要返回 JSON Schema、空对象、null 或格式说明。所有 JSON 字符串都必须使用标准 JSON 转义：字符串内容中的英文双引号写成 \\", 反斜杠写成 \\\\, 实际换行写成 \\n；evidence.quote 引用正文原句时也必须遵守同一转义规则。JSON 解码后的 quote 必须保留原文字面，不得换成其他引号、删去字符或改写内容。
 英文 JSON 字段名保持示例写法；状态 text、reason 使用中文。变化说明由程序按实际前后状态生成，无需填写 changeSummary。根级 changeSummary/summary 不会被当作人物状态，也不得用来代替 subjects。
-推荐结构（仅展示有变化项；未列出的旧项和分类由程序按原合同保留）：
-{"subjects":[{"subject":"主体甲","review":{"adaptive":[{"previousText":"旧模式","toward":"对象乙","action":"refine","text":"保留有效条件与例外的当前模式","reason":"本楼支持调整的原因","evidence":[{"source":"canonicalContent","quote":"正文原句"}]}]},"situational":[{"reason":"本楼结束时仍生效的后果","text":"当前情境","visibility":"private","origin":"floor"}]}]}
+
+推荐结构（仅展示有变化项；未列出的旧项和分类由程序按原合同保留）：此例只有对乙的当前关系结果，self 为空；有独立自身变化时才填写 self。Adaptive 按上面的证据与更新步骤另行判断，没有变化时省略 review/additions。
+{"subjects":[{"subject":"主体甲","situational":{"self":[],"relations":[{"reason":"主体甲明确说误会虽已解释，此刻仍难以完全信任对象乙","text":"误会后此刻对对象乙的信任仍有保留，尚不愿完全依赖对方","toward":"对象乙","visibility":"expressed","origin":"floor"}]}}]}
 不确定的可选人物或分类宁可省略。只输出 JSON，不要解释。`;
 
 // 新生成统一走证据校准协议；编译器仍可读取旧 after-state 格式。
 export function buildCseSystemPrompt(guidance = '', processingPrompt = '') {
   const custom = typeof guidance === 'string' ? guidance : '';
   const businessGuidance = custom.trim() ? custom : DEFAULT_CSE_GUIDANCE;
-  return withBaseProcessingPrompt(`${businessGuidance}\n\n${CSE_FIXED_CONTRACT}`, processingPrompt);
+  return withBaseProcessingPrompt(`${CSE_FIXED_CONTRACT}\n\n【补充分析指引】\n以下指导在上述双丝网职责和各分类证据门槛内适用。\n${businessGuidance}`, processingPrompt);
 }
 
 export const CSE_SYSTEM_PROMPT = buildCseSystemPrompt();
@@ -169,7 +206,7 @@ export async function createBaselineRoleEntities(baseline) {
   ]);
 }
 
-function memoryEntityIds(memory) {
+export function cseReferencedEntityIds(memory) {
   const result = new Set();
   const add = value => { if (typeof value === 'string') result.add(value); };
   memory.participants?.forEach(item => { if (item.presence === 'present' || item.presence === 'remote') add(item.entityId); });
@@ -181,20 +218,17 @@ function memoryEntityIds(memory) {
   return result;
 }
 
-export function selectTrackedSubjects({ baseline, entities = [], floorMemories = [], floorMemory }) {
-  const active = entities.filter(entity => entity.recordStatus === 'active' && entity.status !== 'merged' && entity.status !== 'invalidated' && entity.entityType === 'person');
-  const byId = new Map(active.map(entity => [entity.id, entity]));
-  const repeated = new Map();
-  for (const memory of floorMemories) for (const id of memoryEntityIds(memory)) repeated.set(id, (repeated.get(id) ?? 0) + 1);
-  const strong = new Set();
-  floorMemory.privateCognition?.forEach(item => strong.add(item.ownerEntityId));
-  floorMemory.commitments?.forEach(item => { strong.add(item.speakerEntityId); item.targetEntityIds?.forEach(id => strong.add(id)); });
-  floorMemory.cseSignals?.forEach(item => { strong.add(item.subjectEntityId); if (item.objectEntityId) strong.add(item.objectEntityId); });
-  const selected = new Map();
-  const user = byId.get(baseline.userPersona.entityId) ?? active.find(entity => entity.specialRole === 'user');
-  if (user) selected.set(user.id, user);
-  for (const entity of active) if (entity.specialRole === 'user' || (repeated.get(entity.id) ?? 0) >= 2 || strong.has(entity.id)) selected.set(entity.id, entity);
-  return [...selected.values()];
+export function selectTrackedSubjects({ entities = [], floorMemory }) {
+  const referenced = cseReferencedEntityIds(floorMemory);
+  for (const item of floorMemory.participants ?? []) referenced.add(item.entityId);
+  for (const item of floorMemory.observations ?? []) referenced.add(item.subjectEntityId);
+  for (const item of floorMemory.locations ?? []) for (const id of item.participantEntityIds ?? []) referenced.add(id);
+  for (const item of floorMemory.openLoops ?? []) for (const id of item.ownerEntityIds ?? []) referenced.add(id);
+  for (const item of floorMemory.exactAnchors ?? []) referenced.add(item.speakerEntityId);
+  for (const item of floorMemory.qianshiDelta?.events ?? []) for (const person of item.people ?? []) referenced.add(person.entityId);
+  const active = new Map(entities.filter(entity => entity.recordStatus === 'active' && entity.status !== 'merged'
+    && entity.status !== 'invalidated' && entity.entityType === 'person').map(entity => [entity.id, entity]));
+  return [...referenced].flatMap(id => active.has(id) ? [active.get(id)] : []);
 }
 
 function semanticMemory(memory, entities) {
@@ -247,9 +281,9 @@ function subjectRelevantEvidence(memory, tracked, entities) {
   });
 }
 
-function semanticItems(items, entities, { includeReason = true } = {}) {
+function semanticItems(items, entities, { includeReason = true, category } = {}) {
   const byId = new Map(entities.map(entity => [entity.id, entity.displayName]));
-  return items.map(item => ({ text: item.text, visibility: item.visibility, ...(includeReason ? { reason: item.reason } : {}), origin: item.origin, ...(item.towardEntityId ? { toward: byId.get(item.towardEntityId) ?? null } : {}) }));
+  return items.map(item => ({ text: item.text, visibility: item.visibility, ...(includeReason ? { reason: item.reason } : {}), origin: item.origin, ...(item.towardEntityId ? { toward: byId.get(item.towardEntityId) ?? null } : {}), ...cseQuantificationFields(item, category) }));
 }
 
 function previousSubjectsForPrompt(currentState, tracked) {
@@ -260,9 +294,9 @@ function previousSubjectsForPrompt(currentState, tracked) {
 function previousForPrompt(subjects, entities, coreUserEditedSubjectEntityIds) {
   return subjects.map(subject => {
     const owner = entities.find(entity => entity.id === subject.subjectEntityId);
-    // 完整 Situational 列表按 text/reason 比较变化，Core/Adaptive 旧 reason 仅是前次解释，不再重复发送。
+    // Core/Adaptive 旧 reason 是前次解释，请求只传状态语义；Situational 复核沿用原观察依据。
     return { subject: owner?.displayName ?? '未知人物', coreUserEdited: coreUserEditedSubjectEntityIds.has(subject.subjectEntityId), ownState: {
-      core: semanticItems(subject.core, entities, { includeReason: false }), adaptive: semanticItems(subject.adaptive, entities, { includeReason: false }), situational: semanticItems(subject.situational, entities),
+      core: semanticItems(subject.core, entities, { includeReason: false, category: 'core' }), adaptive: semanticItems(subject.adaptive, entities, { includeReason: false, category: 'adaptive' }), situational: semanticItems(subject.situational, entities, { category: 'situational' }),
     } };
   });
 }
@@ -274,8 +308,10 @@ function cseEvidenceSources({ floor, baseline, currentUserInput, requestSources 
   const sources = [
     { source: 'canonicalContent', kind: 'story', subjectEntityId: null, contents: [floor.content.canonicalContent] },
     { source: 'userPersona', kind: 'authorialSetting', subjectEntityId: baseline.userPersona.entityId, contents: [userPersona.description] },
-    { source: 'characterCard', kind: 'authorialSetting', subjectEntityId: baseline.characterCard.entityId, contents: [characterCard.description, characterCard.personality, characterCard.scenario] },
-    ...worldInfoSources.map((entry, index) => ({ source: `worldbook:${index + 1}`, kind: 'authorialSetting', subjectEntityId: null, contents: [entry.content] })),
+    // 角色卡可包含多人设定，具体人物归属由正文语义判断，不固定归给卡名对应实体。
+    { source: 'characterCard', kind: 'authorialSetting', subjectEntityId: null, contents: [characterCard.description, characterCard.personality, characterCard.scenario] },
+    ...worldInfoSources.map((entry, index) => ({ source: `worldbook:${index + 1}`, kind: 'authorialSetting', subjectEntityId: null, contents: [entry.content],
+      ...(entry.locator ? { locator: entry.locator } : {}), ...(entry.fingerprint ? { fingerprint: entry.fingerprint } : {}) })),
   ];
   if (requestSources.authorNote?.content) sources.push({ source: 'authorNote', kind: 'authorialReference', subjectEntityId: null, contents: [requestSources.authorNote.content] });
   const userInputContents = Array.isArray(currentUserInput?.messages)
@@ -296,28 +332,29 @@ function authorialOtherStateContext(currentState, entities, previousSubjectIds) 
   const visible = items => items.filter(item => item.visibility !== 'private' && item.visibility !== 'authorial');
   return (currentState?.subjects ?? []).filter(subject => !previousSubjectIds.has(subject.subjectEntityId)).map(subject => ({
     subject: entities.find(entity => entity.id === subject.subjectEntityId)?.displayName ?? '未知人物',
-    core: semanticItems(visible(subject.core), entities, { includeReason: false }),
-    adaptive: semanticItems(visible(subject.adaptive), entities, { includeReason: false }),
-    situational: semanticItems(visible(subject.situational), entities),
+    core: semanticItems(visible(subject.core), entities, { includeReason: false, category: 'core' }),
+    adaptive: semanticItems(visible(subject.adaptive), entities, { includeReason: false, category: 'adaptive' }),
+    situational: semanticItems(visible(subject.situational), entities, { category: 'situational' }),
   }));
 }
 
-function auxiliaryStateSnapshotForPrompt(snapshot) {
-  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return snapshot;
-  const schema = snapshot.schema, statData = snapshot.stat_data;
-  const structuralSchema = schema && typeof schema === 'object' && !Array.isArray(schema)
-    && schema.type === 'object' && schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties);
-  if (!statData || typeof statData !== 'object' || Array.isArray(statData) || !structuralSchema) return snapshot;
-  // 仅将识别出的顶层 MVU schema 作为请求元数据省略；原变量快照和嵌套业务字段保持不变。
-  const { schema: _schema, ...snapshotWithoutSchema } = snapshot;
-  return snapshotWithoutSchema;
-}
 
-export function createCseEnvelope({ floor, floorMemory, baseline, currentState, trackedSubjects, entities, requestSources = null, worldInfoSources = null, currentUserInput = null, coreUserEditedSubjectEntityIds = [], identityMemberEntityIdsBySubject = {}, relevantPriorContext = '', userCoreExtraction = null, userAdaptiveHistory = [] }) {
-  const directory = buildEntityIdentityDirectory({ entities });
+export function createCseEnvelope({ floor, floorMemory, baseline, currentState, trackedSubjects, entities, floorOrder = null, identityDirectory = null, identityBriefTargets = [], requestSources = null, worldInfoSources = null, currentUserInput = null, coreUserEditedSubjectEntityIds = [], identityMemberEntityIdsBySubject = {}, relevantPriorContext = '', userCoreExtraction = null, userAdaptiveHistory = [], relationHistory = [], reviewUserAdaptive = true }) {
+  const directory = identityDirectory ?? buildEntityIdentityDirectory({ entities, floorOrder });
   const directoryById = new Map(directory.map(entry => [entry.entityId, entry]));
   const labelsFor = entity => directoryById.get(entity.id)?.labels ?? entityLabels(entity);
   const activeKnownEntities = directory.filter(entry => entry.entityType === 'person' || entry.specialRole !== 'none');
+  const trackedIds = new Set(trackedSubjects.map(entity => entity.id));
+  const reviewCandidates = (currentState?.subjects ?? []).filter(subject => !trackedIds.has(subject.subjectEntityId)
+    && subject.situational.some(item => item.origin !== 'manual'))
+    .map(subject => directoryById.get(subject.subjectEntityId)?.entity)
+    .filter(entity => entity?.entityType === 'person');
+  const candidateBindings = [...trackedSubjects, ...reviewCandidates].map(entity => ({ entityId: entity.id, labels: labelsFor(entity), specialRole: entity.specialRole }));
+  // 旧情境的新增复核资格保持当前主体的唯一绑定。
+  const reviewSubjects = reviewCandidates.filter(entity => labelsFor(entity).every(label => matchingBindings(label, candidateBindings).length === 1))
+    .slice(0, Math.max(0, 80 - trackedSubjects.length));
+  const reviewOnlyIds = new Set(reviewSubjects.map(entity => entity.id));
+  const outputSubjects = [...trackedSubjects, ...reviewSubjects];
   const requestWorldInfoSources = Array.isArray(worldInfoSources) ? worldInfoSources : baseline.worldInfoSources;
   const effectiveSources = requestSources && typeof requestSources === 'object' ? requestSources : {
     userPersona: baseline.userPersona,
@@ -329,9 +366,12 @@ export function createCseEnvelope({ floor, floorMemory, baseline, currentState, 
   const effectiveUserPersona = effectiveSources.userPersona ?? baseline.userPersona;
   const effectiveCharacterCard = effectiveSources.characterCard ?? baseline.characterCard;
   const effectiveWorldInfoSources = Array.isArray(effectiveSources.worldInfoSources) ? effectiveSources.worldInfoSources : requestWorldInfoSources;
+  const sourceLocationReference = Array.isArray(floorMemory.sourceFloorSnapshots)
+    ? floorMemory.sourceFloorSnapshots.find(snapshot => snapshot.floorId === floor.id)?.locationReference
+    : floorMemory.sourceLocationReference;
   const evidenceSources = cseEvidenceSources({ floor, baseline, currentUserInput, requestSources: { ...effectiveSources, worldInfoSources: effectiveWorldInfoSources } });
   const coreUserEdited = new Set(coreUserEditedSubjectEntityIds);
-  const previousSubjects = previousSubjectsForPrompt(currentState, trackedSubjects);
+  const previousSubjects = previousSubjectsForPrompt(currentState, outputSubjects);
   const previousSubjectIds = new Set(previousSubjects.map(subject => subject.subjectEntityId));
   const nameForSubjectId = entityId => directoryById.get(entityId)?.displayName
     ?? (entityId === baseline.userPersona.entityId ? baseline.userPersona.name : entityId === baseline.characterCard.entityId ? baseline.characterCard.name : null);
@@ -339,7 +379,7 @@ export function createCseEnvelope({ floor, floorMemory, baseline, currentState, 
   const userBindings = trackedSubjects.filter(entity => entity.id === userEntityId || identityMemberEntityIdsBySubject?.[entity.id]?.includes(userEntityId));
   const userBinding = userBindings.length === 1 ? userBindings[0] : null;
   const previousUser = userBinding && previousSubjects.find(subject => subject.subjectEntityId === userBinding.id);
-  const userAdaptiveReview = userBinding && !(previousUser?.adaptive?.length)
+  const userAdaptiveReview = reviewUserAdaptive && userBinding && !(previousUser?.adaptive?.length)
     ? {
       subject: nameForSubjectId(userBinding.id) ?? effectiveUserPersona.name,
       task: '独立检查用户自己的长期 Adaptive；自身与明确对象分开判断，不镜像。只用请求材料，符合既有证据合同才更新，否则留空。历史最多含3个完整楼、合计6000字符；从历史归纳新增时，须判断至少两个彼此独立的事件，并在同一新增项引用 canonicalContent 或 currentUserInput 中能确认该模式当前仍适用的原句。不同楼号或多个 quote 不代表独立事件，同一连续事件链只算一个；不得补猜未提供的历史。明确作者设定或纠正仍按原合同处理。历史只供该用户 Adaptive，不用于 Core、Situational、他人状态或角色知识；不复制 Core，不强迫填满。此独立任务只检查该用户 Adaptive；本楼对所有 trackedSubjects 的常规分析照常进行。',
@@ -347,9 +387,21 @@ export function createCseEnvelope({ floor, floorMemory, baseline, currentState, 
     : null;
   const userAdaptiveSources = userAdaptiveReview ? userAdaptiveHistory.map(entry => ({
     source: `userAdaptiveHistory:${entry.floorId}`, kind: 'userAdaptiveHistory',
-    subjectEntityId: baseline.userPersona.entityId, contents: [entry.content],
+    subjectEntityId: baseline.userPersona.entityId, contents: [entry.content, ...(entry.precedingUserInput?.messages ?? []).map(message => message.content)],
   })) : [];
   evidenceSources.push(...userAdaptiveSources);
+  const relationHistorySources = relationHistory.map(entry => ({ source: entry.source, kind: 'relationHistory',
+    pairEntityIds: entry.pairEntityIds, contents: [JSON.stringify(entry.record), ...(entry.quotes ?? [])] }));
+  evidenceSources.push(...relationHistorySources);
+  const baselineEntityIds = new Set([baseline.userPersona?.entityId, baseline.characterCard?.entityId].filter(Boolean));
+  const briefTargets = identityBriefTargets.flatMap((target, index) => {
+    const entry = directoryById.get(target?.entityId);
+    if (!entry || entry.entityType !== 'person' || entry.specialRole !== 'none' || baselineEntityIds.has(entry.entityId)) return [];
+    return [{ key: `npc-${index + 1}`, entityId: entry.entityId, name: target.name ?? entry.displayName,
+      aliases: target.labels ?? entry.labels,
+      identityBriefSource: entry.identityBriefSource,
+      ...((target.identityBrief ?? entry.identityBrief) ? { identityBrief: target.identityBrief ?? entry.identityBrief } : {}) }];
+  }).slice(0, 80);
   return Object.freeze({
     request: Object.freeze({ task: 'understandCharacterStateAfterFloor', locale: 'zh-CN', payload: {
       ...(userCoreExtraction?.hasDescription ? { userCoreExtraction: {
@@ -359,8 +411,17 @@ export function createCseEnvelope({ floor, floorMemory, baseline, currentState, 
       ...(userAdaptiveReview ? { userAdaptiveReview } : {}),
       canonicalContent: floor.content.canonicalContent,
       floorMemory: semanticMemory(floorMemory, entities),
+      ...(Array.isArray(sourceLocationReference) && sourceLocationReference.length ? { sourceLocationReference: {
+        label: '对应来源楼原消息地点标注（仅补充参照；正文和人工修订优先，不代表当前位置或人物在场）',
+        values: sourceLocationReference,
+      } } : {}),
       ...(floorMemory.sourceVariableReference ? { auxiliaryStateSnapshot: auxiliaryStateSnapshotForPrompt(floorMemory.sourceVariableReference) } : {}),
-      previousState: previousForPrompt(previousSubjects, entities, coreUserEdited),
+      previousState: previousSubjects.map(previous => {
+        const subject = previousForPrompt([previous], entities, coreUserEdited)[0];
+        return reviewOnlyIds.has(previous.subjectEntityId)
+          ? { subject: subject.subject, reviewOnly: true, ownState: { situational: subject.ownState.situational.filter(item => item.origin !== 'manual') } }
+          : subject;
+      }),
       relevantBaseline: {
         userPersona: { name: effectiveUserPersona.name, description: effectiveUserPersona.description, visibility: 'authorial' },
         characterCard: { name: effectiveCharacterCard.name, description: effectiveCharacterCard.description, personality: effectiveCharacterCard.personality, scenario: effectiveCharacterCard.scenario, visibility: 'authorial' },
@@ -371,24 +432,32 @@ export function createCseEnvelope({ floor, floorMemory, baseline, currentState, 
       ...(userAdaptiveReview ? { userAdaptiveHistory: userAdaptiveHistory.map(entry => ({
         source: `userAdaptiveHistory:${entry.floorId}`, floorId: entry.floorId,
         assistantSeq: entry.assistantSeq, content: entry.content,
+        ...(entry.precedingUserInput ? { precedingUserInput: entry.precedingUserInput } : {}),
       })) } : {}),
-      evidenceSourceCatalog: evidenceSources.map(source => ({ source: source.source, kind: source.kind, ...(source.subjectEntityId ? { subject: nameForSubjectId(source.subjectEntityId) } : {}) })),
+      ...(relationHistory.length ? { relationHistory: relationHistory.map(({ pairEntityIds, ...entry }) => entry) } : {}),
+      ...(briefTargets.length ? { identityBriefTargets: briefTargets.map(({ key, name, aliases, identityBrief, identityBriefSource }) => ({ key, name, aliases,
+        ...(identityBrief && !identityBriefSource?.facts?.length ? { identityBrief } : {}), ...(identityBriefSource?.facts?.length ? { identityFacts: identityFactsForPrompt(identityBriefSource, key) } : {}) })) } : {}),
+      evidenceSourceCatalog: evidenceSources.map(source => ({ source: source.source, kind: source.kind,
+        ...(source.subjectEntityId ? { subject: nameForSubjectId(source.subjectEntityId) }
+          : source.kind === 'authorialSetting' ? { subjectScope: '按来源原文明确描述的人物' } : {}) })),
       subjectRelevantEvidence: subjectRelevantEvidence(floorMemory, trackedSubjects, entities),
       authorialOtherStateContext: authorialOtherStateContext(currentState, entities, previousSubjectIds),
       ...(relevantPriorContext ? { relevantPriorContext } : {}),
-      trackedSubjects: trackedSubjects.map(entity => ({ name: entity.displayName, aliases: labelsFor(entity), coreUserEdited: coreUserEdited.has(entity.id) })),
+      trackedSubjects: outputSubjects.map(entity => ({ name: entity.displayName, aliases: labelsFor(entity), ...(reviewOnlyIds.has(entity.id) ? { reviewOnly: true } : { coreUserEdited: coreUserEdited.has(entity.id) }) })),
       knownPeople: activeKnownEntities.map(entry => ({ name: entry.displayName, aliases: entry.labels })),
     } }),
     scope: Object.freeze({
       floorId: floor.id, floorMemoryId: floorMemory.id, chatId: floor.chatId, narrativeGeneration: floor.narrativeGeneration, baselineId: baseline.id,
-      trackedBindings: trackedSubjects.map(entity => ({ entityId: entity.id, labels: labelsFor(entity), specialRole: entity.specialRole })),
+      trackedBindings: outputSubjects.map(entity => ({ entityId: entity.id, labels: labelsFor(entity), specialRole: entity.specialRole, ...(reviewOnlyIds.has(entity.id) ? { reviewOnly: true } : {}) })),
       knownBindings: activeKnownEntities.map(entry => ({ entityId: entry.entityId, labels: entry.labels, specialRole: entry.specialRole })),
+      identityBriefBindings: briefTargets.map(({ key, entityId, identityBrief, identityBriefSource }) => ({ key, entityId, identityBrief: identityBrief ?? null,
+        identityFacts: identityBriefSource?.facts ?? [], existingFacts: identityFactBindings(identityBriefSource, key) })),
       evidenceSources,
       sourceSnapshotFingerprint: typeof effectiveSources.fingerprint === 'string' ? effectiveSources.fingerprint : null,
       coreUserEditedSubjectEntityIds: [...coreUserEdited],
       userAdaptiveReview: Boolean(userAdaptiveReview),
       ...(userCoreExtraction ? { userCoreExtraction } : {}),
-      identityMemberEntityIdsBySubject: Object.freeze(Object.fromEntries(trackedSubjects.map(entity => [entity.id, Object.freeze([...new Set([entity.id, ...(identityMemberEntityIdsBySubject?.[entity.id] ?? [])].filter(id => typeof id === 'string' && id))])]))),
+      identityMemberEntityIdsBySubject: Object.freeze(Object.fromEntries(outputSubjects.map(entity => [entity.id, Object.freeze([...new Set([entity.id, ...(identityMemberEntityIdsBySubject?.[entity.id] ?? [])].filter(id => typeof id === 'string' && id))])]))),
     }),
   });
 }
@@ -429,14 +498,46 @@ function normalizeCsePacket(value, { rejectSituationalConflict = false } = {}) {
   return updates ?? packet;
 }
 
-function parsePacket(value, { finishReason } = {}) {
-  if (Array.isArray(value)) return normalizeCsePacket(value);
-  if (value && typeof value === 'object' && !Array.isArray(value)) return normalizeCsePacket(value);
-  let raw = String(value ?? '').trim();
-  const fences = [...raw.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/giu)];
-  if (fences.length) raw = fences[0][1].trim();
+function collectFencedBlocks(raw) {
+  const blocks = [];
+  let quoted = false, escaped = false;
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"') { quoted = true; continue; }
+    if (!raw.startsWith('```', index)) continue;
+    const headerEnd = raw.indexOf('\n', index + 3);
+    if (headerEnd < 0) break;
+    const start = headerEnd + 1;
+    let innerQuoted = false, innerEscaped = false, close = -1;
+    for (let cursor = start; cursor < raw.length; cursor += 1) {
+      const inner = raw[cursor];
+      if (innerQuoted) {
+        if (innerEscaped) innerEscaped = false;
+        else if (inner === '\\') innerEscaped = true;
+        else if (inner === '"') innerQuoted = false;
+        continue;
+      }
+      if (inner === '"') { innerQuoted = true; continue; }
+      if (raw.startsWith('```', cursor)) { close = cursor; break; }
+    }
+    if (close < 0) break;
+    blocks.push(raw.slice(start, close).trim());
+    index = close + 2;
+    quoted = false; escaped = false;
+  }
+  return blocks;
+}
+
+function parsePacketContent(raw, { finishReason } = {}) {
+  raw = String(raw ?? '').trim();
   try { return normalizeCsePacket(JSON.parse(raw)); } catch { /* limited wrapper recovery */ }
-  const symbolRepaired = fences.length <= 1 ? parseJsonWithSymbolRepair(raw, { finishReason })?.value : null;
+  const symbolRepaired = parseJsonWithSymbolRepair(raw, { finishReason })?.value;
   if (symbolRepaired) return normalizeCsePacket(symbolRepaired);
   const start = raw.indexOf('{'), end = raw.lastIndexOf('}');
   if (start >= 0 && end > start) {
@@ -457,6 +558,44 @@ function parsePacket(value, { finishReason } = {}) {
   const error = new TypeError('CSE 返回不是可识别的 JSON。'); error.code = 'V3_CSE_FORMAT_INVALID'; throw error;
 }
 
+function formalPacketSignature(packet, { compareUserCoreExtraction = false } = {}) {
+  const userCoreExtraction = field(packet, ['userCoreExtraction', '用户核心特质提取']);
+  const extractionStatus = userCoreExtraction && typeof userCoreExtraction === 'object' && !Array.isArray(userCoreExtraction)
+    ? normalized(field(userCoreExtraction, ['status', '状态'])) || null
+    : null;
+  return stableCandidate({ noMaterialChange: field(packet, ['noMaterialChange']) === true, subjects: selectSubjectResults(packet) ?? null,
+    identityBriefUpdates: field(packet, ['identityBriefUpdates', '身份简介更新']) ?? null,
+    ...(compareUserCoreExtraction ? { userCoreExtractionStatus: extractionStatus } : {}) });
+}
+
+function parsePacket(value, { finishReason, compareUserCoreExtraction = false } = {}) {
+  if (Array.isArray(value)) return normalizeCsePacket(value);
+  if (value && typeof value === 'object') return normalizeCsePacket(value);
+  const raw = String(value ?? '').trim();
+  try { return normalizeCsePacket(JSON.parse(raw)); } catch { /* wrapped JSON follows */ }
+
+  const blocks = collectFencedBlocks(raw);
+  if (blocks.length) {
+    const candidates = [];
+    for (const block of blocks) {
+      try {
+        const packet = parsePacketContent(block, { finishReason });
+        if (hasRecognizableCseResult(packet)) candidates.push(packet);
+      } catch (error) {
+        if (error?.code === 'V3_CSE_SUBJECT_RESULT_AMBIGUOUS') throw error;
+      }
+    }
+    if (candidates.length) {
+      const signature = formalPacketSignature(candidates[0], { compareUserCoreExtraction });
+      if (candidates.some(candidate => formalPacketSignature(candidate, { compareUserCoreExtraction }) !== signature)) {
+        throw errorWith('V3_CSE_SUBJECT_RESULT_AMBIGUOUS', '模型返回了多份不同的人物状态，无法确认；请重新分析本楼。');
+      }
+      return reconcileQuantification(candidates);
+    }
+  }
+  return parsePacketContent(raw, { finishReason });
+}
+
 const CSE_SUBJECT_RESULT_FIELDS = Object.freeze(['subjects', 'people', 'characters', 'states', '人物', '角色', '状态']);
 
 function subjectResultCandidates(packet) {
@@ -474,8 +613,19 @@ function subjectResultCandidates(packet) {
 
 function stableCandidate(value) {
   if (Array.isArray(value)) return `[${value.map(stableCandidate).join(',')}]`;
-  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableCandidate(value[key])}`).join(',')}}`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).filter(key => key !== 'quantification').sort().map(key => `${JSON.stringify(key)}:${stableCandidate(value[key])}`).join(',')}}`;
   return JSON.stringify(value);
+}
+
+// Equivalent text packets share the result; only an agreed optional number survives.
+function reconcileQuantification(values) {
+  const first = values[0];
+  if (Array.isArray(first)) return first.map((_, index) => reconcileQuantification(values.map(value => value?.[index])));
+  if (!first || typeof first !== 'object') return first;
+  return Object.fromEntries(Object.entries(first).flatMap(([key, value]) => {
+    if (key === 'quantification') return values.every(item => stableCandidate(item?.[key]) === stableCandidate(value)) ? [[key, value]] : [];
+    return [[key, reconcileQuantification(values.map(item => item?.[key]))]];
+  }));
 }
 
 function selectSubjectResults(packet) {
@@ -484,6 +634,7 @@ function selectSubjectResults(packet) {
   if (nonempty.length > 1 && nonempty.some(candidate => stableCandidate(candidate.value) !== stableCandidate(nonempty[0].value))) {
     throw errorWith('V3_CSE_SUBJECT_RESULT_AMBIGUOUS', 'CSE 返回了互相冲突的人物状态字段。');
   }
+  if (nonempty.length > 1) return reconcileQuantification(nonempty.map(candidate => candidate.value));
   const standard = candidates.find(candidate => candidate.name === 'subjects' && (Array.isArray(candidate.value) || candidate.value));
   if (standard && (Array.isArray(standard.value) ? standard.value.length > 0 : Object.keys(standard.value).length > 0)) return standard.value;
   if (nonempty.length) return nonempty[0].value;
@@ -497,11 +648,15 @@ function hasRecognizableCseResult(packet) {
   return Array.isArray(subjects) || Boolean(subjects && typeof subjects === 'object');
 }
 
-function bindingFor(value, bindings) {
+function matchingBindings(value, bindings) {
   const label = identityLabelKey(typeof value === 'string' ? value : field(value, ['subject', 'name', 'person', 'character', '主体', '人物', '姓名']));
-  if (!label) return null;
+  if (!label) return [];
   const userAlias = ['你', '主角', '用户', '{{user}}', 'user', 'player'].includes(label);
-  const matches = bindings.filter(binding => (userAlias && binding.specialRole === 'user') || binding.labels.some(candidate => identityLabelKey(candidate) === label));
+  return bindings.filter(binding => (userAlias && binding.specialRole === 'user') || binding.labels.some(candidate => identityLabelKey(candidate) === label));
+}
+
+function bindingFor(value, bindings) {
+  const matches = matchingBindings(value, bindings);
   return matches.length === 1 ? matches[0] : null;
 }
 
@@ -509,22 +664,25 @@ const visibility = value => ({ private: 'private', 私密: 'private', 内心: 'p
 const origin = value => ({ baseline: 'baseline', 初始设定: 'baseline', floor: 'floor', 本楼: 'floor', reasonableprogression: 'reasonableProgression', naturalprogression: 'reasonableProgression', 合理进展: 'reasonableProgression', 自然进展: 'reasonableProgression' }[normalized(value)] ?? 'floor');
 const itemSemantic = item => typeof item === 'string' ? item.trim() : text(field(item, ['text', 'state', 'description', 'content', '状态', '描述', '内容']), 4000);
 const stateMeaning = item => [item.text, item.visibility, item.reason, item.origin, item.towardEntityId ?? ''];
-const storedProjection = subject => ({ core: subject.core.map(stateMeaning), adaptive: subject.adaptive.map(stateMeaning), situational: subject.situational.map(stateMeaning) });
+const storedProjection = subject => Object.fromEntries(['core', 'adaptive', 'situational'].map(category => [category,
+  subject[category].map(item => [...stateMeaning(item), normalizeCseQuantification(item.quantification, category)])]));
 
-async function compileItems({ raw, category, binding, knownBindings, deltaId, floorId, previous, isolated, acceptedIntents }) {
+async function compileItems({ raw, category, binding, knownBindings, deltaId, floorId, isolated, acceptedIntents }) {
   const output = [];
   for (const [index, item] of list(raw).slice(0, 120).entries()) {
+    if (usesRelationHistory(item)) { isolated.push({ field: category, index, code: 'V3_CSE_CALIBRATION_EVIDENCE_INSUFFICIENT' }); acceptedIntents.count += 1; continue; }
     const value = itemSemantic(item);
     if (!value) { isolated.push({ field: category, index, code: 'V3_CSE_OPTIONAL_ITEM_INVALID' }); continue; }
     let towardEntityId = null;
     const towardRaw = category !== 'core' && typeof item === 'object' ? field(item, ['toward', 'target', 'object', '对谁', '对象']) : null;
     if (towardRaw !== undefined && towardRaw !== null && String(towardRaw).trim()) {
-      const toward = bindingFor(towardRaw, knownBindings);
-      if (!toward) { isolated.push({ field: category, index, code: 'V3_CSE_TOWARD_UNBOUND' }); continue; }
+      const matches = matchingBindings(towardRaw, knownBindings);
+      const toward = matches.length === 1 ? matches[0] : null;
+      if (!toward) { isolated.push({ field: category, index, code: 'V3_CSE_TOWARD_UNBOUND', label: towardRaw, matchCount: matches.length }); continue; }
       towardEntityId = toward.entityId;
     }
     const reason = typeof item === 'object' ? text(field(item, ['reason', 'because', '依据', '原因']), 4000) : '';
-    output.push({ id: await deterministicUuid(['v3-cse-state-item', deltaId, binding.entityId, category, index, value, towardEntityId]), text: value, visibility: visibility(typeof item === 'object' ? field(item, ['visibility', '可见性']) : null), reason: reason || '未提供依据', origin: origin(typeof item === 'object' ? field(item, ['origin', '来源']) : null), towardEntityId, sourceFloorId: floorId, sourceDeltaId: deltaId });
+    output.push({ id: await deterministicUuid(['v3-cse-state-item', deltaId, binding.entityId, category, index, value, towardEntityId]), text: value, visibility: visibility(typeof item === 'object' ? field(item, ['visibility', '可见性']) : null), reason: reason || '未提供依据', origin: origin(typeof item === 'object' ? field(item, ['origin', '来源']) : null), towardEntityId, sourceFloorId: floorId, sourceDeltaId: deltaId, ...cseQuantificationFields(item, category === 'adaptive' ? null : category) });
     acceptedIntents.count += 1;
   }
   return output;
@@ -532,11 +690,51 @@ async function compileItems({ raw, category, binding, knownBindings, deltaId, fl
 
 async function compileAfterStateCategory(options) {
   const output = await compileItems(options);
+  if (options.category === 'adaptive' && options.previous.some(item => normalizeCseQuantification(item.quantification, 'adaptive'))) for (const item of output) {
+    const matches = options.previous.filter(value => sameItemMeaning(value, item));
+    const quantification = matches.length === 1 ? normalizeCseQuantification(matches[0].quantification, 'adaptive') : null;
+    if (quantification) item.quantification = quantification;
+  }
   if (Array.isArray(options.raw) && options.raw.length === 0) { options.acceptedIntents.count += 1; return output; }
   return output.length ? output : options.previous;
 }
 
+async function compileSituationalList(options) {
+  const { raw } = options;
+  if (Array.isArray(raw) || raw === null || raw === undefined || typeof raw !== 'object'
+    || (!Object.hasOwn(raw, 'self') && !Object.hasOwn(raw, 'relations'))) return compileAfterStateCategory(options);
+  if (!Array.isArray(raw.self) || !Array.isArray(raw.relations)) {
+    options.isolated.push({ field: 'situational', index: 0, code: 'V3_CSE_OPTIONAL_ITEM_INVALID' });
+    return options.previous;
+  }
+  if (raw.self.length === 0 && raw.relations.length === 0) {
+    options.acceptedIntents.count += 1;
+    return [];
+  }
+  const self = raw.self.slice(0, 120).map(item => {
+    const toward = field(item, ['toward', 'target', 'object', '对谁', '对象']);
+    return toward !== undefined && toward !== null && String(toward).trim() ? null : item;
+  });
+  const relations = raw.relations.slice(0, Math.max(0, 120 - self.length)).map(item => {
+    const toward = field(item, ['toward', 'target', 'object', '对谁', '对象']);
+    return toward !== undefined && toward !== null && String(toward).trim() ? item : null;
+  });
+  return compileAfterStateCategory({ ...options, raw: [...self, ...relations] });
+}
+
 const categoryNames = category => category === 'core' ? ['core', '核心', '核心人格'] : ['adaptive', '适应', '长期适应'];
+async function compileSituationalCategory(options) {
+  const proposed = await compileSituationalList(options);
+  const used = new Set();
+  return proposed.map(item => {
+    const index = options.previous.findIndex((previous, position) => !used.has(position) && sameItemMeaning(previous, item));
+    if (index < 0) return item;
+    used.add(index);
+    const previous = options.previous[index];
+    return previous.origin === 'manual' ? previous : { ...previous, ...cseQuantificationFields(item, 'situational') };
+  });
+}
+
 const sameItemMeaning = (left, right) => normalized(left?.text) === normalized(right?.text)
   && (left?.towardEntityId ?? null) === (right?.towardEntityId ?? null)
   && left?.visibility === right?.visibility;
@@ -561,6 +759,42 @@ function locateEvidenceQuote(contents, quote) {
   return null;
 }
 
+const relationHistoryNamespace = value => typeof value === 'string' && /^\s*relation[\s_-]*history/iu.test(value.normalize('NFKC'));
+const formalEntries = (value, names) => value && typeof value === 'object' && !Array.isArray(value)
+  ? Object.entries(value).filter(([key]) => names.some(name => normalized(key) === normalized(name))) : [];
+function usesRelationHistory(raw, names = ['evidence', '证据']) {
+  return formalEntries(raw, names).some(([, refs]) => (Array.isArray(refs) ? refs : refs ? [refs] : [])
+    .some(ref => formalEntries(ref, ['source', '来源']).some(([, source]) => relationHistoryNamespace(source))));
+}
+
+// Only the new namespace has this all-reference, whole-mutation gate. Old protocols retain their contract.
+function relationHistoryEvidence(raw, { envelope, binding, category, original = null, index, isolated }) {
+  if (!usesRelationHistory(raw)) return undefined;
+  const reject = () => { isolated.push({ field: category, index, code: 'V3_CSE_CALIBRATION_EVIDENCE_INSUFFICIENT' }); return null; };
+  const groups = formalEntries(raw, ['evidence', '证据']);
+  if (groups.length !== 1) return reject();
+  const refs = groups[0][1];
+  if (category !== 'adaptive' || !Array.isArray(refs) || !refs.length || refs.length > 20) return reject();
+  const towardRaw = field(raw, ['toward', 'target', 'object', '对谁', '对象']);
+  const towardMatches = towardRaw === undefined || towardRaw === null || !String(towardRaw).trim() ? [] : matchingBindings(towardRaw, envelope.scope.knownBindings);
+  const towardEntityId = towardRaw === undefined || towardRaw === null || !String(towardRaw).trim() ? original?.towardEntityId : towardMatches.length === 1 ? towardMatches[0].entityId : null;
+  if (!towardEntityId || towardEntityId === binding.entityId) return reject();
+  const evidence = [];
+  for (const ref of refs) {
+    if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return reject();
+    if (formalEntries(ref, ['source', '来源']).length !== 1 || formalEntries(ref, ['quote', '引用']).length !== 1) return reject();
+    const sourceName = field(ref, ['source', '来源']), quote = field(ref, ['quote', '引用']);
+    if (typeof sourceName !== 'string' || sourceName.length > 160 || typeof quote !== 'string' || !quote.trim() || quote.length > 2000) return reject();
+    const source = envelope.scope.evidenceSources.find(candidate => candidate.source === sourceName);
+    const located = source && locateEvidenceQuote(source.contents, quote);
+    if (!source || !located || source.subjectEntityId && source.subjectEntityId !== binding.entityId) return reject();
+    if (source.kind === 'relationHistory' && !source.pairEntityIds?.some(pair => pair.length === 2 && pair.includes(binding.entityId) && pair.includes(towardEntityId))) return reject();
+    evidence.push({ source: source.source, kind: source.kind, quote: located });
+  }
+  if (!evidence.some(ref => ref.kind === 'relationHistory') || !evidence.some(ref => ref.source === 'canonicalContent' || ref.source === 'currentUserInput')) return reject();
+  return Object.freeze(evidence);
+}
+
 function calibratedEvidence(raw, { envelope, binding, category, index, isolated }) {
   const evidence = [];
   const allSubmitted = list(field(raw, ['evidence', '证据']));
@@ -579,7 +813,9 @@ function calibratedEvidence(raw, { envelope, binding, category, index, isolated 
       isolated.push({ field: path, code: 'V3_CSE_EVIDENCE_SUBJECT_MISMATCH' });
       continue;
     }
-    evidence.push({ source: source.source, kind: source.kind, quote: locatedQuote });
+    evidence.push({ source: source.source, kind: source.kind, quote: locatedQuote,
+      ...(category === 'identityBriefUpdates' ? { floorId: envelope.scope.floorId,
+        ...(source.locator ? { locator: source.locator } : {}), ...(source.fingerprint ? { fingerprint: source.fingerprint } : {}) } : {}) });
   }
   return Object.freeze(evidence);
 }
@@ -590,6 +826,59 @@ function calibratedMutationAllowed({ category, evidence, manualCore }) {
   // Once Core is user-authored, only evidence from the current user input can revise it.
   if (manualCore) return evidence.some(item => item.source === 'currentUserInput');
   return evidence.some(item => item.kind === 'authorialSetting' || item.source === 'currentUserInput');
+}
+
+function compileIdentityBriefUpdates(packet, envelope, isolated, deltaId) {
+  const bindings = envelope.scope.identityBriefBindings ?? [];
+  if (!bindings.length) return [];
+  const bindingByKey = new Map(bindings.map(binding => [binding.key, binding]));
+  const submitted = list(field(packet, ['identityBriefUpdates', '身份简介更新'])).slice(0, 80);
+  const grouped = new Map();
+  for (const [index, raw] of submitted.entries()) {
+    const key = text(field(raw, ['targetKey', 'key', '目标']), 80);
+    if (!key || !bindingByKey.has(key) || !raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      isolated.push({ field: 'identityBriefUpdates', index, code: 'V3_CSE_IDENTITY_BRIEF_TARGET_UNBOUND' });
+      continue;
+    }
+    const items = grouped.get(key) ?? [];
+    items.push({ raw, index }); grouped.set(key, items);
+  }
+  const updates = [];
+  for (const [key, items] of grouped) {
+    const binding = bindingByKey.get(key), validBriefs = new Map();
+    let invalid = false;
+    for (const { raw, index } of items) {
+      try {
+        if (usesRelationHistory(raw, ['evidence', '依据', '证据']) || Array.isArray(raw.identityFacts) && raw.identityFacts.some(fact => usesRelationHistory(fact))) throw new TypeError('identityFacts.evidence');
+        const brief = field(raw, ['identityBrief', 'brief', '简介']);
+        if (!Object.hasOwn(raw, 'identityFacts') && (typeof brief !== 'string' || !brief.trim() || brief.length > 400)) throw new TypeError('identityBrief');
+        const facts = compileIdentityFacts({ raw: { ...raw, identityBrief: brief }, existingFacts: binding.existingFacts,
+          legacyEvidence: field(raw, ['evidence', '依据']), compileEvidence(refs) {
+            if (usesRelationHistory({ evidence: refs })) throw new TypeError('identityFacts.evidence');
+            if (!Array.isArray(refs) || !refs.length || refs.length > 20) throw new TypeError('identityFacts.evidence');
+            if (refs.some(ref => typeof field(ref, ['quote', '引用']) !== 'string' || field(ref, ['quote', '引用']).length > 2000)) throw new TypeError('identityFacts.quote');
+            const evidence = calibratedEvidence({ evidence: refs }, { envelope, binding, category: 'identityBriefUpdates', index, isolated });
+            if (evidence.length !== refs.length || evidence.some(item => item.source === 'userPersona' || item.kind === 'userAdaptiveHistory')) throw new TypeError('identityFacts.evidence');
+            return evidence.map(({ quote, ...ref }) => ({ ...ref, quotedText: quote }));
+          } });
+        if (!facts) continue;
+        const meaning = JSON.stringify(facts);
+        const matching = validBriefs.get(meaning) ?? { facts, indexes: [] };
+        matching.indexes.push(index); validBriefs.set(meaning, matching);
+      } catch {
+        invalid = true;
+        isolated.push({ field: 'identityBriefUpdates', index, code: 'V3_CSE_IDENTITY_BRIEF_INVALID' });
+      }
+    }
+    if (validBriefs.size > 1) {
+      for (const { indexes } of validBriefs.values()) for (const index of indexes) isolated.push({ field: 'identityBriefUpdates', index, code: 'V3_CSE_IDENTITY_BRIEF_TARGET_AMBIGUOUS' });
+      continue;
+    }
+    const [candidate] = validBriefs.values();
+    if (!invalid && candidate && !sameIdentityFacts(candidate.facts, binding.identityFacts)) updates.push({ entityId: binding.entityId, identityBrief: identityFactsText(candidate.facts),
+      identityBriefSource: { sourceFloorId: envelope.scope.floorId, origin: 'cse', sourceDeltaId: deltaId, facts: candidate.facts } });
+  }
+  return updates;
 }
 
 function reasonWithEvidence(raw, evidence) {
@@ -604,12 +893,15 @@ async function calibratedStateItem({ raw, category, binding, knownBindings, delt
   let towardEntityId = category === 'adaptive' ? original?.towardEntityId ?? null : null;
   const towardRaw = typeof raw === 'object' ? field(raw, ['toward', 'target', 'object', '对谁', '对象']) : null;
   if (category === 'adaptive' && towardRaw !== undefined && towardRaw !== null && String(towardRaw).trim()) {
-    const toward = bindingFor(towardRaw, knownBindings);
-    if (!toward) { isolated.push({ field: category, index, code: 'V3_CSE_TOWARD_UNBOUND' }); return null; }
+    const matches = matchingBindings(towardRaw, knownBindings);
+    const toward = matches.length === 1 ? matches[0] : null;
+    if (!toward) { isolated.push({ field: category, index, code: 'V3_CSE_TOWARD_UNBOUND', label: towardRaw, matchCount: matches.length }); return null; }
     towardEntityId = toward.entityId;
   }
   const visibilityRaw = typeof raw === 'object' ? field(raw, ['visibility', '可见性']) : null;
   const sourceOrigin = evidence.every(item => item.kind === 'authorialSetting') ? 'baseline' : 'floor';
+  const quantification = normalizeCseQuantification(raw?.quantification, category);
+  if (category === 'adaptive' && quantification) quantification.strength = advanceAdaptiveStrength(original?.quantification?.strength, quantification.strength);
   return {
     id: await deterministicUuid(['v3-cse-calibrated-state-item', deltaId, binding.entityId, category, index, value, towardEntityId]),
     text: value,
@@ -619,6 +911,7 @@ async function calibratedStateItem({ raw, category, binding, knownBindings, delt
     towardEntityId,
     sourceFloorId: floorId,
     sourceDeltaId: deltaId,
+    ...(quantification ? { quantification } : {}),
   };
 }
 
@@ -658,8 +951,9 @@ async function compileCalibratedCategory({ rawSubject, category, binding, previo
     let towardEntityId;
     const towardRaw = field(review, ['toward', 'target', 'object', '对谁', '对象']);
     if (category === 'adaptive' && towardRaw !== undefined && towardRaw !== null && String(towardRaw).trim()) {
-      const toward = bindingFor(towardRaw, envelope.scope.knownBindings);
-      if (!toward) { isolated.push({ field: `${category}.review`, index, code: 'V3_CSE_TOWARD_UNBOUND' }); continue; }
+      const matches = matchingBindings(towardRaw, envelope.scope.knownBindings);
+      const toward = matches.length === 1 ? matches[0] : null;
+      if (!toward) { isolated.push({ field: `${category}.review`, index, code: 'V3_CSE_TOWARD_UNBOUND', label: towardRaw, matchCount: matches.length }); continue; }
       towardEntityId = toward.entityId;
     }
     const matches = original.filter(item => normalized(item.text) === normalized(previousText)
@@ -667,8 +961,16 @@ async function compileCalibratedCategory({ rawSubject, category, binding, previo
     if (matches.length !== 1 || reviewedIds.has(matches[0]?.id)) { isolated.push({ field: `${category}.review`, index, code: 'V3_CSE_REVIEW_TARGET_AMBIGUOUS' }); continue; }
     const matched = matches[0];
     reviewedIds.add(matched.id);
-    if (action === 'keep') { acceptedIntents.count += 1; continue; }
-    const evidence = calibratedEvidence(review, { envelope, binding, category, index, isolated });
+    const historyEvidence = relationHistoryEvidence(review, { envelope, binding, category, original: matched, index, isolated });
+    if (historyEvidence === null) { acceptedIntents.count += 1; continue; }
+    if (action === 'keep') {
+      if (category === 'adaptive' && matched.origin !== 'manual' && !normalizeCseQuantification(matched.quantification, category)) {
+        const quantification = normalizeCseQuantification(review.quantification, category);
+        if (quantification) output.splice(output.findIndex(item => item.id === matched.id), 1, { ...matched, quantification });
+      }
+      acceptedIntents.count += 1; continue;
+    }
+    const evidence = historyEvidence ?? calibratedEvidence(review, { envelope, binding, category, index, isolated });
     if (!calibratedMutationAllowed({ category, evidence, manualCore })) { isolated.push({ field: `${category}.review`, index, code: 'V3_CSE_CALIBRATION_EVIDENCE_INSUFFICIENT' }); continue; }
     const currentIndex = output.findIndex(item => item.id === matched.id);
     if (currentIndex < 0) { isolated.push({ field: `${category}.review`, index, code: 'V3_CSE_REVIEW_TARGET_AMBIGUOUS' }); continue; }
@@ -682,13 +984,17 @@ async function compileCalibratedCategory({ rawSubject, category, binding, previo
     if (replacement && !sameItemMeaning(matched, replacement)) {
       output.splice(currentIndex, 1, replacement);
       calibrationAudit.push(calibrationAuditEntry({ binding, category, action, original: matched, item: replacement, raw: review, evidence }));
+    } else if (replacement?.quantification && matched.origin !== 'manual') {
+      output.splice(currentIndex, 1, { ...matched, ...cseQuantificationFields(replacement, category) });
     }
     if (replacement) acceptedIntents.count += 1;
   }
 
   for (const [index, addition] of list(additionsRaw).slice(0, 120).entries()) {
     if (!addition || typeof addition !== 'object' || Array.isArray(addition)) { isolated.push({ field: `${category}.additions`, index, code: 'V3_CSE_OPTIONAL_ITEM_INVALID' }); continue; }
-    const evidence = calibratedEvidence(addition, { envelope, binding, category, index, isolated });
+    const historyEvidence = relationHistoryEvidence(addition, { envelope, binding, category, index, isolated });
+    if (historyEvidence === null) { acceptedIntents.count += 1; continue; }
+    const evidence = historyEvidence ?? calibratedEvidence(addition, { envelope, binding, category, index, isolated });
     if (category === 'adaptive' && envelope.scope.userAdaptiveReview
       && evidence.some(item => item.kind === 'userAdaptiveHistory')
       && !evidence.some(item => ['story', 'userInput'].includes(item.kind))) {
@@ -707,20 +1013,34 @@ async function compileCalibratedCategory({ rawSubject, category, binding, previo
 }
 
 export async function compileCseResponse({ response, finishReason, envelope, previousCurrentState, now, deltaId, userCoreExtraction = null }) {
-  const packet = parsePacket(response, { finishReason });
+  const packet = parsePacket(response, { finishReason, compareUserCoreExtraction: Boolean(userCoreExtraction) });
   if (!hasRecognizableCseResult(packet)) throw errorWith('V3_CSE_FORMAT_INVALID', 'CSE 返回不含可识别的人物状态结果。');
   const isolated = [];
+  const identityBriefUpdates = compileIdentityBriefUpdates(packet, envelope, isolated, deltaId);
   const previousById = new Map((previousCurrentState?.subjects ?? []).map(subject => [subject.subjectEntityId, subject]));
   const compiled = new Map();
   const calibrationAudit = [];
   const rawSubjects = list(selectSubjectResults(packet));
   const acceptedIntents = { count: 0 };
   for (const [subjectIndex, raw] of rawSubjects.slice(0, 80).entries()) {
-    const binding = bindingFor(raw, envelope.scope.trackedBindings);
-    if (!binding) { isolated.push({ field: 'subjects', index: subjectIndex, code: 'V3_CSE_SUBJECT_UNBOUND' }); continue; }
-    if (compiled.has(binding.entityId)) { isolated.push({ field: 'subjects', index: subjectIndex, code: 'V3_CSE_SUBJECT_DUPLICATE' }); continue; }
+    const matches = matchingBindings(raw, envelope.scope.trackedBindings);
+    const binding = matches.length === 1 ? matches[0] : null;
+    const subjectLabel = typeof raw === 'string' ? raw : field(raw, ['subject', 'name', 'person', 'character', '主体', '人物', '姓名']);
+    if (!binding) { isolated.push({ field: 'subjects', index: subjectIndex, code: 'V3_CSE_SUBJECT_UNBOUND', label: subjectLabel, matchCount: matches.length }); continue; }
+    if (compiled.has(binding.entityId)) { isolated.push({ field: 'subjects', index: subjectIndex, code: 'V3_CSE_SUBJECT_DUPLICATE', label: subjectLabel, matchCount: matches.length }); continue; }
+    const isolationStart = isolated.length;
     const acceptedBeforeSubject = acceptedIntents.count;
     const previous = previousById.get(binding.entityId) ?? { core: [], adaptive: [], situational: [] };
+    if (binding.reviewOnly) {
+      const rawSituational = field(raw, ['situational', 'situation', '短期状态', '情境']);
+      const proposed = rawSituational === undefined ? previous.situational
+        : await compileSituationalCategory({ raw: rawSituational, category: 'situational', binding, knownBindings: envelope.scope.knownBindings, deltaId, floorId: envelope.scope.floorId, previous: previous.situational, isolated, acceptedIntents });
+      const retainedIds = new Set(proposed.map(item => item.id));
+      const situational = previous.situational.filter(item => item.origin === 'manual' || retainedIds.has(item.id));
+      compiled.set(binding.entityId, { ...previous, subjectEntityId: binding.entityId, situational, changeSummary: [], coreChallenges: [] });
+      acceptedIntents.count += 1;
+      continue;
+    }
     const hasCore = field(raw, categoryNames('core')) !== undefined;
     const hasAdaptive = field(raw, categoryNames('adaptive')) !== undefined;
     const hasSituational = field(raw, ['situational', 'situation', '短期状态', '情境']) !== undefined;
@@ -735,7 +1055,7 @@ export async function compileCseResponse({ response, finishReason, envelope, pre
     }
     const proposedCore = calibratedCore ?? (hasCore ? await compileAfterStateCategory({ raw: field(raw, categoryNames('core')), category: 'core', binding, knownBindings: envelope.scope.knownBindings, deltaId, floorId: envelope.scope.floorId, previous: previous.core, isolated, acceptedIntents }) : previous.core);
     const adaptive = calibratedAdaptive ?? (hasAdaptive ? await compileAfterStateCategory({ raw: field(raw, categoryNames('adaptive')), category: 'adaptive', binding, knownBindings: envelope.scope.knownBindings, deltaId, floorId: envelope.scope.floorId, previous: previous.adaptive, isolated, acceptedIntents }) : previous.adaptive);
-    const situational = hasSituational ? await compileAfterStateCategory({ raw: field(raw, ['situational', 'situation', '短期状态', '情境']), category: 'situational', binding, knownBindings: envelope.scope.knownBindings, deltaId, floorId: envelope.scope.floorId, previous: previous.situational, isolated, acceptedIntents }) : previous.situational;
+    const situational = hasSituational ? await compileSituationalCategory({ raw: field(raw, ['situational', 'situation', '短期状态', '情境']), category: 'situational', binding, knownBindings: envelope.scope.knownBindings, deltaId, floorId: envelope.scope.floorId, previous: previous.situational, isolated, acceptedIntents }) : previous.situational;
     const explicitChallenges = list(field(raw, ['coreChallenges', 'coreChallenge', '核心挑战'])).map(itemSemantic).filter(Boolean);
     let core = proposedCore;
     const challenges = [...explicitChallenges];
@@ -747,8 +1067,15 @@ export async function compileCseResponse({ response, finishReason, envelope, pre
     compiled.set(binding.entityId, { subjectEntityId: binding.entityId, core, adaptive, situational, changeSummary: [], coreChallenges: [...new Set(challenges)].slice(0, 40) });
     if (acceptedIntents.count === acceptedBeforeSubject && !hasCore && !hasAdaptive && !hasSituational
       && calibratedCore === null && calibratedAdaptive === null) acceptedIntents.count += 1;
+    for (let index = isolationStart; index < isolated.length; index += 1) isolated[index].subjectIndex = subjectIndex;
   }
-  if (rawSubjects.length > 0 && acceptedIntents.count === 0 && isolated.length > 0) throw errorWith('V3_CSE_ALL_CANDIDATES_ISOLATED', 'CSE 返回的人物状态候选均未能有效处理，请重试。');
+  if (rawSubjects.length > 0 && acceptedIntents.count === 0 && isolated.length > 0) {
+    const error = errorWith('V3_CSE_ALL_CANDIDATES_ISOLATED', '本楼人物状态未保存：返回结果无法确认人物归属或未通过校验。请到设置 → 记忆管理 → 详细诊断，复制状态诊断反馈。');
+    error.cseDiagnostics = { subjectResolution: projectCseSubjectDiagnostic({
+      trackedSubjects: envelope.request.payload.trackedSubjects, knownPeople: envelope.request.payload.knownPeople, isolated,
+    }) };
+    throw error;
+  }
   let userCoreExtractionResult = null;
   if (userCoreExtraction) {
     const rawReview = field(packet, ['userCoreExtraction', '用户核心特质提取']);
@@ -788,6 +1115,7 @@ export async function compileCseResponse({ response, finishReason, envelope, pre
     return {
       ...subject,
       changeSummary: actualSubjectChanges({ before: previous, after: subject, audits })
+        .filter(change => !isCseQuantificationOnlyChange(change))
         .map(change => summarizeActualChange(change, envelope.scope.knownBindings))
         .slice(0, 40),
     };
@@ -805,29 +1133,37 @@ export async function compileCseResponse({ response, finishReason, envelope, pre
     return [...clearedMembers, subject];
   });
   const fingerprint = `sha256:${await sha256(JSON.stringify([envelope.scope.floorId, envelope.scope.floorMemoryId, subjectSnapshots, noMaterialChange, { fixedChanges }]))}`;
-  const isolationCodes = [...new Set(isolated.map(item => item.code).filter(code => CSE_ISOLATION_CODES.includes(code)))];
-  const delta = validateStateDeltaRecord({ schemaVersion: 3, recordType: 'stateDelta', id: deltaId, chatId: envelope.scope.chatId, narrativeGeneration: envelope.scope.narrativeGeneration, floorId: envelope.scope.floorId, floorMemoryId: envelope.scope.floorMemoryId, baselineId: envelope.scope.baselineId, previousCurrentStateId: previousCurrentState?.id ?? null, subjectSnapshots, fixedChanges, noMaterialChange, fingerprint, source: { promptVersion: CSE_PROMPT_VERSION, compilerVersion: CSE_COMPILER_VERSION, calibrationVersion: CSE_CALIBRATION_VERSION, ...(userCoreExtractionResult ? { userCoreExtraction: userCoreExtractionResult } : {}), ...(calibrationAudit.length ? { calibrationAudit } : {}), ...(isolated.length ? { isolationSummary: { count: isolated.length, codes: isolationCodes } } : {}) }, createdAt: now, updatedAt: now, recordStatus: 'active', supersedes: null }, { expectedChatId: envelope.scope.chatId });
-  return Object.freeze({ delta, isolated: Object.freeze(isolated) });
+  const stateIsolated = isolated.filter(item => item.field !== 'identityBriefUpdates' && !item.field.startsWith('identityBriefUpdates.'));
+  const isolationCodes = [...new Set(stateIsolated.map(item => item.code).filter(code => CSE_ISOLATION_CODES.includes(code)))];
+  const delta = validateStateDeltaRecord({ schemaVersion: 3, recordType: 'stateDelta', id: deltaId, chatId: envelope.scope.chatId, narrativeGeneration: envelope.scope.narrativeGeneration, floorId: envelope.scope.floorId, floorMemoryId: envelope.scope.floorMemoryId, baselineId: envelope.scope.baselineId, previousCurrentStateId: previousCurrentState?.id ?? null, subjectSnapshots, fixedChanges, noMaterialChange, fingerprint, source: { promptVersion: CSE_PROMPT_VERSION, compilerVersion: CSE_COMPILER_VERSION, calibrationVersion: CSE_CALIBRATION_VERSION, ...(userCoreExtractionResult ? { userCoreExtraction: userCoreExtractionResult } : {}), ...(calibrationAudit.length ? { calibrationAudit } : {}), ...(stateIsolated.length ? { isolationSummary: { count: stateIsolated.length, codes: isolationCodes } } : {}) }, createdAt: now, updatedAt: now, recordStatus: 'active', supersedes: null }, { expectedChatId: envelope.scope.chatId });
+  // Successful runs keep their existing isolation record contract; labels belong only to failure hints.
+  for (const item of isolated) { delete item.label; delete item.matchCount; delete item.subjectIndex; }
+  return Object.freeze({ delta, identityBriefUpdates: Object.freeze(identityBriefUpdates.map(update => Object.freeze(update))), isolated: Object.freeze(isolated) });
 }
 
 const categoryAllowsToward = category => category === 'adaptive' || category === 'situational';
 const manualItemMeaning = (item, category) => [item.text, item.visibility, categoryAllowsToward(category) ? item.towardEntityId ?? null : null];
+const manualCategoryLabel = category => ({ core: '核心特质', adaptive: '长期倾向', situational: '当前情境' })[category] ?? '人物状态';
 
 async function manualStateItems({ edits, originals, category, subjectEntityId, floorId, oldDeltaId, deltaId, allowedTowardEntityIds }) {
-  if (!Array.isArray(edits) || edits.length > 120) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', `${category} 编辑内容无效。`);
+  const label = manualCategoryLabel(category);
+  if (!Array.isArray(edits)) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', `${label}编辑内容无效，请调整后重试。`);
+  if (edits.length > 120) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', `${label}最多120项，请删减后保存。`);
   const originalById = new Map(originals.map(item => [item.id, item]));
   const usedIds = new Set();
   const output = [];
   for (const [index, raw] of edits.entries()) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', `${category} 第 ${index + 1} 项无效。`);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', `${label}第${index + 1}项格式无效，请重新编辑。`);
     const itemId = typeof raw.itemId === 'string' && raw.itemId ? raw.itemId : null;
     const original = itemId ? originalById.get(itemId) : null;
-    if (itemId && (!original || usedIds.has(itemId))) throw errorWith('V3_CSE_MANUAL_INPUT_STALE', `${category} 第 ${index + 1} 项已变化，请重新打开编辑。`);
+    if (itemId && (!original || usedIds.has(itemId))) throw errorWith('V3_CSE_MANUAL_INPUT_STALE', `${label}第${index + 1}项已变化，请重新打开编辑。`);
     if (itemId) usedIds.add(itemId);
     const itemText = typeof raw.text === 'string' ? raw.text.trim() : '';
-    if (!itemText || itemText.length > 4000 || !CSE_VISIBILITIES.includes(raw.visibility)) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', `${category} 第 ${index + 1} 项内容或可见性无效。`);
+    if (!itemText) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', `${label}第${index + 1}项内容为空，请填写或删除该项。`);
+    if (itemText.length > 4000) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', `${label}第${index + 1}项内容超过4000字，请缩短后保存。`);
+    if (!CSE_VISIBILITIES.includes(raw.visibility)) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', `${label}第${index + 1}项信息范围无效，请重新选择。`);
     const towardEntityId = categoryAllowsToward(category) && typeof raw.towardEntityId === 'string' && raw.towardEntityId ? raw.towardEntityId : null;
-    if (towardEntityId && !allowedTowardEntityIds.has(towardEntityId)) throw errorWith('V3_CSE_MANUAL_TOWARD_INVALID', '关系对象不在当前锚点可用人物范围内。');
+    if (towardEntityId && !allowedTowardEntityIds.has(towardEntityId)) throw errorWith('V3_CSE_MANUAL_TOWARD_INVALID', '所选关系对象当前不可用，请重新选择人物。');
     const nextMeaning = [itemText, raw.visibility, towardEntityId];
     if (original && JSON.stringify(manualItemMeaning(original, category)) === JSON.stringify(nextMeaning)) {
       if (original.sourceDeltaId !== oldDeltaId) { output.push(original); continue; }
@@ -851,13 +1187,48 @@ async function manualStateItems({ edits, originals, category, subjectEntityId, f
   return output;
 }
 
+export function mergeManualCseEdits({ currentSubject, original, edits, manualChanges = [] }) {
+  const merged = {};
+  for (const category of ['core', 'adaptive', 'situational']) {
+    const current = currentSubject[category] ?? [];
+    const copy = item => ({ itemId: item.id, text: item.text, visibility: item.visibility, towardEntityId: item.towardEntityId ?? null });
+    merged[category] = current.map(copy);
+    if (!Object.hasOwn(edits, category)) continue;
+    const desired = edits[category];
+    if (!Array.isArray(desired) || desired.some(item => !item || typeof item !== 'object')) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', '人物状态编辑内容无效。');
+    const editedIds = desired.map(item => item.itemId).filter(Boolean);
+    if (new Set(editedIds).size !== editedIds.length) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', '人物状态编辑条目重复。');
+    const baseline = original?.[category] ?? current.map(item => ({ ...copy(item), origin: item.origin }));
+    const baselineIds = new Set(baseline.map(item => item.itemId));
+    if (desired.some(item => item.itemId && !baselineIds.has(item.itemId))) throw errorWith('V3_CSE_MANUAL_STALE', '所编辑条目已变化，请保留草稿并重新打开。');
+    const same = (left, right) => JSON.stringify(manualItemMeaning(left, category)) === JSON.stringify(manualItemMeaning(right, category));
+    for (const before of baseline) {
+      const after = desired.find(item => item.itemId === before.itemId);
+      if (after && same(before, after)) continue;
+      const equivalent = current.filter(item => item.origin === before.origin && same(item, before));
+      const latest = current.find(item => item.id === before.itemId) ?? (equivalent.length === 1 ? equivalent[0] : null);
+      const removed = manualChanges.some(change => change.category === category && !change.after
+        && (change.before?.id === before.itemId || (change.before && same(change.before, before)) || current.length === 0));
+      const revised = manualChanges.some(change => change.category === category && change.before?.id === before.itemId
+        && change.after?.origin === 'manual' && !same(change.after, before));
+      if (revised || (latest?.origin === 'manual' && !same(latest, before)) || (after && removed) || (!latest && after && before.origin === 'manual')) {
+        throw errorWith('V3_CSE_MANUAL_STALE', '所编辑条目已被人工修改或删除，请保留草稿并重新打开。');
+      }
+      merged[category] = merged[category].filter(item => item.itemId !== before.itemId && item.itemId !== latest?.id);
+      if (after) merged[category].push({ ...after, itemId: latest?.id ?? null });
+    }
+    merged[category].push(...desired.filter(item => !item.itemId));
+  }
+  return merged;
+}
+
 export async function createManualCseCorrection({ anchorDelta, currentState, subjectEntityId, subjectMemberEntityIds = [subjectEntityId], edits, allowedTowardEntityIds = [], deltaId, now }) {
   const currentSubject = currentState?.subjects?.find(subject => subject.subjectEntityId === subjectEntityId);
   if (!currentSubject || !anchorDelta?.subjectSnapshots || typeof deltaId !== 'string') throw errorWith('V3_CSE_MANUAL_TARGET_INVALID', '当前人物状态或纠正锚点不可用。');
   const allowed = new Set(allowedTowardEntityIds);
   const categories = ['core', 'adaptive', 'situational'];
-  const normalizedEdits = Object.fromEntries(categories.map(category => [category, Array.isArray(edits?.[category]) ? edits[category] : null]));
-  if (categories.some(category => normalizedEdits[category] === null)) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', '人物状态编辑内容不完整。');
+  const normalizedEdits = Object.fromEntries(categories.map(category => [category, Object.hasOwn(edits ?? {}, category) ? edits[category] : currentSubject[category].map(item => ({ itemId: item.id, ...item }))]));
+  if (categories.some(category => !Array.isArray(normalizedEdits[category]))) throw errorWith('V3_CSE_MANUAL_INPUT_INVALID', '人物状态编辑内容不完整。');
   const unchanged = categories.every(category => JSON.stringify(normalizedEdits[category].map(item => [String(item?.text ?? '').trim(), item?.visibility, categoryAllowsToward(category) ? item?.towardEntityId || null : null])) === JSON.stringify(currentSubject[category].map(item => manualItemMeaning(item, category))));
   if (unchanged) return Object.freeze({ status: 'unchanged', delta: null });
 
@@ -876,7 +1247,15 @@ export async function createManualCseCorrection({ anchorDelta, currentState, sub
   const coreChanged = JSON.stringify(normalizedEdits.core.map(item => [String(item?.text ?? '').trim(), item?.visibility])) !== JSON.stringify(currentSubject.core.map(item => [item.text, item.visibility]));
   const manualCoreSubjectEntityIds = [...new Set([...(anchorDelta.source?.manualCoreSubjectEntityIds ?? []), ...(coreChanged ? [subjectEntityId] : [])])].filter(id => snapshotIds.has(id));
   const noMaterialChange = false;
-  const targetItems = actualSubjectChanges({ before: currentSubject, after: corrected, audits: [] });
+  const originalSubject = structuredClone(currentSubject);
+  if (anchorDelta.source?.manualSubjectEntityIds?.includes(subjectEntityId)) {
+    const previousChanges = anchorDelta.fixedChanges?.find(subject => subject.subjectEntityId === subjectEntityId)?.items ?? [];
+    for (const change of [...previousChanges].reverse()) {
+      originalSubject[change.category] = originalSubject[change.category].filter(item => !change.after || (item.id !== change.after.id && JSON.stringify(stateMeaning(item)) !== JSON.stringify(stateMeaning(change.after))));
+      if (change.before) originalSubject[change.category].push(change.before);
+    }
+  }
+  const targetItems = actualSubjectChanges({ before: originalSubject, after: corrected, audits: [] });
   const fixedChanges = [
     ...(anchorDelta.fixedChanges ?? []).filter(subject => !memberIdSet.has(subject.subjectEntityId)),
     ...(targetItems.length ? [{ subjectEntityId, items: targetItems }] : []),
@@ -909,15 +1288,15 @@ export async function createManualCseCorrection({ anchorDelta, currentState, sub
   return Object.freeze({ status: 'ready', delta });
 }
 
-export async function runCseRequest({ generateAnalysisTask, envelope, previousCurrentState, now, deltaId, promptGuidance = '', processingPrompt = '', signal }) {
-  const transportBudget = { remaining: 3, used: 0 };
+export async function runCseRequest({ generateAnalysisTask, envelope, previousCurrentState, now, deltaId, promptGuidance = '', processingPrompt = '', signal, transportBudget = { remaining: 3, used: 0 } }) {
   const systemPrompt = buildCseSystemPrompt(promptGuidance, processingPrompt);
   const taskMessages = [{ role: 'user', content: JSON.stringify(envelope.request) }];
-  for (let attempts = 1; attempts <= 3; attempts += 1) {
+  for (let attempts = 1; attempts <= (transportBudget.totalAttempts ?? 3); attempts += 1) {
     let candidate = null, metadata = sanitizeTaskMetadata(null), receivedResult = false;
     try {
       const result = await generateAnalysisTask({ systemPrompt, taskMessages, maxTokens: 30000, temperature: 0, signal, includeCharacterCard: false, worldInfoSource: 'none', transportBudget, parseMode: 'semantic' });
       receivedResult = true;
+      if (transportBudget.diagnostic) Object.assign(transportBudget.diagnostic, { phase: 'compile', phaseStartedAt: Date.now(), attemptEndedAt: Date.now(), outcome: 'running', endedAt: null });
       candidate = result?.jsonData ?? result?.textData ?? result;
       metadata = sanitizeTaskMetadata(result?.taskMetadata);
       const compiled = await compileCseResponse({ response: candidate, finishReason: result?.taskMetadata?.finishReason, envelope, previousCurrentState, now, deltaId, userCoreExtraction: envelope.scope.userCoreExtraction });
@@ -925,17 +1304,30 @@ export async function runCseRequest({ generateAnalysisTask, envelope, previousCu
     } catch (error) {
       if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
       if (error?.name === 'AbortError') throw error;
+      if (transportBudget.diagnostic) {
+        const code = /^(?:QQJ|V3)_[A-Z0-9_]{1,80}$/.test(error?.code ?? '') ? error.code : null;
+        const name = ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'TimeoutError'].includes(error?.name) ? error.name : null;
+        const status = error?.httpStatus ?? error?.status;
+        if (receivedResult || transportBudget.diagnostic.lastAttemptError?.attempt !== transportBudget.used || transportBudget.diagnostic.lastAttemptError?.code !== code) {
+          transportBudget.diagnostic.lastAttemptError = { code, name, httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null, at: Date.now(), attempt: transportBudget.used, phase: transportBudget.diagnostic.phase };
+        }
+        const failure = transportBudget.diagnostic.lastAttemptError;
+        Object.assign(transportBudget.diagnostic, { outcome: 'failed', error: { code: failure.code, name: failure.name, httpStatus: failure.httpStatus, at: failure.at }, endedAt: Date.now() });
+      }
       const retryable = receivedResult || error?.retryableRecognitionFormat === true || ['QQJ_TIMEOUT', 'QQJ_EMPTY'].includes(error?.code);
-      if (retryable && attempts < 3 && transportBudget.remaining > 0) continue;
+      if (retryable && attempts < (transportBudget.totalAttempts ?? 3) && transportBudget.remaining > 0) continue;
       const failedAttempts = transportBudget.used || attempts;
       if (failedAttempts > 1) error.message = `已尝试 ${failedAttempts} 次仍失败：${error.message}`;
-      error.cseDiagnostics = { attempts, transportAttempts: transportBudget.used || error?.transportAttempts || null, metadata: sanitizeTaskMetadata(error?.taskMetadata ?? metadata), response: sanitizeCompletionDiagnostic(error?.responseDiagnostic), candidate: (() => { try { return JSON.stringify(candidate).slice(0, 24000); } catch { return null; } })(), providerError: sanitizeDiagnosticValue(error?.providerError ?? null) };
+      const subjectResolution = error?.cseDiagnostics?.subjectResolution ?? projectCseSubjectDiagnostic({
+        trackedSubjects: envelope.request.payload.trackedSubjects, knownPeople: envelope.request.payload.knownPeople,
+      });
+      error.cseDiagnostics = { attempts, transportAttempts: transportBudget.used || error?.transportAttempts || null, metadata: sanitizeTaskMetadata(error?.taskMetadata ?? metadata), response: sanitizeCompletionDiagnostic(error?.responseDiagnostic), candidate: (() => { try { return JSON.stringify(candidate).slice(0, 24000); } catch { return null; } })(), providerError: sanitizeDiagnosticValue(error?.providerError ?? null), subjectResolution };
       throw error;
     }
   }
 }
 
-export function filterReachableDeltas({ floors = [], floorMemories = [], stateDeltas = [] }) {
+export function filterReachableDeltas({ floors = [], stateDeltas = [] }) {
   const order = new Map(floors.map((floor, index) => [floor.id, index]));
   const candidates = new Map();
   for (const delta of stateDeltas) {
@@ -973,7 +1365,11 @@ function categoryChanges({ before, after, category, audits }) {
   const beforeKeys = before.map(itemMeaningKey), afterKeys = after.map(itemMeaningKey);
   for (let beforeIndex = 0; beforeIndex < before.length; beforeIndex += 1) {
     const afterIndex = afterKeys.findIndex((key, index) => !usedAfter.has(index) && key === beforeKeys[beforeIndex]);
-    if (afterIndex >= 0) { usedBefore.add(beforeIndex); usedAfter.add(afterIndex); }
+    if (afterIndex >= 0) {
+      usedBefore.add(beforeIndex); usedAfter.add(afterIndex);
+      const change = { category, action: 'update', before: before[beforeIndex], after: after[afterIndex] };
+      if (isCseQuantificationOnlyChange(change)) changes.push(change);
+    }
   }
   const findBefore = (value, toward) => before.findIndex((item, index) => !usedBefore.has(index) && normalized(item.text) === normalized(value) && (item.towardEntityId ?? null) === (toward ?? null));
   const findAfter = (value, toward) => after.findIndex((item, index) => !usedAfter.has(index) && normalized(item.text) === normalized(value) && (item.towardEntityId ?? null) === (toward ?? null));
@@ -1046,6 +1442,67 @@ export function deriveCseTimeline(stateDeltas = []) {
     timeline.push(Object.freeze({ deltaId: delta.id, floorId: delta.floorId, noMaterialChange: delta.noMaterialChange, changes: Object.freeze(changes), endStateSubjects: Object.freeze(endStateSubjects), isolationSummary: delta.source?.isolationSummary ? Object.freeze({ count: delta.source.isolationSummary.count, codes: Object.freeze([...delta.source.isolationSummary.codes]) }) : null }));
   }
   return Object.freeze(timeline);
+}
+
+function manualDeltaChanges(delta) {
+  const ids = new Set(delta.source?.manualSubjectEntityIds ?? []);
+  if (Object.hasOwn(delta, 'fixedChanges')) return delta.fixedChanges.filter(subject => ids.has(subject.subjectEntityId));
+  return delta.subjectSnapshots.filter(snapshot => ids.has(snapshot.subjectEntityId)).map(snapshot => ({
+    subjectEntityId: snapshot.subjectEntityId,
+    items: ['core', 'adaptive', 'situational'].flatMap(category => snapshot[category].filter(item => item.origin === 'manual')
+      .map(after => ({ category, action: 'add', before: null, after }))),
+  }));
+}
+
+function applyManualDeltaChanges(subjects, delta, changes) {
+  const snapshots = [];
+  for (const change of changes) {
+    const snapshot = delta.subjectSnapshots.find(item => item.subjectEntityId === change.subjectEntityId);
+    if (!snapshot) continue;
+    const before = subjects.get(change.subjectEntityId) ?? EMPTY_CSE_SUBJECT;
+    const next = { subjectEntityId: change.subjectEntityId, core: [...before.core], adaptive: [...before.adaptive], situational: [...before.situational] };
+    for (const item of change.items) {
+      const values = next[item.category];
+      const clear = item.action === 'remove' && snapshot[item.category]?.length === 0;
+      next[item.category] = clear ? [] : values.filter(value => value.id !== item.before?.id && (!item.before || itemMeaningKey(value) !== itemMeaningKey(item.before)));
+      if (item.after?.origin === 'manual' && !next[item.category].some(value => value.id === item.after.id)) next[item.category].push(item.after);
+    }
+    if (delta.source?.manualCoreSubjectEntityIds?.includes(change.subjectEntityId) && !snapshot.core.length) next.core = [];
+    subjects.set(change.subjectEntityId, next);
+    snapshots.push(next);
+  }
+  return snapshots;
+}
+
+export async function preserveManualCseDelta(automaticDelta, manualDelta) {
+  if (!manualDelta?.source?.manualSubjectEntityIds?.length) return automaticDelta;
+  const changes = manualDeltaChanges(manualDelta);
+  const subjects = new Map(automaticDelta.subjectSnapshots.map(snapshot => [snapshot.subjectEntityId, snapshot]));
+  applyManualDeltaChanges(subjects, manualDelta, changes);
+  const subjectSnapshots = [...subjects.values()].map(subject => ({ ...subject,
+    changeSummary: subject.changeSummary ?? [], coreChallenges: subject.coreChallenges ?? [] }));
+  const ids = new Set(manualDelta.source.manualSubjectEntityIds);
+  const fixedChanges = [...(automaticDelta.fixedChanges ?? []).filter(subject => !ids.has(subject.subjectEntityId)), ...changes.filter(subject => subject.items.length)];
+  const noMaterialChange = false;
+  const fingerprint = `sha256:${await sha256(JSON.stringify([automaticDelta.floorId, automaticDelta.floorMemoryId, subjectSnapshots, noMaterialChange, { fixedChanges }]))}`;
+  return validateStateDeltaRecord({ ...automaticDelta, subjectSnapshots, fixedChanges, noMaterialChange, fingerprint,
+    source: { ...automaticDelta.source, manualSubjectEntityIds: [...ids],
+      ...(manualDelta.source.manualCoreSubjectEntityIds ? { manualCoreSubjectEntityIds: manualDelta.source.manualCoreSubjectEntityIds } : {}) } }, { expectedChatId: automaticDelta.chatId });
+}
+
+export function projectCseDeltasForSources({ floors = [], stateDeltas = [], confirmedFloorIds }) {
+  const subjects = new Map(), projected = [];
+  for (const delta of filterReachableDeltas({ floors, stateDeltas })) {
+    if (confirmedFloorIds.has(delta.floorId)) {
+      for (const snapshot of delta.subjectSnapshots) applyDeltaSnapshot(subjects, delta, snapshot);
+      projected.push(delta);
+      continue;
+    }
+    const changes = manualDeltaChanges(delta);
+    const snapshots = applyManualDeltaChanges(subjects, delta, changes);
+    if (snapshots.length) projected.push({ ...delta, subjectSnapshots: snapshots, fixedChanges: changes.filter(subject => subject.items.length) });
+  }
+  return projected;
 }
 
 export async function replayCurrentState({ chatId, narrativeGeneration, baselineId, floors = [], floorMemories = [], stateDeltas = [], now, id = null, previousId = null }) {
