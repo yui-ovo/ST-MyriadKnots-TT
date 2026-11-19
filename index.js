@@ -65,6 +65,7 @@ import { normalizeStoryCalendar } from './src/v3/calendar-rules.js';
 
 import { createDynamicWorldbookRuntime } from './src/dynamic-worldbook-runtime.js';
 import { installExtensionUpdateRefresh } from './src/extension-update-refresh.js';
+import { registerInlineMemoryMacro } from './src/inline-memory-macro.js';
 
 let memoryTransfer = null;
 const isGenerating = () => Boolean(is_send_press || is_group_generating);
@@ -486,6 +487,7 @@ const createHistoricalRebuild = options => runHistoricalRebuildTask({
   fetchImpl: globalThis.fetch,
 });
 const inlineMemoryBridge = createInlineMemoryBridge({ hostAdapter, memoryRuntime: v3MemoryRuntime, settings });
+registerInlineMemoryMacro(hostContext(), settings);
 const inlineRenderer = createInlineRenderer({ memoryRuntime: v3MemoryRuntime, recallRuntime: v3RecallRuntime, hostAdapter });
 const chatMemoryManagement = createChatMemoryManagement({
   contextProvider,

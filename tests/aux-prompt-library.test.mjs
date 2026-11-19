@@ -8,6 +8,7 @@ import { createSettingsStore } from '../src/settings.js';
 import { AUX_TASKS } from '../src/aux-prompt-tasks.js';
 import { getAuxTaskTemplateRows } from '../src/aux-prompt-defaults.js';
 import { BASE_PROCESSING_PROMPT } from '../src/shared-processing-prompt.js';
+import { INLINE_MEMORY_PROMPT } from '../src/inline-memory-prompt.js';
 
 function editor(initial) {
   let library = normalizeAuxPromptLibrary(initial);
@@ -197,7 +198,7 @@ test('a clean install has only the locked factory suite; copying it materializes
     assert.equal(base.rows[0].content, BASE_PROCESSING_PROMPT);
     assert.equal(base.rows.at(-1).content, '{{qqj_input}}');
   }
-  for (const key of ['storyClockPrompt', 'avatarPrompt']) {
+  for (const key of ['storyClockPrompt', 'avatarPrompt', 'inlineMemoryPrompt']) {
     assert.equal(getAuxHostPrompt(e.library, key), '');
     const text = getAuxHostPrompt(e.library, key, { display: true });
     assert.ok(text.length > 10);
@@ -214,6 +215,18 @@ test('a clean install has only the locked factory suite; copying it materializes
   assert.equal(getAuxHostPrompt(e.library, 'storyClockPrompt'), '');
   e.edit('deleteSuite', { suiteId });
   assert.deepEqual(e.library, empty);
+});
+
+test('旧版已保存的整套预设自动带上主回复文末摘要，并保留原有选择和修改', () => {
+  const e = editor();
+  e.edit('updateHostPrompt', { key: 'storyClockPrompt', content: '旧套时间戳' });
+  const saved = JSON.parse(JSON.stringify(e.library));
+  delete saved.suites[0].hostPrompts.inlineMemoryPrompt;
+  const settings = createSettingsStore({ extensionSettings: { qianqianjie: { auxPromptLibrary: saved } } });
+  const restored = settings.get().auxPromptLibrary;
+  assert.equal(restored.activeSuiteId, saved.activeSuiteId);
+  assert.equal(getAuxHostPrompt(restored, 'storyClockPrompt'), '旧套时间戳');
+  assert.equal(getAuxHostPrompt(restored, 'inlineMemoryPrompt', { display: true }), INLINE_MEMORY_PROMPT);
 });
 
 test('v1 migration retains chosen variants, connection overrides and task-specific legacy text', () => {

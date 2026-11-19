@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { createContext, SourceTextModule, SyntheticModule } from 'node:vm';
 import { createV3FoundationView } from '../src/ui/v3-foundation-view.js';
 import { applyPluginEnabledImmediately } from '../src/settings.js';
+import { createInlineMemoryMacroField } from '../src/ui/settings/prompts-settings.js';
 import { openHelpGuide } from '../src/ui/help-guide.js';
 import { publicErrorMessage } from '../src/public-error.js';
 import { scrollbarCss } from '../src/ui/scrollbar-style.js';
@@ -89,7 +90,7 @@ test('真实面板按七个主标签映射视图，独立显示预设并恢复�
   const presetsPage = new Node();
   const modules = {
     './dynamic-worldbook-view.js': { createDynamicWorldbookView: () => ({ node: new Node(), dispose() {} }) },
-    '../inline-memory-prompt.js': { INLINE_MEMORY_PROMPT: 'fixture summary prompt' },
+    './settings/prompts-settings.js': { createInlineMemoryMacroField },
     './plugin-updates-view.js': { createPluginUpdatesView: () => ({ controls: new Node(), noticeRow: new Node(), feedback: new Node(), dispose() {} }) },
     './panel.html?raw': { default: '' }, './panel.css?inline': { default: '' },
     './scrollbar-style.js': { scrollbarCss },
@@ -468,7 +469,9 @@ test('真实面板按七个主标签映射视图，独立显示预设并恢复�
   assert.equal(memoryControls.some(node => node.drawerTitle === '时间推演'), false, '设置仅保普通开关，不再有时间抽屉');
   const sourceSelect = memoryControls.flatMap(flatten).find(node => node.attributes?.['aria-label'] === '摘要来源');
   assert.equal(sourceSelect.value, 'api'); assert.deepEqual(Array.from(sourceSelect.children, item => item.value), ['api', 'inline', 'auto']);
-  assert.equal(memoryControls.flatMap(flatten).find(node => node.attributes?.['aria-label'] === '预设摘要提示词').readOnly, true);
+  const summaryMacro = memoryControls.flatMap(flatten).find(node => node.attributes?.['aria-label'] === '酒馆文末摘要宏');
+  assert.equal(summaryMacro.readOnly, true);
+  assert.equal(summaryMacro.value, '{{qqj_memory_prompt}}');
   const timeToggle = memoryControls.find(node => node.id === 'qqj-settings-time');
   assert.equal(timeToggle.tag, 'label'); assert.equal(timeToggle.children[0].textContent, '时间推演');
   assert.equal(timeToggle.children.at(-1).tag, 'input', '时间文字左/开关右');

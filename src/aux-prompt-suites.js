@@ -2,11 +2,16 @@ import { AUX_TASKS } from './aux-prompt-tasks.js';
 import { getAuxTaskTemplateRows, hasLegacyAuxPromptOverrides, materializeLegacyTemplate } from './aux-prompt-defaults.js';
 import { DEFAULT_AVATAR_PROMPT } from './avatar-generation.js';
 import { DEFAULT_MYKNOTS_STORY_CLOCK_PROMPT } from './story-clock.js';
+import { INLINE_MEMORY_PROMPT } from './inline-memory-prompt.js';
 
 export const AUX_BUILTIN_ID = 'builtin';
 const legacySuiteId = 'suite:legacy';
 const builtInSuite = Object.freeze({ id: AUX_BUILTIN_ID, name: '千千结默认' });
-const hostDefaults = { storyClockPrompt: DEFAULT_MYKNOTS_STORY_CLOCK_PROMPT, avatarPrompt: DEFAULT_AVATAR_PROMPT };
+const hostDefaults = {
+  storyClockPrompt: DEFAULT_MYKNOTS_STORY_CLOCK_PROMPT,
+  avatarPrompt: DEFAULT_AVATAR_PROMPT,
+  inlineMemoryPrompt: INLINE_MEMORY_PROMPT,
+};
 const array = value => Array.isArray(value) ? value : [];
 const key = value => typeof value === 'string' ? value.trim() : '';
 const localId = value => Boolean(value && value !== AUX_BUILTIN_ID && !value.startsWith('builtin:'));

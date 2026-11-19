@@ -205,10 +205,10 @@ test('全局包裹符与时钟开关独立保存，宿主的回显保留尚在�
   assert.deepEqual(clock, [{ readOnly: true }, undefined, undefined]); view.dispose(); assert.equal(listeners.size, 0);
 });
 
-test('时间戳与头像提示词随套切换，内置可读，编辑/恢复只写活动套', async () => {
+test('主回复摘要、时间戳与头像提示词随套切换，内置可读，编辑/恢复只写活动套', async () => {
   const settings = createSettingsStore({ extensionSettings: {} }), refreshes = [];
   const ui = auxManager(settings, { onStoryClockChange: options => { refreshes.push(options); } });
-  for (const [key, name] of [['storyClockPrompt','正文时间戳'], ['avatarPrompt','头像生图']]) {
+  for (const [key, name] of [['inlineMemoryPrompt','主回复文末摘要'], ['storyClockPrompt','正文时间戳'], ['avatarPrompt','头像生图']]) {
     await ui.choose('当前使用的预设', 'builtin'); await ui.choose('任务', key); await ui.click(name + '提示词');
     const factory = ui.control('提示词内容').value; assert.ok(factory.length > 20); assert.equal(ui.control('提示词内容').readOnly, true);
     await ui.click('复制整套后编辑本条'); await ui.click('复制并启用');
@@ -222,6 +222,21 @@ test('时间戳与头像提示词随套切换，内置可读，编辑/恢复只�
     assert.equal(getAuxHostPrompt(settings.get().auxPromptLibrary, key), '');
   }
   assert.ok(refreshes.length > 2);
+});
+
+test('主回复文末摘要复制一行酒馆宏，剪贴板不可用时选中宏', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} }), copied = [];
+  const navigatorRef = { clipboard: { writeText: text => copied.push(text) } };
+  const ui = auxManager(settings, { navigatorRef });
+  await ui.choose('任务', 'inlineMemoryPrompt');
+  const field = ui.byLabel('酒馆文末摘要宏');
+  assert.equal(field.readOnly, true);
+  assert.equal(field.value, '{{qqj_memory_prompt}}');
+  await ui.click('复制宏'); assert.deepEqual(copied, [field.value]);
+  delete navigatorRef.clipboard;
+  let selected = false; field.select = () => { selected = true; };
+  await ui.click('复制宏'); assert.ok(selected); assert.equal(documentRef.activeElement, field);
+  ui.view.dispose();
 });
 
 test('副本草稿遇到其他窗口已保存的更改时不覆盖外部数据', async () => {

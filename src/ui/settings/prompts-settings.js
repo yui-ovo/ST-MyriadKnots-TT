@@ -1,4 +1,26 @@
 import { createSettingsKit } from './kit.js';
+import { INLINE_MEMORY_MACRO } from '../../inline-memory-prompt.js';
+
+export function createInlineMemoryMacroField({ documentRef, navigatorRef = documentRef.defaultView?.navigator ?? globalThis.navigator }) {
+  const { element, button } = createSettingsKit(documentRef);
+  const box = element('div', 'qqj-inline-memory-macro');
+  const macro = element('input', 'settings-input');
+  macro.type = 'text'; macro.readOnly = true; macro.value = INLINE_MEMORY_MACRO;
+  macro.setAttribute('aria-label', '酒馆文末摘要宏');
+  const status = element('span', 'settings-hint');
+  status.setAttribute('role', 'status');
+  const copy = button('复制宏', 'secondary-action', async () => {
+    try {
+      await navigatorRef.clipboard.writeText(INLINE_MEMORY_MACRO);
+      status.textContent = '已复制宏。';
+    } catch {
+      macro.focus(); macro.select();
+      status.textContent = '请长按选中的宏复制。';
+    }
+  });
+  box.append(macro, copy, status);
+  return box;
+}
 
 export function createBodyReadSettings({ settings, documentRef = globalThis.document, subscribeSettingsChange, onStoryClockChange }) {
   const { element, field, subDrawer } = createSettingsKit(documentRef);

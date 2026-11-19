@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chooseInlineMemory, readInlineMemory, stripInlineMemory } from '../src/inline-memory-format.js';
-import { INLINE_MEMORY_PROMPT } from '../src/inline-memory-prompt.js';
+import { INLINE_MEMORY_MACRO, INLINE_MEMORY_PROMPT } from '../src/inline-memory-prompt.js';
 import { sanitizeMemoryContent } from '../src/memory-content-sanitizer.js';
 import { createInlineMemoryBridge } from '../src/inline-memory-bridge.js';
+import { registerInlineMemoryMacro } from '../src/inline-memory-macro.js';
+import { editAuxPromptLibrary } from '../src/aux-prompt-library.js';
 import { createSettingsStore } from '../src/settings.js';
 
 import { inlinePacket, inlineBlock } from './inline-memory-fixture.mjs';
@@ -75,6 +77,52 @@ test('配套预设文本用可解析的分栏文字，保留原摘要篇幅与�
   assert.match(INLINE_MEMORY_PROMPT, /通常 200—500 字，最多 4000 字/u);
   assert.doesNotMatch(INLINE_MEMORY_PROMPT, /"version"\s*:|"summary"\s*:/u);
   assert.doesNotMatch(INLINE_MEMORY_PROMPT, /\{\{.*?\}\}/u, '不依赖预设变量存取或被宿主误展开的宏');
+});
+
+test('酒馆宏在发送时读取已保存的预设、摘要来源和总开关', () => {
+  const settings = createSettingsStore({ extensionSettings: {} });
+  let expand;
+  registerInlineMemoryMacro({ registerMacro(name, handler) {
+    assert.equal('{{' + name + '}}', INLINE_MEMORY_MACRO);
+    expand = handler;
+  } }, settings);
+  assert.equal(expand(), '');
+  settings.update({ summarySource: 'inline' });
+  assert.equal(expand(), INLINE_MEMORY_PROMPT);
+
+  const editSuite = action => {
+    const result = editAuxPromptLibrary(settings.get().auxPromptLibrary, action);
+    settings.update({ auxPromptLibrary: result.library });
+    return result.suiteId;
+  };
+  const copy = editSuite({ type: 'copySuite', suiteId: 'builtin', name: '文末摘要副本' });
+  const ownText = '  自用规则\n<qqj_memory>…</qqj_memory>  ';
+  editSuite({ type: 'updateHostPrompt', key: 'inlineMemoryPrompt', content: ownText });
+  settings.update({ summarySource: 'auto' });
+  assert.equal(expand(), ownText);
+  editSuite({ type: 'selectSuite', suiteId: 'builtin' });
+  assert.equal(expand(), INLINE_MEMORY_PROMPT);
+  editSuite({ type: 'selectSuite', suiteId: copy });
+  settings.update({ summarySource: 'api' });
+  assert.equal(expand(), '');
+  settings.update({ summarySource: 'auto', pluginEnabled: false });
+  assert.equal(expand(), '');
+  settings.update({ pluginEnabled: true });
+  assert.equal(expand(), ownText);
+});
+
+test('双引擎宿主只注册当前引擎，也支持仅提供新注册接口的宿主', () => {
+  const settings = { get: () => ({ summarySource: 'auto' }) };
+  for (const [experimental, hasLegacy, expected] of [[false, true, 'legacy'], [true, true, 'modern'], [undefined, false, 'modern']]) {
+    const calls = [];
+    const host = {
+      powerUserSettings: { experimental_macro_engine: experimental },
+      macros: { register: (name, options) => calls.push(['modern', name, options.handler()]) },
+    };
+    if (hasLegacy) host.registerMacro = (name, handler) => calls.push(['legacy', name, handler()]);
+    registerInlineMemoryMacro(host, settings);
+    assert.deepEqual(calls, [[expected, 'qqj_memory_prompt', INLINE_MEMORY_PROMPT]]);
+  }
 });
 
 test('记忆JSON不能污染剧情证据，默认、自定义包裹符、未闭合区块均隔离', () => {

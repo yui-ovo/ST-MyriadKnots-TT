@@ -1,3 +1,6 @@
+export const INLINE_MEMORY_MACRO_NAME = 'qqj_memory_prompt';
+export const INLINE_MEMORY_MACRO = '{{' + INLINE_MEMORY_MACRO_NAME + '}}';
+
 export const INLINE_MEMORY_PROMPT = String.raw`【千千结 · 随正文生成记忆 · 文字版】
 正常完成本轮剧情正文后，在回复末尾另起一行输出且只输出一个 <qqj_memory>…</qqj_memory> 区块。区块不属于剧情，不要在其中继续创作，也不要放在思考、注释、代码围栏或正文包裹标签内。
 

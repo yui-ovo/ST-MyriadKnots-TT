@@ -15,6 +15,7 @@ import { DEFAULT_MYKNOTS_STORY_CLOCK_PROMPT } from '../src/story-clock.js';
 import { ChatSessionError } from '../src/chat-session.js';
 import { cloneHostJsonMetadata, readHostState } from '../src/host-context.js';
 import { createHostAdapter } from '../src/v3/host-adapter.js';
+import { registerInlineMemoryMacro } from '../src/inline-memory-macro.js';
 import { createFoundationStore } from '../src/v3/foundation-store.js';
 import { createFoundationRuntime } from '../src/v3/foundation-runtime.js';
 import { RECALL_RECEIPT_SCHEMA_VERSION, RECALL_STRATEGY_VERSION, projectHistoricalRecallReceipt } from '../src/v3/recall-runtime.js';
@@ -1040,6 +1041,8 @@ test('manifest 唯一登记主入口，生产分包依赖完整、内容哈希�
   let backendCalls = 0;
   let metadataWrites = 0;
   let registrations = 0;
+  const summarySettings = { pluginEnabled: false, summarySource: 'inline' };
+  const hostMacros = new Map();
   const host = {
     characterId: 0,
     groupId: null,
@@ -1055,6 +1058,7 @@ test('manifest 唯一登记主入口，生产分包依赖完整、内容哈希�
     eventTypes: { CHAT_CHANGED: 'chat', PERSONA_CHANGED: 'persona', MESSAGE_SENT: 'sent', MESSAGE_RECEIVED: 'received' },
     eventSource: { on: (name, handler) => eventHandlers.set(name, handler) },
     registerExtensionApi: () => { registrations += 1; },
+    registerMacro: (name, handler) => hostMacros.set(name, handler),
     generateTask: async () => { aiCalls += 1; throw new Error('isolation load must not call AI'); },
   };
   const context = createContext({
@@ -1086,7 +1090,7 @@ test('manifest 唯一登记主入口，生产分包依赖完整、内容哈希�
     else if (hostPath === '/scripts/user.js') module = synthetic(identifier, { getCurrentUserHandle: () => 'isolated-test-user' });
     else if (hostPath === '/lib.js') module = synthetic(identifier, { showdown: {}, DOMPurify: {}, localforage: { INDEXEDDB: 'INDEXEDDB', createInstance: () => ({ async ready() {}, async getItem() { return null; }, async setItem() {}, async removeItem() {}, async keys() { return []; } }) } });
     else if (hostPath === '/scripts/power-user.js') module = synthetic(identifier, { power_user: { persona_description: '' } });
-    else if (hostPath === '/scripts/extensions.js') module = synthetic(identifier, { extension_settings: { qianqianjie: { pluginEnabled: false }, 'schedule-planner': {} }, extensionTypes: {}, extensionNames: [] });
+    else if (hostPath === '/scripts/extensions.js') module = synthetic(identifier, { extension_settings: { qianqianjie: summarySettings, 'schedule-planner': {} }, extensionTypes: {}, extensionNames: [] });
     else if (hostPath === '/script.js') module = synthetic(identifier, { is_send_press: false, saveSettingsDebounced() {}, getRequestHeaders: () => ({}) });
     else if (hostPath === '/scripts/group-chats.js') module = synthetic(identifier, { is_group_generating: false });
     else if (hostPath === '/scripts/world-info.js') module = synthetic(identifier, { loadWorldInfo: async () => null, selected_world_info: [], world_info: {}, world_info_case_sensitive: false, world_info_match_whole_words: false, world_names: [] });
@@ -1110,6 +1114,13 @@ test('manifest 唯一登记主入口，生产分包依赖完整、内容哈希�
   assert.equal(typeof eventHandlers.get('persona'), 'function');
   assert.equal(typeof eventHandlers.get('sent'), 'function');
   assert.equal(typeof eventHandlers.get('received'), 'function');
+  const expandSummary = hostMacros.get('qqj_memory_prompt');
+  assert.equal(expandSummary(), '');
+  summarySettings.pluginEnabled = true;
+  assert.match(expandSummary(), /<qqj_memory>/u);
+  summarySettings.summarySource = 'api';
+  assert.equal(expandSummary(), '');
+  summarySettings.pluginEnabled = false;
   eventHandlers.get('chat')();
   eventHandlers.get('persona')();
   eventHandlers.get('sent')();
@@ -1335,6 +1346,7 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
   let inlineMemoryOptions;
   const inlineMemoryBridge = { clear() { inlineMemoryCalls.push('clear'); }, prepare(type) { inlineMemoryCalls.push(type); }, abortAll() {} };
   define('./src/inline-memory-bridge.js', { createInlineMemoryBridge: options => { inlineMemoryOptions = options; return inlineMemoryBridge; } });
+  define('./src/inline-memory-macro.js', { registerInlineMemoryMacro });
   let peopleWorkspaceState = { status: 'ready', chatId: 'test',
     profilesByEntityId: { 'awake-id': { name: '在场人物', birthday: '1月1日', aliases: '人工称呼', manualFields: ['aliases'] }, 'sleep-id': { name: '休眠人物', birthday: '2月2日' }, 'old-id': { name: '旧身份', birthday: '3月3日' }, 'deleted-id': { name: '已删除', birthday: '4月4日' } },
     identityRedirectsByEntityId: { 'old-id': 'awake-id' }, deletedEntityIds: ['deleted-id'], revision: 1, people: [{ entityId: 'awake-id' }] };

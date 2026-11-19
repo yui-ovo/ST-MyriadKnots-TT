@@ -16,7 +16,7 @@ import { createPluginUpdatesView } from './plugin-updates-view.js';
 import { sharedUiCss } from './shared-ui-style.js';
 
 import { createDynamicWorldbookView } from './dynamic-worldbook-view.js';
-import { INLINE_MEMORY_PROMPT } from '../inline-memory-prompt.js';
+import { createInlineMemoryMacroField } from './settings/prompts-settings.js';
 
 const PUBLIC_API_EXAMPLE = `const bridge = globalThis.qqj_v3_public_bridge_v1;
 const status = bridge.getStatus();
@@ -277,7 +277,7 @@ export function createPanel({
     unmountContent();
     screen = 'presets';
     highlightTab(screen);
-    presetsView ??= createPromptPresetsView({ settings, documentRef, promptPreview, onStoryClockChange, subscribeSettingsChange,
+    presetsView ??= createPromptPresetsView({ settings, documentRef, navigatorRef, promptPreview, onStoryClockChange, subscribeSettingsChange,
       customImpl: options => dialog?.custom?.(options) });
     view.append(presetsView.node);
     mountedContentView = 'presets';
@@ -422,16 +422,10 @@ export function createPanel({
     summarySource.addEventListener('change', () => { settings.update({ summarySource: summarySource.value }); });
     summarySourceRow.append(element('span', '', '摘要来源'), summarySource);
     const promptDetails = element('details', 'settings-subdrawer');
-    promptDetails.append(element('summary', '', '主回复摘要 · 配套预设文本'));
-    const promptText = element('textarea', 'settings-input'); promptText.value = INLINE_MEMORY_PROMPT; promptText.readOnly = true; promptText.rows = 10; promptText.setAttribute('aria-label', '预设摘要提示词');
-    const copyPrompt = element('button', 'secondary-action', '复制预设摘要提示词'); copyPrompt.type = 'button';
-    const copyResult = element('p', 'settings-hint');
-    copyPrompt.addEventListener('click', async () => {
-      try { await navigatorRef.clipboard.writeText(INLINE_MEMORY_PROMPT); copyResult.textContent = '已复制。请替换原预设摘要条目的全部内容，并启用该条目。'; }
-      catch { promptText.focus(); promptText.select?.(); copyResult.textContent = '请长按或复制上方已选中的完整文本。'; }
-    });
-    promptDetails.append(promptText, copyPrompt, copyResult);
-    memoryBody.append(summarySourceRow, element('p', 'settings-hint', '仅影响之后处理的摘要，已有记忆保留。主回复模式需启用配套预设条目；区块残缺会提示，不会偷偷改用 API。CSE 仍单独分析。整段历史压缩需摘要 API。'), promptDetails);
+    promptDetails.append(element('summary', '', '主回复文末摘要 · 酒馆宏'),
+      element('p', 'settings-hint', '用这一行替换酒馆「文末摘要」条目的全部内容，并启用条目。可在千千结「预设」中选择「主回复文末摘要」查看或修改全文。'),
+      createInlineMemoryMacroField({ documentRef, navigatorRef }));
+    memoryBody.append(summarySourceRow, element('p', 'settings-hint', '摘要来源在下次处理时生效。主回复记忆区块残缺时会提示修正。CSE 单独分析，整段历史压缩使用摘要 API。'), promptDetails);
     const timeToggle = element('label', 'setting-switch');
     timeToggle.id = 'qqj-settings-time';
     const timeInput = element('input'); timeInput.type = 'checkbox'; timeInput.checked = settings.get().timeEvolutionEnabled === true;

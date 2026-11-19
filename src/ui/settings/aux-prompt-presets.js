@@ -1,5 +1,5 @@
 import { createSettingsKit } from './kit.js';
-import { createBodyReadSettings } from './prompts-settings.js';
+import { createBodyReadSettings, createInlineMemoryMacroField } from './prompts-settings.js';
 import { createInlineSelect } from '../inline-select.js';
 import { publicErrorMessage } from '../../public-error.js';
 import { AUX_TASKS } from '../../aux-prompt-tasks.js';
@@ -11,6 +11,7 @@ import {
 const roleNames = { system: '系统', user: '用户', assistant: '助手' };
 const roleOptions = Object.entries(roleNames).map(([value, label]) => ({ value, label }));
 const hostTasks = [
+  { id: 'inlineMemoryPrompt', label: '主回复文末摘要', source: '酒馆生成正文时，通过文末摘要宏读取本套提示词。' },
   { id: 'storyClockPrompt', label: '正文时间戳', source: '正文生成时使用的 QQJ 时间戳提示词。' },
   { id: 'avatarPrompt', label: '头像生图', source: '头像生成时使用的人物绘图提示词。' },
 ];
@@ -18,7 +19,7 @@ const tasks = [...AUX_TASKS, ...hostTasks];
 const taskNames = new Map(tasks.map(task => [task.id, task.label]));
 const optionsFor = items => items.map(item => ({ value: item.id, label: item.label ?? item.name }));
 
-export function createPromptPresetsView({ settings, documentRef = globalThis.document, promptPreview, onStoryClockChange, subscribeSettingsChange }) {
+export function createPromptPresetsView({ settings, documentRef = globalThis.document, navigatorRef, promptPreview, onStoryClockChange, subscribeSettingsChange }) {
   const { element, button, field } = createSettingsKit(documentRef);
   const globalControls = createBodyReadSettings({ settings, documentRef, onStoryClockChange });
   const stored = () => settings.get().auxPromptLibrary;
@@ -155,6 +156,10 @@ export function createPromptPresetsView({ settings, documentRef = globalThis.doc
     page.append(namedPicker('任务', choices));
     if (hostTask()) {
       page.append(action(task.label + '提示词', showHostPrompt, 'qqj-aux-host-row'));
+      if (task.id === 'inlineMemoryPrompt') {
+        page.append(note('把宏粘贴到酒馆的「文末摘要」条目并启用。选择「千千结 API」时宏留空。'),
+          createInlineMemoryMacroField({ documentRef, navigatorRef }));
+      }
       addSaveBar();
       return;
     }
