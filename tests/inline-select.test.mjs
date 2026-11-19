@@ -85,6 +85,41 @@ test('局部更新预设名称保留选值、展开与禁用状态，不派发ch
 });
 
 const descendants = node => [node, ...node.children.flatMap(descendants)];
+
+test('点开可搜索列表可直接切换，点搜索框才进入输入；键盘仍可打开并搜索', () => {
+  const changes = [];
+  const picker = createInlineSelect({ documentRef, searchable: true, options, onChange: value => changes.push(value) });
+  const search = descendants(picker.node).find(node => node.type === 'search');
+  const tap = node => node.fire('click', { pointerType: 'touch' });
+
+  tap(picker.trigger);
+  assert.equal(picker.trigger.attributes['aria-expanded'], 'true');
+  assert.equal(documentRef.activeElement, picker.trigger);
+  assert.equal(search.focused ?? 0, 0);
+  tap(picker.list.children[1]);
+  assert.equal(picker.value, 'b');
+  assert.equal(picker.list.hidden, true);
+
+  tap(picker.trigger);
+  assert.equal(documentRef.activeElement, picker.trigger);
+  search.focus(); // Native focus from tapping the search input.
+  search.value = '甲';
+  search.fire('input');
+  assert.equal(documentRef.activeElement, search);
+  assert.deepEqual(picker.list.children.filter(node => !node.hidden), [picker.list.children[0]]);
+  tap(picker.list.children[0]);
+  assert.deepEqual(changes, ['b', 'a']);
+
+  tap(picker.trigger);
+  assert.equal(documentRef.activeElement, picker.trigger);
+  assert.equal(search.value, '');
+  assert.ok(picker.list.children.every(node => !node.hidden));
+  tap(picker.trigger);
+  picker.trigger.fire('keydown', { key: 'Enter' });
+  assert.equal(documentRef.activeElement, search);
+  assert.equal(picker.trigger.attributes['aria-expanded'], 'true');
+});
+
 test('可搜索内联单选按完整路径过滤，清空搜索/取消不改已选，键盘只走可见选项',()=>{
  const changes=[],picker=createInlineSelect({documentRef,searchable:true,showChevron:false,searchPlaceholder:'搜索地点名称或路径',options:[{value:'',label:'无（顶层地点）'},{value:'l1',label:'宿舍 / 一楼'},{value:'l2',label:'宿舍 / 二楼'},{value:'other',label:'工作室 / 一楼'}],value:'l2',onChange:value=>changes.push(value)});
  const find=cls=>descendants(picker.node).find(node=>node.className.split(' ').includes(cls)),search=find('qqj-inline-select-search-input'),clear=find('qqj-inline-select-search-clear');assert.ok(search,'在原选择面板内提供搜索');assert.ok(clear);assert.equal(picker.trigger.children.some(node=>node.className==='qqj-inline-select-chevron'),false);

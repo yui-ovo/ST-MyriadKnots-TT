@@ -76,10 +76,17 @@ export function createInlineSelect({ documentRef = globalThis.document, options 
     if (searchable) { search.disabled = disabled; filterSearch(); }
   }
   function close() { opened = false; list.hidden = true; if (searchPanel) searchPanel.hidden = true; root.classList?.remove?.('open'); trigger.setAttribute('aria-expanded', 'false'); }
-  function open() {
+  function open({ focusSearch = true } = {}) {
     if (disabled) return;
     opened = true; list.hidden = false; root.classList?.add?.('open'); trigger.setAttribute('aria-expanded', 'true');
-    if (searchable) { searchPanel.hidden = false; search.value = ''; filterSearch(); search.focus?.({ preventScroll: true }); return; }
+    if (searchable) {
+      searchPanel.hidden = false;
+      search.value = '';
+      filterSearch();
+      const focusTarget = focusSearch ? search : trigger;
+      focusTarget.focus?.({ preventScroll: true });
+      return;
+    }
     const active = optionButtons[items.findIndex(item => item.value === selected)] ?? optionButtons[0];
     active?.focus?.({ preventScroll: true });
   }
@@ -103,7 +110,7 @@ export function createInlineSelect({ documentRef = globalThis.document, options 
     return true;
   }
   trigger.addEventListener('focus', () => onFocus?.());
-  trigger.addEventListener('click', event => { event?.stopPropagation?.(); if (suppressNextClick) { suppressNextClick = false; return; } if (opened) close(); else open(); });
+  trigger.addEventListener('click', event => { event?.stopPropagation?.(); if (suppressNextClick) { suppressNextClick = false; return; } if (opened) close(); else open({ focusSearch: false }); });
   trigger.addEventListener('keydown', event => {
     if (event.key === 'Escape') { event.preventDefault?.(); event.stopPropagation?.(); close(); return; }
     if (!['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(event.key)) return;

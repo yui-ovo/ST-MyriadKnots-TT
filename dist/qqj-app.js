@@ -17353,10 +17353,10 @@ function Rm({ documentRef: e = globalThis.document, options: t = [], value: n = 
 	function k() {
 		S = !1, h.hidden = !0, g && (g.hidden = !0), d.classList?.remove?.("open"), f.setAttribute("aria-expanded", "false");
 	}
-	function A() {
+	function A({ focusSearch: e = !0 } = {}) {
 		if (!x) {
 			if (S = !0, h.hidden = !1, d.classList?.add?.("open"), f.setAttribute("aria-expanded", "true"), s) {
-				g.hidden = !1, _.value = "", D(), _.focus?.({ preventScroll: !0 });
+				g.hidden = !1, _.value = "", D(), (e ? _ : f).focus?.({ preventScroll: !0 });
 				return;
 			}
 			(w[u.findIndex((e) => e.value === b)] ?? w[0])?.focus?.({ preventScroll: !0 });
@@ -17382,7 +17382,7 @@ function Rm({ documentRef: e = globalThis.document, options: t = [], value: n = 
 			C = !1;
 			return;
 		}
-		S ? k() : A();
+		S ? k() : A({ focusSearch: !1 });
 	}), f.addEventListener("keydown", (e) => {
 		if (e.key === "Escape") {
 			e.preventDefault?.(), e.stopPropagation?.(), k();
