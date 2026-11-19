@@ -1,7 +1,7 @@
 import { createSettingsKit } from './kit.js';
 import { INLINE_MEMORY_MACRO } from '../../inline-memory-prompt.js';
 
-export function createInlineMemoryMacroField({ documentRef, navigatorRef = documentRef.defaultView?.navigator ?? globalThis.navigator }) {
+function createInlineMemoryMacroField({ documentRef, navigatorRef = documentRef.defaultView?.navigator ?? globalThis.navigator }) {
   const { element, button } = createSettingsKit(documentRef);
   const box = element('div', 'qqj-inline-memory-macro');
   const macro = element('input', 'settings-input');
@@ -22,8 +22,25 @@ export function createInlineMemoryMacroField({ documentRef, navigatorRef = docum
   return box;
 }
 
-export function createBodyReadSettings({ settings, documentRef = globalThis.document, subscribeSettingsChange, onStoryClockChange }) {
-  const { element, field, subDrawer } = createSettingsKit(documentRef);
+export function createPresetPageSettings({ settings, documentRef = globalThis.document, navigatorRef, subscribeSettingsChange, onStoryClockChange }) {
+  const { element, field, appendOption, subDrawer } = createSettingsKit(documentRef);
+  const node = element('div', 'settings-page');
+  const sourceSection = element('section', 'settings-block');
+  const source = element('select', 'settings-input');
+  source.setAttribute('aria-label', '摘要来源');
+  appendOption(source, 'api', '千千结 API');
+  appendOption(source, 'inline', '只读主回复记忆区块');
+  appendOption(source, 'auto', '主回复优先，没有区块才调用摘要 API');
+  source.addEventListener('change', () => settings.update({ summarySource: source.value }));
+  const macro = subDrawer({ title: '主回复文末摘要 · 酒馆宏' });
+  macro.body.append(
+    element('p', 'settings-hint', '用这行宏替换酒馆预设「文末摘要」条目的全部内容，并启用该条目。选择「千千结 API」时，宏会展开为空文本。在本页「任务」中选择「主回复文末摘要」可查看或修改提示词。'),
+    createInlineMemoryMacroField({ documentRef, navigatorRef }),
+  );
+  sourceSection.append(field('摘要来源', source),
+    element('p', 'settings-hint', '所有预设共用此选择，下次处理摘要时生效。主回复记忆区块残缺时会提示修正。CSE 单独分析，整段历史压缩使用摘要 API。'),
+    macro.drawer);
+
   const { drawer, body } = subDrawer({ title: '正文读取与时间戳', id: 'qqj-settings-wrappers' });
   const tags = settings.wrappers();
   const keep = element('input', 'settings-input');
@@ -48,6 +65,7 @@ export function createBodyReadSettings({ settings, documentRef = globalThis.docu
   reference.addEventListener('change', () => { settings.update({ storyClockReferenceTags: reference.value }); refreshClock(); });
   const refresh = () => {
     const latest = settings.wrappers(), saved = settings.get();
+    source.value = saved.summarySource ?? 'api';
     for (const [control, value] of [[keep, latest.keepTags], [extra, latest.extraTags], [reference, saved.storyClockReferenceTags ?? '']]) {
       if (documentRef.activeElement !== control && !control.matches?.(':focus')) control.value = value;
     }
@@ -59,5 +77,6 @@ export function createBodyReadSettings({ settings, documentRef = globalThis.docu
   const unsubscribe = subscribeSettingsChange?.(refresh);
   body.append(element('p', 'settings-hint', '这些设置对所有预设生效。正文包裹符由白鳥系列插件共享。'),
     field('保留包裹符', keep), field('清洗包裹符', extra), toggle, field('正文时间参考标签', reference), status);
-  return { node: drawer, refresh, dispose: () => unsubscribe?.() };
+  node.append(sourceSection, drawer);
+  return { node, macroDrawer: macro.drawer, refresh, dispose: () => unsubscribe?.() };
 }

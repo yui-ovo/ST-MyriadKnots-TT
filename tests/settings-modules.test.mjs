@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createBodyReadSettings } from '../src/ui/settings/prompts-settings.js';
+import { createPresetPageSettings } from '../src/ui/settings/prompts-settings.js';
 import { createPromptPresetsView } from '../src/ui/settings/aux-prompt-presets.js';
 import { AUX_TASKS } from '../src/aux-prompt-tasks.js';
 import { editAuxPromptLibrary, getAuxHostPrompt, getAuxPromptPreset, resolveAuxPromptPreset } from '../src/aux-prompt-library.js';
@@ -190,9 +190,9 @@ test('全局包裹符与时钟开关独立保存，宿主的回显保留尚在�
   const ext = { qianqianjie: { sourceKeepTags: 'content' }, 'schedule-planner': { extraTags: 'think' } };
   const settings = createSettingsStore({ extensionSettings: ext });
   const listeners = new Set(), clock = [];
-  const view = createBodyReadSettings({ settings, documentRef, onStoryClockChange: options => { clock.push(options); return { label: '时间戳已刷新' }; },
+  const view = createPresetPageSettings({ settings, documentRef, onStoryClockChange: options => { clock.push(options); return { label: '时间戳已刷新' }; },
     subscribeSettingsChange: callback => { listeners.add(callback); return () => listeners.delete(callback); } });
-  assert.equal(view.node.open, false); assert.equal(view.node.id, 'qqj-settings-wrappers');
+  assert.equal(view.node.find(n => n.id === 'qqj-settings-wrappers').open, false);
   const keep = fieldControl(view.node, '保留包裹符'), extra = fieldControl(view.node, '清洗包裹符');
   ext['schedule-planner'].bodyWrappers.extraTags = '[[...]]';
   keep.value = 'CONTENT，正文'; await keep.fire('change');
@@ -224,15 +224,44 @@ test('主回复摘要、时间戳与头像提示词随套切换，内置可读�
   assert.ok(refreshes.length > 2);
 });
 
-test('主回复文末摘要复制一行酒馆宏，剪贴板不可用时选中宏', async () => {
+test('预设列表在正文读取与时间戳上方显示已保存的摘要来源，切换任务和预设共用该选择', async () => {
+  const settings = createSettingsStore({ extensionSettings: { qianqianjie: { summarySource: 'auto' } } });
+  const ui = auxManager(settings);
+  const source = ui.byLabel('摘要来源');
+  const clock = ui.node.find(n => n.id === 'qqj-settings-wrappers');
+  const sections = clock.parentNode.children;
+  const sourceSection = sections[sections.indexOf(clock) - 1];
+  assert.ok(sourceSection.contains(source));
+  assert.ok(sourceSection.contains(ui.byLabel('酒馆文末摘要宏')));
+  assert.equal(source.value, 'auto');
+  assert.deepEqual(source.children.map(option => option.value), ['api', 'inline', 'auto']);
+  source.value = 'inline'; await source.fire('change');
+  assert.equal(settings.get().summarySource, 'inline');
+  await ui.choose('任务', 'inlineMemoryPrompt');
+  await ui.click('复制整套'); await ui.click('复制并启用');
+  assert.equal(ui.byLabel('摘要来源').value, 'inline');
+  await ui.choose('当前使用的预设', 'builtin');
+  assert.equal(ui.byLabel('摘要来源').value, 'inline');
+  ui.view.deactivate(); settings.update({ summarySource: 'api' }); ui.view.activate();
+  assert.equal(ui.byLabel('摘要来源').value, 'api');
+  ui.view.dispose();
+});
+
+test('预设列表和主回复任务共用一个酒馆宏，支持复制和手动选中', async () => {
   const settings = createSettingsStore({ extensionSettings: {} }), copied = [];
   const navigatorRef = { clipboard: { writeText: text => copied.push(text) } };
   const ui = auxManager(settings, { navigatorRef });
-  await ui.choose('任务', 'inlineMemoryPrompt');
   const field = ui.byLabel('酒馆文末摘要宏');
+  const drawer = ui.node.find(n => n.tagName === 'details' && n.contains(field));
+  assert.equal(drawer.open, false);
+  drawer.open = true;
   assert.equal(field.readOnly, true);
   assert.equal(field.value, '{{qqj_memory_prompt}}');
   await ui.click('复制宏'); assert.deepEqual(copied, [field.value]);
+  drawer.open = false;
+  await ui.choose('任务', 'inlineMemoryPrompt');
+  assert.equal(drawer.open, true);
+  assert.deepEqual(ui.node.findAll(n => n.attributes['aria-label'] === '酒馆文末摘要宏'), [field]);
   delete navigatorRef.clipboard;
   let selected = false; field.select = () => { selected = true; };
   await ui.click('复制宏'); assert.ok(selected); assert.equal(documentRef.activeElement, field);

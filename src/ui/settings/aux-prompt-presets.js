@@ -1,5 +1,5 @@
 import { createSettingsKit } from './kit.js';
-import { createBodyReadSettings, createInlineMemoryMacroField } from './prompts-settings.js';
+import { createPresetPageSettings } from './prompts-settings.js';
 import { createInlineSelect } from '../inline-select.js';
 import { publicErrorMessage } from '../../public-error.js';
 import { AUX_TASKS } from '../../aux-prompt-tasks.js';
@@ -21,7 +21,7 @@ const optionsFor = items => items.map(item => ({ value: item.id, label: item.lab
 
 export function createPromptPresetsView({ settings, documentRef = globalThis.document, navigatorRef, promptPreview, onStoryClockChange, subscribeSettingsChange }) {
   const { element, button, field } = createSettingsKit(documentRef);
-  const globalControls = createBodyReadSettings({ settings, documentRef, onStoryClockChange });
+  const globalControls = createPresetPageSettings({ settings, documentRef, navigatorRef, onStoryClockChange });
   const stored = () => settings.get().auxPromptLibrary;
   let observed = stored(), base = normalizeAuxPromptLibrary(observed), library = base;
   let task = tasks[0], editingRoute = '', sorting = false, draggedRow = '';
@@ -133,6 +133,7 @@ export function createPromptPresetsView({ settings, documentRef = globalThis.doc
   }
   function chooseTask(id) {
     task = tasks.find(item => item.id === id);
+    if (id === 'inlineMemoryPrompt') globalControls.macroDrawer.open = true;
     resetRoute(); sorting = false; showList();
   }
   function nextName() {
@@ -156,10 +157,6 @@ export function createPromptPresetsView({ settings, documentRef = globalThis.doc
     page.append(namedPicker('任务', choices));
     if (hostTask()) {
       page.append(action(task.label + '提示词', showHostPrompt, 'qqj-aux-host-row'));
-      if (task.id === 'inlineMemoryPrompt') {
-        page.append(note('把宏粘贴到酒馆的「文末摘要」条目并启用。选择「千千结 API」时宏留空。'),
-          createInlineMemoryMacroField({ documentRef, navigatorRef }));
-      }
       addSaveBar();
       return;
     }

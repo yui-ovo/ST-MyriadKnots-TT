@@ -16,7 +16,6 @@ import { createPluginUpdatesView } from './plugin-updates-view.js';
 import { sharedUiCss } from './shared-ui-style.js';
 
 import { createDynamicWorldbookView } from './dynamic-worldbook-view.js';
-import { createInlineMemoryMacroField } from './settings/prompts-settings.js';
 
 const PUBLIC_API_EXAMPLE = `const bridge = globalThis.qqj_v3_public_bridge_v1;
 const status = bridge.getStatus();
@@ -413,19 +412,6 @@ export function createPanel({
       open: settingsDrawerState.isOpen('memory', false),
       onToggle: open => { settingsDrawerState.set('memory', open); syncStorageActivation(); },
     });
-    const summarySourceRow = element('label', 'setting-field');
-    const summarySource = element('select', 'settings-input'); summarySource.setAttribute('aria-label', '摘要来源');
-    for (const [value, label] of [['api', '千千结 API'], ['inline', '只读主回复记忆区块'], ['auto', '主回复优先，没有区块才调用摘要 API']]) {
-      const option = element('option', '', label); option.value = value; summarySource.append(option);
-    }
-    summarySource.value = settings.get().summarySource ?? 'api';
-    summarySource.addEventListener('change', () => { settings.update({ summarySource: summarySource.value }); });
-    summarySourceRow.append(element('span', '', '摘要来源'), summarySource);
-    const promptDetails = element('details', 'settings-subdrawer');
-    promptDetails.append(element('summary', '', '主回复文末摘要 · 酒馆宏'),
-      element('p', 'settings-hint', '用这一行替换酒馆「文末摘要」条目的全部内容，并启用条目。可在千千结「预设」中选择「主回复文末摘要」查看或修改全文。'),
-      createInlineMemoryMacroField({ documentRef, navigatorRef }));
-    memoryBody.append(summarySourceRow, element('p', 'settings-hint', '摘要来源在下次处理时生效。主回复记忆区块残缺时会提示修正。CSE 单独分析，整段历史压缩使用摘要 API。'), promptDetails);
     const timeToggle = element('label', 'setting-switch');
     timeToggle.id = 'qqj-settings-time';
     const timeInput = element('input'); timeInput.type = 'checkbox'; timeInput.checked = settings.get().timeEvolutionEnabled === true;

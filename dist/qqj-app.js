@@ -24521,45 +24521,54 @@ function rx({ documentRef: e, navigatorRef: t = e.defaultView?.navigator ?? glob
 	});
 	return i.append(a, s, o), i;
 }
-function ix({ settings: e, documentRef: t = globalThis.document, subscribeSettingsChange: n, onStoryClockChange: r }) {
-	let { element: i, field: a, subDrawer: o } = sg(t), { drawer: s, body: c } = o({
+function ix({ settings: e, documentRef: t = globalThis.document, navigatorRef: n, subscribeSettingsChange: r, onStoryClockChange: i }) {
+	let { element: a, field: o, appendOption: s, subDrawer: c } = sg(t), l = a("div", "settings-page"), u = a("section", "settings-block"), d = a("select", "settings-input");
+	d.setAttribute("aria-label", "摘要来源"), s(d, "api", "千千结 API"), s(d, "inline", "只读主回复记忆区块"), s(d, "auto", "主回复优先，没有区块才调用摘要 API"), d.addEventListener("change", () => e.update({ summarySource: d.value }));
+	let f = c({ title: "主回复文末摘要 · 酒馆宏" });
+	f.body.append(a("p", "settings-hint", "用这行宏替换酒馆预设「文末摘要」条目的全部内容，并启用该条目。选择「千千结 API」时，宏会展开为空文本。在本页「任务」中选择「主回复文末摘要」可查看或修改提示词。"), rx({
+		documentRef: t,
+		navigatorRef: n
+	})), u.append(o("摘要来源", d), a("p", "settings-hint", "所有预设共用此选择，下次处理摘要时生效。主回复记忆区块残缺时会提示修正。CSE 单独分析，整段历史压缩使用摘要 API。"), f.drawer);
+	let { drawer: p, body: m } = c({
 		title: "正文读取与时间戳",
 		id: "qqj-settings-wrappers"
-	}), l = e.wrappers(), u = i("input", "settings-input");
-	u.value = l.keepTags, u.placeholder = "content";
-	let d = i("input", "settings-input");
-	d.value = l.extraTags, d.placeholder = "如 think, reasoning, [[...]]", u.addEventListener("change", () => e.updateWrappers({ keepTags: u.value })), d.addEventListener("change", () => e.updateWrappers({ extraTags: d.value }));
-	let f = i("input");
-	f.type = "checkbox";
-	let p = i("label", "setting-switch");
-	p.append(f, i("span", "", "启用正文时间戳"));
-	let m = i("input", "settings-input");
-	m.placeholder = "可选，用逗号或换行分隔";
-	let h = i("p", "settings-result");
-	h.id = "qqj-story-clock-status";
-	let g = () => {
-		h.textContent = r?.()?.label ?? "时间戳状态将在下次正文生成前刷新。";
+	}), h = e.wrappers(), g = a("input", "settings-input");
+	g.value = h.keepTags, g.placeholder = "content";
+	let _ = a("input", "settings-input");
+	_.value = h.extraTags, _.placeholder = "如 think, reasoning, [[...]]", g.addEventListener("change", () => e.updateWrappers({ keepTags: g.value })), _.addEventListener("change", () => e.updateWrappers({ extraTags: _.value }));
+	let v = a("input");
+	v.type = "checkbox";
+	let y = a("label", "setting-switch");
+	y.append(v, a("span", "", "启用正文时间戳"));
+	let b = a("input", "settings-input");
+	b.placeholder = "可选，用逗号或换行分隔";
+	let x = a("p", "settings-result");
+	x.id = "qqj-story-clock-status";
+	let S = () => {
+		x.textContent = i?.()?.label ?? "时间戳状态将在下次正文生成前刷新。";
 	};
-	f.addEventListener("change", () => {
-		e.update({ storyClockEnabled: f.checked }), g();
-	}), m.addEventListener("change", () => {
-		e.update({ storyClockReferenceTags: m.value }), g();
+	v.addEventListener("change", () => {
+		e.update({ storyClockEnabled: v.checked }), S();
+	}), b.addEventListener("change", () => {
+		e.update({ storyClockReferenceTags: b.value }), S();
 	});
-	let _ = () => {
+	let C = () => {
 		let n = e.wrappers(), r = e.get();
+		d.value = r.summarySource ?? "api";
 		for (let [e, i] of [
-			[u, n.keepTags],
-			[d, n.extraTags],
-			[m, r.storyClockReferenceTags ?? ""]
+			[g, n.keepTags],
+			[_, n.extraTags],
+			[b, r.storyClockReferenceTags ?? ""]
 		]) t.activeElement !== e && !e.matches?.(":focus") && (e.value = i);
-		f.checked = r.storyClockEnabled !== !1;
+		v.checked = r.storyClockEnabled !== !1;
 	};
-	u.addEventListener("blur", _), d.addEventListener("blur", _), m.addEventListener("blur", _), _(), h.textContent = r?.({ readOnly: !0 })?.label ?? "时间戳状态将在下次正文生成前刷新。";
-	let v = n?.(_);
-	return c.append(i("p", "settings-hint", "这些设置对所有预设生效。正文包裹符由白鳥系列插件共享。"), a("保留包裹符", u), a("清洗包裹符", d), p, a("正文时间参考标签", m), h), {
-		node: s,
-		refresh: _,
-		dispose: () => v?.()
+	g.addEventListener("blur", C), _.addEventListener("blur", C), b.addEventListener("blur", C), C(), x.textContent = i?.({ readOnly: !0 })?.label ?? "时间戳状态将在下次正文生成前刷新。";
+	let w = r?.(C);
+	return m.append(a("p", "settings-hint", "这些设置对所有预设生效。正文包裹符由白鳥系列插件共享。"), o("保留包裹符", g), o("清洗包裹符", _), y, o("正文时间参考标签", b), x), l.append(u, p), {
+		node: l,
+		macroDrawer: f.drawer,
+		refresh: C,
+		dispose: () => w?.()
 	};
 }
 //#endregion
@@ -24595,6 +24604,7 @@ function dx({ settings: e, documentRef: t = globalThis.document, navigatorRef: n
 	let { element: o, button: s, field: c } = sg(t), l = ix({
 		settings: e,
 		documentRef: t,
+		navigatorRef: n,
 		onStoryClockChange: i
 	}), u = () => e.get().auxPromptLibrary, d = u(), f = lb(d), p = f, m = cx[0], h = "", g = !1, _ = "", v = 0, y = "list", b = !1, x = !1, S = "", C = 0, w = o("section", "settings-page qqj-preset-manager"), T = o("section", "settings-block qqj-aux-editor"), E = o("div", "qqj-aux-page"), D = o("p", "settings-result qqj-aux-feedback");
 	D.setAttribute("role", "status");
@@ -24698,7 +24708,7 @@ function dx({ settings: e, documentRef: t = globalThis.document, navigatorRef: n
 		});
 	}
 	function ie(e) {
-		m = cx.find((t) => t.id === e), ee(), g = !1, oe();
+		m = cx.find((t) => t.id === e), e === "inlineMemoryPrompt" && (l.macroDrawer.open = !0), ee(), g = !1, oe();
 	}
 	function ae() {
 		let e = new Set(ub(p).map((e) => e.name)), t = k().name + "（副本）", n = t, r = 2;
@@ -24707,45 +24717,42 @@ function dx({ settings: e, documentRef: t = globalThis.document, navigatorRef: n
 	}
 	function oe(e = "") {
 		!I() && u() !== d && (q(), ee(), g = !1), W("list");
-		let r = ub(p), i = H("当前使用的预设", ux(r), p.activeSuiteId, re, r.length > 7);
-		E.append(U("当前使用的预设", i));
-		let a = [V("复制整套", () => X("copySuite")), V("新建", () => X("createSuite"))];
-		A() || a.push(V("重命名", () => X("renameSuite")), V("删除", se)), E.append(R(...a));
-		let s = H("任务", ux(cx), m.id, ie, cx.length > 7);
-		if (E.append(U("任务", s)), j()) {
-			E.append(V(m.label + "提示词", ce, "qqj-aux-host-row")), m.id === "inlineMemoryPrompt" && E.append(L("把宏粘贴到酒馆的「文末摘要」条目并启用。选择「千千结 API」时宏留空。"), rx({
-				documentRef: t,
-				navigatorRef: n
-			})), ne();
+		let t = ub(p), n = H("当前使用的预设", ux(t), p.activeSuiteId, re, t.length > 7);
+		E.append(U("当前使用的预设", n));
+		let r = [V("复制整套", () => X("copySuite")), V("新建", () => X("createSuite"))];
+		A() || r.push(V("重命名", () => X("renameSuite")), V("删除", se)), E.append(R(...r));
+		let i = H("任务", ux(cx), m.id, ie, cx.length > 7);
+		if (E.append(U("任务", i)), j()) {
+			E.append(V(m.label + "提示词", ce, "qqj-aux-host-row")), ne();
 			return;
 		}
-		let c = M(), l = N(), f = !A() && c.id !== "builtin", v = h && hb(p, m.id, h);
-		if (l) {
-			let e = gb(p, m.id, l.id);
-			E.append(L("当前 API · " + l.label + " · " + e.name + (hb(p, m.id, l.id) ? "（连接指定）" : "（跟随任务）")));
+		let a = M(), s = N(), c = !A() && a.id !== "builtin", l = h && hb(p, m.id, h);
+		if (s) {
+			let e = gb(p, m.id, s.id);
+			E.append(L("当前 API · " + s.label + " · " + e.name + (hb(p, m.id, s.id) ? "（连接指定）" : "（跟随任务）")));
 		}
-		let y = o("div", "qqj-aux-page-head"), b = v ? F(h) + "使用的条目" : "任务默认条目", x = p.bindings.filter((e) => e.suiteId === p.activeSuiteId && e.taskId === m.id && e.routeKey);
-		y.append(o("h3", "", b), V("连接配置", ue, "qqj-aux-text-button")), E.append(y), x.length && E.append(L("已指定的连接 · " + x.map((e) => F(e.routeKey)).join("、"))), A() ? E.append(L("千千结默认 · 只读。点条目可查看原文与来源。")) : E.append(L("正在编辑 · " + c.name));
-		let S = c.id;
-		if (f && c.rows.length > 1) {
+		let f = o("div", "qqj-aux-page-head"), v = l ? F(h) + "使用的条目" : "任务默认条目", y = p.bindings.filter((e) => e.suiteId === p.activeSuiteId && e.taskId === m.id && e.routeKey);
+		f.append(o("h3", "", v), V("连接配置", ue, "qqj-aux-text-button")), E.append(f), y.length && E.append(L("已指定的连接 · " + y.map((e) => F(e.routeKey)).join("、"))), A() ? E.append(L("千千结默认 · 只读。点条目可查看原文与来源。")) : E.append(L("正在编辑 · " + a.name));
+		let b = a.id;
+		if (c && a.rows.length > 1) {
 			let e = V(g ? "完成排序" : "排序", () => {
 				g = !g, oe();
 			}, "qqj-aux-text-button");
-			e.setAttribute("aria-pressed", String(g)), y.append(e);
+			e.setAttribute("aria-pressed", String(g)), f.append(e);
 		}
-		let C = o("div", "qqj-aux-rows");
-		C.setAttribute("role", "list");
-		let w = (e, t) => {
+		let x = o("div", "qqj-aux-rows");
+		x.setAttribute("role", "list");
+		let S = (e, t) => {
 			G({
 				type: "moveRow",
-				presetId: S,
+				presetId: b,
 				rowId: e,
 				index: t
 			}), oe(e);
-		}, T;
-		for (let [t, n] of c.rows.entries()) {
+		}, C;
+		for (let [t, n] of a.rows.entries()) {
 			let r = o("div", "qqj-aux-row");
-			if (r.setAttribute("role", "listitem"), r.setAttribute("data-enabled", String(n.enabled)), f) {
+			if (r.setAttribute("role", "listitem"), r.setAttribute("data-enabled", String(n.enabled)), c) {
 				let e = o("span", "qqj-aux-grip", "⠿");
 				e.draggable = !0, e.title = "拖动排序", e.setAttribute("aria-hidden", "true"), e.addEventListener("dragstart", (e) => {
 					_ = n.id, e.dataTransfer?.setData("text/plain", n.id), e.dataTransfer && (e.dataTransfer.effectAllowed = "move");
@@ -24754,11 +24761,11 @@ function dx({ settings: e, documentRef: t = globalThis.document, navigatorRef: n
 				}), r.addEventListener("dragover", (e) => {
 					_ && e.preventDefault();
 				}), r.addEventListener("drop", (e) => {
-					_ &&= (e.preventDefault(), _ !== n.id && w(_, t), "");
+					_ &&= (e.preventDefault(), _ !== n.id && S(_, t), "");
 				}), r.append(e);
 			}
 			let i = V(n.name, () => de(n), "qqj-aux-row-name");
-			if (n.id === e && (T = i), r.append(i, o("span", "qqj-aux-row-role", ax[n.role])), g && f) for (let [e, i, a] of [[
+			if (n.id === e && (C = i), r.append(i, o("span", "qqj-aux-row-role", ax[n.role])), g && c) for (let [e, i, o] of [[
 				"上移",
 				-1,
 				"↑"
@@ -24767,15 +24774,15 @@ function dx({ settings: e, documentRef: t = globalThis.document, navigatorRef: n
 				1,
 				"↓"
 			]]) {
-				let o = V(a, () => w(n.id, t + i), "qqj-aux-arrow");
-				o.setAttribute("aria-label", e + n.name), o.disabled = t + i < 0 || t + i >= c.rows.length, r.append(o);
+				let s = V(o, () => S(n.id, t + i), "qqj-aux-arrow");
+				s.setAttribute("aria-label", e + n.name), s.disabled = t + i < 0 || t + i >= a.rows.length, r.append(s);
 			}
 			else {
 				let e = o("label", "qqj-aux-switch"), t = o("input", "qqj-aux-toggle");
-				t.type = "checkbox", t.setAttribute("role", "switch"), t.checked = n.enabled, t.disabled = !f, t.setAttribute("aria-label", "启用" + n.name), t.addEventListener("change", () => {
+				t.type = "checkbox", t.setAttribute("role", "switch"), t.checked = n.enabled, t.disabled = !c, t.setAttribute("aria-label", "启用" + n.name), t.addEventListener("change", () => {
 					G({
 						type: "updateRow",
-						presetId: S,
+						presetId: b,
 						rowId: n.id,
 						enabled: t.checked
 					}), r.setAttribute("data-enabled", String(t.checked)), O.replaceChildren(), ne();
@@ -24783,11 +24790,11 @@ function dx({ settings: e, documentRef: t = globalThis.document, navigatorRef: n
 				let i = o("span", "qqj-aux-switch-track");
 				i.setAttribute("aria-hidden", "true"), e.append(t, i), r.append(e);
 			}
-			C.append(r);
+			x.append(r);
 		}
-		c.rows.length || C.append(L("此预设暂无条目。")), E.append(C);
-		let D = f ? [V("新增条目", () => de()), V("从已有条目添加", fe)] : [V(A() ? "复制后编辑" : "复制此配置", () => A() ? X("copySuite") : le())];
-		E.append(R(...D, V("宏与格式", me))), E.append(V("预览请求", he, "qqj-aux-text-button")), ne(), T?.focus?.({ preventScroll: !0 });
+		a.rows.length || x.append(L("此预设暂无条目。")), E.append(x);
+		let w = c ? [V("新增条目", () => de()), V("从已有条目添加", fe)] : [V(A() ? "复制后编辑" : "复制此配置", () => A() ? X("copySuite") : le())];
+		E.append(R(...w, V("宏与格式", me))), E.append(V("预览请求", he, "qqj-aux-text-button")), ne(), C?.focus?.({ preventScroll: !0 });
 	}
 	function X(e, t) {
 		let n = {
@@ -26071,7 +26078,7 @@ function Vx({ dynamicWorldbook: e, promptPreview: t, settings: n, apiTools: r, v
 			id: `qqj-settings-group-${e}`,
 			open: G.isOpen(e, !1),
 			onToggle: (t) => G.set(e, t)
-		}), M = (e) => G.isOpen(e, !1), N = (e) => (t) => G.set(e, t), { drawer: P, body: F } = O("general", "通用设置"), L = tx({
+		}), A = (e) => G.isOpen(e, !1), M = (e) => (t) => G.set(e, t), { drawer: N, body: P } = O("general", "通用设置"), F = tx({
 			settings: n,
 			apiTools: r,
 			vectorIndex: a,
@@ -26080,80 +26087,62 @@ function Vx({ dynamicWorldbook: e, promptPreview: t, settings: n, apiTools: r, v
 			onEditingRoleChange: (e) => {
 				K = e;
 			},
-			open: M("api"),
-			onToggle: N("api"),
-			advancedOpen: M("api-advanced"),
-			onAdvancedToggle: N("api-advanced"),
+			open: A("api"),
+			onToggle: M("api"),
+			advancedOpen: A("api-advanced"),
+			onAdvancedToggle: M("api-advanced"),
 			rerender: () => Ee(),
 			isSevenDaysAvailable: w,
 			confirmImpl: (e) => E?.confirm?.(e) ?? !1,
 			promptImpl: (e) => E?.prompt?.(e) ?? null,
 			customImpl: (e) => E?.custom?.(e) ?? Promise.resolve(null)
 		});
-		ee = L;
-		let R = nx({
+		ee = F;
+		let L = nx({
 			settings: n,
 			vectorApi: i,
 			vectorIndex: a,
 			documentRef: k,
-			open: M("vector"),
-			onToggle: N("vector")
+			open: A("vector"),
+			onToggle: M("vector")
 		});
-		q = R;
-		let z = m?.renderSettings?.({
-			open: M("worldbook"),
-			onDrawerToggle: N("worldbook")
-		}), U = fx({
+		q = L;
+		let R = m?.renderSettings?.({
+			open: A("worldbook"),
+			onDrawerToggle: M("worldbook")
+		}), z = fx({
 			settings: n,
 			documentRef: k,
-			open: M("appearance"),
-			onToggle: N("appearance"),
+			open: A("appearance"),
+			onToggle: M("appearance"),
 			applyAppearance: () => fe.apply()
 		});
-		F.append(L.node, R.node), z && F.append(z), F.append(U.node), l.append(P), e && (re = Rx({
+		P.append(F.node, L.node), R && P.append(R), P.append(z.node), l.append(N), e && (re = Rx({
 			runtime: e,
 			settings: n,
 			documentRef: k,
 			confirmImpl: (e) => E?.confirm?.(e) ?? !1,
-			open: M("dynamic-worldbook"),
-			onToggle: N("dynamic-worldbook")
+			open: A("dynamic-worldbook"),
+			onToggle: M("dynamic-worldbook")
 		}), l.append(re.node));
-		let te, J = G.isOpen("storage", !1), ie = () => {
-			ae.open && te?.open ? f.activate() : f.deactivate();
-		}, { drawer: ae, body: oe } = og({
+		let U, te = G.isOpen("storage", !1), J = () => {
+			ie.open && U?.open ? f.activate() : f.deactivate();
+		}, { drawer: ie, body: ae } = og({
 			documentRef: k,
 			title: "记忆设置",
 			level: "group",
 			id: "qqj-settings-group-memory",
 			open: G.isOpen("memory", !1),
 			onToggle: (e) => {
-				G.set("memory", e), ie();
+				G.set("memory", e), J();
 			}
-		}), X = pe("label", "setting-field"), se = pe("select", "settings-input");
-		se.setAttribute("aria-label", "摘要来源");
-		for (let [e, t] of [
-			["api", "千千结 API"],
-			["inline", "只读主回复记忆区块"],
-			["auto", "主回复优先，没有区块才调用摘要 API"]
-		]) {
-			let n = pe("option", "", t);
-			n.value = e, se.append(n);
-		}
-		se.value = n.get().summarySource ?? "api", se.addEventListener("change", () => {
-			n.update({ summarySource: se.value });
-		}), X.append(pe("span", "", "摘要来源"), se);
-		let ue = pe("details", "settings-subdrawer");
-		ue.append(pe("summary", "", "主回复文末摘要 · 酒馆宏"), pe("p", "settings-hint", "用这一行替换酒馆「文末摘要」条目的全部内容，并启用条目。可在千千结「预设」中选择「主回复文末摘要」查看或修改全文。"), rx({
-			documentRef: k,
-			navigatorRef: A
-		})), oe.append(X, pe("p", "settings-hint", "摘要来源在下次处理时生效。主回复记忆区块残缺时会提示修正。CSE 单独分析，整段历史压缩使用摘要 API。"), ue);
-		let de = pe("label", "setting-switch");
-		de.id = "qqj-settings-time";
-		let ge = pe("input");
-		ge.type = "checkbox", ge.checked = n.get().timeEvolutionEnabled === !0, ge.setAttribute("aria-label", "时间推演"), de.append(pe("span", "", "时间推演"), ge), de.addEventListener("click", (e) => e.stopPropagation()), ge.addEventListener("change", async () => {
-			if (ge.checked && n.get().timeEvolutionEnabled !== !0 && T?.()) {
+		}), oe = pe("label", "setting-switch");
+		oe.id = "qqj-settings-time";
+		let X = pe("input");
+		X.type = "checkbox", X.checked = n.get().timeEvolutionEnabled === !0, X.setAttribute("aria-label", "时间推演"), oe.append(pe("span", "", "时间推演"), X), oe.addEventListener("click", (e) => e.stopPropagation()), X.addEventListener("change", async () => {
+			if (X.checked && n.get().timeEvolutionEnabled !== !0 && T?.()) {
 				let e = W;
-				ge.checked = !1, ge.disabled = !0;
+				X.checked = !1, X.disabled = !0;
 				let t;
 				try {
 					t = await E?.confirm?.({
@@ -26163,148 +26152,148 @@ function Vx({ dynamicWorldbook: e, promptPreview: t, settings: n, apiTools: r, v
 						cancelText: "取消"
 					});
 				} finally {
-					ge.disabled = !1;
+					X.disabled = !1;
 				}
 				if (!t || e !== W || j.hidden) return;
-				ge.checked = !0;
+				X.checked = !0;
 			}
-			n.update({ timeEvolutionEnabled: ge.checked }), await x?.();
-		}), oe.append(de, pe("p", "settings-hint", "按剧情时间推算身体状态、周期与期限，直接读 AI 正文，使用摘要 API（每批最多一次）。从当前楼开始追踪；旧楼请到“近期事项”补查。已保存结果可保留并续跑。与构画刻度建议只开一方注入。"));
-		let ve = pe("label", "setting-switch");
-		ve.id = "qqj-settings-auto-hide";
-		let xe = pe("input");
-		xe.type = "checkbox", xe.checked = n.get().autoHideEnabled === !0, ve.append(pe("span", "", "自动隐藏"), xe);
-		let Se = pe("label", "qqj-auto-hide-row");
-		Se.append(pe("span", "", "保留历史 AI 楼数"));
-		let we = pe("input", "settings-input settings-num");
-		we.type = "number", we.min = "1", we.max = "50", we.step = "1", we.value = String(n.get().autoHideKeepAiCount ?? 3), Se.append(we);
-		let Te = pe("p", "settings-result"), De = async (e) => {
-			xe.disabled = !0, we.disabled = !0, Te.className = "settings-result", Te.textContent = "正在保存并整理当前聊天…";
+			n.update({ timeEvolutionEnabled: X.checked }), await x?.();
+		}), ae.append(oe, pe("p", "settings-hint", "按剧情时间推算身体状态、周期与期限，直接读 AI 正文，使用摘要 API（每批最多一次）。从当前楼开始追踪；旧楼请到“近期事项”补查。已保存结果可保留并续跑。与构画刻度建议只开一方注入。"));
+		let se = pe("label", "setting-switch");
+		se.id = "qqj-settings-auto-hide";
+		let ue = pe("input");
+		ue.type = "checkbox", ue.checked = n.get().autoHideEnabled === !0, se.append(pe("span", "", "自动隐藏"), ue);
+		let de = pe("label", "qqj-auto-hide-row");
+		de.append(pe("span", "", "保留历史 AI 楼数"));
+		let ge = pe("input", "settings-input settings-num");
+		ge.type = "number", ge.min = "1", ge.max = "50", ge.step = "1", ge.value = String(n.get().autoHideKeepAiCount ?? 3), de.append(ge);
+		let ve = pe("p", "settings-result"), xe = async (e) => {
+			ue.disabled = !0, ge.disabled = !0, ve.className = "settings-result", ve.textContent = "正在保存并整理当前聊天…";
 			try {
 				n.update(e);
 				let t = n.get();
-				if (xe.checked = t.autoHideEnabled === !0, we.value = String(t.autoHideKeepAiCount), (await b?.({
+				if (ue.checked = t.autoHideEnabled === !0, ge.value = String(t.autoHideKeepAiCount), (await b?.({
 					enabled: t.autoHideEnabled,
 					keepAiCount: t.autoHideKeepAiCount
 				}))?.status === "disabled") {
-					Te.textContent = "设置已保存；重新启用千千结后生效。", Te.className = "settings-result success";
+					ve.textContent = "设置已保存；重新启用千千结后生效。", ve.className = "settings-result success";
 					return;
 				}
-				Te.textContent = t.autoHideEnabled ? `已开启；后续保留最近 ${t.autoHideKeepAiCount} 个 AI 楼，并另留当前回复供重生成；已隐藏楼保持隐藏。` : "已关闭；由千千结隐藏的消息已恢复。", Te.className = "settings-result success";
+				ve.textContent = t.autoHideEnabled ? `已开启；后续保留最近 ${t.autoHideKeepAiCount} 个 AI 楼，并另留当前回复供重生成；已隐藏楼保持隐藏。` : "已关闭；由千千结隐藏的消息已恢复。", ve.className = "settings-result success";
 			} catch (e) {
-				Te.textContent = `设置已保存，自动隐藏未完成：${Zm(e, { fallback: "操作失败。" })}`, Te.className = "settings-result error";
+				ve.textContent = `设置已保存，自动隐藏未完成：${Zm(e, { fallback: "操作失败。" })}`, ve.className = "settings-result error";
 			} finally {
-				xe.disabled = !1, we.disabled = !1;
+				ue.disabled = !1, ge.disabled = !1;
 			}
 		};
-		xe.addEventListener("change", () => {
-			De({ autoHideEnabled: xe.checked });
-		}), we.addEventListener("change", () => {
-			De({ autoHideKeepAiCount: Number(we.value) });
+		ue.addEventListener("change", () => {
+			xe({ autoHideEnabled: ue.checked });
+		}), ge.addEventListener("change", () => {
+			xe({ autoHideKeepAiCount: Number(ge.value) });
 		});
-		let Oe = S(), ke = pe("div", "qqj-calendar-row");
-		ke.id = "qqj-settings-calendar", ke.append(pe("span", "", "历法选择"));
-		let Q = pe("div", "qqj-calendar-choices");
-		Q.setAttribute("role", "group"), Q.setAttribute("aria-label", "历法选择");
-		let je = [4, 12].map((e) => {
+		let Se = S(), we = pe("div", "qqj-calendar-row");
+		we.id = "qqj-settings-calendar", we.append(pe("span", "", "历法选择"));
+		let Te = pe("div", "qqj-calendar-choices");
+		Te.setAttribute("role", "group"), Te.setAttribute("aria-label", "历法选择");
+		let De = [4, 12].map((e) => {
 			let t = pe("label", "setting-switch"), n = pe("input");
-			return n.type = "checkbox", n.setAttribute("aria-label", `${e}个月`), n.checked = (Oe.calendar?.months ?? 12) === e, n.disabled = !Oe.chatId, t.append(pe("span", "", String(e)), n), Q.append(t), {
+			return n.type = "checkbox", n.setAttribute("aria-label", `${e}个月`), n.checked = (Se.calendar?.months ?? 12) === e, n.disabled = !Se.chatId, t.append(pe("span", "", String(e)), n), Te.append(t), {
 				months: e,
 				input: n
 			};
 		});
-		ke.append(Q);
-		let Me = pe("label", "qqj-calendar-row");
-		Me.append(pe("span", "", "特殊年"));
-		let Ne = pe("input", "settings-input qqj-calendar-prefix");
-		Ne.type = "text", Ne.maxLength = 40, Ne.placeholder = "如：启航", Ne.value = Oe.calendar?.prefix ?? "", Ne.disabled = !Oe.chatId, Ne.setAttribute("aria-label", "特殊纪年名称"), Me.append(Ne);
-		let Pe = pe("p", "settings-result");
-		Pe.hidden = !0;
-		let Fe = () => {
+		we.append(Te);
+		let Oe = pe("label", "qqj-calendar-row");
+		Oe.append(pe("span", "", "特殊年"));
+		let ke = pe("input", "settings-input qqj-calendar-prefix");
+		ke.type = "text", ke.maxLength = 40, ke.placeholder = "如：启航", ke.value = Se.calendar?.prefix ?? "", ke.disabled = !Se.chatId, ke.setAttribute("aria-label", "特殊纪年名称"), Oe.append(ke);
+		let Q = pe("p", "settings-result");
+		Q.hidden = !0;
+		let je = () => {
 			let e = S().calendar;
-			for (let { months: t, input: n } of je) n.checked = (e?.months ?? 12) === t;
-			Ne.value = e?.prefix ?? "";
-		}, Ie = async (e) => {
-			let t = Ne.value.normalize("NFKC").trim(), n = S();
-			if (n.chatId !== Oe.chatId) {
-				Fe();
+			for (let { months: t, input: n } of De) n.checked = (e?.months ?? 12) === t;
+			ke.value = e?.prefix ?? "";
+		}, Me = async (e) => {
+			let t = ke.value.normalize("NFKC").trim(), n = S();
+			if (n.chatId !== Se.chatId) {
+				je();
 				return;
 			}
 			if (n.calendar?.months === e && n.calendar.prefix === t) {
-				Fe();
+				je();
 				return;
 			}
 			let r = W;
-			for (let { input: e } of je) e.disabled = !0;
-			Ne.disabled = !0, Pe.hidden = !0;
+			for (let { input: e } of De) e.disabled = !0;
+			ke.disabled = !0, Q.hidden = !0;
 			try {
 				if (!await E?.confirm?.({
 					title: "确认历法",
 					body: "仅当前聊天生效，仅影响间隔计算。",
 					confirmText: "确认",
 					cancelText: "取消"
-				}) || r !== W || S().chatId !== Oe.chatId) return;
+				}) || r !== W || S().chatId !== Se.chatId) return;
 				await C?.({
-					chatId: Oe.chatId,
+					chatId: Se.chatId,
 					calendar: {
 						months: e,
 						prefix: t
 					}
 				});
 			} catch (e) {
-				r === W && (Pe.hidden = !1, Pe.className = "settings-result error", Pe.textContent = Zm(e, { fallback: "历法未保存，请重试。" }));
+				r === W && (Q.hidden = !1, Q.className = "settings-result error", Q.textContent = Zm(e, { fallback: "历法未保存，请重试。" }));
 			} finally {
-				Fe();
-				for (let { input: e } of je) e.disabled = !S().chatId;
-				Ne.disabled = !S().chatId;
+				je();
+				for (let { input: e } of De) e.disabled = !S().chatId;
+				ke.disabled = !S().chatId;
 			}
 		};
-		for (let { months: e, input: t } of je) t.addEventListener("change", () => {
-			for (let t of je) t.input.checked = t.months === e;
-			return Ie(e);
+		for (let { months: e, input: t } of De) t.addEventListener("change", () => {
+			for (let t of De) t.input.checked = t.months === e;
+			return Me(e);
 		});
-		Ne.addEventListener("change", () => Ie(je.find(({ input: e }) => e.checked)?.months ?? 12));
-		let Le = pe("label", "setting-switch");
-		Le.id = "qqj-settings-core-cache";
-		let Re = pe("input");
-		Re.type = "checkbox", Re.checked = n.get().coreCacheEnabled !== !1, Re.setAttribute("aria-label", "浏览器缓存（IndexedDB）"), Le.append(pe("span", "", "浏览器缓存（IndexedDB）"), Re), Le.addEventListener("click", (e) => e.stopPropagation());
-		let ze = pe("p", "settings-hint", "关闭不会删除记忆，之后直接从正式存储读取，打开长聊天可能更慢。更改后整页刷新酒馆生效。"), Be = pe("p", "settings-result");
-		Be.id = "qqj-settings-core-cache-result", Re.addEventListener("change", () => {
-			n.update({ coreCacheEnabled: Re.checked }), Be.textContent = "设置已修改；整页刷新酒馆后生效。", Be.className = "settings-result success";
-		}), oe.append(Le, ze, Be);
-		let Ve = og({
+		ke.addEventListener("change", () => Me(De.find(({ input: e }) => e.checked)?.months ?? 12));
+		let Ne = pe("label", "setting-switch");
+		Ne.id = "qqj-settings-core-cache";
+		let Pe = pe("input");
+		Pe.type = "checkbox", Pe.checked = n.get().coreCacheEnabled !== !1, Pe.setAttribute("aria-label", "浏览器缓存（IndexedDB）"), Ne.append(pe("span", "", "浏览器缓存（IndexedDB）"), Pe), Ne.addEventListener("click", (e) => e.stopPropagation());
+		let Fe = pe("p", "settings-hint", "关闭不会删除记忆，之后直接从正式存储读取，打开长聊天可能更慢。更改后整页刷新酒馆生效。"), Ie = pe("p", "settings-result");
+		Ie.id = "qqj-settings-core-cache-result", Pe.addEventListener("change", () => {
+			n.update({ coreCacheEnabled: Pe.checked }), Ie.textContent = "设置已修改；整页刷新酒馆后生效。", Ie.className = "settings-result success";
+		}), ae.append(Ne, Fe, Ie);
+		let Le = og({
 			documentRef: k,
 			title: "存储管理",
 			level: "sub",
 			id: "qqj-settings-sub-storage",
-			open: J,
+			open: te,
 			onToggle: (e) => {
-				G.set("storage", e), ie();
+				G.set("storage", e), J();
 			}
 		});
-		te = Ve.drawer;
-		let He = pe("div");
-		f.mount(He), Ve.body.append(He), Y = p?.({
+		U = Le.drawer;
+		let Re = pe("div");
+		f.mount(Re), Le.body.append(Re), Y = p?.({
 			open: G.isOpen("memory-transfer", !1),
 			onToggle: (e) => G.set("memory-transfer", e)
-		}) ?? null, Y && Ve.body.append(Y.node), oe.append(ve, Se, Te, ke, Me, pe("p", "settings-hint", "历法用于推算时间间隔，仅当前聊天生效。特殊年只填年份前的完整纪年名称，不填数字或“年”。"), pe("p", "settings-hint", "例：启航387年，填启航。"), Pe, te), l.append(ae), l.append(D, ce);
-		let { drawer: Ue, body: We } = O("documentation", "教程与配置文件"), Ge = pe("div", "settings-document-row"), Ke = pe("button", "secondary-action", "教程文档");
-		Ke.type = "button", Ke.addEventListener("click", () => {
+		}) ?? null, Y && Le.body.append(Y.node), ae.append(se, de, ve, we, Oe, pe("p", "settings-hint", "历法用于推算时间间隔，仅当前聊天生效。特殊年只填年份前的完整纪年名称，不填数字或“年”。"), pe("p", "settings-hint", "例：启航387年，填启航。"), Q, U), l.append(ie), l.append(D, ce);
+		let { drawer: ze, body: Be } = O("documentation", "教程与配置文件"), Ve = pe("div", "settings-document-row"), He = pe("button", "secondary-action", "教程文档");
+		He.type = "button", He.addEventListener("click", () => {
 			_x({
 				documentRef: k,
 				customImpl: (e) => E?.custom?.(e)
 			});
-		}), Ge.append(pe("span", "", "教程文档"), Ke);
-		let qe = pe("div", "settings-document-row"), Je = pe("button", "secondary-action", "复制接口示例");
-		Je.type = "button";
-		let Ye = pe("span", "settings-hint", le), Xe = pe("div"), Ze = () => {
-			if (Ye.textContent = le, Xe.replaceChildren(), !Z) return;
+		}), Ve.append(pe("span", "", "教程文档"), He);
+		let Ue = pe("div", "settings-document-row"), We = pe("button", "secondary-action", "复制接口示例");
+		We.type = "button";
+		let Ge = pe("span", "settings-hint", le), Ke = pe("div"), qe = () => {
+			if (Ge.textContent = le, Ke.replaceChildren(), !Z) return;
 			let e = pe("textarea", "v3-diagnostic-fallback");
-			e.value = Z, e.textContent = Z, e.readOnly = !0, Xe.append(pe("p", "settings-hint", "调用示例（长按全选复制）"), e);
+			e.value = Z, e.textContent = Z, e.readOnly = !0, Ke.append(pe("p", "settings-hint", "调用示例（长按全选复制）"), e);
 		};
-		Je.addEventListener("click", async () => {
-			await me(), Ze();
-		}), qe.append(pe("span", "", "API 接口"), Je), Ye.setAttribute("role", "status"), We.append(Ge, qe), ne && We.append(ne.noticeRow), We.append(Ye, Xe), Ze(), l.append(Ue), c.mount(D, { page: "management" }), V = "foundation-settings", I.append(l), H && he(), ie(), be("settings"), t && z?.scrollIntoView?.({ block: "start" });
+		We.addEventListener("click", async () => {
+			await me(), qe();
+		}), Ue.append(pe("span", "", "API 接口"), We), Ge.setAttribute("role", "status"), Be.append(Ve, Ue), ne && Be.append(ne.noticeRow), Be.append(Ge, Ke), qe(), l.append(ze), c.mount(D, { page: "management" }), V = "foundation-settings", I.append(l), H && he(), J(), be("settings"), t && R?.scrollIntoView?.({ block: "start" });
 	}
 	function De(e) {
 		o?.ensureChecked(), U = e ?? U, j.hidden = !1, j.setAttribute("aria-hidden", "false"), R.restore();
