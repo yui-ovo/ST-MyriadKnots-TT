@@ -35,7 +35,7 @@ const waitFor = async (condition, message, timeoutMs = 2000) => {
   assert.fail(message);
 };
 
-test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视图，并恢复各页滚动位置', async () => {
+test('真实面板按七个主标签映射视图，独立显示预设并恢复各页滚动位置', async () => {
   const [source, panelHtml, panelCss] = await Promise.all([
     readFile(new URL('../src/ui/panel.js', import.meta.url), 'utf8'),
     readFile(new URL('../src/ui/panel.html', import.meta.url), 'utf8'),
@@ -47,9 +47,14 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   const panelNode = new Node('section'), body = new Node('main'), view = new Node('div');
   const topbar = new Node('header'), resize = new Node('button'), close = new Node('button'), themeButton = new Node('button'), fabButton = new Node('button');
   const themeSvg = new Node('svg'); themeButton.querySelector = selector => selector === 'svg' ? themeSvg : null;
-  const profileTab = new Node('button'), eventTab = new Node('button'), qianshiTab = new Node('button'), qianchuangTab = new Node('button'), peopleTab = new Node('button'), settingsTab = new Node('button'); profileTab.dataset.tab = 'profiles'; eventTab.dataset.tab = 'events'; qianshiTab.dataset.tab = 'qianshi'; qianchuangTab.dataset.tab = 'qianchuang'; peopleTab.dataset.tab = 'people'; settingsTab.dataset.tab = 'settings';
+  const tabs = ['profiles', 'events', 'qianshi', 'qianchuang', 'people', 'presets', 'settings'].map(id => {
+    const button = new Node('button');
+    button.dataset.tab = id;
+    return button;
+  });
+  const [profileTab, eventTab, qianshiTab, qianchuangTab, peopleTab, presetsTab, settingsTab] = tabs;
   const nodeMap = new Map([['.panel', panelNode], ['.body', body], ['.view', view], ['.topbar', topbar], ['.panel-resize-handle', resize], ['.close', close], ['.theme-btn', themeButton], ['.fab-toggle-btn', fabButton]]);
-  const root = { innerHTML: '', querySelector: selector => nodeMap.get(selector) ?? null, querySelectorAll: selector => selector === '.tab' ? [profileTab, eventTab, qianshiTab, qianchuangTab, peopleTab, settingsTab] : [] };
+  const root = { innerHTML: '', querySelector: selector => nodeMap.get(selector) ?? null, querySelectorAll: selector => selector === '.tab' ? tabs : [] };
   const host = new Node('host'); host.attachShadow = () => root;
   let firstElement = true;
   const documentEvents = {}, documentListeners = new Map();
@@ -80,7 +85,8 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   let tauriTavern = false;
   const saveScheduleError = new Error('private settings scheduler detail');
   let apiSettingsMounts = 0, apiSettingsDisposals = 0, vectorSettingsMounts = 0, vectorSettingsDisposals = 0;
-  let wrapperMounts = 0, wrapperDisposals = 0;
+  let presetActivations = 0, presetDeactivations = 0;
+  const presetsPage = new Node();
   const modules = {
     './dynamic-worldbook-view.js': { createDynamicWorldbookView: () => ({ node: new Node(), dispose() {} }) },
     '../inline-memory-prompt.js': { INLINE_MEMORY_PROMPT: 'fixture summary prompt' },
@@ -104,7 +110,11 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
       const vector = drawer({ title: '向量配置', id: 'qqj-settings-vector-api', open, onToggle, level: 'sub' });
       return { node: vector.drawer, dispose() { vectorSettingsDisposals++; } };
     } },
-    './settings/prompts-settings.js': { createPromptsSettings: () => { wrapperMounts++; return { node: new Node(), dispose() { wrapperDisposals++; } }; } },
+    './settings/aux-prompt-presets.js': { createPromptPresetsView: () => ({
+      node: presetsPage,
+      activate() { presetActivations++; },
+      deactivate() { presetDeactivations++; },
+    }) },
     './settings/appearance-settings.js': { createAppearanceSettings: () => ({ node: new Node() }) },
     './help-guide.js': { openHelpGuide },
     '../settings.js': { applyPluginEnabledImmediately },
@@ -187,7 +197,13 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   let autoHideApplyStatus = null;
   let calendarChatId = foundationState.chatId, savedCalendar = null; const calendarChanges = [];
   const calendarContextProvider = () => ({ chatId: calendarChatId, calendar: savedCalendar });
-  panel = entry.namespace.createPanel({ pluginUpdates, calendarContextProvider, onCalendarChange: async value => { calendarChanges.push(value); savedCalendar = value.calendar; }, settings, v3FoundationView, timeRuntime, memoryRuntime, peopleProfilesView, qianshiTimelineView, qianchuangView: { mount(target) { calls.push(['window-mount',target]); }, activate() { calls.push(['window-activate']); return Promise.resolve({status:'ready'}); }, deactivate() { calls.push(['window-deactivate']); } }, storageManagementView, memoryTransferViewFactory, documentRef, isSevenDaysLedgerInjectionEnabled: () => ledgerInjectionEnabled, onPluginEnabledChange: async value => { if (rejectPluginDisable && value === false) throw pluginDisableError; }, onPluginEnableFailure: (error, phase) => pluginFailures.push({ error, phase, settingsEnabled: settings.isEnabled() }), onTimeEvolutionChange: () => { timeChanges += 1; }, navigatorRef: { clipboard: { async writeText(value) { clipboardWrites.push(value); if (clipboardFail) throw new Error('clipboard denied'); } } }, dialog: { setAppearance(value) { dialogAppearances.push(value); }, confirm(options) { timeConfirms.push(options); dialogActive = true; return new Promise(resolve => { resolveTimeConfirm = result => { dialogActive = false; resolve(result); }; }); }, custom(options) { helpDialog = options; dialogActive = true; return Promise.resolve(true); }, closeAll() { resolveTimeConfirm?.(false); dialogActive = false; }, hasActive: () => dialogActive, cancelTop() { dialogCancels += 1; dialogActive = false; } }, onFabShowChange: value => { fabVisible = value; }, onAutoHideChange: async value => { autoHideApplies.push(value); return autoHideApplyStatus ? { status: autoHideApplyStatus } : undefined; } });
+  let onPresetChatChange;
+  function subscribeDialogContextChange(handler) {
+    assert.equal(onPresetChatChange, undefined);
+    onPresetChatChange = handler;
+    return () => { onPresetChatChange = undefined; };
+  }
+  panel = entry.namespace.createPanel({ subscribeDialogContextChange, pluginUpdates, calendarContextProvider, onCalendarChange: async value => { calendarChanges.push(value); savedCalendar = value.calendar; }, settings, v3FoundationView, timeRuntime, memoryRuntime, peopleProfilesView, qianshiTimelineView, qianchuangView: { mount(target) { calls.push(['window-mount',target]); }, activate() { calls.push(['window-activate']); return Promise.resolve({status:'ready'}); }, deactivate() { calls.push(['window-deactivate']); } }, storageManagementView, memoryTransferViewFactory, documentRef, isSevenDaysLedgerInjectionEnabled: () => ledgerInjectionEnabled, onPluginEnabledChange: async value => { if (rejectPluginDisable && value === false) throw pluginDisableError; }, onPluginEnableFailure: (error, phase) => pluginFailures.push({ error, phase, settingsEnabled: settings.isEnabled() }), onTimeEvolutionChange: () => { timeChanges += 1; }, navigatorRef: { clipboard: { async writeText(value) { clipboardWrites.push(value); if (clipboardFail) throw new Error('clipboard denied'); } } }, dialog: { setAppearance(value) { dialogAppearances.push(value); }, confirm(options) { timeConfirms.push(options); dialogActive = true; return new Promise(resolve => { resolveTimeConfirm = result => { dialogActive = false; resolve(result); }; }); }, custom(options) { helpDialog = options; dialogActive = true; return Promise.resolve(true); }, closeAll() { resolveTimeConfirm?.(false); dialogActive = false; }, hasActive: () => dialogActive, cancelTop() { dialogCancels += 1; dialogActive = false; } }, onFabShowChange: value => { fabVisible = value; }, onAutoHideChange: async value => { autoHideApplies.push(value); return autoHideApplyStatus ? { status: autoHideApplyStatus } : undefined; } });
 
   await panel.show();
   await Promise.resolve();
@@ -366,7 +382,7 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   assert.equal(masterInput.checked, true);
   rejectSaveSchedule = false;
   assert.equal(apiSettingsDisposals, apiSettingsMounts - 1, '当前设置页保留唯一 API 进度订阅');
-  assert.equal(wrapperDisposals, wrapperMounts - 1, '当前设置页保留唯一包裹值回显订阅');
+  assert.equal(presetActivations, presetDeactivations, '设置页不挂载预设编辑器');
   assert.equal(view.children[0]?.children.some(node => node.className === 'master-switch'), true, '设置首开不得被真实 setPage 重绘清掉总开关');
   const settingsGroups = view.children[0]?.children.filter(node => node.tag === 'details');
   assert.deepEqual(settingsGroups.map(node => node.drawerTitle), ['通用设置', '记忆设置', '教程与配置文件'], '存储管理应收进记忆设置，不再占用顶层抽屉');
@@ -530,7 +546,7 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   assert.equal(body.scrollTop, 39, '从设置返回双丝网时恢复其滚动位置');
   assert.deepEqual(calls.filter(([kind]) => kind === 'mount').at(-1), ['mount', view], '返回内容页应重新挂载到主视图容器');
   assert.equal(apiSettingsDisposals, apiSettingsMounts, '离开设置页必须释放 API 进度订阅');
-  assert.equal(wrapperDisposals, wrapperMounts, '离开设置页释放包裹值回显订阅');
+  assert.equal(presetActivations, presetDeactivations);
   assert.equal(view.children[0]?.className, 'qqj-page qqj-people-page', '返回内容页应移除设置 DOM 并呈现真实内容视图');
   eventTab.fire('click');
   assert.equal(body.scrollTop, 71, '回到千结时恢复千结滚动位置');
@@ -617,7 +633,20 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   assert.equal(panel.getState().activeTab,'people','第四次左滑应进入双丝网');
   body.fire('touchstart', { touches: [touch(260, 100)], target: swipeTarget });
   body.fire('touchend', { changedTouches: [touch(160, 105)], target: swipeTarget });
-  assert.equal(panel.getState().screen, 'settings', '第四次左滑应进入设置页');
+  assert.equal(panel.getState().screen, 'presets', '双丝网左滑进入预设');
+  assert.equal(view.children[0], presetsPage);
+  assert.equal(presetsTab.attributes['aria-selected'], 'true');
+  assert.equal(presetActivations, presetDeactivations + 1);
+  const previousActivations = presetActivations;
+  onPresetChatChange();
+  assert.equal(presetActivations, previousActivations + 1, '切换聊天时撤下原聊天的预览');
+  assert.equal(presetActivations, presetDeactivations + 1);
+  body.scrollTop = 73;
+  body.fire('touchstart', { touches: [touch(260, 100)], target: swipeTarget });
+  body.fire('touchend', { changedTouches: [touch(160, 105)], target: swipeTarget });
+  assert.equal(panel.getState().screen, 'settings', '预设左滑进入设置');
+  assert.equal(presetActivations, presetDeactivations);
+  assert.equal(onPresetChatChange, undefined);
   const settingsInputTarget = { closest: selector => selector.includes('input') ? {} : null };
   body.fire('touchstart', { touches: [touch(100, 100)], target: settingsInputTarget });
   body.fire('touchend', { changedTouches: [touch(200, 105)], target: settingsInputTarget });
@@ -628,7 +657,11 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   assert.equal(panel.getState().screen, 'settings', '内联选择器横向操作应保留自身手势，不触发切页');
   body.fire('touchstart', { touches: [touch(100, 100)], target: swipeTarget });
   body.fire('touchend', { changedTouches: [touch(200, 105)], target: swipeTarget });
-  assert.equal(panel.getState().activeTab, 'people'); assert.equal(panel.getState().screen, 'content', '设置页右滑应回到双丝网');
+  assert.equal(panel.getState().screen, 'presets', '设置右滑回到预设');
+  assert.equal(body.scrollTop, 73);
+  body.fire('touchstart', { touches: [touch(100, 100)], target: swipeTarget });
+  body.fire('touchend', { changedTouches: [touch(200, 105)], target: swipeTarget });
+  assert.equal(panel.getState().activeTab, 'people'); assert.equal(panel.getState().screen, 'content', '预设右滑回到双丝网');
   body.fire('touchstart', { touches: [touch(200, 100)], target: swipeTarget });
   const verticalMove = touchEvent({ touches: [touch(190, 190)], target: swipeTarget }); body.fire('touchmove', verticalMove);
   const verticalEnd = touchEvent({ changedTouches: [touch(185, 220)], target: swipeTarget }); body.fire('touchend', verticalEnd);
@@ -703,7 +736,7 @@ test('真实面板入口按千人/千结/千事/千窗/双丝网/设置映射视
   closedTimeInput.checked = true; const closedTime = closedTimeInput.fire('change');
   panel.close(); await closedTime;
   assert.equal(apiSettingsDisposals, apiSettingsMounts, '关闭面板释放最后一个 API 进度订阅');
-  assert.equal(wrapperDisposals, wrapperMounts, '关闭面板释放最后一个包裹值回显订阅');
+  assert.equal(presetActivations, presetDeactivations, '关闭面板不保留预设订阅');
   assert.ok(transferViews.length > 0 && transferViews.every(value => value.disposed), '切页、重绘与关闭均销毁导入导出视图');
   assert.equal(values.timeEvolutionEnabled, false); assert.equal(timeChanges, 4, '关面板取消确认，不开启时间推演');
   assert.equal(timeListeners.size, 0); assert.equal(memoryListeners.size, 0, '关面板解除时间与记忆订阅');

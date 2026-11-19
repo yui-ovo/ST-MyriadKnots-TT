@@ -2,7 +2,7 @@ import { getSharedBodyWrappers, updateSharedBodyWrappers } from './shared-body-w
 import { initializeSharedProcessingPrompt, getSharedProcessingPrompt, updateSharedProcessingPrompt } from './shared-processing-prompt.js';
 import { normalizeStoryClockReferenceTags } from './story-clock.js';
 import { normalizeStoryCalendar } from './v3/calendar-rules.js';
-import { normalizeAuxPromptLibrary } from './aux-prompt-library.js';
+import { getAuxHostPrompt, normalizeAuxPromptLibrary } from './aux-prompt-library.js';
 
 export const SETTINGS_ID = 'qianqianjie';
 
@@ -190,14 +190,51 @@ const normalizeQianchuangBasemaps = value => Object.fromEntries(Object.entries(v
 export function createSettingsStore({ extensionSettings, save = () => {}, now, random } = {}) {
   if (!extensionSettings || typeof extensionSettings !== 'object') throw new Error('千千结设置存储不可用');
   getSharedBodyWrappers(extensionSettings);
-  initializeSharedProcessingPrompt(extensionSettings, save);
+  const initializedSharedPrompt = initializeSharedProcessingPrompt(extensionSettings);
   let normalizedAuxLibrary;
   const failedAuxWrites = new WeakMap();
-  const setAuxLibrary = (settings, value) => {
-    normalizedAuxLibrary = normalizeAuxPromptLibrary(value);
-    settings.auxPromptLibrary = normalizedAuxLibrary;
-    return normalizedAuxLibrary;
+  const failedMigrations = new WeakMap();
+  const legacyPromptSettings = settings => ({
+    processingPrompt: getSharedProcessingPrompt(extensionSettings),
+    summaryPrompt: settings.summaryPrompt, csePrompt: settings.csePrompt, profilePrompt: settings.profilePrompt,
+    worldbookPrompt: settings.worldbookPrompt, storyClockPrompt: settings.storyClockPrompt, avatarPrompt: settings.avatarPrompt,
+  });
+  const attachAuxLibrary = (settings, library) => {
+    normalizedAuxLibrary = library;
+    settings.auxPromptLibrary = library;
+    // The story-clock owner in the peer plugin reads this field directly.
+    settings.storyClockPrompt = getAuxHostPrompt(library, 'storyClockPrompt');
+    settings.avatarPrompt = getAuxHostPrompt(library, 'avatarPrompt');
+    return library;
   };
+  const setAuxLibrary = (settings, value) => attachAuxLibrary(settings, normalizeAuxPromptLibrary(value, legacyPromptSettings(settings)));
+  const existing = extensionSettings[SETTINGS_ID] ?? {};
+  let scheduledMigration = false;
+  if (existing.auxPromptLibrary?.version !== 2) {
+    const migrated = normalizeAuxPromptLibrary(existing.auxPromptLibrary, legacyPromptSettings(existing));
+    if (migrated.suites.length) {
+      const keys = ['auxPromptLibrary', 'storyClockPrompt', 'avatarPrompt'];
+      const before = Object.fromEntries(keys.filter(key => own(existing, key)).map(key => [key, existing[key]]));
+      extensionSettings[SETTINGS_ID] = existing;
+      attachAuxLibrary(existing, migrated);
+      scheduledMigration = true;
+      const restoreSource = () => {
+        for (const key of keys) {
+          if (own(before, key)) existing[key] = before[key];
+          else delete existing[key];
+        }
+        normalizedAuxLibrary = undefined;
+      };
+      const restore = () => {
+        failedMigrations.set(migrated, restoreSource);
+        if (existing.auxPromptLibrary === migrated) restoreSource();
+      };
+      // A failed host write leaves the legacy source available for deterministic migration on the next access.
+      try { const pending = save(); if (typeof pending?.then === 'function') Promise.resolve(pending).catch(restore); }
+      catch { restore(); }
+    }
+  }
+  if (initializedSharedPrompt && !scheduledMigration) save();
   const get = () => {
     const settings = extensionSettings[SETTINGS_ID] ??= { ...DEFAULT_SETTINGS, apiExcludeParams: [], apiPresets: [] };
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) if (!own(settings, key)) {
@@ -307,8 +344,9 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
         if (settings.auxPromptLibrary !== applied) return;
         let restored = previous;
         while (failedAuxWrites.has(restored)) restored = failedAuxWrites.get(restored);
-        normalizedAuxLibrary = restored;
-        settings.auxPromptLibrary = restored;
+        const restoreSource = failedMigrations.get(restored);
+        if (restoreSource) restoreSource();
+        else attachAuxLibrary(settings, restored);
       });
     }
     notify(observeSaveFailure);
@@ -538,7 +576,7 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
       restoreApiFields(current, before, applied);
       if (removedBindings.length) {
         const latest = current.auxPromptLibrary;
-        const missing = removedBindings.filter(binding => !latest.bindings.some(item => item.taskId === binding.taskId && item.routeKey === routeKey));
+        const missing = removedBindings.filter(binding => !latest.bindings.some(item => item.suiteId === binding.suiteId && item.taskId === binding.taskId && item.routeKey === routeKey));
         if (missing.length) setAuxLibrary(current, { ...latest, bindings: [...latest.bindings, ...missing] });
       }
     });

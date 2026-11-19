@@ -1,10 +1,11 @@
-import { AUX_BUILTIN_ID, resolveAuxPromptPreset } from './aux-prompt-library.js';
+import { resolveAuxPromptPreset } from './aux-prompt-library.js';
+import { getAuxOriginalInstructions, getAuxSelectionRetry } from './aux-prompt-defaults.js';
 import { AUX_TASKS, getAuxDemoTaskOptions, getAuxPromptValues } from './aux-prompt-tasks.js';
-import { prependProcessingPrompt, resolveSharedProcessingPrompt } from './shared-processing-prompt.js';
+import { BASE_PROCESSING_PROMPT, prependProcessingPrompt } from './shared-processing-prompt.js';
 
 const taskIds = new Set(AUX_TASKS.map(task => task.id));
 const fallbackInstructions = 'Process only the supplied task input. Return only JSON matching the requested schema.';
-const macroPattern = /\{\{\s*(qqj_[\w]+)\s*\}\}/gu;
+const macroPattern = /\{\{(\s*)(!*)(qqj_\w+)(\s*)\}\}/gu;
 const roles = new Set(['system', 'user', 'assistant']);
 const presetError = message => Object.assign(new Error(message), { code: 'QQJ_PROMPT_PRESET_INVALID' });
 
@@ -19,36 +20,49 @@ function taskInput(options) {
 
 export function renderAuxPrompt(taskId, preset, options, prefix) {
   const input = taskInput(options);
-  if (!preset || preset.id === AUX_BUILTIN_ID) {
+  if (!preset) {
     return { messages: [
       { role: 'system', content: prependProcessingPrompt(input.systemPrompt, prefix) },
       ...input.taskMessages.filter(message => message.role !== 'assistant'),
     ], warnings: [] };
   }
   if (preset.taskId !== taskId) throw presetError('所选提示词预设属于其他任务。');
-  const values = getAuxPromptValues(taskId, input, prefix);
   const messages = [], warnings = [];
+  let materialValues, previousSystemGroup = false;
+  function expand(row, token, before, escapes, key, after) {
+    if (escapes) return '{{' + before + escapes.slice(1) + key + after + '}}';
+    if (key === 'qqj_prefix') return BASE_PROCESSING_PROMPT;
+    if (key === 'qqj_instructions') return getAuxOriginalInstructions(taskId, input);
+    if (key === 'qqj_input') return input.taskMessages.map(message => message.content).join('\n\n');
+    if (key === 'qqj_selection_retry' && taskId === 'worldbookSelect') return getAuxSelectionRetry(input);
+    materialValues ??= getAuxPromptValues(taskId, input, BASE_PROCESSING_PROMPT);
+    if (!Object.hasOwn(materialValues, key)) throw presetError(`「${row.name}」使用了本任务无法识别的宏 ${token}。`);
+    return materialValues[key];
+  }
   for (const row of preset.rows) {
     if (!row.enabled) continue;
     if (!roles.has(row.role)) throw presetError(`「${row.name}」的消息角色无效。`);
     // A single input placeholder keeps separate upstream messages (e.g. a catalog and a query).
-    const parts = /^\s*\{\{\s*qqj_input\s*\}\}\s*$/u.test(row.content)
+    const inputRow = /^\s*\{\{\s*qqj_input\s*\}\}\s*$/u.test(row.content);
+    const parts = inputRow
       ? input.taskMessages.map(message => message.content)
-      : [row.content.replace(macroPattern, (token, key) => {
-        if (!Object.hasOwn(values, key)) throw presetError(`「${row.name}」使用了本任务无法识别的宏 ${token}。`);
-        return values[key];
-      })];
+      : [row.content.replace(macroPattern, (token, before, escapes, key, after) => expand(row, token, before, escapes, key, after))];
     const nonempty = parts.filter(part => part.trim());
     if (!nonempty.length) warnings.push(`「${row.name}」展开后为空，已跳过。`);
-    for (const content of nonempty) messages.push({ role: row.role, content });
+    const groupedSystem = !inputRow && row.role === 'system' && row.messageGroup === 'systemPrompt';
+    for (const content of nonempty) {
+      if (groupedSystem && previousSystemGroup) messages[messages.length - 1].content += '\n\n' + content;
+      else messages.push({ role: row.role, content });
+      previousSystemGroup = groupedSystem;
+    }
   }
   if (!messages.length) throw presetError('预设展开后没有可发送的消息，请启用含有内容的条目。');
   return { messages, warnings };
 }
 
 function policyText(preset, prefix) {
-  if (!preset || preset.id === AUX_BUILTIN_ID) return prefix;
-  return JSON.stringify([prefix, preset.rows.filter(row => row.enabled).map(row => [row.role, row.content])]);
+  if (!preset) return prefix;
+  return JSON.stringify(preset.rows.filter(row => row.enabled).map(row => [row.role, row.messageGroup ?? null, row.content]));
 }
 
 export const auxRouteKey = route => {
@@ -68,7 +82,7 @@ export function createAuxPromptRuntime({ settings, resolver, currentIdentity, li
     return { key, chatId: identity?.chatId };
   };
   const selected = (taskId, routeKey) => resolveAuxPromptPreset(settings.get().auxPromptLibrary, taskId, routeKey);
-  const signature = (taskId, routeKey, prefix) => policyText(selected(taskId, routeKey), resolveSharedProcessingPrompt(prefix));
+  const signature = (taskId, routeKey, prefix) => policyText(selected(taskId, routeKey), prefix);
   function prepare(options, prefix) {
     const { promptTask: taskId, routeKey, transportBudget } = options;
     const id = JSON.stringify([taskId, routeKey]);
@@ -87,8 +101,7 @@ export function createAuxPromptRuntime({ settings, resolver, currentIdentity, li
         recent.set(taskId, { id: `request:${++serial}`, input });
       }
     }
-    return { ...renderAuxPrompt(taskId, recipe.preset, options, recipe.prefix),
-      policy: policyText(recipe.preset, recipe.prefix), custom: Boolean(recipe.preset && recipe.preset.id !== AUX_BUILTIN_ID) };
+    return { ...renderAuxPrompt(taskId, recipe.preset, options, recipe.prefix), policy: policyText(recipe.preset, recipe.prefix), managed: Boolean(recipe.preset) };
   }
   function sources(taskId) {
     if (!taskIds.has(taskId)) return [];
@@ -99,10 +112,9 @@ export function createAuxPromptRuntime({ settings, resolver, currentIdentity, li
   }
   async function preview({ taskId, sourceId, preset }) {
     if (!taskIds.has(taskId)) throw presetError('请选择可用的任务。');
-    const prefix = resolveSharedProcessingPrompt(settings.processingPrompt());
     if (sourceId === 'demo') {
-      const result = renderAuxPrompt(taskId, preset, getAuxDemoTaskOptions(taskId), prefix);
-      result.warnings.unshift('此处使用示例材料和简短任务指令演示排布。');
+      const result = renderAuxPrompt(taskId, preset, getAuxDemoTaskOptions(taskId), BASE_PROCESSING_PROMPT);
+      result.warnings.unshift('此处用示例材料展开当前预设。');
       return result;
     }
     const initial = scope().key, revision = contextRevision;
@@ -110,11 +122,18 @@ export function createAuxPromptRuntime({ settings, resolver, currentIdentity, li
     const captured = recent.get(taskId);
     const input = captured && sourceId === captured.id ? captured.input : await readSource(taskId, sourceId);
     if (!input || initial !== scope().key || revision !== contextRevision) throw presetError('预览资料已变化，请重新选择。');
-    return renderAuxPrompt(taskId, preset, input, prefix);
+    return renderAuxPrompt(taskId, preset, input, BASE_PROCESSING_PROMPT);
   }
   const routes = () => [
     { id: 'main', label: '千千结主配置' },
     ...resolver.describeSevenDaysPresets().map(({ id, name }) => ({ id: `preset:${id}`, label: name })),
   ];
-  return { prepare, signature, clear, preview, routes, sources };
+  function activeRoute(taskId) {
+    const resolve = taskId === 'cse' ? resolver.resolve
+      : ['recall', 'worldbookSelect'].includes(taskId) ? resolver.resolveRecall
+        : ['worldbookClassify', 'worldbookUpdate'].includes(taskId) ? resolver.resolveWorldbook : resolver.resolveUtility;
+    const route = resolve?.();
+    return { id: auxRouteKey(route), label: route?.sourceLabel || '千千结主配置' };
+  }
+  return { prepare, signature, clear, preview, routes, sources, activeRoute };
 }

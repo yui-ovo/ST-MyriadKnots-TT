@@ -123,6 +123,7 @@ export function bootstrap({
     onPluginEnableFailure,
     onStoryClockChange,
     subscribeSettingsChange,
+    subscribeDialogContextChange,
     onAutoHideChange,
     onTimeEvolutionChange,
     calendarContextProvider,

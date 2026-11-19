@@ -1,3 +1,6 @@
+import { getAuxOriginalInstructions, getAuxSelectionRetry } from './aux-prompt-defaults.js';
+import { BASE_PROCESSING_PROMPT } from './shared-processing-prompt.js';
+
 // Section definitions project only the messages that the task already prepared.
 // An unchanged task can continue to send its original messages verbatim.
 const macro = (key, label, description) => ({ name: `qqj_${key}`, label, description });
@@ -7,8 +10,8 @@ const rows = (key, label, description, table, property, ids, includeTop = false)
 const source = (key, label, description, kind) => ({ ...field(key, label, description, 'sources'), kind });
 
 const base = [
-  macro('prefix', '通用前缀', '当前请求使用的通用处理提示词，可放在任意条目。'),
-  macro('instructions', '任务指令', '本次任务的内置指令、已生效的内容指导和输出格式。'),
+  macro('prefix', '原版通用前缀', '千千结内置的通用处理提示词，可放在任意条目。'),
+  macro('instructions', '原版任务指令', '此任务的完整原版内容指导和输出格式，包含本次请求适用的校验提示。'),
   macro('input', '完整任务材料', '包含下面各项材料。需要分别安排位置时，可用各项材料和其余材料组合。'),
 ];
 const remaining = macro('remaining', '其余材料', '提取各项独立材料后余下的字段和来源标识。与各项独立材料搭配使用。');
@@ -194,7 +197,9 @@ const registry = [
     example: { changes: [], unchangedReason: '本批材料未显示原有设定发生变化。', reviewNeeded: [] },
     hint: '修改时，每项 changes 引用本批 uid、segmentId 和 evidenceRefs，并用 replacements 给出逐字原文及替换文本。',
   }, {
-    id: 'worldbookSelect', label: '资料条目选材', sections: [
+    id: 'worldbookSelect', label: '资料条目选材',
+    liveMacros: [macro('selection_retry', '本次选材校验提示', '首次请求为空。校验后重试时提供当前错误和本批可用编号。')],
+    sections: [
       entries, field('recent', '最近对话', '本次选材使用的最近对话及角色。', 'recent'),
     ], demo: [{ entries: [demoEntry] }, { recent: [{ role: 'user', content: '我能去哪里阅览这些书？' }] }],
     example: { selected: ['entry-1'] },
@@ -202,9 +207,9 @@ const registry = [
   },
 ];
 
-export const AUX_TASKS = Object.freeze(registry.map(({ id, label, sections, example, hint }) => Object.freeze({
+export const AUX_TASKS = Object.freeze(registry.map(({ id, label, sections, liveMacros = [], example, hint }) => Object.freeze({
   id, label,
-  macros: Object.freeze([...base, ...sections, remaining].map(({ name, label, description }) => Object.freeze({ name, label, description }))),
+  macros: Object.freeze([...base, ...sections, ...liveMacros, remaining].map(({ name, label, description }) => Object.freeze({ name, label, description }))),
   outputExample: JSON.stringify(example, null, 2), outputHint: hint,
 })));
 
@@ -214,7 +219,7 @@ export function getAuxDemoTaskOptions(taskId) {
   const packets = Array.isArray(task.demo) ? task.demo : [task.demo];
   return {
     promptTask: task.id,
-    systemPrompt: `${task.label}的示例指令。\n${task.hint}`,
+    systemPrompt: getAuxOriginalInstructions(taskId),
     taskMessages: packets.map(packet => ({ role: 'user', content: JSON.stringify(packet) })),
   };
 }
@@ -262,11 +267,12 @@ export function getAuxPromptValues(taskId, options, prefix = '') {
   const task = registry.find(item => item.id === taskId);
   const contents = (Array.isArray(options?.taskMessages) ? options.taskMessages : []).map(message => asText(message?.content));
   const values = {
-    qqj_prefix: typeof prefix === 'string' ? prefix : '',
-    qqj_instructions: typeof options?.systemPrompt === 'string' ? options.systemPrompt : '',
+    qqj_prefix: task ? BASE_PROCESSING_PROMPT : typeof prefix === 'string' ? prefix : '',
+    qqj_instructions: task ? getAuxOriginalInstructions(taskId, options) : typeof options?.systemPrompt === 'string' ? options.systemPrompt : '',
     qqj_input: contents.join('\n\n'),
   };
   if (!task) return values;
+  if (taskId === 'worldbookSelect') values.qqj_selection_retry = getAuxSelectionRetry(options);
   const parts = Object.fromEntries(task.sections.map(({ name }) => [name, []]));
   const rest = [];
   for (const content of contents) {

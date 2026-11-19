@@ -3,7 +3,10 @@ import test from 'node:test';
 import { createCompactApiClient } from '../src/compact-api-client.js';
 import { createTaskRouter } from '../src/api-routing.js';
 import { createAuxPromptRuntime, renderAuxPrompt } from '../src/aux-prompt-runtime.js';
-import { getAuxPromptPreset } from '../src/aux-prompt-library.js';
+import { editAuxPromptLibrary, getAuxPromptPreset, resolveAuxPromptPreset } from '../src/aux-prompt-library.js';
+import { getAuxOriginalInstructions } from '../src/aux-prompt-defaults.js';
+import { createSettingsStore } from '../src/settings.js';
+import { BASE_PROCESSING_PROMPT } from '../src/shared-processing-prompt.js';
 
 function library(first) {
   const entries = [
@@ -18,14 +21,18 @@ function library(first) {
   ] }], bindings: [{ taskId: 'summary', routeKey: 'preset:a', presetId: 'edited' }] };
 }
 
-const options = { promptTask: 'summary', promptOwnerId: 'chat', systemPrompt: '任务及输出格式', taskMessages: [
+const instructions = getAuxOriginalInstructions('summary');
+const options = { promptTask: 'summary', promptOwnerId: 'chat', systemPrompt: instructions, taskMessages: [
   { role: 'user', content: JSON.stringify({ payload: { canonicalContent: '原文 {{qqj_prefix}}', precedingUserInput: '刚才的输入' } }) },
 ] };
 
 test('按实际连接应用预设，同一任务重试固定模板并使用新的任务输入。预览和发送的角色、内容完全相同', async () => {
-  let saved = library('{{qqj_floor_body}}'), routeId = 'a';
-  const settings = { get: () => ({ auxPromptLibrary: saved }), processingPrompt: () => '前缀' };
-  const route = () => ({ kind: 'independent', source: 'shared-preset', config: { id: routeId, url: 'https://test.invalid', key: 'offline-key' } });
+  let routeId = 'a';
+  const settings = createSettingsStore({ extensionSettings: {
+    qianqianjie: { auxPromptLibrary: library('{{qqj_floor_body}}') },
+    'schedule-planner': { processingPrompt: '前缀' },
+  } });
+  const route = () => ({ kind: 'independent', source: 'shared-preset', sourceLabel: routeId.toUpperCase(), config: { id: routeId, url: 'https://test.invalid', key: 'offline-key' } });
   const resolver = { resolve: route, resolveUtility: route, describeSevenDaysPresets: () => [{ id: 'a', name: 'A', key: 'offline-key' }] };
   const runtime = createAuxPromptRuntime({ settings, resolver, currentIdentity: () => ({ chatId: 'chat', hostChatId: 'file' }) });
   const requests = [];
@@ -37,22 +44,70 @@ test('按实际连接应用预设，同一任务重试固定模板并使用新�
   const router = createTaskRouter({ resolver, compactClient: client });
   const transportBudget = { remaining: 3, used: 0 };
   await router.generateUtilityTask({ ...options, transportBudget });
-  const expected = [{ role: 'user', content: '原文 {{qqj_prefix}}' }, { role: 'assistant', content: '任务及输出格式' }];
+  const expected = [{ role: 'user', content: '原文 {{qqj_prefix}}' }, { role: 'assistant', content: instructions }];
   assert.deepEqual(requests[0], expected);
   const sourceId = runtime.sources('summary')[0].id;
-  const draft = getAuxPromptPreset(saved, 'summary', 'edited');
+  const draft = getAuxPromptPreset(settings.get().auxPromptLibrary, 'summary', 'edited');
   assert.deepEqual((await runtime.preview({ taskId: 'summary', sourceId, preset: draft })).messages, expected);
   assert.equal(requests.length, 1);
   assert.deepEqual(runtime.routes(), [{ id: 'main', label: '千千结主配置' }, { id: 'preset:a', label: 'A' }]);
-  saved = library('新模板');
+  assert.deepEqual(runtime.activeRoute('summary'), { id: 'preset:a', label: 'A' });
+  const edited = editAuxPromptLibrary(settings.get().auxPromptLibrary, {
+    type: 'updateEntry', presetId: draft.id, rowId: draft.rows[0].id, content: '新模板', mode: 'local',
+  }).library;
+  settings.update({ auxPromptLibrary: edited });
   routeId = 'b';
-  await router.generateUtilityTask({ ...options, systemPrompt: '本次格式修正', transportBudget });
-  assert.deepEqual(requests[1], [expected[0], { role: 'assistant', content: '本次格式修正' }]);
+  await router.generateUtilityTask({ ...options, taskMessages: [
+    { role: 'user', content: JSON.stringify({ payload: { canonicalContent: '本次重试的正文' } }) },
+  ], transportBudget });
+  assert.deepEqual(requests[1], [{ role: 'user', content: '本次重试的正文' }, expected[1]]);
   await router.generateUtilityTask(options);
-  assert.deepEqual(requests[2], [{ role: 'system', content: '前缀\n\n任务及输出格式' }, ...options.taskMessages]);
+  assert.deepEqual(requests[2], [{ role: 'system', content: '前缀\n\n' + instructions }, ...options.taskMessages]);
   routeId = 'a';
   await router.generateUtilityTask(options);
   assert.equal(requests[3][0].content, '新模板');
+});
+
+test('顶栏所选整套立即作用于下一次摘要请求；副本的修改独立，原版和历史楼层材料可分别核对', async () => {
+  const host = {};
+  const settings = createSettingsStore({ extensionSettings: host });
+  const route = () => ({ kind: 'independent', source: 'qqj-main', sourceLabel: '主配置', config: { url: 'https://example.invalid', key: 'offline-key' } });
+  const resolver = { resolve: route, resolveUtility: route };
+  const runtime = createAuxPromptRuntime({ settings, resolver, currentIdentity: () => ({ chatId: 'chat', hostChatId: 'file' }) });
+  const sent = [];
+  const client = createCompactApiClient({ processingPrompt: settings.processingPrompt, promptPresets: runtime,
+    fetchImpl: async (_url, { body }) => {
+      sent.push(JSON.parse(body).messages);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: '{"ok":true}' } }] }) };
+    } });
+  const router = createTaskRouter({ resolver, compactClient: client });
+  const edit = action => settings.update({ auxPromptLibrary: editAuxPromptLibrary(settings.get().auxPromptLibrary, action).library });
+  await router.generateUtilityTask(options);
+  const original = [{ role: 'system', content: BASE_PROCESSING_PROMPT + '\n\n' + instructions }, ...options.taskMessages];
+  assert.deepEqual(sent[0], original);
+  edit({ type: 'createSuite', name: '试用预设' });
+  const suite = settings.get().auxPromptLibrary.activeSuiteId;
+  const copy = resolveAuxPromptPreset(settings.get().auxPromptLibrary, 'summary');
+  const guidance = copy.rows.find(row => row.name === '摘要内容指导');
+  assert.ok(guidance.content.length > 30);
+  await router.generateUtilityTask(options);
+  assert.deepEqual(sent[1], original);
+  edit({ type: 'updateEntry', presetId: copy.id, rowId: guidance.id, content: '写明本楼事件发生的地点。', mode: 'local' });
+  await router.generateUtilityTask(options);
+  assert.equal(sent[2][0].content, original[0].content.replace(guidance.content, '写明本楼事件发生的地点。'));
+  assert.deepEqual(sent[2].slice(1), options.taskMessages);
+  const effective = resolveAuxPromptPreset(settings.get().auxPromptLibrary, 'summary');
+  const source = runtime.sources('summary')[0];
+  assert.deepEqual((await runtime.preview({ taskId: 'summary', sourceId: source.id, preset: effective })).messages, sent[2]);
+  edit({ type: 'selectSuite', suiteId: 'builtin' });
+  await router.generateUtilityTask(options);
+  assert.deepEqual(sent[3], original);
+  edit({ type: 'selectSuite', suiteId: suite });
+  await router.generateUtilityTask(options);
+  assert.deepEqual(sent[4], sent[2]);
+  const restored = createSettingsStore({ extensionSettings: structuredClone(host) });
+  assert.equal(restored.get().auxPromptLibrary.activeSuiteId, suite);
+  assert.ok(!JSON.stringify(host).includes('原文 {{qqj_prefix}}'));
 });
 
 test('独立输入宏保留多条消息，空材料可见，整份预设无消息或宏无效时终止', () => {

@@ -1,14 +1,15 @@
+import { buildPeopleProfileSystemPrompt } from './analysis-prompts.js';
+export { DEFAULT_PROFILE_GUIDANCE, PROFILE_FIXED_CONTRACT, buildPeopleProfileSystemPrompt } from './analysis-prompts.js';
 import { capturePrecedingUserInputFromSnapshot, memoriesBySourceFloor, storedSourceUserInput } from './user-input-source.js';
 import { identityBriefFields } from './identity-brief.js';
 import { collectPeopleHistory, compactPeopleHistory, createPeopleEvidenceProjection, peopleMaterialSignature as materialSignature, splitProfileSource, yieldProfileWork } from './people-profile-material.js';
 import { isUuid } from '../host-context.js';
 import { normalizeAvatarSource } from '../avatar-image-store.js';
 import { scanWorldInfo, createWorldInfoSourceCandidates } from '../world-info-scanner.js';
-import { withBaseProcessingPrompt } from '../internal-processing-prompt.js';
 import { replaceCseSourceMacros } from '../cse-source-selection.js';
 import {
-  LEGACY_PEOPLE_PROFILE_FIELDS, PEOPLE_PROFILE_DEFINITIONS, PEOPLE_PROFILE_FIELDS,
-  PEOPLE_PROFILE_FIELD_SET, PEOPLE_PROFILE_LABELS, emptyPeopleProfileFields, hasPeopleProfileMaterial as hasProfileMaterial,
+  LEGACY_PEOPLE_PROFILE_FIELDS, PEOPLE_PROFILE_FIELDS,
+  PEOPLE_PROFILE_FIELD_SET, emptyPeopleProfileFields, hasPeopleProfileMaterial as hasProfileMaterial,
 } from './people-profile-fields.js';
 import {
   buildEntityIdentityDirectory, deriveUserIdentityProjection, identityProjectionMembers, isIdentityDeleted,
@@ -23,35 +24,6 @@ import { replayCurrentState } from './cse-engine.js';
 export const PEOPLE_WORKSPACE_RECORD_ID = 'v3-people-workspace';
 export const PEOPLE_WORKSPACE_SCHEMA_VERSION = 3;
 export const PEOPLE_PROFILE_INPUT_CHAR_BUDGET = 24000;
-
-export const DEFAULT_PROFILE_GUIDANCE = `你是“千千结”的人物基础资料整理员，只整理有明确依据、适合长期建档的目标人物资料。
-人物卡和世界书属于明确设定；CSE Core 是人物分析，不自动等同作者设定。以明确设定和可定位的剧情事实整理能归属到目标的人物资料，保留必要的时期与条件，直接陈述事实。
-按基础信息、外貌、身份、性格与 NSFW 五类整理。性别、年龄、生日无依据时省略，外观年龄不当实际年龄；短期情绪、当前关系变化和一时应对不固化为人格。appearance 只填写无法归入细分外貌字段的必要补充；notes 只填写其他字段容纳不了的长期资料，不写来源说明、整理过程、核验过程、解释或模型想法。缺少明确值时不补猜类型、数值或身份标签。`;
-
-const PROFILE_FIELD_GUIDE = PEOPLE_PROFILE_FIELDS
-  .map(field => `${field}（${PEOPLE_PROFILE_LABELS[field]}）：${PEOPLE_PROFILE_DEFINITIONS[field]}`)
-  .join('\n');
-
-export const PROFILE_FIXED_CONTRACT = `【固定人物资料合同】
-1. 只处理输入 people 中的目标人物。characterCard 是共享的作者侧角色卡材料，按明确归属提取，不默认把卡名或卡主当作目标。history 提供已记录的有效 summary、目标相关 facts、sources 原句及该来源冻结的 precedingUserInput；聚合来源按 precedingUserInputBySourceFloor 分别标注。事实的 evidence 与 participantEvidence 用 sourceIndex 引用当前楼材料 sources（从1开始）；各自的 evidenceMode、sourceEntityId、supports 和 occurrence 保留原意，转述、内心和推断不等于客观设定。sourceFloor 指真实来源楼；precedingUser 及其 sourceSnapshotIndex 表示该楼前置用户原文。manual 原句保留人工载体及已明确知情人；知情不等于作者或内容主体，不得把原文中他人的设定归给知情目标。缺引用不表示事实无效，不猜未提供的原文。AI与对应USER共同作为剧情事实来源，按已发生行动、对白、作者修订或未来写作要求分别理解；recentFloors 是自动粗扫的清洗原文，注明片段时并非完整楼。sourceEntityNames 将实际引用的来源人或知情人 ID 对应到确定姓名，people.entityId 表明目标身份；未知名不猜。summarySource 保留有效摘要的 user/ai 来源。CSE Core 仍为分析，manual 仅表示人工纠正，不自动成为作者静态设定；priorContext 是过去背景，不覆盖新事实；人物卡、许可世界书、旧档案和人工字段各按其来源判断归属。
-2. history.auxiliaryStateSnapshot 是首份有来源的只读变量快照；后续 auxiliaryStateChanges 基于 fromSourceFloor 的快照，changes 按字符串数组 path 定位，value 替换、delete:true 删除，数组整值替换，空 changes 表示当楼无变化。缺少快照/变化字段不表示清空；按 history 原顺序延续，不把缺楼视作变化。变量只作人物整理辅助。它可能同时包含多个人物、不完整或过时信息，不能整份归给目标人物，也不能当作人工字段或权威证据；与正文或用户明确事实冲突时以正文和用户明确事实为准。
-3. 只返回一个 JSON 对象，根对象必须包含 profiles 数组；profiles 每个输入人物恰好一项，且每项内部的 personKey 必须逐字使用输入中的键，不得新增、遗漏或合并人物。合法形状示例：{"profiles":[{"personKey":"person-1","name":"示例姓名"}]}。
-4. 每项除 personKey 外只返回需要新增或纠正的字段。existingProfile 是待核旧 AI 资料，不是权威；结合本次证据纠错、补齐和整合，未覆盖字段省略并保留，不因缺少整楼原文而删除旧细节。材料明确否定旧值时可替换，明确应删除且没有替代值时返回空值。完整整理中，非人工 aliases 必须返回经本次全部材料核对的稳定别名全集；旧 aliases 仅为待核候选，不照单保留临时叫法，无稳定别名返回 []。自动粗扫的 aliases 只返回新发现的稳定称谓，空字符串或空数组表示无更新。文本字段最多 20000 字符；aliases 可返回字符串或字符串数组，数组每项最多 500 字符、合并后最多 20000 字符。不要返回 null、对象或其他错误类型。
-5. sourceFragments 是长资料按顺序切出的连续来源片段；part/total 表示同一来源的连续位置。长材料分批时，共享角色卡也按来源连续切片并在当前请求中只提供一次。单人主动重整的一次请求包含本轮全部已选片段，应综合完整输入整理；分批整理时当前批可能只包含该来源的一部分，以 existingProfile 作为前批累计结果继续整理。不要把当前请求未出现的来源或字段当成不存在，也不要把局部片段当成完整人物档。
-6. manualProfile 和 manualFields 由保存层保护，不需要模型复制；不输出解释、剧情续写、数据库 ID 或 JSON 之外的内容。
-7. 自动粗扫每约十个新增稳定AI楼运行一次，输入为楼层标记的清洗原文；仅提取明确新增或重大变化的长期基础资料，例如稳定外貌、职业和身份。短期处境、换装和剧情状态不固化；无变化时该人物只返回 personKey。原文按最新楼优先提供，人工资料和旧档案仅作边界参考。
-8. allowedWorldInfo 中的 EJS、MVU 或其他脚本包裹符号均为未执行的条件原文；不要执行，也不要把分支条件当成已成立。可整理明确归属的长期信息并保留其条件限定，不得仅因条目含控制符而忽略整条。
-9. 所有字段只写人物事实与必要的时间、阶段或条件，不把来源说明、材料比较、整理过程或核验评语写进字段。不要用“人物卡记载”“世界书条目称”“口径存在差异”“待核实”等话替代人物资料。既有 AI 档案中的这些评语也在同一次整理中改成事实表述，保留独立已知信息及有效限定；整段只有整理评语且没有人物事实时才可返回空字符串。不要按词删内容，人物回避冲突、技能涉及武器口径等真实资料应正常保留。manualProfile 中的人工字段及空值保持原样。
-10. 明确的作者更正优先于旧值；人物卡和许可世界书中明确归属的设定是稳定资料依据，CSE 分析、转述和旧 AI 档案不能自行覆盖它。对年龄、发型、衣着、职业和居所等按可定位的故事时点或阶段表达；过去与现在、不同条件下可并存的事实直接写出事实和限定，不把它们误写成冲突。年龄不能仅用年份相减，还需考虑生日是否已到及原资料对应时点，不为整理补算材料未明示的年龄。确有同一时点、同一属性的矛盾且没有可靠依据决定时，省略无法确定的新值，不臆选一方，也不将争议评语塞入其他字段；保留可独立确定的其它事实和未覆盖的旧细节。
-11. 在同一次整理中，将旧 existingProfile、manualProfile 及本次明确材料里的血型、星座、MBTI 等信息拆入对应独立字段。只处理明示值，不根据生日推星座、根据性格推MBTI或九型、根据国籍推语言，也不从一次行为夸大技能。非人工 notes、personality 等字段移除已拆出的重复标签，同时保留其独有事实、具体性格和条件；人工原文不改。没有新资料不强行填满字段，不因本次材料未覆盖而清空旧资料。
-
-【字段中文定义】
-${PROFILE_FIELD_GUIDE}`;
-
-export function buildPeopleProfileSystemPrompt(guidance = '', processingPrompt = '') {
-  const custom = typeof guidance === 'string' ? guidance : '';
-  return withBaseProcessingPrompt(`${custom.trim() ? custom : DEFAULT_PROFILE_GUIDANCE}\n\n${PROFILE_FIXED_CONTRACT}`, processingPrompt);
-}
 
 function errorWith(code, message) { return Object.assign(new Error(message), { code }); }
 function clone(value) { return structuredClone(value); }

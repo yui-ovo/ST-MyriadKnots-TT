@@ -6,7 +6,7 @@ import { createAppearanceController } from './appearance.js';
 import { createSettingsDrawer, createSettingsDrawerState } from './settings-drawer.js';
 import { createApiSettings } from './settings/api-settings.js';
 import { createVectorApiSettings } from './settings/vector-api-settings.js';
-import { createPromptsSettings } from './settings/prompts-settings.js';
+import { createPromptPresetsView } from './settings/aux-prompt-presets.js';
 import { createAppearanceSettings } from './settings/appearance-settings.js';
 import { publicErrorMessage } from '../public-error.js';
 import { openHelpGuide } from './help-guide.js';
@@ -57,6 +57,7 @@ export function createPanel({
   onPluginEnableFailure,
   onStoryClockChange,
   subscribeSettingsChange,
+  subscribeDialogContextChange,
   onAutoHideChange,
   onTimeEvolutionChange,
   calendarContextProvider = () => ({ chatId: null, calendar: null }),
@@ -113,7 +114,7 @@ export function createPanel({
   let apiEditingRole = 'analysis';
   let apiSettingsView = null;
   let vectorSettingsView = null;
-  let promptsSettingsView = null;
+  let presetsView = null, releasePresetContext = null;
   let updatesSettingsView = null;
   let memoryTransferView = null;
   let dynamicWorldbookView = null;
@@ -188,12 +189,17 @@ export function createPanel({
       return { status: 'error', error };
     }
   };
+  const deactivatePresets = () => {
+    releasePresetContext?.();
+    releasePresetContext = null;
+    if (mountedContentView === 'presets') presetsView?.deactivate?.();
+  };
   const unmountContent = () => {
     dynamicWorldbookView?.dispose(); dynamicWorldbookView = null;
     memoryTransferView?.dispose(); memoryTransferView = null;
     apiSettingsView?.dispose?.(); apiSettingsView = null;
     vectorSettingsView?.dispose(); vectorSettingsView = null;
-    promptsSettingsView?.dispose(); promptsSettingsView = null;
+    deactivatePresets();
     updatesSettingsView?.dispose(); updatesSettingsView = null;
     v3FoundationView.deactivate();
     peopleProfilesView.deactivate();
@@ -204,7 +210,7 @@ export function createPanel({
     mountedContentView = null;
     settingsManagementError = null;
   };
-  const scrollKey = () => screen === 'settings' ? 'settings' : activeTab;
+  const scrollKey = () => screen === 'content' ? activeTab : screen;
   const rememberScroll = () => { if (body) scrollPositions.set(scrollKey(), body.scrollTop || 0); };
   const restoreScroll = key => { if (body) body.scrollTop = scrollPositions.get(key) || 0; };
   const showStatus = text => {
@@ -249,26 +255,56 @@ export function createPanel({
     return result;
   }
 
+  function highlightTab(tab) {
+    tabs.forEach(node => {
+      const active = node.dataset.tab === tab;
+      node.classList.toggle('active', active);
+      node.setAttribute('aria-selected', String(active));
+      if (active) {
+        const nav = node.parentElement;
+        if (nav && nav.scrollWidth > nav.clientWidth) {
+          if (node.offsetLeft < nav.scrollLeft) nav.scrollLeft = node.offsetLeft;
+          else if (node.offsetLeft + node.offsetWidth > nav.scrollLeft + nav.clientWidth) nav.scrollLeft = node.offsetLeft + node.offsetWidth - nav.clientWidth;
+        }
+      }
+    });
+  }
+
+  function renderPresets() {
+    rememberScroll();
+    activationEpoch += 1;
+    unmountContent();
+    screen = 'presets';
+    highlightTab(screen);
+    presetsView ??= createPromptPresetsView({ settings, documentRef, promptPreview, onStoryClockChange, subscribeSettingsChange,
+      customImpl: options => dialog?.custom?.(options) });
+    view.append(presetsView.node);
+    mountedContentView = 'presets';
+    presetsView.activate?.();
+    releasePresetContext = subscribeDialogContextChange?.(() => {
+      presetsView.deactivate?.();
+      presetsView.activate?.();
+    });
+    restoreScroll(screen);
+  }
+
   function selectTab(tab) {
     if (tab === 'settings') { if (screen !== 'settings') renderSettings(); return; }
+    if (tab === 'presets') { if (screen !== 'presets') renderPresets(); return; }
     rememberScroll();
     activationEpoch += 1;
     screen = 'content';
     activeTab = tab;
-    tabs.forEach(node => {
-      const active = node.dataset.tab === activeTab;
-      node.classList.toggle('active', active);
-      node.setAttribute('aria-selected', String(active));
-    });
+    highlightTab(tab);
     swipeGesture = null;
-    void activateFoundation().catch(() => showStatus('当前聊天暂时无法读取千千结记忆。'));
+    void activateFoundation().catch(() => { if (screen === 'content' && activeTab === tab) showStatus('当前聊天暂时无法读取千千结记忆。'); });
   }
 
   function renderSettings({ focusSources = false } = {}) {
     rememberScroll();
     activationEpoch += 1;
     screen = 'settings';
-    tabs.forEach(node => { const active = node.dataset.tab === 'settings'; node.classList.toggle('active', active); node.setAttribute('aria-selected', String(active)); });
+    highlightTab(screen);
     unmountContent();
     if (focusSources) { settingsDrawerState.open('general'); settingsDrawerState.open('worldbook'); }
 
@@ -330,7 +366,7 @@ export function createPanel({
     const subOpen = key => settingsDrawerState.isOpen(key, false);
     const subToggle = key => open => settingsDrawerState.set(key, open);
 
-    // 通用设置：世界书排除、提示词和外观即时保存；API 角色选择即时生效，配置编辑需点“保存设置”。
+    // API 角色选择即时生效，连接编辑由“保存设置”提交。
     const { drawer: general, body: generalBody } = groupOf('general', '通用设置');
     const api = createApiSettings({
       settings, apiTools, vectorIndex, documentRef,
@@ -350,15 +386,13 @@ export function createPanel({
     const worldbook = sourcePermissionView?.renderSettings?.({
       open: subOpen('worldbook'), onDrawerToggle: subToggle('worldbook'),
     });
-    const prompts = createPromptsSettings({ settings, documentRef, open: subOpen('prompts'), onToggle: subToggle('prompts'), onStoryClockChange, subscribeSettingsChange, promptPreview, customImpl: options => dialog?.custom?.(options) });
-    promptsSettingsView = prompts;
     const appearanceSettings = createAppearanceSettings({
       settings, documentRef, open: subOpen('appearance'), onToggle: subToggle('appearance'),
       applyAppearance: () => appearance.apply(),
     });
     generalBody.append(api.node, vector.node);
     if (worldbook) generalBody.append(worldbook);
-    generalBody.append(prompts.node, appearanceSettings.node);
+    generalBody.append(appearanceSettings.node);
     page.append(general);
     if (dynamicWorldbook) {
       dynamicWorldbookView = createDynamicWorldbookView({ runtime: dynamicWorldbook, settings, documentRef,
@@ -570,6 +604,7 @@ export function createPanel({
     geometry.restore();
     let result = { status: 'ready' };
     if (screen === 'settings') renderSettings();
+    else if (screen === 'presets') renderPresets();
     else result = activateFoundation();
     root.querySelector('.close')?.focus?.();
     return result;
@@ -582,7 +617,8 @@ export function createPanel({
     activationEpoch += 1;
     apiSettingsView?.dispose?.(); apiSettingsView = null;
     vectorSettingsView?.dispose(); vectorSettingsView = null;
-    promptsSettingsView?.dispose(); promptsSettingsView = null;
+    deactivatePresets();
+    if (mountedContentView === 'presets') mountedContentView = null;
     updatesSettingsView?.dispose(); updatesSettingsView = null;
     v3FoundationView.deactivate();
     peopleProfilesView.deactivate();
@@ -620,7 +656,11 @@ export function createPanel({
       activationEpoch += 1;
       v3FoundationView.deactivate();
       qianshiTimelineView.deactivate();
-    qianchuangView.deactivate();
+      qianchuangView.deactivate();
+      if (!host.hidden && screen === 'presets') {
+        presetsView.deactivate?.();
+        presetsView.activate?.();
+      }
       if (!host.hidden && screen === 'content') showStatus('千千结当前已关闭。设置仍可打开。');
     } else if (!host.hidden && screen === 'content') void activateFoundation().catch(() => showStatus('当前聊天暂时无法读取千结记忆。'));
     else if (!host.hidden && screen === 'settings') void activateManagement();
@@ -646,7 +686,7 @@ export function createPanel({
     if (Math.abs(gesture.dx) < 60 || Math.abs(gesture.dx) <= Math.abs(gesture.dy) * 1.35) return;
     event.preventDefault?.();
 
-    const swipeTabs = ['profiles', 'events', 'qianshi', 'qianchuang', 'people', 'settings'], current = screen === 'settings' ? 'settings' : activeTab, index = swipeTabs.indexOf(current), next = index + (gesture.dx < 0 ? 1 : -1);
+    const swipeTabs = tabs.map(tab => tab.dataset.tab), index = swipeTabs.indexOf(scrollKey()), next = index + (gesture.dx < 0 ? 1 : -1);
     if (next >= 0 && next < swipeTabs.length) selectTab(swipeTabs[next]);
   }, { passive: false });
   body?.addEventListener?.('touchcancel', () => { swipeGesture = null; }, { passive: true });

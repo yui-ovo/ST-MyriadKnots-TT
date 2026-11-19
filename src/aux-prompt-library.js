@@ -1,72 +1,36 @@
-export const AUX_BUILTIN_ID = 'builtin';
+import {
+  AUX_BUILTIN_ID, builtinTask, discardUnusedEntries, editSuite, newPromptId, normalizeSuiteData,
+  readAuxHost, requiredName, rowMetadata, suiteList, validRoute,
+} from './aux-prompt-suites.js';
 
-const builtinRows = [
-  { key: 'prefix', name: '通用前缀', role: 'system', content: '{{qqj_prefix}}' },
-  { key: 'instructions', name: '任务指令', role: 'system', content: '{{qqj_instructions}}' },
-  { key: 'input', name: '任务材料', role: 'user', content: '{{qqj_input}}' },
-].map(({ key, ...row }) => ({ ...row, id: 'builtin:' + key, entryId: 'builtin:' + key, enabled: true }));
+export { AUX_BUILTIN_ID };
 
 const validRoles = new Set(['system', 'user', 'assistant']);
 const canonical = new WeakSet();
-const list = value => Array.isArray(value) ? value : [];
 const keyOf = value => typeof value === 'string' ? value.trim() : '';
-const localId = value => Boolean(value && value !== AUX_BUILTIN_ID && !value.startsWith('builtin:'));
-const validRoute = route => route === '' || route === 'main' || (route.startsWith('preset:') && route.slice(7).trim() !== '');
-const builtinEntry = id => builtinRows.find(row => row.entryId === id);
 const asLibrary = lib => canonical.has(lib) ? lib : normalizeAuxPromptLibrary(lib);
+const suiteActions = new Set(['selectSuite', 'createSuite', 'copySuite', 'renameSuite', 'deleteSuite', 'updateHostPrompt']);
 
 // Only definitions, placement options and bindings belong in extension settings.
 // Expanded macros can contain chat material and are never part of this representation.
-export function normalizeAuxPromptLibrary(raw) {
-  const entries = new Map();
-  for (const item of list(raw?.entries)) {
-    const id = keyOf(item?.id);
-    if (!localId(id) || entries.has(id) || typeof item.content !== 'string') continue;
-    entries.set(id, { id, name: keyOf(item.name) || '未命名条目', content: item.content });
-  }
-  const presets = new Map();
-  const usedEntries = new Set();
-  for (const item of list(raw?.presets)) {
-    const id = keyOf(item?.id), taskId = keyOf(item?.taskId);
-    if (!localId(id) || !taskId || presets.has(id)) continue;
-    const rows = [];
-    const rowIds = new Set();
-    for (const row of list(item.rows)) {
-      const rowId = keyOf(row?.id), entryId = keyOf(row?.entryId);
-      if (!localId(rowId) || rowIds.has(rowId) || (!entries.has(entryId) && !builtinEntry(entryId))) continue;
-      if (!validRoles.has(row.role)) continue;
-      rows.push({ id: rowId, entryId, role: row.role, enabled: row.enabled !== false });
-      rowIds.add(rowId);
-      usedEntries.add(entryId);
-    }
-    presets.set(id, { id, taskId, name: keyOf(item.name) || '未命名预设', rows });
-  }
-  const bindings = new Map();
-  for (const item of list(raw?.bindings)) {
-    const taskId = keyOf(item?.taskId), presetId = keyOf(item?.presetId);
-    const routeKey = item?.routeKey ?? '';
-    if (!taskId || typeof routeKey !== 'string' || !validRoute(routeKey)) continue;
-    if (presetId !== AUX_BUILTIN_ID && presets.get(presetId)?.taskId !== taskId) continue;
-    bindings.set(JSON.stringify([taskId, routeKey]), { taskId, routeKey, presetId });
-  }
-  const library = {
-    version: 1,
-    entries: [...entries.values()].filter(entry => usedEntries.has(entry.id)),
-    presets: [...presets.values()],
-    bindings: [...bindings.values()],
-  };
+export function normalizeAuxPromptLibrary(raw, legacySettings) {
+  const library = normalizeSuiteData(raw, legacySettings);
   canonical.add(library);
   return library;
 }
 
-function builtinPreset(taskId) {
-  return { id: AUX_BUILTIN_ID, taskId, name: '内置默认', rows: builtinRows.map(row => ({ ...row })) };
+export function listAuxSuites(lib) {
+  return suiteList(asLibrary(lib));
+}
+
+export function getAuxHostPrompt(lib, key, { display = false } = {}) {
+  return readAuxHost(asLibrary(lib), key, display);
 }
 
 function expandedPreset(library, preset) {
   const entries = new Map(library.entries.map(entry => [entry.id, entry]));
   const rows = preset.rows.map(row => {
-    const { name, content } = entries.get(row.entryId) ?? builtinEntry(row.entryId);
+    const { name, content } = entries.get(row.entryId);
     return { ...row, name, content };
   });
   return { ...preset, rows };
@@ -74,42 +38,34 @@ function expandedPreset(library, preset) {
 
 export function listAuxPresets(lib, taskId) {
   const library = asLibrary(lib);
-  return [builtinPreset(taskId), ...library.presets.filter(preset => preset.taskId === taskId).map(preset => expandedPreset(library, preset))];
+  return [builtinTask(taskId), ...library.presets.filter(preset => preset.suiteId === library.activeSuiteId && preset.taskId === taskId).map(preset => expandedPreset(library, preset))];
 }
 
 export function getAuxPromptPreset(lib, taskId, presetId) {
-  if (presetId === AUX_BUILTIN_ID) return builtinPreset(taskId);
+  if (presetId === AUX_BUILTIN_ID) return builtinTask(taskId);
   const library = asLibrary(lib);
-  const preset = library.presets.find(item => item.id === presetId && item.taskId === taskId);
+  const preset = library.presets.find(item => item.suiteId === library.activeSuiteId && item.id === presetId && item.taskId === taskId);
   return preset ? expandedPreset(library, preset) : null;
 }
 
 export function getAuxPromptBinding(lib, taskId, routeKey = '') {
-  const binding = asLibrary(lib).bindings.find(item => item.taskId === taskId && item.routeKey === routeKey);
+  const library = asLibrary(lib);
+  const binding = library.bindings.find(item => item.suiteId === library.activeSuiteId && item.taskId === taskId && item.routeKey === routeKey);
   return binding?.presetId ?? null;
 }
 
 export function resolveAuxPromptPreset(lib, taskId, routeKey = '') {
   const library = asLibrary(lib);
-  const selected = getAuxPromptBinding(library, taskId, routeKey) ?? getAuxPromptBinding(library, taskId);
-  return getAuxPromptPreset(library, taskId, selected) ?? builtinPreset(taskId);
+  const selected = getAuxPromptBinding(library, taskId, routeKey) ?? getAuxPromptBinding(library, taskId)
+    ?? library.presets.find(item => item.suiteId === library.activeSuiteId && item.taskId === taskId && item.base)?.id;
+  return getAuxPromptPreset(library, taskId, selected) ?? builtinTask(taskId);
 }
 
 export function getAuxEntryUses(lib, entryId) {
-  return asLibrary(lib).presets.filter(preset => preset.rows.some(row => row.entryId === entryId))
-    .map(({ id: presetId, name, taskId }) => ({ presetId, name, taskId }));
-}
-
-let nextId = 0;
-function newId() {
-  if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
-  return 'aux-' + Date.now().toString(36) + '-' + (++nextId).toString(36) + '-' + Math.random().toString(36).slice(2);
-}
-
-function requiredName(value) {
-  const name = keyOf(value);
-  if (!name) throw new Error('请填写名称。');
-  return name;
+  const library = asLibrary(lib);
+  const names = new Map(library.suites.map(suite => [suite.id, suite.name]));
+  return library.presets.filter(preset => preset.rows.some(row => row.entryId === entryId))
+    .map(({ id: presetId, name, taskId, suiteId }) => ({ presetId, name, taskId, suiteId, suiteName: names.get(suiteId) }));
 }
 
 function requiredTask(value) {
@@ -135,65 +91,65 @@ function requiredEnabled(enabled) {
 
 function editablePreset(library, id) {
   if (id === AUX_BUILTIN_ID) throw new Error('请先复制内置默认预设。');
-  const preset = library.presets.find(item => item.id === id);
+  const preset = library.presets.find(item => item.id === id && item.suiteId === library.activeSuiteId);
   if (!preset) throw new Error('找不到此提示词预设。');
   return preset;
 }
 
 function sourceEntry(library, entryId) {
-  const entry = library.entries.find(item => item.id === entryId) ?? builtinEntry(entryId);
+  const entry = library.entries.find(item => item.id === entryId);
   if (!entry) throw new Error('找不到此提示词条目。');
   return entry;
 }
 
 function addDefinition(library, name, content) {
-  const entry = { id: newId(), name: requiredName(name), content: requiredContent(content) };
+  const entry = { id: newPromptId(), name: requiredName(name), content: requiredContent(content) };
   library.entries.push(entry);
   return entry;
 }
 
-function appendRow(preset, entryId, role, enabled) {
-  const row = { id: newId(), entryId, role: requiredRole(role), enabled: requiredEnabled(enabled) };
+function appendRow(preset, entryId, role, enabled, metadata = {}) {
+  const row = { id: newPromptId(), entryId, role: requiredRole(role), enabled: requiredEnabled(enabled), ...rowMetadata(metadata) };
   preset.rows.push(row);
   return row;
 }
 
 function copyPreset(library, source, taskId, name) {
-  const preset = { id: newId(), taskId: requiredTask(taskId), name: requiredName(name), rows: [] };
+  const preset = { id: newPromptId(), suiteId: library.activeSuiteId, taskId: requiredTask(taskId), name: requiredName(name), rows: [] };
   const copies = new Map();
   for (const row of source.rows) {
     if (!copies.has(row.entryId)) copies.set(row.entryId, addDefinition(library, row.name, row.content));
-    appendRow(preset, copies.get(row.entryId).id, row.role, row.enabled);
+    appendRow(preset, copies.get(row.entryId).id, row.role, row.enabled, row);
   }
   library.presets.push(preset);
   return { library, presetId: preset.id };
-}
-
-function discardUnusedEntries(library) {
-  const used = new Set(library.presets.flatMap(preset => preset.rows.map(row => row.entryId)));
-  library.entries = library.entries.filter(entry => used.has(entry.id));
 }
 
 function bindPreset(library, action) {
   const taskId = requiredTask(action.taskId), routeKey = action.routeKey ?? '';
   if (typeof routeKey !== 'string' || !validRoute(routeKey)) throw new Error('API 连接标识无效。');
   if (action.presetId !== null && !getAuxPromptPreset(library, taskId, action.presetId)) throw new Error('请选择当前任务的提示词预设。');
-  const match = binding => binding.taskId === taskId && binding.routeKey === routeKey;
+  const suiteId = library.activeSuiteId;
+  const match = binding => binding.suiteId === suiteId && binding.taskId === taskId && binding.routeKey === routeKey;
   const existing = library.bindings.find(match);
   if (action.presetId === null) library.bindings = library.bindings.filter(binding => !match(binding));
   else if (existing) existing.presetId = action.presetId;
-  else library.bindings.push({ taskId, routeKey, presetId: action.presetId });
+  else library.bindings.push({ suiteId, taskId, routeKey, presetId: action.presetId });
   return { library, presetId: action.presetId };
 }
 
 function addEntryRow(library, preset, action) {
-  let entry;
+  let entry, origin;
   if (action.type === 'addEntry') entry = addDefinition(library, action.name, action.content);
   else {
     const source = sourceEntry(library, action.entryId);
     entry = action.type === 'referenceEntry' ? source : addDefinition(library, source.name, source.content);
+    for (const recipe of library.presets) {
+      origin = recipe.rows.find(row => row.entryId === source.id && row.source)?.source;
+      if (origin) break;
+    }
   }
-  const row = appendRow(preset, entry.id, action.role ?? 'system', action.enabled ?? true);
+  const row = appendRow(preset, entry.id, action.role ?? 'system', action.enabled ?? true, { source: origin });
   return { library, presetId: preset.id, rowId: row.id, entryId: entry.id };
 }
 
@@ -202,24 +158,28 @@ function editEntry(library, row, action) {
   if (action.mode && !['local', 'shared'].includes(action.mode)) throw new Error('请选择条目的修改范围。');
   const name = action.name === undefined ? entry.name : requiredName(action.name);
   const content = action.content === undefined ? entry.content : requiredContent(action.content);
+  const textChanged = content !== entry.content;
   if (action.mode === 'local') {
     entry = addDefinition(library, name, content);
     row.entryId = entry.id;
+    if (textChanged) row.source = '用户编辑';
     discardUnusedEntries(library);
     return;
   }
   if (name === entry.name && content === entry.content) return;
-  if (builtinEntry(row.entryId)) throw new Error('请先将内置条目复制为独立条目。');
-  const shared = library.presets.some(preset => preset.rows.some(other => other !== row && other.entryId === entry.id));
-  if (shared && action.mode !== 'shared') throw new Error('此条目被多处引用。请选择同步修改或仅修改本处。');
+  const references = library.presets.flatMap(preset => preset.rows.filter(item => item.entryId === entry.id));
+  if (references.length > 1 && action.mode !== 'shared') throw new Error('此条目被多处引用。请选择同步修改或仅修改本处。');
   Object.assign(entry, { name, content });
+  if (textChanged) for (const reference of references) reference.source = '用户编辑';
 }
 
 // Edits are atomic and return a new library, so an open editor can stage or discard them.
 export function editAuxPromptLibrary(lib, action) {
   const library = normalizeAuxPromptLibrary(lib);
+  if (suiteActions.has(action.type)) return editSuite(library, action);
+  if (library.activeSuiteId === AUX_BUILTIN_ID) throw new Error('请先复制千千结默认预设。');
   if (action.type === 'bind') return bindPreset(library, action);
-  if (action.type === 'createPreset') return copyPreset(library, builtinPreset(action.taskId), action.taskId, action.name);
+  if (action.type === 'createPreset') return copyPreset(library, builtinTask(action.taskId), action.taskId, action.name);
   if (action.type === 'copyPreset') {
     const source = getAuxPromptPreset(library, action.taskId, action.presetId);
     if (!source) throw new Error('找不到要复制的提示词预设。');
@@ -231,6 +191,7 @@ export function editAuxPromptLibrary(lib, action) {
       preset.name = requiredName(action.name);
       return { library, presetId: preset.id };
     case 'deletePreset':
+      if (preset.base) throw new Error('本套的任务基础配置可直接编辑。');
       library.presets = library.presets.filter(item => item !== preset);
       library.bindings = library.bindings.filter(binding => binding.presetId !== preset.id);
       discardUnusedEntries(library);

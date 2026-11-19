@@ -239,3 +239,35 @@
 .qqj-provider-error-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 18rem; overflow: auto; font: inherit; user-select: text; }
 
 .qqj-worldbook-diff{display:grid;gap:6px;min-width:0}.qqj-worldbook-diff-text{margin:0 0 8px;padding:10px;border:1px solid var(--line);border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.7;color:var(--ink);background:var(--paper)}.qqj-worldbook-diff-text del{color:#8a1027;background:#ffdae1;text-decoration:line-through;text-decoration-thickness:1.5px}.qqj-worldbook-diff-text ins{color:#075735;background:#cff4dd;text-decoration:underline;text-decoration-thickness:1.5px}
+/* The preset manager lives in the panel ShadowRoot and shares the panel palette. */
+.qqj-preset-manager .qqj-aux-editor,.qqj-aux-page,.qqj-aux-preview,.qqj-aux-reference{display:grid;min-width:0;gap:10px}
+.qqj-preset-manager [hidden]{display:none!important}
+.qqj-aux-editor h3,.qqj-aux-editor h4,.qqj-aux-editor p{margin:0}
+.qqj-aux-editor h4{font-size:var(--qqj-font-body)}
+.qqj-aux-pair{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);align-items:start;gap:8px}
+.qqj-aux-field{display:grid;align-content:start;min-width:0;gap:4px}
+.qqj-aux-field>span{color:var(--soft);font-size:var(--qqj-font-body);font-weight:600}
+.qqj-aux-note,.qqj-aux-feedback{overflow-wrap:anywhere}
+.qqj-aux-feedback:empty,.qqj-aux-save:empty{display:none}
+.qqj-aux-save{border-top:1px solid var(--line);padding-top:7px}
+.qqj-aux-tools,.qqj-aux-page-head,.qqj-aux-insert{display:flex;align-items:center;gap:6px;min-width:0}
+.qqj-aux-tools,.qqj-aux-page-head{flex-wrap:wrap}
+.qqj-aux-tools :is(.primary-action,.secondary-action),.qqj-aux-insert .secondary-action{min-height:max(28px,var(--qqj-compact-height));padding:var(--qqj-compact-pad-y) var(--qqj-compact-pad-x);font-size:var(--qqj-font-caption);line-height:var(--qqj-compact-line)}
+.qqj-aux-page-head{border-bottom:1px solid var(--line);padding-block:2px 4px}.qqj-aux-page-head h3{margin-right:auto;overflow-wrap:anywhere}
+.qqj-aux-row-name,.qqj-aux-text-button,.qqj-aux-host-row,.qqj-aux-arrow{appearance:none;min-width:0;margin:0;border:0;background:transparent;color:var(--ink);font:inherit;text-align:start;cursor:pointer;overflow-wrap:anywhere}
+.qqj-aux-text-button{justify-self:start;color:var(--knot);font-size:var(--qqj-font-caption);min-height:28px;padding:4px}
+.qqj-aux-row{display:flex;align-items:center;gap:6px;min-height:34px;padding:2px 1px;border-bottom:1px solid var(--line)}
+.qqj-aux-host-row{padding:7px 2px;border-block:1px solid var(--line)}
+.qqj-aux-row-name{align-self:stretch;flex:1 1 0%;padding:5px 2px}
+.qqj-aux-row[data-enabled=false] .qqj-aux-row-name{color:var(--soft)}
+.qqj-aux-row-role{flex:0 0 auto;color:var(--soft);font-size:var(--qqj-font-caption)}
+.qqj-aux-grip{padding:2px;color:var(--soft);cursor:grab;user-select:none}
+.qqj-aux-arrow{width:29px;min-height:30px;text-align:center;border:1px solid var(--line);border-radius:var(--qqj-radius-option)}
+.qqj-aux-editor input[type=checkbox]{width:18px;height:18px;margin:2px 4px;accent-color:var(--knot);cursor:pointer}
+.qqj-aux-insert{align-items:flex-start}.qqj-aux-insert>.qqj-inline-select{flex:1 1 0%;min-width:0}
+.qqj-aux-editor .qqj-inline-select-trigger{height:auto;min-width:0;text-align:start}.qqj-aux-editor .qqj-inline-select-value{min-width:0;white-space:normal;overflow-wrap:anywhere}
+.qqj-aux-editor .qqj-aux-content{min-height:200px;resize:vertical}
+.qqj-aux-macros{display:grid;gap:3px;min-width:0;margin:0}.qqj-aux-macros dt{overflow-wrap:anywhere;font-weight:600}.qqj-aux-macros dd{margin:0 0 4px;color:var(--soft);overflow-wrap:anywhere}
+.qqj-aux-message{display:grid;gap:3px;min-width:0}
+.qqj-aux-sample{min-width:0;max-height:32dvh;overflow:auto;margin:0;padding:8px;background:var(--paper);color:var(--ink);border:1px solid var(--line);border-radius:var(--qqj-radius-option);font:inherit;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:360px){.qqj-aux-pair{grid-template-columns:minmax(0,1fr)}}

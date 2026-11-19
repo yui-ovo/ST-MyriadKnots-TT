@@ -211,9 +211,15 @@ const persistStoryCalendar = (targetChatId, calendar) => {
   return settings.get().storyCalendars?.[targetChatId] ?? null;
 };
 const sourcePermissions = createSourcePermissionController({ settings, contextProvider });
-const summaryPrompt = () => settings.get().summaryPrompt;
-const csePrompt = () => settings.get().csePrompt;
-const profilePrompt = () => settings.get().profilePrompt;
+// Migrated guidance lives in each suite's editable rows. Build the native task
+// contract here so an inactive suite's legacy guidance cannot enter another one.
+function legacyGuidance(key) {
+  const current = settings.get();
+  return current.auxPromptLibrary?.version === 2 ? '' : current[key];
+}
+const summaryPrompt = () => legacyGuidance('summaryPrompt');
+const csePrompt = () => legacyGuidance('csePrompt');
+const profilePrompt = () => legacyGuidance('profilePrompt');
 const coreRecordCache = settings.get().coreCacheEnabled === false
   ? null : createIndexedDbCoreRecordCache({ localForage: localforage, accountHandleProvider: getCurrentUserHandle });
 const foundationStore = createFoundationStore({ client: backendClient, contextProvider: () => session.identity(), isEnabled: settings.isEnabled, coreRecordCache });
@@ -513,7 +519,7 @@ const dynamicWorldbook = createDynamicWorldbookRuntime({
   client: backendClient, hostAdapter, identityProvider: () => session.identity(),
   memoryState: () => ({ ...v3MemoryRuntime.getState(), chatId: foundationRuntime.getReachable()?.root?.chatId }),
   generateUpdate: taskRouter.generateWorldbookTask, generateSelect: taskRouter.generateRecallTask,
-  processingPrompt, updateGuidance: () => settings.get().worldbookPrompt,
+  processingPrompt, updateGuidance: () => legacyGuidance('worldbookPrompt'),
   isEnabled: settings.isEnabled, isGenerating: () => isMemoryWorkBlocked() || chatMemoryManagement.getActivityState().busy
     || ['scanning', 'cleaning'].includes(storageManagement.getState().status), sanitizerOptions,
   isBookAllowed: name => sourcePermissions.filterWorldInfoSources([{ sourceName: name }]).length > 0,

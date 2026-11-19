@@ -1,18 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BASE_PROCESSING_PROMPT, resolveSharedProcessingPrompt } from '../src/shared-processing-prompt.js';
-import { createPromptsSettings } from '../src/ui/settings/prompts-settings.js';
+import { createBodyReadSettings } from '../src/ui/settings/prompts-settings.js';
+import { createPromptPresetsView } from '../src/ui/settings/aux-prompt-presets.js';
 import { AUX_TASKS } from '../src/aux-prompt-tasks.js';
-import { editAuxPromptLibrary, getAuxPromptPreset, resolveAuxPromptPreset } from '../src/aux-prompt-library.js';
+import { editAuxPromptLibrary, getAuxHostPrompt, getAuxPromptPreset, resolveAuxPromptPreset } from '../src/aux-prompt-library.js';
 import { createAppearanceSettings } from '../src/ui/settings/appearance-settings.js';
 import { resolveVectorConfig, VECTOR_DEFAULT_URL, VECTOR_DEFAULT_MODEL } from '../src/vector-api.js';
 import { createApiSettings } from '../src/ui/settings/api-settings.js';
 import { createVectorApiSettings } from '../src/ui/settings/vector-api-settings.js';
 import { createSettingsStore } from '../src/settings.js';
 import { createApiResolver, createTaskRouter } from '../src/api-routing.js';
-import { DEFAULT_EXTRACTOR_GUIDANCE } from '../src/v3/extractor.js';
-import { DEFAULT_CSE_GUIDANCE } from '../src/v3/cse-engine.js';
-import { DEFAULT_PROFILE_GUIDANCE } from '../src/v3/people-workspace.js';
 
 class Node {
   constructor(tag) {
@@ -38,7 +35,6 @@ class Node {
   findAll(predicate) { return this.descendants().filter(predicate); }
 }
 const documentRef = { activeElement: null, createElement: tag => new Node(tag) };
-const promptSettings=settings=>({...settings,processingPrompt:settings.processingPrompt??(()=>settings.get().processingPrompt??'')});
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const fieldControl = (node, label) => {
   const field = node.find(n => n.tagName === 'label' && n.children[0]?.textContent === label)?.children[1];
@@ -61,269 +57,175 @@ const chooseInline = async (control, value) => {
 };
 const focusInline = control => inlineTrigger(control).fire('focus');
 
-function auxManager(settings, promptPreview) {
-  let dialog;
-  const { node } = createPromptsSettings({ documentRef, settings, promptPreview, customImpl: options => { dialog = options; } });
-  const findButton = (content, label) => {
-    const button = content.find(n => n.tagName === 'button' && n.textContent === label);
-    assert.ok(button, '缺少按钮 ' + label);
-    return button;
-  };
+function auxManager(settings, options = {}) {
+  const view = createPromptPresetsView({ documentRef, settings, ...options }), node = view.node;
   return {
-    open: () => findButton(node, '副 API 提示词预设').fire('click'),
-    click: label => findButton(dialog.content, label).fire('click'),
-    choose: (label, value) => chooseInline(dialog.content.find(n => n.attributes['aria-label'] === label && n.className.includes('qqj-inline-select-trigger')).parentNode, value),
-    control: label => fieldControl(dialog.content, label),
-    byLabel: label => dialog.content.find(n => n.attributes['aria-label'] === label),
-    get dialog() { return dialog; },
+    view, node,
+    click: async label => {
+      const button = node.find(n => n.tagName === 'button' && n.textContent === label);
+      assert.ok(button, '缺少按钮 ' + label);
+      await button.fire('click'); await flush();
+    },
+    choose: async (label, value) => {
+      const trigger = node.find(n => n.attributes['aria-label'] === label && n.className.includes('qqj-inline-select-trigger'));
+      assert.ok(trigger, '缺少选择器 ' + label);
+      await chooseInline(trigger.parentNode, value); await flush();
+    },
+    control: label => fieldControl(node, label),
+    byLabel: label => node.find(n => n.attributes['aria-label'] === label),
   };
 }
 
-test('副 API 预设从设置打开，可复制、插入宏、排序与启停，保存后才生效', async () => {
-  const settings = createSettingsStore({ extensionSettings: {} });
-  const firstTask = AUX_TASKS[0], ui = auxManager(settings);
-  await ui.open(); await ui.click('复制后编辑');
-  ui.control('预设名称').value = '自定义顺序';
-  ui.byLabel('设为此任务的默认预设').checked = true;
-  await ui.click('应用'); await ui.click('新增条目');
-  ui.control('条目名称').value = '核对材料';
+test('预设页直接阅读锁定的内置指令，复制整套后留在原条目编辑并保存', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} }), task = AUX_TASKS[0];
+  const ui = auxManager(settings);
+  assert.equal(ui.byLabel('当前使用的预设').textContent, '千千结默认›');
+  assert.doesNotMatch(ui.node.textContent, /提示词与包裹符|副 API 提示词预设/);
+  const built = resolveAuxPromptPreset(settings.get().auxPromptLibrary, task.id);
+  const rule = built.rows.find(row => row.id === 'builtin:instructions');
+  await ui.click(rule.name);
+  assert.equal(ui.control('提示词内容').readOnly, true);
+  assert.equal(ui.control('提示词内容').value, rule.content); assert.ok(rule.content.length > 80);
+  assert.ok(ui.node.textContent.includes(rule.source));
+  await ui.click('复制整套后编辑本条'); ui.control('预设名称').value = '我的预设'; await ui.click('复制并启用');
+  assert.equal(ui.control('提示词内容').readOnly, false); assert.equal(ui.control('提示词内容').value, rule.content);
+  const suiteId = settings.get().auxPromptLibrary.activeSuiteId;
+  assert.notEqual(suiteId, 'builtin');
   const text = ui.control('提示词内容');
   text.value = '甲乙'; text.selectionStart = 1; text.selectionEnd = 1;
-  await ui.choose('插入宏', 'qqj_input'); await ui.click('插入');
-  assert.equal(text.value, '甲{{qqj_input}}乙');
-  await ui.choose('消息角色', 'assistant');
-  await ui.click('宏与输出格式说明');
-  assert.ok(ui.dialog.content.textContent.includes(firstTask.outputExample));
-  await ui.click('应用条目'); await ui.click('排序');
-  await ui.byLabel('上移核对材料').fire('click'); await ui.click('完成排序');
-  const enabled = ui.byLabel('启用核对材料'); enabled.checked = false; await enabled.fire('change');
-  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, firstTask.id).id, 'builtin');
-  await ui.dialog.submit();
-  const saved = resolveAuxPromptPreset(settings.get().auxPromptLibrary, firstTask.id);
-  assert.equal(saved.name, '自定义顺序'); assert.equal(saved.rows[2].name, '核对材料');
-  assert.equal(saved.rows[2].content, '甲{{qqj_input}}乙'); assert.equal(saved.rows[2].role, 'assistant'); assert.equal(saved.rows[2].enabled, false);
-
-  await ui.open(); await ui.click('核对材料'); ui.control('提示词内容').value = '未保存的草稿'; await ui.click('放弃编辑');
-  await ui.click('核对材料'); assert.equal(ui.control('提示词内容').value, '甲{{qqj_input}}乙');
-  ui.control('提示词内容').value = '在编辑页面直接保存'; await ui.dialog.submit();
-  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, firstTask.id).rows[2].content, '在编辑页面直接保存');
+  await ui.choose('插入宏', 'qqj_input'); await ui.click('插入'); assert.equal(text.value, '甲{{qqj_input}}乙');
+  await ui.choose('消息角色', 'assistant'); await ui.click('宏与输出格式说明');
+  assert.ok(ui.node.textContent.includes(task.outputExample)); await ui.click('保存条目');
+  const saved = resolveAuxPromptPreset(settings.get().auxPromptLibrary, task.id).rows.find(row => row.name === rule.name);
+  assert.equal(saved.content, '甲{{qqj_input}}乙'); assert.equal(saved.role, 'assistant');
+  await ui.choose('当前使用的预设', 'builtin');
+  assert.equal(settings.get().auxPromptLibrary.activeSuiteId, 'builtin');
+  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, task.id).rows.find(row => row.id === rule.id).content, rule.content);
+  await ui.choose('当前使用的预设', suiteId); await ui.click(rule.name); ui.control('提示词内容').value = '未保存的草稿';
+  ui.view.deactivate(); ui.view.activate(); assert.equal(ui.control('提示词内容').value, '未保存的草稿');
+  await ui.click('取消'); await ui.click(rule.name); assert.equal(ui.control('提示词内容').value, saved.content);
+  ui.view.dispose();
 });
 
-test('从其他任务引用条目后可选择影响范围，连接覆盖及角色保持独立', async () => {
-  const settings = createSettingsStore({ extensionSettings: {} });
-  const [taskA, taskB] = AUX_TASKS;
-  let library;
-  const edit = patch => { const result = editAuxPromptLibrary(library, patch); library = result.library; return result; };
-  const first = edit({ type: 'createPreset', taskId: taskA.id, name: '第一套' }).presetId;
-  const second = edit({ type: 'createPreset', taskId: taskB.id, name: '第二套' }).presetId;
-  const source = edit({ type: 'addEntry', presetId: first, name: '共用准则', content: '初始内容', role: 'user' }).entryId;
-  for (const [taskId, presetId] of [[taskA.id, first], [taskB.id, second]]) edit({ type: 'bind', taskId, presetId });
-  settings.update({ auxPromptLibrary: library });
-  const ui = auxManager(settings, { routes: () => [{ id: 'main', label: '主配置' }] });
-  await ui.open(); await ui.choose('任务', taskB.id); await ui.click('从已有条目添加');
-  await ui.choose('已有条目', source); await ui.choose('消息角色', 'assistant'); await ui.click('引用条目');
-  await ui.click('共用准则'); ui.control('提示词内容').value = '共用版本';
-  assert.ok(ui.dialog.content.textContent.includes(taskA.label + ' / 第一套'));
-  assert.ok(ui.dialog.content.textContent.includes(taskB.label + ' / 第二套'));
-  await assert.rejects(ui.dialog.submit(), /请选择内容修改范围/);
-  await ui.choose('内容修改范围', 'shared'); await ui.click('应用条目');
-  await ui.choose('任务', taskA.id); await ui.click('共用准则'); assert.equal(ui.control('提示词内容').value, '共用版本');
-  await ui.click('放弃编辑'); await ui.choose('任务', taskB.id); await ui.click('共用准则');
-  ui.control('提示词内容').value = '本处版本';
-  await ui.choose('内容修改范围', 'local'); await ui.click('应用条目');
-  await ui.click('应用范围'); await ui.choose('此连接使用', 'builtin'); await ui.click('返回列表');
-  await ui.dialog.submit();
-  const saved = settings.get().auxPromptLibrary;
-  const a = getAuxPromptPreset(saved, taskA.id, first).rows.at(-1), b = getAuxPromptPreset(saved, taskB.id, second).rows.at(-1);
-  assert.notEqual(a.entryId, b.entryId); assert.equal(a.role, 'user'); assert.equal(b.role, 'assistant');
-  assert.equal(a.content, '共用版本'); assert.equal(b.content, '本处版本');
-  assert.equal(resolveAuxPromptPreset(saved, taskB.id, 'main').id, 'builtin');
-  assert.equal(resolveAuxPromptPreset(saved, taskB.id, 'preset:extra').id, second);
+test('条目的启停和手机排序作为草稿，切换整套时可保留或放弃', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} }), task = AUX_TASKS[0], ui = auxManager(settings);
+  await ui.click('新建'); ui.control('预设名称').value = '排序测试'; await ui.click('创建并启用');
+  const suiteId = settings.get().auxPromptLibrary.activeSuiteId;
+  await ui.click('新增条目'); ui.control('条目名称').value = '回顾'; ui.control('提示词内容').value = '核对'; await ui.click('保存条目');
+  const included = ui.byLabel('启用回顾'); included.checked = false; await included.fire('change');
+  await ui.click('排序'); await ui.byLabel('上移回顾').fire('click'); await ui.click('完成排序');
+  await ui.choose('当前使用的预设', 'builtin'); assert.equal(settings.get().auxPromptLibrary.activeSuiteId, suiteId);
+  await ui.click('继续编辑'); await ui.click('保存预设');
+  let rows = resolveAuxPromptPreset(settings.get().auxPromptLibrary, task.id).rows;
+  assert.equal(rows.at(-2).name, '回顾'); assert.equal(rows.at(-2).enabled, false);
+  ui.byLabel('启用回顾').checked = true; await ui.byLabel('启用回顾').fire('change');
+  await ui.choose('当前使用的预设', 'builtin'); await ui.click('放弃更改后继续');
+  assert.equal(settings.get().auxPromptLibrary.activeSuiteId, 'builtin');
+  await ui.choose('当前使用的预设', suiteId);
+  rows = resolveAuxPromptPreset(settings.get().auxPromptLibrary, task.id).rows;
+  assert.equal(rows.at(-2).enabled, false);
 });
 
-test('请求预览采用当前草稿，切换楼层或关闭后丢弃迟到的结果', async () => {
+test('当前 API 覆盖显示有效配置，可创建独立配置并恢复跟随任务', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} }), task = AUX_TASKS[0];
+  const api = { id: 'preset:flash', label: '快速模型' }, ui = auxManager(settings, { promptPreview: {
+    activeRoute: () => api, routes: () => [{ id: 'main', label: '主配置' }, api],
+  } });
+  await ui.click('复制整套'); await ui.click('复制并启用');
+  assert.match(ui.node.textContent, /快速模型.*跟随任务/);
+  await ui.click('连接配置'); await ui.click('为此连接复制独立配置');
+  const lib = settings.get().auxPromptLibrary, specific = resolveAuxPromptPreset(lib, task.id, api.id), common = resolveAuxPromptPreset(lib, task.id);
+  assert.notEqual(common.id, specific.id); assert.match(ui.node.textContent, /快速模型.*连接指定/);
+  const name = specific.rows[0].name;
+  await ui.click(name); ui.control('提示词内容').value = '只给快速模型'; await ui.click('保存条目');
+  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, task.id, api.id).rows[0].content, '只给快速模型');
+  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, task.id).rows[0].content, common.rows[0].content);
+  await ui.click('连接配置'); await ui.choose('使用的条目配置', '');
+  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, task.id, api.id).id, common.id);
+});
+
+test('从另一项任务引用条目后，角色独立，共用文字须明确选择修改范围', async () => {
   const settings = createSettingsStore({ extensionSettings: {} });
-  const pending = [];
-  const ui = auxManager(settings, {
+  const [a, b] = AUX_TASKS;
+  let lib = editAuxPromptLibrary(settings.get().auxPromptLibrary, { type: 'createSuite', name: '两项任务' }).library;
+  const first = resolveAuxPromptPreset(lib, a.id).id, second = resolveAuxPromptPreset(lib, b.id).id;
+  const source = editAuxPromptLibrary(lib, { type: 'addEntry', presetId: first, name: '统一措辞', content: '初稿', role: 'user' });
+  settings.update({ auxPromptLibrary: source.library });
+  const ui = auxManager(settings); await ui.choose('任务', b.id); await ui.click('从已有条目添加');
+  await ui.choose('已有条目', source.entryId); await ui.choose('消息角色', 'assistant'); await ui.click('引用条目');
+  await ui.click('统一措辞'); ui.control('提示词内容').value = '共用版'; await ui.click('保存条目');
+  assert.match(ui.node.textContent, /请选择内容修改范围/); assert.ok(ui.node.textContent.includes(a.label)); assert.ok(ui.node.textContent.includes(b.label));
+  await ui.choose('内容修改范围', 'shared'); await ui.click('保存条目');
+  await ui.click('统一措辞'); ui.control('提示词内容').value = '独立版'; await ui.choose('内容修改范围', 'local'); await ui.click('保存条目');
+  lib = settings.get().auxPromptLibrary;
+  const x = getAuxPromptPreset(lib, a.id, first).rows.at(-1), y = getAuxPromptPreset(lib, b.id, second).rows.at(-1);
+  assert.notEqual(x.entryId, y.entryId); assert.equal(x.content, '共用版'); assert.equal(y.content, '独立版');
+  assert.equal(x.role, 'user'); assert.equal(y.role, 'assistant');
+});
+
+test('预览页面按楼展示真实草稿，离开顶栏后丢弃样本与迟到结果', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} }), pending = [];
+  const ui = auxManager(settings, { promptPreview: {
     sources: () => [{ id: 'a', label: '第 2 楼' }, { id: 'b', label: '第 4 楼' }],
-    preview: request => new Promise(resolve => pending.push({ request, resolve })),
-  });
-  await ui.open(); await ui.click('复制后编辑'); ui.control('预设名称').value = '预览草稿'; await ui.click('应用');
-  await ui.click('预览请求');
-  assert.equal(pending[0].request.preset.name, '预览草稿'); assert.equal(pending[0].request.sourceId, 'a');
-  await ui.choose('预览材料', 'b');
-  pending[1].resolve({ messages: [{ role: 'system', content: '<私有场景>' }, { role: 'user', content: '当前样本' }], warnings: ['材料提示'] });
-  await flush();
-  assert.match(ui.dialog.content.textContent, /材料提示1 · 系统<私有场景>2 · 用户当前样本/);
-  pending[0].resolve({ messages: [{ role: 'user', content: '过期样本' }] }); await flush();
-  assert.doesNotMatch(ui.dialog.content.textContent, /过期样本/);
-  await ui.choose('预览材料', 'a'); ui.dialog.onClose();
-  pending[2].resolve({ messages: [{ role: 'user', content: '取消后的材料' }] }); await flush();
-  assert.doesNotMatch(ui.dialog.content.textContent, /取消后的材料/);
-  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, AUX_TASKS[0].id).id, 'builtin');
+    preview: args => new Promise(resolve => pending.push({ args, resolve })),
+  } });
+  await ui.click('预览请求'); await ui.choose('预览材料', 'b');
+  pending[1].resolve({ messages: [{ role: 'user', content: '最新样本' }], warnings: ['提示'] }); await flush();
+  assert.match(ui.node.textContent, /提示1 · 用户最新样本/);
+  pending[0].resolve({ messages: [{ role: 'user', content: '早先样本' }] }); await flush(); assert.doesNotMatch(ui.node.textContent, /早先样本/);
+  await ui.choose('预览材料', 'a'); ui.view.deactivate();
+  assert.doesNotMatch(ui.node.textContent, /最新样本/);
+  pending[2].resolve({ messages: [{ role: 'user', content: '离开后的样本' }] }); await flush(); ui.view.activate();
+  assert.doesNotMatch(ui.node.textContent, /离开后的样本|最新样本/);
 });
 
-test('副 API 编辑器遇到另一个窗口已保存的预设时保留其设置', async () => {
-  const settings = createSettingsStore({ extensionSettings: {} });
-  const ui = auxManager(settings); await ui.open(); await ui.click('复制后编辑');
-  ui.control('预设名称').value = '当前草稿'; await ui.click('应用');
-  const outside = editAuxPromptLibrary(settings.get().auxPromptLibrary, { type: 'createPreset', taskId: AUX_TASKS[0].id, name: '来自其他窗口' });
-  settings.update({ auxPromptLibrary: outside.library });
-  await assert.rejects(ui.dialog.submit(), /其他位置/);
-  assert.deepEqual(settings.get().auxPromptLibrary.presets.map(preset => preset.name), ['来自其他窗口']);
-});
-
-test('提示词模块字段 change 即持久化', () => {
-  const patches = [];
-  const settings = { get: () => ({}), wrappers: () => ({ keepTags: 'content', extraTags: '' }), updateWrappers: patch => patches.push(patch), update: patch => { patches.push(patch); return patch; } };
-  const { node } = createPromptsSettings({ settings:promptSettings(settings), documentRef });
-  const wrappers = node.find(n => n.id === 'qqj-settings-wrappers');
-  assert.ok(wrappers); assert.equal(wrappers.open, false);
-  assert.equal(wrappers.children[0].textContent, '包裹符');
-  assert.match(node.children[1].className, /settings-drawer-list/);
-  const keep = fieldControl(wrappers, '保留包裹符');
-  keep.value = 'content,summary'; keep.fire('change');
-  assert.deepEqual(patches.at(-1), { keepTags: 'content,summary' });
-  const clean = fieldControl(wrappers, '清洗包裹符');
-  clean.value = 'think,reasoning'; clean.fire('change');
-  assert.deepEqual(patches.at(-1), { extraTags: 'think,reasoning' });
-  assert.equal(fieldControl(node, '通用附加提示词'), undefined, '退役入口不得继续显示');
-});
-
-test('包裹面板只保存编辑字段，宿主保存回显保留正在输入内容并在销毁时释放', async () => {
-  const ext = { qianqianjie: { sourceKeepTags: 'content' }, 'schedule-planner': { extraTags: 'think', processingPrompt:'' } };
-  let saves = 0;
-  const settings = createSettingsStore({ extensionSettings: ext, save() { saves++; } });
-  const listeners = new Set();
-  const view = createPromptsSettings({ settings:promptSettings(settings), documentRef, subscribeSettingsChange: listener => { listeners.add(listener); return () => listeners.delete(listener); } });
+test('全局包裹符与时钟开关独立保存，宿主的回显保留尚在输入的字段', async () => {
+  const ext = { qianqianjie: { sourceKeepTags: 'content' }, 'schedule-planner': { extraTags: 'think' } };
+  const settings = createSettingsStore({ extensionSettings: ext });
+  const listeners = new Set(), clock = [];
+  const view = createBodyReadSettings({ settings, documentRef, onStoryClockChange: options => { clock.push(options); return { label: '时间戳已刷新' }; },
+    subscribeSettingsChange: callback => { listeners.add(callback); return () => listeners.delete(callback); } });
+  assert.equal(view.node.open, false); assert.equal(view.node.id, 'qqj-settings-wrappers');
   const keep = fieldControl(view.node, '保留包裹符'), extra = fieldControl(view.node, '清洗包裹符');
-  assert.equal(keep.value, 'content'); assert.equal(extra.value, 'think');
-  assert.equal(view.node.find(n => n.id === 'qqj-settings-wrappers').children[1].children[0].textContent, '白鳥系列插件全部共享');
   ext['schedule-planner'].bodyWrappers.extraTags = '[[...]]';
   keep.value = 'CONTENT，正文'; await keep.fire('change');
-  assert.deepEqual(settings.wrappers(), { keepTags: 'content,正文', extraTags: '[[...]]' }, '不以面板旧的另一个字段覆盖外部编辑');
-  extra.focus(); extra.value = '正在输入';
-  for (const listener of listeners) listener();
-  assert.equal(keep.value, 'content,正文'); assert.equal(extra.value, '正在输入');
-  documentRef.activeElement = null; await extra.fire('blur');
-  assert.equal(extra.value, '[[...]]');
-  extra.value = ''; await extra.fire('change');
-  assert.equal(settings.wrappers().extraTags, ''); assert.equal(saves, 2);
-  view.dispose(); assert.equal(listeners.size, 0);
+  assert.deepEqual(settings.wrappers(), { keepTags: 'content,正文', extraTags: '[[...]]' });
+  extra.focus(); extra.value = '正在输入'; for (const callback of listeners) callback();
+  assert.equal(extra.value, '正在输入'); documentRef.activeElement = null; await extra.fire('blur'); assert.equal(extra.value, '[[...]]');
+  const check = view.node.find(n => n.type === 'checkbox'); check.checked = false; await check.fire('change');
+  const reference = fieldControl(view.node, '正文时间参考标签'); reference.value = 'clock'; await reference.fire('change');
+  assert.equal(settings.get().storyClockEnabled, false); assert.equal(settings.get().storyClockReferenceTags, 'clock');
+  assert.deepEqual(clock, [{ readOnly: true }, undefined, undefined]); view.dispose(); assert.equal(listeners.size, 0);
 });
 
-test('长提示词从编辑入口打开草稿弹窗，取消不写设置', async () => {
-  const current = { sourceKeepTags: 'content', sourceExtraTags: '', processingPrompt: '原文本' };
-  const patches = [], opened = [];
-  const settings = { wrappers: () => ({ keepTags: 'content', extraTags: '' }), updateWrappers() {}, get: () => ({ ...current }), update: patch => { patches.push(patch); Object.assign(current, patch); } };
-  const { node } = createPromptsSettings({ settings:promptSettings(settings), documentRef, customImpl: options => { opened.push(options); return Promise.resolve(true); } });
-  const edit = node.find(n => n.tagName === 'button' && n.textContent === '编辑破限提示词');
-  assert.ok(edit, '长提示词应由明确编辑入口打开');
-  await edit.fire('click');
-  assert.equal(opened.length, 1);
-  const input = opened[0].content.find(n => n.tagName === 'textarea');
-  assert.equal(input.value, '原文本');
-  input.value = '取消的草稿';
-  await opened[0].onClose?.();
-  assert.deepEqual(patches, [], '取消不得写入设置');
-});
-
-test('共享破限草稿：取消与恢复不写，保存纯空白后实际使用默认', async () => {
-  const ext = { qianqianjie: {}, 'schedule-planner': { processingPrompt: '  自定义\n' } };
-  let saves = 0, active;
-  const settings = createSettingsStore({ extensionSettings: ext, save() { saves++; } });
-  const { node } = createPromptsSettings({ settings, documentRef, customImpl: options => { active = options; return Promise.resolve(true); } });
-  const drawer = node.find(n => n.id === 'qqj-settings-processing-prompt');
-  const open = () => drawer.find(n => n.tagName === 'button' && n.textContent === '编辑破限提示词').fire('click');
-  const before = saves;
-  await open();
-  await active.content.find(n => n.tagName === 'button' && n.textContent === '恢复默认').fire('click');
-  assert.equal(active.content.find(n => n.tagName === 'textarea').value, '');
-  await active.onClose?.(); assert.equal(saves, before); assert.equal(settings.processingPrompt(), '  自定义\n');
-  await open(); active.content.find(n => n.tagName === 'textarea').value = ' \n\t ';
-  await active.submit();
-  assert.equal(settings.processingPrompt(), ' \n\t '); assert.equal(resolveSharedProcessingPrompt(settings.processingPrompt()), BASE_PROCESSING_PROMPT); assert.equal(saves, before + 1);
-  await open();
-  assert.equal(active.content.find(n => n.tagName === 'textarea').value, ' \n\t ', '重开保留已保存空白草稿，实际默认仍由消费者解析');
-  assert.equal(drawer.children[1].children.length, 2, '抽屉只保留说明和编辑按钮');
-});
-
-test('提示词模块提供时间戳开关、独立参考标签与保存后生效的时间戳编辑弹窗', async () => {
-  const current = { sourceKeepTags: 'content', sourceExtraTags: '', storyClockEnabled: true, storyClockPrompt: '', storyClockReferenceTags: '' };
-  const patches = [], refreshes = []; let active = null;
-  const settings = { wrappers: () => ({ keepTags: 'content', extraTags: '' }), updateWrappers() {}, get: () => ({ ...current }), update: patch => { Object.assign(current, patch); patches.push(patch); return { ...current }; } };
-  const { node } = createPromptsSettings({ settings:promptSettings(settings), documentRef, customImpl: options => { active = options; return Promise.resolve(true); }, onStoryClockChange: options => { refreshes.push(options ?? {}); return { label: current.storyClockPrompt ? '使用自定义时间戳提示词' : '已调用千千结时间戳' }; } });
-  assert.equal(node.find(n => n.id === 'qqj-story-clock-status').textContent, '已调用千千结时间戳');
-  const referenceTags = fieldControl(node, '正文时间参考标签');
-  assert.equal(referenceTags.value, '');
-  assert.doesNotMatch(referenceTags.placeholder, /Ti/u);
-  referenceTags.value = 'Ti,时标'; await referenceTags.fire('change');
-  assert.deepEqual(patches.at(-1), { storyClockReferenceTags: 'Ti,时标' });
-  assert.match(node.textContent, /不改变正文清洗/);
-  assert.equal(node.find(n => n.tagName === 'textarea'), undefined, '长提示词仅在弹窗中编辑');
-  await node.find(n => n.tagName === 'button' && n.textContent === '编辑时间戳提示词').fire('click');
-  let textarea = active.content.find(n => n.tagName === 'textarea');
-  assert.equal(textarea.value, '');
-  textarea.value = '  自定义\n'; await textarea.fire('change');
-  assert.equal(current.storyClockPrompt, '', '输入仍是草稿'); assert.equal(refreshes.length, 1, '输入不刷新时间服务');
-  await active.submit(); active = null;
-  assert.deepEqual(patches.at(-1), { storyClockPrompt: '  自定义\n' });
-  assert.equal(node.find(n => n.id === 'qqj-story-clock-status').textContent, '使用自定义时间戳提示词');
-  await node.find(n => n.tagName === 'button' && n.textContent === '编辑时间戳提示词').fire('click');
-  textarea = active.content.find(n => n.tagName === 'textarea');
-  assert.equal(textarea.value, '  自定义\n', '再次打开从最新设置读取');
-  await active.onClose?.(); active = null;
-  assert.equal(current.storyClockPrompt, '  自定义\n', '取消不回滚已保存内容');
-  await node.find(n => n.tagName === 'button' && n.textContent === '编辑时间戳提示词').fire('click');
-  textarea = active.content.find(n => n.tagName === 'textarea');
-  await active.content.find(n => n.tagName === 'button' && n.textContent === '载入内置默认').fire('click');
-  assert.match(textarea.value, /<!-- QQJ-start/); assert.doesNotMatch(textarea.value, /myknots-start/);
-  await active.content.find(n => n.tagName === 'button' && n.textContent === '恢复默认').fire('click');
-  assert.equal(textarea.value, ''); assert.equal(current.storyClockPrompt, '  自定义\n', '恢复默认按钮也只改草稿');
-  await active.submit(); active = null;
-  assert.deepEqual(patches.at(-1), { storyClockPrompt: '' }); assert.equal(textarea.value, '');
-  assert.match(node.textContent, /QQJ-start\/end.*兼容 SDC 和旧 myknots 格式/);
-  assert.equal(refreshes[0].readOnly, true); assert.equal(refreshes.length, 3);
-});
-
-test('破限、摘要、CSE、人物资料与头像提示词在弹窗保存后生效，默认操作留在草稿直到保存', async () => {
-  const current = { sourceKeepTags: 'content', sourceExtraTags: '', storyClockEnabled: true, storyClockPrompt: '', processingPrompt: '', summaryPrompt: '', csePrompt: '', profilePrompt: '', avatarPrompt: '' };
-  const patches = []; let active = null;
-  const settings = { wrappers: () => ({ keepTags: 'content', extraTags: '' }), updateWrappers() {}, get: () => ({ ...current }), update: patch => { Object.assign(current, patch); patches.push(patch); return { ...current }; } };
-  const { node } = createPromptsSettings({ settings:promptSettings(settings), documentRef, customImpl: options => { active = options; return Promise.resolve(true); } });
-  const processingDrawer = node.find(n => n.id === 'qqj-settings-processing-prompt');
-  const summaryDrawer = node.find(n => n.id === 'qqj-settings-summary-prompt');
-  const cseDrawer = node.find(n => n.id === 'qqj-settings-cse-prompt');
-  const profileDrawer = node.find(n => n.id === 'qqj-settings-profile-prompt');
-  const avatarDrawer = node.find(n => n.id === 'qqj-settings-avatar-prompt');
-  const prompts = [
-    [processingDrawer, '破限提示词', 'processingPrompt', '  用户破限文本\n'],
-    [summaryDrawer, '摘要内容指导', 'summaryPrompt', '  用户摘要要求\n'],
-    [cseDrawer, 'CSE 内容指导', 'csePrompt', '  用户 CSE 要求\n'],
-    [profileDrawer, '人物资料内容指导', 'profilePrompt', '  用户人物资料要求\n'],
-    [avatarDrawer, '头像生图提示词', 'avatarPrompt', '  custom portrait\n'],
-  ];
-  const savedTextareas = [];
-  for (const [drawer, labelText, key, value] of prompts) {
-    await drawer.find(n => n.tagName === 'button' && n.textContent === `编辑${labelText}`).fire('click');
-    const textarea = active.content.find(n => n.tagName === 'textarea'); textarea.value = value;
-    assert.equal(current[key], '', '输入不立即写设置');
-    await active.submit(); active = null; savedTextareas.push(textarea);
-    assert.equal(drawer.children[1].children.length, 2, '同类提示词抽屉只保留说明和编辑按钮');
-    assert.equal(drawer.textContent.includes(value), false, '保存后不在抽屉显示当前内容预览');
+test('时间戳与头像提示词随套切换，内置可读，编辑/恢复只写活动套', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} }), refreshes = [];
+  const ui = auxManager(settings, { onStoryClockChange: options => { refreshes.push(options); } });
+  for (const [key, name] of [['storyClockPrompt','正文时间戳'], ['avatarPrompt','头像生图']]) {
+    await ui.choose('当前使用的预设', 'builtin'); await ui.choose('任务', key); await ui.click(name + '提示词');
+    const factory = ui.control('提示词内容').value; assert.ok(factory.length > 20); assert.equal(ui.control('提示词内容').readOnly, true);
+    await ui.click('复制整套后编辑本条'); await ui.click('复制并启用');
+    const id = settings.get().auxPromptLibrary.activeSuiteId;
+    assert.equal(ui.control('提示词内容').readOnly, false);
+    ui.control('提示词内容').value = '套内专用提示词'; await ui.click('保存提示词');
+    assert.equal(getAuxHostPrompt(settings.get().auxPromptLibrary, key), '套内专用提示词');
+    await ui.choose('当前使用的预设', 'builtin'); assert.equal(getAuxHostPrompt(settings.get().auxPromptLibrary, key), '');
+    await ui.choose('当前使用的预设', id); await ui.click(name + '提示词'); assert.equal(ui.control('提示词内容').value, '套内专用提示词');
+    await ui.click('恢复此项默认'); assert.equal(ui.control('提示词内容').value, factory); await ui.click('保存提示词');
+    assert.equal(getAuxHostPrompt(settings.get().auxPromptLibrary, key), '');
   }
-  assert.deepEqual(patches.slice(-prompts.length),prompts.map(([, ,key,value])=>({[key]:value})));
+  assert.ok(refreshes.length > 2);
+});
 
-  for (const [drawer, labelText, key] of prompts) {
-    await drawer.find(n => n.tagName === 'button' && n.textContent === `编辑${labelText}`).fire('click');
-    const textarea = active.content.find(n => n.tagName === 'textarea'); assert.equal(textarea.value, current[key], '重开读取已保存值');
-    await active.content.find(n => n.tagName === 'button' && n.textContent === '载入内置默认').fire('click');
-    await active.content.find(n => n.tagName === 'button' && n.textContent === '恢复默认').fire('click');
-    assert.equal(current[key], prompts.find(item => item[2] === key)[3], '默认操作未提交前保持原值');
-    await active.submit(); active = null;
-  }
-  assert.deepEqual(patches.slice(-prompts.length),prompts.map(([, ,key])=>({[key]:''})));
-  assert.deepEqual(savedTextareas.map(textarea => textarea.value),prompts.map(([, ,,value])=>value));
+test('副本草稿遇到其他窗口已保存的更改时不覆盖外部数据', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} }), ui = auxManager(settings);
+  await ui.click('新建'); ui.control('预设名称').value = '现用'; await ui.click('创建并启用');
+  const original = settings.get().auxPromptLibrary.activeSuiteId, name = resolveAuxPromptPreset(settings.get().auxPromptLibrary, AUX_TASKS[0].id).rows[0].name;
+  await ui.click(name); ui.control('提示词内容').value = '当前草稿';
+  const outside = editAuxPromptLibrary(settings.get().auxPromptLibrary, { type: 'createSuite', name: '来自其他窗口' });
+  settings.update({ auxPromptLibrary: outside.library });
+  await ui.click('保存条目'); assert.match(ui.node.textContent, /其他位置/); assert.notEqual(settings.get().auxPromptLibrary.activeSuiteId, original);
+  await ui.click('取消'); assert.match(ui.byLabel('当前使用的预设').textContent, /来自其他窗口/);
 });
 
 test('外观模块内联选择即存并即时应用；程序设置同步标签，改 URL 清空缓存 family', async () => {

@@ -492,9 +492,10 @@ export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryW
     const prepared = promptPresets?.prepare({ ...options, transportBudget }, prefix) ?? renderAuxPrompt(null, null, options, prefix);
     const compactMessages = prepared.messages;
     const processingPromptFingerprint = `sha256:${await sha256(prepared.policy ?? prefix)}`;
-    const systemPromptFingerprint = `sha256:${await sha256(prepared.custom
-      ? JSON.stringify(compactMessages.filter(message => message.role === 'system').map(message => message.content))
-      : compactMessages[0].content)}`;
+    const systemMessages = compactMessages.filter(message => message.role === 'system').map(message => message.content);
+    const systemPromptText = prepared.managed && systemMessages.length !== 1
+      ? JSON.stringify(systemMessages) : systemMessages[0];
+    const systemPromptFingerprint = `sha256:${await sha256(systemPromptText)}`;
     const configuredValue = config?.qqjTemperature;
     const configuredTemperature = configuredValue === null || configuredValue === undefined || typeof configuredValue === 'string' && configuredValue.trim() === ''
       ? null : typeof configuredValue === 'number' || typeof configuredValue === 'string' ? Number(configuredValue) : NaN;

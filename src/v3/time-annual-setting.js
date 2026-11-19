@@ -7,10 +7,7 @@ const ANNUAL_WORDS = /生日|诞辰|誕辰|忌日|周年|週年|纪念日|紀念
 const DATE_CONTEXT = /(?:年|月|日|号|號|初[一二三四五六七八九十]|\d{1,2}[/.~-]\d{1,2})/u;
 const DAYS = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
-export const ANNUAL_SETTING_SYSTEM_PROMPT = `你是“千千结”的年度日期设定整理器。输入仅含人物基础资料或用户人设中与年度日期有关的小段。
-逐个 sourceId 返回且只能返回一次；即使没有合格事项也返回空 items。只提取明确生日、诞辰、忌日、周年、纪念日或明确“每年此日”行动。普通历史事件只有一次日期时不创建年度事项，也不提取身体恢复、生理周期或普通承诺。
-输出浅层 JSON：{"sources":[{"sourceId":"S1","items":[{"category":"birthday|anniversary|memorial","label":"简短名称","originalDate":"原设定日期文本","note":"简短年度含义"}]}]}。
-原样保留日期文字，不换算、补年份或猜测下一次日期。不得创造数据库 ID、日期、仪式、已庆祝或已履约事实。`;
+export { ANNUAL_SETTING_SYSTEM_PROMPT } from './time-prompts.js';
 
 function fragments(value, always = false) {
   const text = String(value ?? '').trim();

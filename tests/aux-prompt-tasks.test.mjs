@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { AUX_TASKS, getAuxDemoTaskOptions, getAuxPromptValues } from '../src/aux-prompt-tasks.js';
+import { getAuxOriginalInstructions } from '../src/aux-prompt-defaults.js';
+import { BASE_PROCESSING_PROMPT } from '../src/shared-processing-prompt.js';
 import { buildExtractorTaskOptions, createExtractorEnvelope, normalizeExtractorResponse, runExtractorRequest } from '../src/v3/extractor.js';
 import { buildCseTaskOptions, runCseRequest } from '../src/v3/cse-engine.js';
 import { buildWorldbookSelectionRequest } from '../src/dynamic-worldbook-selection.js';
@@ -38,8 +40,8 @@ test('summary sections preserve raw text, user snapshot numbers and unlisted evi
     chat: { content: '未授权的其他聊天' }, config: { apiKey: '本地密钥' }, promptOwnerId: '本地聊天归属' };
   const before = structuredClone(options);
   const actual = getAuxPromptValues('summary', options, '通用前缀');
-  assert.equal(actual.qqj_prefix, '通用前缀');
-  assert.equal(actual.qqj_instructions, options.systemPrompt);
+  assert.equal(actual.qqj_prefix, BASE_PROCESSING_PROMPT);
+  assert.equal(actual.qqj_instructions, getAuxOriginalInstructions('summary', options));
   assert.equal(actual.qqj_input, options.taskMessages[0].content);
   assert.equal(actual.qqj_floor_body, body);
   assert.deepEqual(JSON.parse(actual.qqj_user_input), users);
@@ -135,11 +137,11 @@ test('every task has a synthetic preview with native message boundaries and fres
     const options = getAuxDemoTaskOptions(id), parts = getAuxPromptValues(id, options, '示例前缀');
     assert.equal(options.promptTask, id);
     assert.equal(options.promptOwnerId, undefined);
-    assert.match(options.systemPrompt, /示例指令/u);
+    assert.equal(options.systemPrompt, getAuxOriginalInstructions(id));
     assert.ok(options.taskMessages.every(message => message.role === 'user' && JSON.parse(message.content)));
     assert.equal(options.taskMessages.length, id === 'worldbookSelect' ? 2 : 1);
     for (const { name } of macros) {
-      if (name === 'qqj_remaining' || id === 'profile' && name === 'qqj_recent') continue;
+      if (name === 'qqj_remaining' || name === 'qqj_selection_retry' || id === 'profile' && name === 'qqj_recent') continue;
       assert.ok(parts[name], id + ' ' + name);
     }
     assert.equal(parts.qqj_input, options.taskMessages.map(message => message.content).join('\n\n'));
