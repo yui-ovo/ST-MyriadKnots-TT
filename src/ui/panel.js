@@ -101,6 +101,7 @@ export function createPanel({
     panel,
     dragHandle: root.querySelector('.topbar'),
     resizeHandle: root.querySelector('.panel-resize-handle'),
+    fullscreenButton: root.querySelector('.fullscreen-btn'),
     viewport: documentRef.defaultView ?? globalThis,
     documentRef,
   });
@@ -666,7 +667,7 @@ export function createPanel({
     else if (!host.hidden && screen === 'settings') void activateManagement();
   }
 
-  const mobile = () => Number(documentRef.defaultView?.innerWidth) <= 640 || documentRef.defaultView?.matchMedia?.('(max-width: 640px)')?.matches === true;
+  const mobile = () => Number(documentRef.defaultView?.innerWidth) <= 640 || documentRef.defaultView?.matchMedia?.('(max-width: 640px)')?.matches === true || geometry.isMobileFullscreen?.() === true;
   const blocksSwipe = target => Boolean(target?.closest?.('input,textarea,select,[contenteditable="true"],.qqj-inline-select,.qqj-profile-switcher,.qqj-relation-switcher,.qqj-model-list-items,.source-permission-list,.v3-memory-json,.v3-recall-injection,.qqj-dialog-overlay'));
   const point = event => event.touches?.[0] ?? event.changedTouches?.[0] ?? null;
   body?.addEventListener?.('touchstart', event => {

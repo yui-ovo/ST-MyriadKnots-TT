@@ -4,6 +4,7 @@ export const PANEL_MIN_WIDTH = 320;
 export const PANEL_MIN_HEIGHT = 300;
 export const PANEL_POSITION_KEY = 'qqj-panel-pos-v2';
 export const PANEL_SIZE_KEY = 'qqj-panel-size-v2';
+export const PANEL_MOBILE_VIEW_KEY = 'qqj-panel-mobile-view-v1';
 
 const finite = value => Number.isFinite(Number(value));
 const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
@@ -68,12 +69,15 @@ function panelRect(panel) {
   };
 }
 
-export function createPanelGeometryController({ panel, dragHandle, resizeHandle, storage = globalThis.localStorage, viewport = globalThis } = {}) {
+export function createPanelGeometryController({ panel, dragHandle, resizeHandle, fullscreenButton, storage = globalThis.localStorage, viewport = globalThis } = {}) {
   let gesture = null;
   let frame = null;
   let queuedPoint = null;
-
-  const isDesktop = () => Number(viewport?.innerWidth) >= DESKTOP_PANEL_BREAKPOINT;
+  let preferFullscreen = readPreference(storage, PANEL_MOBILE_VIEW_KEY)?.fullscreen === true;
+  const touchLandscape = viewport?.matchMedia?.('(orientation: landscape) and (pointer: coarse) and (max-height: 640px)');
+  const canFullscreen = () => Boolean(fullscreenButton) && (Number(viewport?.innerWidth) < DESKTOP_PANEL_BREAKPOINT || touchLandscape?.matches === true);
+  const isMobileFullscreen = () => preferFullscreen && canFullscreen();
+  const isDesktop = () => Number(viewport?.innerWidth) >= DESKTOP_PANEL_BREAKPOINT && !isMobileFullscreen();
   const dimensions = () => {
     const visual = viewport?.visualViewport;
     const view = { left: Number(visual?.offsetLeft) || 0, top: Number(visual?.offsetTop) || 0,
@@ -190,8 +194,17 @@ export function createPanelGeometryController({ panel, dragHandle, resizeHandle,
     finish();
     if (!panel) return;
     const desktop = isDesktop();
+    const fullscreen = isMobileFullscreen();
+    if (fullscreenButton) {
+      fullscreenButton.hidden = !canFullscreen();
+      const action = fullscreen ? '退出全屏' : '全屏显示';
+      fullscreenButton.title = action;
+      fullscreenButton.setAttribute('aria-label', action);
+      fullscreenButton.setAttribute('aria-pressed', String(fullscreen));
+    }
     const host = panel.getRootNode?.().host;
     if (host) {
+      host.toggleAttribute?.('data-mobile-fullscreen', fullscreen);
       // 手机零原点保留原 fixed 层级，非零原点沿既有补偿。
       host.style.transform = desktop ? 'translate(0px, 0px)' : '';
       const origin = host.getBoundingClientRect();
@@ -218,10 +231,17 @@ export function createPanelGeometryController({ panel, dragHandle, resizeHandle,
     const focused = panel?.getRootNode?.()?.activeElement;
     const editing = focused?.isContentEditable || !focused?.readOnly && (focused?.tagName === 'TEXTAREA'
       || focused?.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'email', 'password', 'number'].includes(focused.type));
-    if (!isDesktop() && event?.type !== 'orientationchange' && panel?.contains?.(focused) && editing) return;
+    if (!isMobileFullscreen() && !isDesktop() && event?.type !== 'orientationchange' && panel?.contains?.(focused) && editing) return;
+    restore();
+  };
+  const toggleFullscreen = () => {
+    if (!canFullscreen()) return;
+    preferFullscreen = !preferFullscreen;
+    writePreference(PANEL_MOBILE_VIEW_KEY, { fullscreen: preferFullscreen });
     restore();
   };
   const bindings = [
+    [fullscreenButton, 'click', toggleFullscreen], [touchLandscape, 'change', onViewportChange],
     [dragHandle, 'pointerdown', onDragDown], [dragHandle, 'pointermove', onDragMove], [dragHandle, 'pointerup', onPointerUp], [dragHandle, 'pointercancel', onPointerCancel], [dragHandle, 'lostpointercapture', onPointerCancel],
     [resizeHandle, 'pointerdown', onResizeDown], [resizeHandle, 'pointermove', onResizeMove], [resizeHandle, 'pointerup', onPointerUp], [resizeHandle, 'pointercancel', onPointerCancel], [resizeHandle, 'lostpointercapture', onPointerCancel],
     [viewport, 'resize', onViewportChange], [viewport, 'scroll', onViewportChange], [viewport, 'orientationchange', onViewportChange],
@@ -231,6 +251,7 @@ export function createPanelGeometryController({ panel, dragHandle, resizeHandle,
   restore();
   return {
     restore,
+    isMobileFullscreen,
     cancelGesture: () => finish(),
     destroy() {
       finish();

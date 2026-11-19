@@ -1,4 +1,4 @@
-import { createPanelGeometryController, desktopPanelSize, mobilePanelRect, PANEL_POSITION_KEY, PANEL_SIZE_KEY } from '../src/ui/layout.js';
+import { createPanelGeometryController, desktopPanelSize, mobilePanelRect, PANEL_MOBILE_VIEW_KEY, PANEL_POSITION_KEY, PANEL_SIZE_KEY } from '../src/ui/layout.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -753,7 +753,7 @@ test('真实面板按七个主标签映射视图，独立显示预设并恢复�
 });
 
 
-function panelGeometryFixture({ width = 1200, height = 900, chat = { left: 200, top: 60, width: 800, height: 720 }, visual = null, saved = {} } = {}) {
+function panelGeometryFixture({ width = 1200, height = 900, chat = { left: 200, top: 60, width: 800, height: 720 }, visual = null, saved = {}, touch = false } = {}) {
   const eventTarget = () => {
     const listeners = new Map();
     return {
@@ -767,6 +767,7 @@ function panelGeometryFixture({ width = 1200, height = 900, chat = { left: 200, 
   const storage = { getItem: key => preferences.get(key), setItem(key, value) { writes.push([key, value]); preferences.set(key, value); } };
   const resizeObservers = [];
   const viewport = { ...eventTarget(), innerWidth: width, innerHeight: height,
+    matchMedia: () => ({ get matches() { return touch && viewport.innerWidth > viewport.innerHeight && viewport.innerHeight <= 640; } }),
     ResizeObserver: class { constructor(callback) { resizeObservers.push(callback); } observe() {} disconnect() {} },
     ...(visual ? { visualViewport: { ...eventTarget(), ...visual } } : {}) };
   const variables = new Map();
@@ -775,9 +776,62 @@ function panelGeometryFixture({ width = 1200, height = 900, chat = { left: 200, 
   const dragHandle = eventTarget(), resizeHandle = eventTarget();
   const nodes = { chat: { getBoundingClientRect: () => chat } };
   const documentRef = { getElementById: key => nodes[key] ?? null };
-  const controller = createPanelGeometryController({ panel, dragHandle, resizeHandle, viewport, storage, documentRef });
-  return { controller, panel, viewport, dragHandle, resizeHandle, variables, writes, nodes, resizeObservers, resizeChat: () => resizeObservers.forEach(callback => callback()), setChat: value => { chat = value; } };
+  const fullscreenButton = Object.assign(new Node('button'), eventTarget());
+  const controller = createPanelGeometryController({ panel, dragHandle, resizeHandle, fullscreenButton, viewport, storage, documentRef });
+  return { controller, panel, viewport, dragHandle, resizeHandle, fullscreenButton, variables, writes, nodes, resizeObservers, resizeChat: () => resizeObservers.forEach(callback => callback()), setChat: value => { chat = value; } };
 }
+
+test('手机切换全屏记住本机选择，随键盘可视区域和横竖屏调整', () => {
+  const visual = { width: 390, height: 844, offsetTop: 0, offsetLeft: 0 };
+  const f = panelGeometryFixture({ ...visual, visual, touch: true });
+  const attributes = new Set();
+  const root = { activeElement: null, host: { style: {}, getBoundingClientRect: () => ({ left: 0, top: 0 }),
+    toggleAttribute(name, value) { if (value) attributes.add(name); else attributes.delete(name); },
+  } };
+  f.panel.getRootNode = () => root;
+  f.panel.contains = node => node === root.activeElement;
+  f.controller.restore();
+  assert.equal(f.fullscreenButton.hidden, false);
+  assert.equal(f.fullscreenButton.attributes['aria-pressed'], 'false');
+  f.fullscreenButton.fire('click');
+  assert.ok(attributes.has('data-mobile-fullscreen'));
+  assert.equal(f.fullscreenButton.attributes['aria-label'], '退出全屏');
+  assert.deepEqual(f.writes, [[PANEL_MOBILE_VIEW_KEY, JSON.stringify({ fullscreen: true })]]);
+
+  root.activeElement = { tagName: 'INPUT', type: 'text' };
+  Object.assign(f.viewport.visualViewport, { offsetTop: 46, offsetLeft: 3, width: 385, height: 390 });
+  f.viewport.visualViewport.fire('resize', { type: 'resize' });
+  for (const [key, value] of Object.entries({ top: '46px', left: '3px', width: '385px', height: '390px' })) {
+    assert.equal(f.variables.get('--qqj-panel-bounds-' + key), value);
+  }
+  Object.assign(f.viewport, { innerWidth: 844, innerHeight: 390 });
+  Object.assign(f.viewport.visualViewport, { width: 844, height: 390, offsetTop: 0, offsetLeft: 0 });
+  f.viewport.fire('orientationchange', { type: 'orientationchange' });
+  assert.equal(f.controller.isMobileFullscreen(), true);
+  assert.equal(f.fullscreenButton.hidden, false);
+  assert.equal(f.panel.style.width, '');
+  assert.equal(f.variables.get('--qqj-panel-bounds-width'), '844px');
+  assert.equal(f.writes.length, 1);
+
+  const saved = { [PANEL_MOBILE_VIEW_KEY]: JSON.parse(f.writes[0][1]), [PANEL_SIZE_KEY]: { width: 540, height: 480 } };
+  const reopened = panelGeometryFixture({ width: 390, height: 844, saved });
+  assert.equal(reopened.fullscreenButton.attributes['aria-pressed'], 'true');
+  Object.assign(reopened.viewport, { innerWidth: 1280, innerHeight: 800 });
+  reopened.viewport.fire('resize');
+  assert.equal(reopened.fullscreenButton.hidden, true);
+  assert.equal(reopened.controller.isMobileFullscreen(), false);
+  assert.equal(reopened.panel.style.width, '540px');
+  reopened.fullscreenButton.fire('click');
+  assert.deepEqual(reopened.writes, []);
+  reopened.viewport.innerWidth = 390; reopened.viewport.fire('resize');
+  assert.equal(reopened.controller.isMobileFullscreen(), true);
+  reopened.fullscreenButton.fire('click');
+  assert.equal(reopened.fullscreenButton.attributes['aria-pressed'], 'false');
+  assert.deepEqual(reopened.writes, [[PANEL_MOBILE_VIEW_KEY, JSON.stringify({ fullscreen: false })]]);
+  f.controller.destroy(); reopened.controller.destroy();
+  reopened.fullscreenButton.fire('click');
+  assert.equal(reopened.writes.length, 1);
+});
 
 test('主面板桌面恢复、拖动和调整尺寸使用整个可视视口及偏移', () => {
   const f = panelGeometryFixture({ visual: { offsetLeft: 100, offsetTop: 120, width: 900, height: 420 },
