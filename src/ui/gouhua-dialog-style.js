@@ -75,6 +75,36 @@ export const gouhuaDialogCss = `${scrollbarCss}${sharedDialogCss}
 .sp-dialog-sheet-custom:has(.qqj-editor-dialog)>.sp-dialog-head,.sp-dialog-sheet-custom:has(.qqj-editor-dialog)>.sp-dialog-input-error,.sp-dialog-sheet-custom:has(.qqj-editor-dialog)>.sp-dialog-actions{flex:0 0 auto}
 @media(max-height:540px){.sp-dialog-overlay:has(.qqj-editor-dialog){padding:10px}.sp-dialog-sheet-custom:has(.qqj-editor-dialog){max-height:100%;padding:12px 14px;gap:8px}.sp-dialog-sheet-custom:has(.qqj-editor-dialog)>.sp-dialog-input-error:empty{display:none}}
 .qqj-editor-dialog{display:grid;min-width:0;gap:12px;color:var(--sp-on-surface);font-family:var(--sp-font);font-size:var(--sp-fs-83);line-height:1.55}
+.sp-dialog-sheet-custom:has(.qqj-aux-editor){width:540px}
+.qqj-aux-editor,.qqj-aux-page,.qqj-aux-preview,.qqj-aux-reference{display:grid;min-width:0;gap:10px}
+.qqj-aux-editor [hidden]{display:none!important}
+.qqj-aux-editor h3,.qqj-aux-editor h4,.qqj-aux-editor p{margin:0}
+.qqj-aux-editor h3{font-size:var(--sp-fs-95)}.qqj-aux-editor h4{font-size:var(--sp-fs-85)}
+.qqj-aux-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.qqj-aux-field{display:grid;align-content:start;min-width:0;gap:4px}
+.qqj-aux-field>span,.qqj-aux-note,.qqj-aux-dirty{color:var(--sp-subtle);font-size:var(--sp-fs-75);overflow-wrap:anywhere}
+.qqj-aux-feedback{color:var(--sp-danger);overflow-wrap:anywhere}
+.qqj-aux-editor .qqj-aux-feedback:empty,.qqj-aux-editor .qqj-aux-dirty:empty{display:none}
+.qqj-aux-tools,.qqj-aux-page-head,.qqj-aux-insert{display:flex;align-items:center;gap:6px;min-width:0}
+.qqj-aux-tools{flex-wrap:wrap}
+.qqj-aux-editor .qqj-aux-tools button.secondary-action,.qqj-aux-editor .qqj-aux-insert button.secondary-action{min-height:var(--qqj-compact-height);padding:var(--qqj-compact-pad-y) var(--qqj-compact-pad-x);font-size:var(--qqj-font-caption);line-height:var(--qqj-compact-line)}
+.qqj-aux-page-head{justify-content:space-between;border-bottom:1px solid var(--sp-divider);padding-block:2px 4px}
+.qqj-aux-row-name,.qqj-aux-text-button,.qqj-aux-arrow{appearance:none;min-width:0;margin:0;border:0;background:transparent;color:var(--sp-on-surface);font:inherit;text-align:start;cursor:pointer;overflow-wrap:anywhere}
+.qqj-aux-text-button{justify-self:start;color:var(--sp-primary);font-size:var(--sp-fs-75);min-height:28px;padding:4px}
+.qqj-aux-row{display:flex;align-items:center;gap:6px;min-height:34px;padding:2px 1px;border-bottom:1px solid var(--sp-divider)}
+.qqj-aux-row-name{align-self:stretch;flex:1 1 0%;padding:5px 2px}
+.qqj-aux-row[data-enabled=false] .qqj-aux-row-name{color:var(--sp-subtle)}
+.qqj-aux-row-role{flex:0 0 auto;color:var(--sp-subtle);font-size:var(--sp-fs-75)}
+.qqj-aux-grip{padding:2px;color:var(--sp-subtle);cursor:grab;user-select:none}
+.qqj-aux-arrow{width:29px;min-height:30px;text-align:center;border:1px solid var(--sp-divider);border-radius:var(--qqj-radius-option)}
+.qqj-aux-editor input[type=checkbox]{width:18px;height:18px;margin:2px 4px;accent-color:var(--sp-primary);cursor:pointer}
+.qqj-aux-editor .qqj-aux-check{display:flex;align-items:center;gap:5px;min-height:30px}
+.qqj-aux-insert{align-items:flex-start}.qqj-aux-insert>.qqj-inline-select{flex:1 1 0%;min-width:0}
+.qqj-aux-editor .qqj-inline-select-value{overflow-wrap:anywhere}
+.qqj-aux-macros{display:grid;gap:3px;min-width:0;margin:0}.qqj-aux-macros dt{overflow-wrap:anywhere;font-weight:600}.qqj-aux-macros dd{margin:0 0 4px;color:var(--sp-subtle);overflow-wrap:anywhere}
+.qqj-aux-message{display:grid;gap:3px;min-width:0}
+.qqj-aux-sample{min-width:0;max-height:32dvh;overflow:auto;margin:0;padding:8px;background:var(--sp-surface-high);color:var(--sp-on-surface);border-radius:var(--qqj-radius-option);font:inherit;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:360px){.qqj-aux-pair{grid-template-columns:minmax(0,1fr)}}
 .qqj-summary-comparison>p{margin:0;color:var(--sp-subtle)}
 .qqj-summary-comparison>h3{margin:0;font-size:1em}
 .qqj-summary-comparison-text{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0;border:1px solid var(--sp-divider);border-radius:8px;padding:12px;line-height:1.8}

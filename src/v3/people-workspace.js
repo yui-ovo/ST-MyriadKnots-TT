@@ -1458,6 +1458,7 @@ export function createPeopleWorkspaceRuntime({
         let result;
         try {
           result = await generateUtilityTask({ systemPrompt, taskMessages: [{ role: 'user', content: JSON.stringify(request) }],
+            promptTask: 'profile', promptOwnerId: operation.identity.chatId,
             maxTokens: 30000, temperature: 0, signal: operation.controller.signal, includeCharacterCard: false, worldInfoSource: 'none' });
         } catch (error) {
           if (rebuilding && isProfileInputLimitError(error)) {

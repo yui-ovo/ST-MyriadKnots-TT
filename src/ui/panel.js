@@ -39,6 +39,7 @@ const shellCss = ':host{position:fixed;inset:0;z-index:4000;width:100dvw;height:
 
 export function createPanel({
   dynamicWorldbook,
+  promptPreview,
   settings,
   apiTools,
   vectorApi,
@@ -349,7 +350,7 @@ export function createPanel({
     const worldbook = sourcePermissionView?.renderSettings?.({
       open: subOpen('worldbook'), onDrawerToggle: subToggle('worldbook'),
     });
-    const prompts = createPromptsSettings({ settings, documentRef, open: subOpen('prompts'), onToggle: subToggle('prompts'), onStoryClockChange, subscribeSettingsChange, customImpl: options => dialog?.custom?.(options) });
+    const prompts = createPromptsSettings({ settings, documentRef, open: subOpen('prompts'), onToggle: subToggle('prompts'), onStoryClockChange, subscribeSettingsChange, promptPreview, customImpl: options => dialog?.custom?.(options) });
     promptsSettingsView = prompts;
     const appearanceSettings = createAppearanceSettings({
       settings, documentRef, open: subOpen('appearance'), onToggle: subToggle('appearance'),

@@ -109,6 +109,7 @@ export async function runHistoricalRebuildTask({
   extractorPromptGuidance = () => '',
   csePromptGuidance = () => '',
   processingPrompt = () => '',
+  summaryPromptPolicy = null,
   storyClockReferenceTags = () => '',
   storyCalendarForChat = () => null,
   filterWorldInfoSources = sources => sources,
@@ -213,7 +214,7 @@ export async function runHistoricalRebuildTask({
   const memoryRuntime = createV3MemoryRuntime({
     storyCalendarProvider: () => storyCalendar, foundationRuntime, store, hostAdapter, generateAnalysisTask, generateUtilityTask,
     isEnabled, automationSettings, notifyUser, isMainGenerationActive: () => false,
-    extractorPromptGuidance, csePromptGuidance, processingPrompt, storyClockReferenceTags,
+    extractorPromptGuidance, csePromptGuidance, processingPrompt, summaryPromptPolicy, storyClockReferenceTags,
     filterWorldInfoSources, sanitizerOptions, persistAnchors, identityProjectionProvider,
     captureBusinessIdentity: () => targetSession.identity(), storeForIdentity: identityValue => store.forIdentity(identityValue),
     onQianshiEventDeleted: () => {}, qianshiExternalReferenceProvider, newUuid, logger,

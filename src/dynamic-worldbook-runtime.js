@@ -198,6 +198,7 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       let results = [];
       if (JSON.stringify(batch).length <= 100000) {
         const response = jsonResult(await generateUpdate({ systemPrompt: withBaseProcessingPrompt(CLASSIFY_PROMPT, processingPrompt()),
+          promptTask: 'worldbookClassify', promptOwnerId: target.identity.chatId,
           taskMessages: [{ role: 'user', content: JSON.stringify({ entries: batch }) }],
           maxTokens: 12000, temperature: 0, signal, includeCharacterCard: false, worldInfoSource: 'none', parseMode: 'semantic' }));
         guard();
@@ -462,6 +463,7 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       for (const batch of batches(materials)) {
         receipt.calls += 1; emit();
         const response = await generateUpdate({ systemPrompt,
+          promptTask: 'worldbookUpdate', promptOwnerId: target.identity.chatId,
           taskMessages: [{ role: 'user', content: JSON.stringify({ entries: batch, ...sourceInput }) }],
           maxTokens: 12000, temperature: 0, signal, includeCharacterCard: false, worldInfoSource: 'none', parseMode: 'semantic' });
         guard();
@@ -532,6 +534,7 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
           guard();
           // Only retry locally detected output problems, never transport/provider failures.
           const response = await generateSelect({ systemPrompt: withBaseProcessingPrompt(request.systemPrompt + correction, processingPrompt()),
+            promptTask: 'worldbookSelect', promptOwnerId: target.identity.chatId,
             taskMessages: request.taskMessages,
             maxTokens: 2000, temperature: 0, signal, includeCharacterCard: false, worldInfoSource: 'none', parseMode: 'semantic' });
           guard();

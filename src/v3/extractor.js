@@ -2140,16 +2140,25 @@ export function inferCanonicalCurrentTime(canonicalContent, { allowOpeningFallba
   return relative ? Object.freeze({ text: relative, kind: 'relative' }) : null;
 }
 
+export function buildExtractorTaskOptions({ envelope, promptGuidance = '', processingPrompt = '', aggregate = false }) {
+  return {
+    promptTask: aggregate ? 'summaryBatch' : 'summary',
+    promptOwnerId: envelope.scope?.chatId,
+    systemPrompt: aggregate ? buildHighFloorExtractorSystemPrompt(promptGuidance, processingPrompt) : buildExtractorSystemPrompt(promptGuidance, processingPrompt),
+    taskMessages: [{ role: 'user', content: JSON.stringify(envelope.request) }],
+    maxTokens: 30000, temperature: 0, includeCharacterCard: false, worldInfoSource: 'none', parseMode: 'semantic',
+  };
+}
+
 export async function runExtractorRequest({ generateUtilityTask, envelope, floor, existingEntities = [], now, supersedes = null, preservedSummary = null, expectedScope, promptGuidance = '', processingPrompt = '', aggregate = false, signal, transportBudget = { remaining: 3, used: 0 } }) {
   if (typeof generateUtilityTask !== 'function') throw new TypeError('V3 Extractor utility route unavailable');
   if (!expectedScope) throw extractorError('V3_EXTRACTOR_LOCAL_SCOPE_INVALID', 'expectedScope');
   const validationErrors = [];
-  const systemPrompt = aggregate ? buildHighFloorExtractorSystemPrompt(promptGuidance, processingPrompt) : buildExtractorSystemPrompt(promptGuidance, processingPrompt);
-  const taskMessages = [{ role: 'user', content: JSON.stringify(envelope.request) }];
+  const taskOptions = buildExtractorTaskOptions({ envelope, promptGuidance, processingPrompt, aggregate });
   for (let attempts = 1; attempts <= (transportBudget.totalAttempts ?? 3); attempts += 1) {
     let candidate = null, metadata = sanitizeTaskMetadata(null), responseFingerprint = null, receivedResult = false;
     try {
-      const result = await generateUtilityTask({ systemPrompt, taskMessages, maxTokens: 30000, temperature: 0, signal, includeCharacterCard: false, worldInfoSource: 'none', transportBudget, parseMode: 'semantic' });
+      const result = await generateUtilityTask({ ...taskOptions, signal, transportBudget });
       receivedResult = true;
       if (transportBudget.diagnostic) Object.assign(transportBudget.diagnostic, { phase: 'normalize', phaseStartedAt: Date.now(), attemptEndedAt: Date.now(), outcome: 'running', endedAt: null });
       candidate = result?.jsonData ?? result?.textData ?? result;

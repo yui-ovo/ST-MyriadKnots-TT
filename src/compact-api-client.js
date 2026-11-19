@@ -1,7 +1,8 @@
 import { describeCompletionResponse, redactProviderErrorText } from './completion-diagnostic.js';
 import { createActivitySignal } from './plugin-activity.js';
 import { withBaseProcessingPrompt } from './internal-processing-prompt.js';
-import { getSharedProcessingPrompt, prependProcessingPrompt, resolveSharedProcessingPrompt } from './shared-processing-prompt.js';
+import { getSharedProcessingPrompt, resolveSharedProcessingPrompt } from './shared-processing-prompt.js';
+import { renderAuxPrompt } from './aux-prompt-runtime.js';
 import { sha256 } from './identity.js';
 import { normalizeFinishReason, parseJsonWithSymbolRepair, repairJsonWithUniqueMissingObjectClose } from './json-symbol-repair.js';
 import { normalizeRetryCount, parseAdditionalParams } from './settings.js';
@@ -399,7 +400,7 @@ function requestFailure(budget, error, cancelled = false) {
   if (!cancelled) value.lastAttemptError = { ...failure, attempt: budget.used, phase: value.phase };
 }
 
-export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryWait = wait, timeoutMs = seconds => seconds * 1000, onBusyChange = () => {}, processingPrompt = () => getSharedProcessingPrompt((globalThis.SillyTavern ?? globalThis.Luker)?.getContext?.()?.extensionSettings) } = {}) {
+export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryWait = wait, timeoutMs = seconds => seconds * 1000, onBusyChange = () => {}, promptPresets, processingPrompt = () => getSharedProcessingPrompt((globalThis.SillyTavern ?? globalThis.Luker)?.getContext?.()?.extensionSettings) } = {}) {
   if (fetchImpl !== undefined && typeof fetchImpl !== 'function') throw new Error('fetch 不可用');
   let activeRequests = 0;
   const activity = createActivitySignal(() => ({ busy: activeRequests > 0, phase: activeRequests > 0 ? 'request' : null }));
@@ -483,19 +484,17 @@ export function createCompactApiClient({ fetchImpl, headers = () => ({}), retryW
       changeBusy(-1);
     }
   };
-  const generateTask = async ({ config, taskMessages, jsonSchema, signal, maxTokens = 12000, temperature = 0.2, systemPrompt, transportBudget = null, parseMode = 'strict' } = {}) => {
-    transportBudget ??= { remaining: 1 + (normalizeRetryCount(config?.qqjRetryCount) ?? 2), used: 0 };
+  const generateTask = async (options = {}) => {
+    const { config, jsonSchema, signal, maxTokens = 12000, temperature = 0.2, parseMode = 'strict' } = options;
+    const transportBudget = options.transportBudget ?? { remaining: 1 + (normalizeRetryCount(config?.qqjRetryCount) ?? 2), used: 0 };
     requestProgress(transportBudget, 'preparing', { outcome: 'running', error: null, endedAt: null, attemptStartedAt: null, attemptEndedAt: null, timeoutMs: null });
-    const compactMessages = [
-      { role: 'system', content: typeof systemPrompt === 'string' && systemPrompt.trim()
-        ? systemPrompt.trim()
-        : 'Process only the supplied task input. Return only JSON matching the requested schema.' },
-      ...(Array.isArray(taskMessages) ? taskMessages : []).filter(message => ['system', 'user'].includes(message?.role) && typeof message.content === 'string').map(message => ({ role: message.role, content: message.content })),
-    ];
     const prefix = resolveSharedProcessingPrompt(processingPrompt());
-    compactMessages[0].content = prependProcessingPrompt(compactMessages[0].content, prefix);
-    const processingPromptFingerprint = `sha256:${await sha256(prefix)}`;
-    const systemPromptFingerprint = `sha256:${await sha256(compactMessages[0].content)}`;
+    const prepared = promptPresets?.prepare({ ...options, transportBudget }, prefix) ?? renderAuxPrompt(null, null, options, prefix);
+    const compactMessages = prepared.messages;
+    const processingPromptFingerprint = `sha256:${await sha256(prepared.policy ?? prefix)}`;
+    const systemPromptFingerprint = `sha256:${await sha256(prepared.custom
+      ? JSON.stringify(compactMessages.filter(message => message.role === 'system').map(message => message.content))
+      : compactMessages[0].content)}`;
     const configuredValue = config?.qqjTemperature;
     const configuredTemperature = configuredValue === null || configuredValue === undefined || typeof configuredValue === 'string' && configuredValue.trim() === ''
       ? null : typeof configuredValue === 'number' || typeof configuredValue === 'string' ? Number(configuredValue) : NaN;

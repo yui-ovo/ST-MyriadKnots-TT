@@ -1288,13 +1288,22 @@ export async function createManualCseCorrection({ anchorDelta, currentState, sub
   return Object.freeze({ status: 'ready', delta });
 }
 
+export function buildCseTaskOptions({ envelope, promptGuidance = '', processingPrompt = '' }) {
+  return {
+    promptTask: 'cse',
+    promptOwnerId: envelope.scope?.chatId,
+    systemPrompt: buildCseSystemPrompt(promptGuidance, processingPrompt),
+    taskMessages: [{ role: 'user', content: JSON.stringify(envelope.request) }],
+    maxTokens: 30000, temperature: 0, includeCharacterCard: false, worldInfoSource: 'none', parseMode: 'semantic',
+  };
+}
+
 export async function runCseRequest({ generateAnalysisTask, envelope, previousCurrentState, now, deltaId, promptGuidance = '', processingPrompt = '', signal, transportBudget = { remaining: 3, used: 0 } }) {
-  const systemPrompt = buildCseSystemPrompt(promptGuidance, processingPrompt);
-  const taskMessages = [{ role: 'user', content: JSON.stringify(envelope.request) }];
+  const taskOptions = buildCseTaskOptions({ envelope, promptGuidance, processingPrompt });
   for (let attempts = 1; attempts <= (transportBudget.totalAttempts ?? 3); attempts += 1) {
     let candidate = null, metadata = sanitizeTaskMetadata(null), receivedResult = false;
     try {
-      const result = await generateAnalysisTask({ systemPrompt, taskMessages, maxTokens: 30000, temperature: 0, signal, includeCharacterCard: false, worldInfoSource: 'none', transportBudget, parseMode: 'semantic' });
+      const result = await generateAnalysisTask({ ...taskOptions, signal, transportBudget });
       receivedResult = true;
       if (transportBudget.diagnostic) Object.assign(transportBudget.diagnostic, { phase: 'compile', phaseStartedAt: Date.now(), attemptEndedAt: Date.now(), outcome: 'running', endedAt: null });
       candidate = result?.jsonData ?? result?.textData ?? result;

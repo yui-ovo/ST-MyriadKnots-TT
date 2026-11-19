@@ -136,6 +136,28 @@ const baseline = { id: '88888888-1111-4111-8111-111111111111', userPersona: { en
 const memory = id => ({ id, summary: { effectiveSource: 'ai', aiText: '摘要' }, chronology: [], locations: [], participants: [], actions: [], observations: [], informationTransfers: [], privateCognition: [], commitments: [], cseSignals: [] });
 const floor = (id, content) => ({ id, chatId: CHAT, narrativeGeneration: GEN, content: { canonicalContent: content } });
 
+test('同楼摘要和 CSE 的请求预览沿用实际输入，预览不写记忆或调用模型', async () => {
+  const h = runtimeHarness();
+  await h.foundationRuntime.start();
+  await h.runtime.start();
+  const [{ id }] = h.runtime.promptFloorSources('summary');
+  const before = h.commitResults.length;
+  const summary = await h.runtime.previewFloorPrompt('summary', id);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.commitResults.length, before);
+  await h.runtime.extractFloor(id, { analyzeState: false });
+  assert.deepEqual(summary.taskMessages, h.calls[0].taskMessages);
+  assert.equal(summary.systemPrompt, h.calls[0].systemPrompt);
+  assert.ok(h.runtime.promptFloorSources('cse').some(source => source.id === id));
+  const afterSummary = h.commitResults.length;
+  const state = await h.runtime.previewFloorPrompt('cse', id);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.commitResults.length, afterSummary);
+  await h.runtime.retryStateAnalysis(id);
+  assert.deepEqual(state.taskMessages, h.calls[1].taskMessages);
+  assert.equal(state.systemPrompt, h.calls[1].systemPrompt);
+});
+
 test('可选量化：复合情绪与数字单独更新保存重放，不编造文字变化；坏数字不补请求', async () => {
   const make = currentState => createCseEnvelope({ floor: floor(FLOOR1, '甲说喜欢相处，也反感冒险。'), floorMemory: memory(MEMORY1), baseline,
     currentState, trackedSubjects: [entities[1]], entities });

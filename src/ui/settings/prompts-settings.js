@@ -1,4 +1,5 @@
 import { createSettingsKit } from './kit.js';
+import { openAuxPromptPresets } from './aux-prompt-presets.js';
 import { DEFAULT_MYKNOTS_STORY_CLOCK_PROMPT } from '../../story-clock.js';
 import { DEFAULT_EXTRACTOR_GUIDANCE } from '../../v3/extractor.js';
 import { DEFAULT_CSE_GUIDANCE } from '../../v3/cse-engine.js';
@@ -8,7 +9,7 @@ import { DEFAULT_WORLDBOOK_GUIDANCE } from '../../dynamic-worldbook-update.js';
 import { DEFAULT_AVATAR_PROMPT } from '../../avatar-generation.js';
 
 // 长提示词在草稿弹窗内编辑，保存时一次写入；短设置仍即时生效。
-export function createPromptsSettings({ settings, documentRef = globalThis.document, open = false, onToggle, onStoryClockChange, customImpl = null, subscribeSettingsChange = null } = {}) {
+export function createPromptsSettings({ settings, documentRef = globalThis.document, open = false, onToggle, onStoryClockChange, customImpl = null, subscribeSettingsChange = null, promptPreview = null } = {}) {
   const { element, button, field, subDrawer } = createSettingsKit(documentRef);
   const { drawer, body } = subDrawer({ title: '提示词与包裹符', id: 'qqj-settings-prompts', open, onToggle });
   body.className += ' settings-drawer-list';
@@ -83,6 +84,11 @@ export function createPromptsSettings({ settings, documentRef = globalThis.docum
   promptEditor({ body: avatarBody, key: 'avatarPrompt', defaultText: DEFAULT_AVATAR_PROMPT, label: '头像生图提示词', hint: '单人头像构图，人物外貌来自柏宝绘角色库。保存后供后续生成使用；留空使用默认。' });
 
   wrapperBody.append(element('p', 'settings-hint', '白鳥系列插件全部共享'), field('保留包裹符', keepTags), field('清洗包裹符', extraTags));
+  if (typeof customImpl === 'function') {
+    body.append(button('副 API 提示词预设', 'secondary-action', () => {
+      void openAuxPromptPresets({ settings, documentRef, customImpl, promptPreview });
+    }));
+  }
   body.append(
     wrapperDrawer,
     storyClockDrawer,

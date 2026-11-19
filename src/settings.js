@@ -2,6 +2,7 @@ import { getSharedBodyWrappers, updateSharedBodyWrappers } from './shared-body-w
 import { initializeSharedProcessingPrompt, getSharedProcessingPrompt, updateSharedProcessingPrompt } from './shared-processing-prompt.js';
 import { normalizeStoryClockReferenceTags } from './story-clock.js';
 import { normalizeStoryCalendar } from './v3/calendar-rules.js';
+import { normalizeAuxPromptLibrary } from './aux-prompt-library.js';
 
 export const SETTINGS_ID = 'qianqianjie';
 
@@ -42,6 +43,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   apiPresets: [],
   apiPresetActiveId: '',
   sharedApiMigrationVersion: 0,
+  auxPromptLibrary: null,
   sourceWorldInfoExcludedBooks: [],
   sourceKeepTags: 'content',
   sourceExtraTags: '',
@@ -189,6 +191,13 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
   if (!extensionSettings || typeof extensionSettings !== 'object') throw new Error('千千结设置存储不可用');
   getSharedBodyWrappers(extensionSettings);
   initializeSharedProcessingPrompt(extensionSettings, save);
+  let normalizedAuxLibrary;
+  const failedAuxWrites = new WeakMap();
+  const setAuxLibrary = (settings, value) => {
+    normalizedAuxLibrary = normalizeAuxPromptLibrary(value);
+    settings.auxPromptLibrary = normalizedAuxLibrary;
+    return normalizedAuxLibrary;
+  };
   const get = () => {
     const settings = extensionSettings[SETTINGS_ID] ??= { ...DEFAULT_SETTINGS, apiExcludeParams: [], apiPresets: [] };
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) if (!own(settings, key)) {
@@ -197,6 +206,7 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (!API_MODES.has(settings.apiMode)) settings.apiMode = 'auto';
     if (!Array.isArray(settings.apiExcludeParams)) settings.apiExcludeParams = [];
     if (!Array.isArray(settings.apiPresets)) settings.apiPresets = [];
+    if (!normalizedAuxLibrary || settings.auxPromptLibrary !== normalizedAuxLibrary) setAuxLibrary(settings, settings.auxPromptLibrary);
     if (!Array.isArray(settings.sourceWorldInfoExcludedBooks)) settings.sourceWorldInfoExcludedBooks = [];
     if (!APPEARANCE_THEMES.has(settings.appearanceTheme)) settings.appearanceTheme = 'auto';
     settings.inlineRecallVisible = settings.inlineRecallVisible !== false;
@@ -289,6 +299,18 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (own(patch, 'appearanceScale')) settings.appearanceScale = normalizeScale(patch.appearanceScale);
     if (own(patch, 'appearanceFontCssUrl')) settings.appearanceFontCssUrl = text(patch.appearanceFontCssUrl).trim();
     if (own(patch, 'appearanceFontFamily')) settings.appearanceFontFamily = text(patch.appearanceFontFamily).trim();
+    if (own(patch, 'auxPromptLibrary')) {
+      const previous = settings.auxPromptLibrary;
+      const applied = setAuxLibrary(settings, patch.auxPromptLibrary);
+      return persistApiEdit(settings, { observeSaveFailure }, () => {
+        failedAuxWrites.set(applied, previous);
+        if (settings.auxPromptLibrary !== applied) return;
+        let restored = previous;
+        while (failedAuxWrites.has(restored)) restored = failedAuxWrites.get(restored);
+        normalizedAuxLibrary = restored;
+        settings.auxPromptLibrary = restored;
+      });
+    }
     notify(observeSaveFailure);
     return settings;
   };
@@ -503,6 +525,10 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
     if (text(current.recallPresetId).trim() === presetId) current.recallPresetId = '';
     if (text(current.worldbookPresetId).trim() === presetId) current.worldbookPresetId = '';
     if (text(current.vectorPresetId).trim() === presetId) current.vectorEnabled = false;
+    const routeKey = 'preset:' + presetId;
+    const library = current.auxPromptLibrary;
+    const removedBindings = library.bindings.filter(binding => binding.routeKey === routeKey);
+    if (removedBindings.length) setAuxLibrary(current, { ...library, bindings: library.bindings.filter(binding => binding.routeKey !== routeKey) });
     const applied = Object.fromEntries(keys.map(key => [key, current[key]]));
     return persistApiEdit(true, options, () => {
       const owner = sevenDaysSettings(), original = list.find(value => value && typeof value === 'object' && text(value.id).trim() === presetId);
@@ -510,6 +536,11 @@ export function createSettingsStore({ extensionSettings, save = () => {}, now, r
         const restored = [...owner.apiPresets]; restored.splice(Math.min(list.indexOf(original), restored.length), 0, original); owner.apiPresets = restored;
       }
       restoreApiFields(current, before, applied);
+      if (removedBindings.length) {
+        const latest = current.auxPromptLibrary;
+        const missing = removedBindings.filter(binding => !latest.bindings.some(item => item.taskId === binding.taskId && item.routeKey === routeKey));
+        if (missing.length) setAuxLibrary(current, { ...latest, bindings: [...latest.bindings, ...missing] });
+      }
     });
   };
   const sharedSnapshotKey = () => {

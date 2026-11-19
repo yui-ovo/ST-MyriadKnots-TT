@@ -29,6 +29,7 @@ import { bootstrap } from './src/bootstrap.js';
 import { createSettingsStore } from './src/settings.js';
 import { createApiResolver, createApiTools, createTaskRouter } from './src/api-routing.js';
 import { createCompactApiClient } from './src/compact-api-client.js';
+import { auxRouteKey, createAuxPromptRuntime } from './src/aux-prompt-runtime.js';
 import { createChatSession } from './src/chat-session.js';
 import { createChatIdentityCoordinator } from './src/chat-identity.js';
 import { readHostState, cloneHostJsonMetadata, createHostChatList } from './src/host-context.js';
@@ -141,11 +142,17 @@ const clearPluginLifecycleFailureIfUnchanged = revision => {
   if (pluginLifecycleFailureRevision === revision) clearPluginLifecycleFailure();
 };
 const processingPrompt = () => settings.processingPrompt();
+const apiResolver = createApiResolver({ settings });
+const promptPresets = createAuxPromptRuntime({ settings, resolver: apiResolver,
+  currentIdentity: () => session.identity(),
+  listSources: taskId => v3MemoryRuntime.promptFloorSources(taskId),
+  readSource: (taskId, id) => v3MemoryRuntime.previewFloorPrompt(taskId, id),
+});
+const summaryPromptPolicy = (taskId, prefix) => promptPresets.signature(taskId, auxRouteKey(apiResolver.resolveUtility()), prefix);
 const compactClient = createCompactApiClient({
   headers: () => hostContext()?.getRequestHeaders?.() ?? {},
-  processingPrompt,
+  processingPrompt, promptPresets,
 });
-const apiResolver = createApiResolver({ settings });
 const taskRouter = createTaskRouter({
   resolver: apiResolver,
   compactClient,
@@ -308,7 +315,7 @@ const v3MemoryRuntime = createV3MemoryRuntime({
   extractorPromptGuidance: summaryPrompt,
   summarySourceProvider: () => settings.get().summarySource,
   csePromptGuidance: csePrompt,
-  processingPrompt,
+  processingPrompt, summaryPromptPolicy,
   storyClockReferenceTags: () => settings.get().storyClockReferenceTags,
   filterWorldInfoSources: sourcePermissions.filterWorldInfoSources,
   sanitizerOptions,
@@ -457,14 +464,14 @@ const createHistoricalRebuild = options => runHistoricalRebuildTask({
   extractorPromptGuidance: summaryPrompt,
   summarySourceProvider: () => settings.get().summarySource,
   csePromptGuidance: csePrompt,
-  processingPrompt,
+  processingPrompt, summaryPromptPolicy,
   storyClockReferenceTags: () => settings.get().storyClockReferenceTags,
   storyCalendarForChat: chatId => {
     const calendars = settings.get().storyCalendars ?? {};
     if (Object.hasOwn(calendars, chatId)) return calendars[chatId] ?? null;
     return options.storyCalendar ? persistStoryCalendar(chatId, options.storyCalendar) : null;
   },
-  generateTimeTask: taskRouter.generateTimeTask,
+  generateTimeTask: taskRouter.generateUtilityTask,
   isTimeEvolutionEnabled: () => settings.isEnabled() && settings.get().timeEvolutionEnabled === true,
   filterWorldInfoSources: sourcePermissions.filterWorldInfoSources,
   identityProjectionProvider,
@@ -613,6 +620,7 @@ const setAllEnabled = async enabled => {
   const diagnosticRevisionAtStart = pluginLifecycleFailureRevision;
   refreshStoryClock({ announce: true });
   if (!enabled) {
+    promptPresets.clear();
     const stopped = await Promise.allSettled([
       () => inlineRenderer.setEnabled(false), () => autoHideController.stop(), () => timeRuntime.stop(),
       () => peopleWorkspaceRuntime.setEnabled(false), () => v3RecallRuntime.setEnabled(false),
@@ -648,6 +656,7 @@ const qianchuangWorldInfoProvider = async ({chatId,organize=false}) => {
 if (settings.isEnabled()) startQianchuangMaps();
 ui = bootstrap({
   dynamicWorldbook,
+  promptPreview: promptPresets,
   userAvatarProvider: () => user_avatar ? getUserAvatar(user_avatar) : null,
   moduleUrl: import.meta.url,
   activity: pluginActivity,
@@ -749,7 +758,10 @@ void (async () => {
     timeRuntime.bind({ eventSource: host?.eventSource, eventTypes: host?.eventTypes, foundationRuntime });
     for (const name of ['CHAT_CHANGED', 'GENERATION_STARTED']) {
       const eventName = host?.eventTypes?.[name];
-      if (eventName) host?.eventSource?.on?.(eventName, () => refreshStoryClock());
+      if (eventName) host?.eventSource?.on?.(eventName, () => {
+        if (name === 'CHAT_CHANGED') promptPresets.clear();
+        refreshStoryClock();
+      });
     }
     refreshStoryClock({ announce: true });
     inlineRenderer.setEnabled(settings.isEnabled());

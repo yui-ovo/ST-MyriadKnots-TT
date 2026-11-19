@@ -24,6 +24,7 @@ import { estimateRecallTokens, formatRecallInjection, recallBudget, selectRecall
 import { selectPrequel } from '../src/v3/recall-prequel.js';
 import { normalizeIdentityProjection } from '../src/v3/entity-identity.js';
 import { createV3MemoryRuntime } from '../src/v3/memory-runtime.js';
+import { auxRouteKey, createAuxPromptRuntime } from '../src/aux-prompt-runtime.js';
 import { createPeopleWorkspaceStore, createPeopleWorkspaceRuntime } from '../src/v3/people-workspace.js';
 import { createPluginUpdates } from '../src/plugin-updates.js';
 import { readRecallSource } from '../src/v3/recall-source.js';
@@ -1245,6 +1246,7 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
     createTaskRouter: options => { const router = { generateAnalysisTask: analysisTask, generateUtilityTask: taskRouters.length ? peopleUtilityTask : utilityTask, generateRecallTask: recallTask, generateWorldbookTask: worldbookTask, abortAll() {} }; taskRouters.push({ options, router }); return router; },
   });
   define('./src/compact-api-client.js', { createCompactApiClient: options => { compactOptions = options; return compactStub; } });
+  define('./src/aux-prompt-runtime.js', { auxRouteKey, createAuxPromptRuntime });
   define('./src/chat-session.js', { createChatSession: options => {
     sessionOptions = options;
     return { prepare: () => options.identityCoordinator.prepare(), identity: () => { if (sessionIdentityError) throw sessionIdentityError; return { chatId: 'test' }; }, invalidate() {}, getState: () => sessionState };
@@ -1585,6 +1587,7 @@ test('生产入口行为接线：V3 memory 区分分析与摘要 API，session/l
 
   assert.equal(Object.hasOwn(v3MemoryOptions, 'customGuidance'), false, '退役通用附加不得继续接入运行时');
   assert.equal(v3MemoryOptions.extractorPromptGuidance(), '摘要指导');
+  assert.equal(bootstrapOptions.promptPreview, compactOptions.promptPresets, '预览和实际传输必须使用同一套提示词预设');
   assert.equal(v3MemoryOptions.csePromptGuidance(), 'CSE 指导');
   assert.equal(v3MemoryOptions.processingPrompt(), '  破限接线\n');
   assert.equal(v3MemoryOptions.storyClockReferenceTags(), 'Ti,时标');
@@ -2124,7 +2127,7 @@ test('可选时间戳：实际refresh封装失败仍启动核心，所有停止�
     const stop = name => () => { calls.push(name); if (name === 'time' && failure === 'sync-stop') throw new Error('stop failed'); if (name === 'time' && failure === 'pending-stop') return new Promise(resolve => { release = resolve; }); return name; };
     const ctx = createContext({ console: { warn() {} }, globalThis: {}, pluginLifecycleFailureRevision: 0,
       projectStoryClockStatus() { calls.push('clock'); if (failure === 'clock') throw new Error('clock failed'); }, announceStoryClockChange() {},
-      inlineRenderer: { setEnabled: stop('inline') }, autoHideController: { stop: stop('hide') }, timeRuntime: { stop: stop('time') },
+      promptPresets: { clear: stop('prompts') }, inlineRenderer: { setEnabled: stop('inline') }, autoHideController: { stop: stop('hide') }, timeRuntime: { stop: stop('time') },
       peopleWorkspaceRuntime: { setEnabled: stop('people') }, v3RecallRuntime: { setEnabled: stop('recall') }, v3MemoryRuntime: { setEnabled: stop('memory') },
       lifecycle: { setEnabled: stop('lifecycle') }, clearPluginLifecycleFailureIfUnchanged() {},
     });
@@ -2135,7 +2138,7 @@ test('可选时间戳：实际refresh封装失败仍启动核心，所有停止�
     const beforeRelease = [...calls];
     if (failure === 'pending-stop') release?.();
     await observed;
-    assert.deepEqual(beforeRelease.filter(name => name !== 'clock'), ['inline', 'hide', 'time', 'people', 'recall', 'memory', 'lifecycle']);
+    assert.deepEqual(beforeRelease.filter(name => name !== 'clock'), ['prompts', 'inline', 'hide', 'time', 'people', 'recall', 'memory', 'lifecycle']);
     assert.equal(await task, 'memory');
   });
 });

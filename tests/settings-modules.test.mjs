@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { BASE_PROCESSING_PROMPT, resolveSharedProcessingPrompt } from '../src/shared-processing-prompt.js';
 import { createPromptsSettings } from '../src/ui/settings/prompts-settings.js';
+import { AUX_TASKS } from '../src/aux-prompt-tasks.js';
+import { editAuxPromptLibrary, getAuxPromptPreset, resolveAuxPromptPreset } from '../src/aux-prompt-library.js';
 import { createAppearanceSettings } from '../src/ui/settings/appearance-settings.js';
 import { resolveVectorConfig, VECTOR_DEFAULT_URL, VECTOR_DEFAULT_MODEL } from '../src/vector-api.js';
 import { createApiSettings } from '../src/ui/settings/api-settings.js';
@@ -58,6 +60,118 @@ const chooseInline = async (control, value) => {
   await option.fire('click');
 };
 const focusInline = control => inlineTrigger(control).fire('focus');
+
+function auxManager(settings, promptPreview) {
+  let dialog;
+  const { node } = createPromptsSettings({ documentRef, settings, promptPreview, customImpl: options => { dialog = options; } });
+  const findButton = (content, label) => {
+    const button = content.find(n => n.tagName === 'button' && n.textContent === label);
+    assert.ok(button, '缺少按钮 ' + label);
+    return button;
+  };
+  return {
+    open: () => findButton(node, '副 API 提示词预设').fire('click'),
+    click: label => findButton(dialog.content, label).fire('click'),
+    choose: (label, value) => chooseInline(dialog.content.find(n => n.attributes['aria-label'] === label && n.className.includes('qqj-inline-select-trigger')).parentNode, value),
+    control: label => fieldControl(dialog.content, label),
+    byLabel: label => dialog.content.find(n => n.attributes['aria-label'] === label),
+    get dialog() { return dialog; },
+  };
+}
+
+test('副 API 预设从设置打开，可复制、插入宏、排序与启停，保存后才生效', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} });
+  const firstTask = AUX_TASKS[0], ui = auxManager(settings);
+  await ui.open(); await ui.click('复制后编辑');
+  ui.control('预设名称').value = '自定义顺序';
+  ui.byLabel('设为此任务的默认预设').checked = true;
+  await ui.click('应用'); await ui.click('新增条目');
+  ui.control('条目名称').value = '核对材料';
+  const text = ui.control('提示词内容');
+  text.value = '甲乙'; text.selectionStart = 1; text.selectionEnd = 1;
+  await ui.choose('插入宏', 'qqj_input'); await ui.click('插入');
+  assert.equal(text.value, '甲{{qqj_input}}乙');
+  await ui.choose('消息角色', 'assistant');
+  await ui.click('宏与输出格式说明');
+  assert.ok(ui.dialog.content.textContent.includes(firstTask.outputExample));
+  await ui.click('应用条目'); await ui.click('排序');
+  await ui.byLabel('上移核对材料').fire('click'); await ui.click('完成排序');
+  const enabled = ui.byLabel('启用核对材料'); enabled.checked = false; await enabled.fire('change');
+  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, firstTask.id).id, 'builtin');
+  await ui.dialog.submit();
+  const saved = resolveAuxPromptPreset(settings.get().auxPromptLibrary, firstTask.id);
+  assert.equal(saved.name, '自定义顺序'); assert.equal(saved.rows[2].name, '核对材料');
+  assert.equal(saved.rows[2].content, '甲{{qqj_input}}乙'); assert.equal(saved.rows[2].role, 'assistant'); assert.equal(saved.rows[2].enabled, false);
+
+  await ui.open(); await ui.click('核对材料'); ui.control('提示词内容').value = '未保存的草稿'; await ui.click('放弃编辑');
+  await ui.click('核对材料'); assert.equal(ui.control('提示词内容').value, '甲{{qqj_input}}乙');
+  ui.control('提示词内容').value = '在编辑页面直接保存'; await ui.dialog.submit();
+  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, firstTask.id).rows[2].content, '在编辑页面直接保存');
+});
+
+test('从其他任务引用条目后可选择影响范围，连接覆盖及角色保持独立', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} });
+  const [taskA, taskB] = AUX_TASKS;
+  let library;
+  const edit = patch => { const result = editAuxPromptLibrary(library, patch); library = result.library; return result; };
+  const first = edit({ type: 'createPreset', taskId: taskA.id, name: '第一套' }).presetId;
+  const second = edit({ type: 'createPreset', taskId: taskB.id, name: '第二套' }).presetId;
+  const source = edit({ type: 'addEntry', presetId: first, name: '共用准则', content: '初始内容', role: 'user' }).entryId;
+  for (const [taskId, presetId] of [[taskA.id, first], [taskB.id, second]]) edit({ type: 'bind', taskId, presetId });
+  settings.update({ auxPromptLibrary: library });
+  const ui = auxManager(settings, { routes: () => [{ id: 'main', label: '主配置' }] });
+  await ui.open(); await ui.choose('任务', taskB.id); await ui.click('从已有条目添加');
+  await ui.choose('已有条目', source); await ui.choose('消息角色', 'assistant'); await ui.click('引用条目');
+  await ui.click('共用准则'); ui.control('提示词内容').value = '共用版本';
+  assert.ok(ui.dialog.content.textContent.includes(taskA.label + ' / 第一套'));
+  assert.ok(ui.dialog.content.textContent.includes(taskB.label + ' / 第二套'));
+  await assert.rejects(ui.dialog.submit(), /请选择内容修改范围/);
+  await ui.choose('内容修改范围', 'shared'); await ui.click('应用条目');
+  await ui.choose('任务', taskA.id); await ui.click('共用准则'); assert.equal(ui.control('提示词内容').value, '共用版本');
+  await ui.click('放弃编辑'); await ui.choose('任务', taskB.id); await ui.click('共用准则');
+  ui.control('提示词内容').value = '本处版本';
+  await ui.choose('内容修改范围', 'local'); await ui.click('应用条目');
+  await ui.click('应用范围'); await ui.choose('此连接使用', 'builtin'); await ui.click('返回列表');
+  await ui.dialog.submit();
+  const saved = settings.get().auxPromptLibrary;
+  const a = getAuxPromptPreset(saved, taskA.id, first).rows.at(-1), b = getAuxPromptPreset(saved, taskB.id, second).rows.at(-1);
+  assert.notEqual(a.entryId, b.entryId); assert.equal(a.role, 'user'); assert.equal(b.role, 'assistant');
+  assert.equal(a.content, '共用版本'); assert.equal(b.content, '本处版本');
+  assert.equal(resolveAuxPromptPreset(saved, taskB.id, 'main').id, 'builtin');
+  assert.equal(resolveAuxPromptPreset(saved, taskB.id, 'preset:extra').id, second);
+});
+
+test('请求预览采用当前草稿，切换楼层或关闭后丢弃迟到的结果', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} });
+  const pending = [];
+  const ui = auxManager(settings, {
+    sources: () => [{ id: 'a', label: '第 2 楼' }, { id: 'b', label: '第 4 楼' }],
+    preview: request => new Promise(resolve => pending.push({ request, resolve })),
+  });
+  await ui.open(); await ui.click('复制后编辑'); ui.control('预设名称').value = '预览草稿'; await ui.click('应用');
+  await ui.click('预览请求');
+  assert.equal(pending[0].request.preset.name, '预览草稿'); assert.equal(pending[0].request.sourceId, 'a');
+  await ui.choose('预览材料', 'b');
+  pending[1].resolve({ messages: [{ role: 'system', content: '<私有场景>' }, { role: 'user', content: '当前样本' }], warnings: ['材料提示'] });
+  await flush();
+  assert.match(ui.dialog.content.textContent, /材料提示1 · 系统<私有场景>2 · 用户当前样本/);
+  pending[0].resolve({ messages: [{ role: 'user', content: '过期样本' }] }); await flush();
+  assert.doesNotMatch(ui.dialog.content.textContent, /过期样本/);
+  await ui.choose('预览材料', 'a'); ui.dialog.onClose();
+  pending[2].resolve({ messages: [{ role: 'user', content: '取消后的材料' }] }); await flush();
+  assert.doesNotMatch(ui.dialog.content.textContent, /取消后的材料/);
+  assert.equal(resolveAuxPromptPreset(settings.get().auxPromptLibrary, AUX_TASKS[0].id).id, 'builtin');
+});
+
+test('副 API 编辑器遇到另一个窗口已保存的预设时保留其设置', async () => {
+  const settings = createSettingsStore({ extensionSettings: {} });
+  const ui = auxManager(settings); await ui.open(); await ui.click('复制后编辑');
+  ui.control('预设名称').value = '当前草稿'; await ui.click('应用');
+  const outside = editAuxPromptLibrary(settings.get().auxPromptLibrary, { type: 'createPreset', taskId: AUX_TASKS[0].id, name: '来自其他窗口' });
+  settings.update({ auxPromptLibrary: outside.library });
+  await assert.rejects(ui.dialog.submit(), /其他位置/);
+  assert.deepEqual(settings.get().auxPromptLibrary.presets.map(preset => preset.name), ['来自其他窗口']);
+});
 
 test('提示词模块字段 change 即持久化', () => {
   const patches = [];

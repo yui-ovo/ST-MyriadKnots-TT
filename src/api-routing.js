@@ -1,4 +1,5 @@
 import { normalizePreset, normalizeRetryCount } from './settings.js';
+import { auxRouteKey } from './aux-prompt-runtime.js';
 
 const validConfig = config => Boolean(config?.url && config?.key);
 const sevenDaysPresets = value => Array.isArray(value?.apiPresets) ? value.apiPresets.map(item => item && typeof item === 'object' ? { ...item, ...normalizePreset(item) } : null).filter(item => item?.id) : [];
@@ -105,7 +106,7 @@ export function createTaskRouter({ resolver, compactClient, isEnabled = () => tr
     const onExternalAbort = () => controller.abort();
     if (externalSignal?.aborted) controller.abort(); else externalSignal?.addEventListener?.('abort', onExternalAbort, { once: true });
     try {
-      const result = await compactClient.generateTask({ ...options, transportBudget, config: route.config, signal: controller.signal });
+      const result = await compactClient.generateTask({ ...options, transportBudget, routeKey: auxRouteKey(route), config: route.config, signal: controller.signal });
       if (!isEnabled() || mine !== epoch) throw abortError();
       return withTaskMetadata(result, route);
     }

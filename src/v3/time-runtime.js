@@ -724,6 +724,7 @@ export function createTimeRuntime({ store, foundationStore, hostAdapter, session
     try {
       const transportBudget = { remaining: 1, used: 0 }; operation.requests += 1;
       const result = await generateTimeTask({ systemPrompt: withBaseProcessingPrompt(ANNUAL_SETTING_SYSTEM_PROMPT, operation.processingPrompt), taskMessages: [{ role: 'user', content: JSON.stringify(annual.request) }],
+        promptTask: 'annualSetting', promptOwnerId: operation.chatId,
         temperature: 0, includeCharacterCard: false, worldInfoSource: 'none', parseMode: 'semantic', transportBudget, transportRetries: 0, signal: operation.controller.signal });
       if (!await stillCurrent()) return stored;
       const compiled = compileAnnualSettingResponse(result, { sources: annual.sources });
@@ -826,6 +827,7 @@ export function createTimeRuntime({ store, foundationStore, hostAdapter, session
           operation.failurePhase = 'request';
           try {
             result = await generateTimeTask({ systemPrompt: withBaseProcessingPrompt(prepared.systemPrompt, operation.processingPrompt), taskMessages: [{ role: 'user', content: JSON.stringify(prepared.request) }],
+              promptTask: currentReview ? 'timeReview' : 'time', promptOwnerId: operation.chatId,
               temperature: 0, includeCharacterCard: false, worldInfoSource: 'none', parseMode: 'semantic', transportBudget, transportRetries: 0, signal: operation.controller.signal });
             if (!current(operation)) return;
             operation.phase = 'saving'; notify();

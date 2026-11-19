@@ -302,6 +302,7 @@ export async function selectRecallWithLlm({
     const taskMessages = [{ role: 'user', content: serializedTaskInput }];
     updateStep('utilityTask');
     result = await generateUtilityTask({
+      promptTask: 'recall', promptOwnerId: source?.chatId,
       systemPrompt,
       taskMessages,
       temperature: 0,

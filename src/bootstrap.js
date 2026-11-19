@@ -13,6 +13,7 @@ import { comparisonAfterExtraction, showSummaryComparison } from './ui/summary-c
 
 export function bootstrap({
   dynamicWorldbook,
+  promptPreview,
   settings,
   activity,
   apiTools,
@@ -104,6 +105,7 @@ export function bootstrap({
   };
   panel = panelFactory({
     dynamicWorldbook,
+    promptPreview,
     settings,
     apiTools,
     vectorApi,
