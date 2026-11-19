@@ -83,6 +83,10 @@ test('预设页直接阅读锁定的内置指令，复制整套后留在原条�
   assert.doesNotMatch(ui.node.textContent, /提示词与包裹符|副 API 提示词预设/);
   const built = resolveAuxPromptPreset(settings.get().auxPromptLibrary, task.id);
   const rule = built.rows.find(row => row.id === 'builtin:instructions');
+  const lockedSwitch = ui.byLabel('启用' + rule.name);
+  assert.equal(lockedSwitch.attributes.role, 'switch');
+  assert.equal(lockedSwitch.disabled, true);
+  assert.equal(lockedSwitch.checked, rule.enabled);
   await ui.click(rule.name);
   assert.equal(ui.control('提示词内容').readOnly, true);
   assert.equal(ui.control('提示词内容').value, rule.content); assert.ok(rule.content.length > 80);
@@ -112,7 +116,10 @@ test('条目的启停和手机排序作为草稿，切换整套时可保留或�
   await ui.click('新建'); ui.control('预设名称').value = '排序测试'; await ui.click('创建并启用');
   const suiteId = settings.get().auxPromptLibrary.activeSuiteId;
   await ui.click('新增条目'); ui.control('条目名称').value = '回顾'; ui.control('提示词内容').value = '核对'; await ui.click('保存条目');
-  const included = ui.byLabel('启用回顾'); included.checked = false; await included.fire('change');
+  const included = ui.byLabel('启用回顾');
+  assert.equal(included.attributes.role, 'switch');
+  assert.equal(included.disabled, false);
+  included.checked = false; await included.fire('change');
   await ui.click('排序'); await ui.byLabel('上移回顾').fire('click'); await ui.click('完成排序');
   await ui.choose('当前使用的预设', 'builtin'); assert.equal(settings.get().auxPromptLibrary.activeSuiteId, suiteId);
   await ui.click('继续编辑'); await ui.click('保存预设');

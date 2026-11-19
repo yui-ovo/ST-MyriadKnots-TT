@@ -221,8 +221,10 @@ export function createPromptPresetsView({ settings, documentRef = globalThis.doc
           item.append(arrow);
         }
       } else {
+        const toggle = element('label', 'qqj-aux-switch');
         const included = element('input', 'qqj-aux-toggle');
         included.type = 'checkbox';
+        included.setAttribute('role', 'switch');
         included.checked = row.enabled;
         included.disabled = !editable;
         included.setAttribute('aria-label', '启用' + row.name);
@@ -231,7 +233,10 @@ export function createPromptPresetsView({ settings, documentRef = globalThis.doc
           item.setAttribute('data-enabled', String(included.checked));
           saveBar.replaceChildren(); addSaveBar();
         });
-        item.append(included);
+        const track = element('span', 'qqj-aux-switch-track');
+        track.setAttribute('aria-hidden', 'true');
+        toggle.append(included, track);
+        item.append(toggle);
       }
       list.append(item);
     }
