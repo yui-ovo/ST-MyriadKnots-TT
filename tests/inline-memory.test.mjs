@@ -7,6 +7,45 @@ import { createInlineMemoryBridge } from '../src/inline-memory-bridge.js';
 import { createSettingsStore } from '../src/settings.js';
 
 import { inlinePacket, inlineBlock } from './inline-memory-fixture.mjs';
+import { block as textBlock, packet as textPacket } from './fixtures/main-reply-memory-text.mjs';
+
+test('分栏文字与原JSON保留同一份完整资料，不缩短摘要或丢掉领域字段', () => {
+  assert.deepEqual(readInlineMemory(textBlock), textPacket);
+  assert.deepEqual(readInlineMemory(textBlock), readInlineMemory(inlineBlock(textPacket)));
+  assert.deepEqual(readInlineMemory(textBlock.replaceAll('\n', '\r\n')), textPacket);
+});
+
+test('文字值保留引号、冒号、转义分隔符、原文换行与字面空值', () => {
+  const raw = textBlock.replace('裴先生、晚生', String.raw`裴\、先生、晚生`)
+    .replace('手背有一道擦伤', String.raw`他写道：“A: B｜C”。\n路径 C:\\notes；左\→右`.replace('B｜C', String.raw`B\｜C`))
+    .replace('林岚｜裴晚生｜trust', String.raw`林岚｜\无｜trust`);
+  const parsed = readInlineMemory(raw);
+  assert.deepEqual(parsed.people[1].aliases, ['裴、先生', '晚生']);
+  assert.equal(parsed.knowledge[0].description, '他写道：“A: B｜C”。\n路径 C:\\notes；左→右');
+  assert.equal(parsed.cseSignals[0].object, '无');
+});
+
+test('文字区块缺栏目、重复栏目、错列、缺引用配对及断裂路径都拒绝，不回退摘要API', () => {
+  for (const [raw, code] of [
+    [textBlock.replace(/【状态线索】[^]*?(?=【空间地点】)/u, ''), 'V3_INLINE_MEMORY_INCOMPLETE'],
+    [textBlock.replace('【人物】', '【摘要】'), 'V3_INLINE_MEMORY_INVALID'],
+    [textBlock.replace('林岚｜injury｜手背有一道擦伤', '林岚｜手背有一道擦伤'), 'V3_INLINE_MEMORY_INVALID'],
+    [textBlock.replace('钥匙｜否｜无｜无', '钥匙｜否｜matter:old｜无'), 'V3_INLINE_MEMORY_INVALID'],
+    [textBlock.replace('place-mention-1→place-mention-2', 'place-mention-404→place-mention-2'), 'V3_INLINE_MEMORY_INVALID'],
+  ]) assert.throws(() => chooseInlineMemory(raw, 'auto'), { code });
+});
+
+test('文字格式能明确复用旧人物、地点与事项，原引用交给入库时校验', () => {
+  const raw = textBlock.replace('character｜present｜无', 'character｜present｜person:known')
+    .replace('place-mention-1｜钟楼｜new｜canonicalContent｜林岚与裴晚生走进钟楼的一层书房。', 'place-mention-1｜钟楼｜existing｜canonicalContent｜林岚与裴晚生走进钟楼的一层书房。｜place:known｜钟楼旧称')
+    .replace('钥匙｜否｜无｜无', '钥匙｜否｜matter:known｜progress');
+  const parsed = readInlineMemory(raw);
+  assert.equal(parsed.people[1].sameAsEntityKey, 'person:known');
+  assert.equal(parsed.spatialFacts.places[0].sameAsPlaceKey, 'place:known');
+  assert.deepEqual(parsed.spatialFacts.places[0].aliases, ['钟楼旧称']);
+  assert.equal(parsed.placePaths[0].path[0].sameAsPlaceKey, 'place:known');
+  assert.deepEqual(parsed.qianshi.events[0].links, [{ candidateKey: 'matter:known', kind: 'progress' }]);
+});
 
 test('正文记忆按固定标记读取：仅真正缺失才允许auto走API，残缺和多段不可降级', () => {
   const raw = `正文\n${inlineBlock(inlinePacket())}`;
@@ -31,8 +70,10 @@ test('摘要来源默认保旧API且可持久切换，非法设置不能触发�
   settings.update({ summarySource: 'unknown' }); assert.equal(store().get().summarySource, 'api');
 });
 
-test('配套预设文本包含可解析的完整字段骨架', () => {
+test('配套预设文本用可解析的分栏文字，保留原摘要篇幅与全部栏目', () => {
   assert.equal(readInlineMemory(INLINE_MEMORY_PROMPT.slice(INLINE_MEMORY_PROMPT.lastIndexOf('<qqj_memory>'))).version, 1);
+  assert.match(INLINE_MEMORY_PROMPT, /通常 200—500 字，最多 4000 字/u);
+  assert.doesNotMatch(INLINE_MEMORY_PROMPT, /"version"\s*:|"summary"\s*:/u);
   assert.doesNotMatch(INLINE_MEMORY_PROMPT, /\{\{.*?\}\}/u, '不依赖预设变量存取或被宿主误展开的宏');
 });
 
@@ -44,6 +85,8 @@ test('记忆JSON不能污染剧情证据，默认、自定义包裹符、未闭�
   }
   assert.equal(sanitizeMemoryContent(`<content>正文</content>${block}`), '正文');
   assert.equal(sanitizeMemoryContent('正文<qqj_memory>{"summary":"截断'), '正文');
+  assert.equal(sanitizeMemoryContent(`正文${textBlock}`), '正文');
+  assert.equal(sanitizeMemoryContent('正文<qqj_memory>【摘要】\n未完成的摘要'), '正文');
 });
 
 test('参考信息按来源开关注入独立槽，清除不触碰正文或预设，宏与标签仅作数据', () => {

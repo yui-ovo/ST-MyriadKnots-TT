@@ -1,3 +1,5 @@
+import { parseInlineMemoryText } from './inline-memory-text.js';
+
 export const INLINE_MEMORY_TAG = 'qqj_memory';
 export const SUMMARY_SOURCES = Object.freeze(['api', 'inline', 'auto']);
 export const normalizeSummarySource = value => SUMMARY_SOURCES.includes(value) ? value : 'api';
@@ -20,7 +22,10 @@ export function readInlineMemory(raw) {
   const body = text.slice(starts[0].index + starts[0][0].length, ends[0].index).trim();
   if (body.length > 200000) throw failure('V3_INLINE_MEMORY_INVALID', '本楼记忆区块过长，未保存。');
   let packet;
-  try { packet = JSON.parse(body); } catch { throw failure('V3_INLINE_MEMORY_INVALID', '本楼记忆区块不是完整 JSON，未保存。可修正后重读，或使用摘要 API 重提。'); }
+  if (body.startsWith('【')) packet = parseInlineMemoryText(body);
+  else {
+    try { packet = JSON.parse(body); } catch { throw failure('V3_INLINE_MEMORY_INVALID', '本楼记忆区块格式不完整，未保存。请使用配套文字格式，或修正已有 JSON 后重读。'); }
+  }
   if (!packet || Array.isArray(packet) || packet.version !== 1 || typeof packet.summary !== 'string' || !packet.summary.trim() || packet.summary.length > 4000) {
     throw failure('V3_INLINE_MEMORY_INVALID', '本楼记忆区块版本或摘要格式不正确，请使用配套提示词。');
   }

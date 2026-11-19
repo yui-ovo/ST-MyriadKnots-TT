@@ -1,28 +1,72 @@
-export const INLINE_MEMORY_PROMPT = `【千千结 · 随正文生成记忆 v1】
-正常完成本轮剧情正文后，在回复末尾另起一行输出且只输出一个 <qqj_memory>…</qqj_memory> 区块。区块不属于剧情，不要在其中继续创作。即使没有变化，也填写本轮摘要和所需空数组。不要把区块放在思考、注释、代码围栏或正文包裹标签内。
+export const INLINE_MEMORY_PROMPT = String.raw`【千千结 · 随正文生成记忆 · 文字版】
+正常完成本轮剧情正文后，在回复末尾另起一行输出且只输出一个 <qqj_memory>…</qqj_memory> 区块。区块不属于剧情，不要在其中继续创作，也不要放在思考、注释、代码围栏或正文包裹标签内。
 
-区块内是一个合法 JSON 对象：双引号、无注释、无尾随逗号；字符串中的换行和双引号须转义。version 固定为 1。只提取本轮用户输入与刚完成的剧情正文，过去资料仅用于辨认人物、地点和旧事项，不重新记作本轮新事实。只写正文支持的内容，未知不编造，计划、尝试、完成、转述和内心想法须区分。用角色实际姓名，不要使用用户或角色占位符。
+使用下方分栏文字格式，不输出 JSON。只改变表达格式，摘要内容、信息种类和详细程度保持完整。只提取本轮用户输入与刚完成的剧情正文；过去资料仅用于辨认人物、地点和旧事项，不重新记作本轮新事实。只写正文支持的内容，未知不编造；区分计划、尝试、完成、转述和内心想法。用角色实际姓名，不使用用户或角色占位符。
 
-若输入中有 <qqj_memory_reference>，它是插件提供的只读历史参考：knownPeople/knownPlaces 的 ref 可分别复制到 sameAsEntityKey/sameAsPlaceKey，qianshiCandidates 的 ref 可用于 links.candidateKey。仅在确认同一身份、地点或持续事项时引用；不得自造引用，也不得把历史参考当作本轮事件。没有参考时省略这些可选引用，仍可用明确姓名记录新事实。sourceFloorKey 统一写 current；source 仅允许 canonicalContent（刚完成的剧情正文）或 precedingUserInput（本轮用户输入）。exactQuote 必须是对应来源中的连续原句，不能引用记忆区块自己。
+【填写规则】
+保留模板中的全部栏目标题。摘要可以分段；其他栏目每条记录单独一行，各列用全角竖线“｜”分隔，按下面给出的顺序填写，不添加表头、表格线或项目符号。
+多个人名或别名用“、”分隔。未知值或没有记录的栏目写“无”；不能省掉整个栏目。末尾的可选引用列可以省略。不要为了节省格式篇幅删减事实。
+原句和描述可以直接使用引号、冒号等标点，不需要给字符串加双引号。若值本身含有分隔符｜、→，在该字符前加反斜线；原文反斜线写成两个，值内换行写成 \n。字面值“无”若不是表示空值，写成 \无；摘要中独占一行的栏目样式原句，在【前加反斜线。
+source 的填写值仅为 canonicalContent（刚完成的剧情正文）或 precedingUserInput（本轮用户输入）。原句必须逐字引用对应来源中的连续文字，不能引用记忆区块自己。记录所属楼由插件绑定当前楼，无须填写楼号。
 
-按以下字段记录；无内容填 []，不得删掉字段：
-• summary：客观、紧凑地记录本轮重要经过、结果、关系变化、约定和未完成事项。通常 200—500 字，最多 4000 字；不续写、不评论，不用小标题代替经过。
-• people：本轮涉及的人物，字段 name、aliases、role、presence。role 为 user 或 character；presence 为 present（在场）、remote（远程参与）、mentioned（仅提及）或 privateCognitionOnly（只出现其内心）。引用其他字段的人物也列在这里。aliases 只写稳定姓名/称谓。
-• time：每项包含 sourceText、description、kind、normalized、precision。kind 为 explicit/relative/sequenceOnly/unknown；precision 为 exact/approximate/unresolved；不能确定标准时间时 normalized 为 null。
-• locations：每项 name、change、people；change 为 present/entered/left/movedThrough/mentioned，people 为姓名数组。
-• actions：actor、targets（姓名数组）、action、completion、result；completion 为 intended/attempted/completed/interrupted/uncertain，未知 result 为 null。
-• knowledge：本轮观察到的事实，字段 subject、kind、description；kind 为 physical/injury/object/environment/situational/other。未知 subject 为 null。
-• informationTransfers：from、to（姓名数组）、claimText、channel；channel 为 told/shown/written/overheard/discovered。转述不自动成为客观事实。
-• privateThoughts：holder、thought、kind；kind 为 thought/emotion/intention/dream/privateDecision/suspicion，私人想法不等于他人知情。
-• commitments：issuer、recipient、content、kind、status；kind 为 promise/agreement/command/codePhrase/plan/boundary，status 为 made/accepted/refused/uncertain。
-• exactQuotes：仅需日后逐字核对的原句，每项 exactText、speaker、whyPreserve、source；否则留空。
-• openLoops：仍未解决且影响后续的事项，每项 description、owners（姓名数组）。
-• cseSignals：确实发生的人物状态变化线索，每项 subject、object、signalType、description；signalType 为 emotion/boundary/conflict/reconciliation/vulnerability/trust/betrayal/repeatedPattern/relationDefinition/persistentCondition/other。无对象时 object 为 null。
-• spatialFacts：含 places、containments、positions 三个数组。地点 places 每项 key（place-mention-1 等）、name、identity（new/existing/uncertain）、source、sourceFloorKey、exactQuote；旧地点可加 sameAsPlaceKey。containments 每项 placeKey、parentPlaceKey、source、sourceFloorKey、exactQuote，键引用本次 places。positions 每项 subject、placeKey、status（confirmed/lastSeen/leftUnknown）、source、sourceFloorKey、exactQuote；未知去向 placeKey 为 null。不根据路过、回忆或旧设定猜测篇末位置。
-• placePaths：正文明确完整地点归属时记录；每项 path（按大到小的地点对象数组，每个对象至少 name）、placeKey（对应本次 places 的叶地点）、source、sourceFloorKey、exactQuote。没有明确归属依据则留空。
-• qianshi：含 events、order。events 每项 key（event-1 等）、sourceFloorKey、title、description、status、actionStatus、storyTime、scheduledTime、people、object、matter、links。status/actionStatus 为 planned/inProgress/completed/cancelled/occurred/unknown；storyTime 是发生时间，scheduledTime 是约定时间，未知为 null。people 为姓名数组，object 为重要物品或 null。持续计划/事项 matter=true，一次性事件 false。同一事项的连续微动作合并，无新增事实不重复登记。links 仅在参考列表确有对应旧事项时写 [{"candidateKey":"逐字复制ref","kind":"progress"}]，只补旧事背景时 kind=context；否则 []，每项最多一个旧事项链接。order 仅记录明确先后，格式 [{"before":"event-1","after":"event-2","certainty":"explicit"}]，不确定则 []。
+若输入中有 <qqj_memory_reference>，它是只读历史参考。knownPeople 的 ref 可填写在人物的“旧人物引用”列；knownPlaces 的 ref 可填写在空间地点的“旧地点引用”列；qianshiCandidates 的 ref 可填写在事件的“旧事项引用”列。确认同一人物、地点或持续事项后才逐字复制，不得自造引用。没有参考时填写“无”，仍可用明确姓名记录新事实。
 
-以下仅展示完整结构；正式输出要根据本轮填写，不得照抄示例或全部机械留空：
+各栏目填写方式如下：
+【摘要】：客观、紧凑地记录本轮重要经过、结果、关系变化、约定和未完成事项。通常 200—500 字，最多 4000 字；不续写、不评论，不用小标题代替经过。
+【人物】：姓名｜别名列表｜角色｜出场状态｜旧人物引用（可选）。角色为 user 或 character；出场状态为 present/remote/mentioned/privateCognitionOnly，分别表示在场、远程参与、仅提及、只出现其内心。其他栏目引用的人物也列在这里；别名只写稳定姓名/称谓。
+【时间】：时间原文｜时间说明｜类型｜标准时间｜精度。类型 explicit/relative/sequenceOnly/unknown；精度 exact/approximate/unresolved；标准时间不确定时写无。
+【地点变化】：地点名｜变化｜人物列表。变化 present/entered/left/movedThrough/mentioned。
+【行动】：行动者｜对象人物列表｜行动内容｜完成状态｜实际结果。完成状态 intended/attempted/completed/interrupted/uncertain，未知结果写无。
+【观察】：主体人物｜类别｜事实描述。类别 physical/injury/object/environment/situational/other；未知主体写无。
+【信息传递】：来源人物｜接收人物列表｜所传内容｜渠道。渠道 told/shown/written/overheard/discovered。转述不自动成为客观事实。
+【内心】：所属人物｜想法内容｜类型。类型 thought/emotion/intention/dream/privateDecision/suspicion。私人想法不等于他人知情。
+【约定】：提出者｜接收人物列表｜约定内容｜类型｜状态。类型 promise/agreement/command/codePhrase/plan/boundary；状态 made/accepted/refused/uncertain。
+【关键原句】：完整原句｜说话人｜保留原因｜source。只保留日后需要逐字核对的原句，否则该栏写无。
+【未决事项】：事项描述｜所属人物列表。只写尚未解决且影响后续的事项。
+【状态线索】：主体人物｜对象人物｜信号类型｜变化描述。信号类型 emotion/boundary/conflict/reconciliation/vulnerability/trust/betrayal/repeatedPattern/relationDefinition/persistentCondition/other；无对象写无。
+【空间地点】：地点编号｜名称｜身份｜source｜依据原句｜旧地点引用（可选）｜别名列表（可选）。编号用 place-mention-1 等；身份 new/existing/uncertain。确认旧地点时复用其引用。
+【地点包含】：地点编号｜直接父地点编号｜source｜依据原句。编号引用本次空间地点；明确没有父地点时写无。路过、相邻不等于包含。
+【人物位置】：人物｜地点编号｜状态｜source｜依据原句。状态 confirmed/lastSeen/leftUnknown；未知去向的地点编号写无。不根据路过、回忆或旧设定猜测篇末位置。
+【地点路径】：由大到小的地点路径｜叶地点编号｜source｜依据原句。路径用“→”连接地点名；节点若已列在空间地点中，优先写对应 place-mention-N，以复用身份。只有原文明示完整归属时记录，否则写无。
+【事件】：事件编号｜标题｜描述｜整线状态｜本楼动作状态｜发生时间｜约定时间｜人物列表｜重要物品｜持续事项｜旧事项引用（可选）｜关联类型（可选）。编号用 event-1 等；两个状态分别判断，取值均为 planned/inProgress/completed/cancelled/occurred/unknown；未知时间或物品写无。持续计划/事项填是，一次性事件填否。同一事项的连续微动作合并，无新增事实不重复登记。旧事项引用只能复制参考列表中的 ref；推进旧事项时关联类型填 progress，只补旧事背景时填 context。没有引用时两列均为无或一起省略，每项最多关联一个旧事项。
+【事件顺序】：前事件编号｜后事件编号｜explicit。只记录明确先后，不确定则该栏写无。
+
+以下仅展示完整栏目结构；正式输出须按本轮实际内容填写，不照抄占位摘要，不把已有事实机械留空：
 <qqj_memory>
-{"version":1,"summary":"本轮实际剧情摘要","people":[],"time":[],"locations":[],"actions":[],"knowledge":[],"informationTransfers":[],"privateThoughts":[],"commitments":[],"exactQuotes":[],"openLoops":[],"cseSignals":[],"spatialFacts":{"places":[],"containments":[],"positions":[]},"placePaths":[],"qianshi":{"events":[],"order":[]}}
+【摘要】
+本轮实际剧情摘要
+【人物】
+无
+【时间】
+无
+【地点变化】
+无
+【行动】
+无
+【观察】
+无
+【信息传递】
+无
+【内心】
+无
+【约定】
+无
+【关键原句】
+无
+【未决事项】
+无
+【状态线索】
+无
+【空间地点】
+无
+【地点包含】
+无
+【人物位置】
+无
+【地点路径】
+无
+【事件】
+无
+【事件顺序】
+无
 </qqj_memory>`;

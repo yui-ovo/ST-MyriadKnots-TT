@@ -1,4 +1,5 @@
 import { inlinePacket, inlineBlock } from './inline-memory-fixture.mjs';
+import { block as inlineTextBlock, packet as inlineTextPacket, narrative as inlineTextNarrative } from './fixtures/main-reply-memory-text.mjs';
 import { projectQianchuangSnapshot } from '../src/v3/qianchuang-domain.js';
 import { createPlaceWorkspaceStore } from '../src/v3/place-workspace.js';
 import { processingTransport } from './fixtures/processing-transport.mjs';
@@ -411,6 +412,26 @@ async function waitFor(predicate, message = '等待异步状态超时') {
   assert.fail(typeof message === 'function' ? message() : message);
 }
 
+test('主回复文字版完整入库：摘要和各类事实保留，结构转换不调用模型', async () => {
+  const h = harness({ initialChat: [user('继续'), assistant(inlineTextNarrative + inlineTextBlock), user('后续')], summarySourceProvider: () => 'inline' });
+  await h.runtime.start(); const floorId = h.runtime.getState().floors[0].floorId;
+  await h.runtime.extractFloor(floorId);
+  const floor = h.runtime.getState().floors[0], memory = floor.memory;
+  assert.equal(floor.api.source, 'main-reply'); assert.equal(h.calls.length, 1, '仅原本的CSE分析，没有转格式或摘要模型请求');
+  assert.equal(memory.summary.aiText, inlineTextPacket.summary);
+  assert.equal(memory.chronology.length, 1); assert.equal(memory.locations.length, 1); assert.equal(memory.participants.length, 2);
+  assert.equal(memory.actions[0].action, '交付钥匙'); assert.equal(memory.observations[0].description, '手背有一道擦伤');
+  assert.equal(memory.informationTransfers[0].claimText, '晚上八点在钟楼会合。');
+  assert.equal(memory.privateCognition[0].content, '希望她能按时到。'); assert.equal(memory.commitments[0].content, '晚上八点在钟楼会合');
+  assert.equal(memory.exactAnchors[0].exactText, '晚上八点在钟楼会合。'); assert.equal(memory.openLoops[0].description, '失联的向导仍未找到');
+  assert.equal(memory.cseSignals[0].signalType, 'trust');
+  assert.equal(memory.spatialFacts.positions.length, 2); assert.equal(memory.spatialFacts.containments.length, 2);
+  assert.equal(memory.qianshiDelta.status, 'ready'); assert.equal(memory.qianshiDelta.events.length, 2); assert.equal(memory.qianshiDelta.relations.length, 1);
+  assert.deepEqual(memory.qianshiDelta.events.map(event => event.title), ['交接钥匙', '晚间钟楼会合']);
+  const cold = await h.store.readReachable({ mode: 'runtime' }); assert.equal(cold.floorMemories[0].summary.aiText, inlineTextPacket.summary);
+  assert.ok(['ready', 'noChange'].includes(floor.cse.status));
+});
+
 test('主回复记忆：完整区块直接保存人物事件地点，CSE仍分析且不调用摘要模型', async () => {
   const body = '裴晚生在书房提醒林岚带伞。';
   const evidence = { source: 'canonicalContent', sourceFloorKey: 'current', exactQuote: body };
@@ -441,6 +462,8 @@ test('主回复记忆：自动模式仅缺失时调用API，格式错误和只�
     ['auto', '', 1, null], ['inline', '', 0, 'V3_INLINE_MEMORY_MISSING'],
     ['auto', '<qqj_memory>{bad}</qqj_memory>', 0, 'V3_INLINE_MEMORY_INVALID'],
     ['auto', inlineBlock({ version: 1, summary: '缺字段' }), 0, 'V3_INLINE_MEMORY_INCOMPLETE'],
+    ['auto', inlineTextBlock.replace(/【状态线索】[^]*?(?=【空间地点】)/u, ''), 0, 'V3_INLINE_MEMORY_INCOMPLETE'],
+    ['auto', inlineTextBlock.replace('林岚｜injury｜手背有一道擦伤', '林岚｜手背有一道擦伤'), 0, 'V3_INLINE_MEMORY_INVALID'],
   ]) {
     const h = harness({ text: '裴晚生提醒你带伞。' + suffix, summarySourceProvider: () => mode });
     await h.runtime.start(); await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
