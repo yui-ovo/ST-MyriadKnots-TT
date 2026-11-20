@@ -1,4 +1,6 @@
 import { sanitizeMemoryContent } from './memory-content-sanitizer.js';
+import { selectAssistantMessage } from './v3/foundation-domain.js';
+import { sha256 } from './identity.js';
 import { parseJsonOutput } from './compact-api-client.js';
 import { withBaseProcessingPrompt } from './internal-processing-prompt.js';
 import { CLASSIFY_PROMPT, buildWorldbookUpdatePrompt, buildWorldbookSources, cseForFloor, validateWorldbookDecision } from './dynamic-worldbook-update.js';
@@ -358,11 +360,21 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       for (const index of floor.sourceMessageIndexes ?? [floor.messageIndex]) byIndex.set(index, floor);
     }
     const result = [];
+    // A later user turn confirms the selected reply, including replies now hidden by QQJ.
+    const lastUser = target.chat.findLastIndex(message => {
+      if (message?.is_user !== true || message.extra?.type === 'narrator' || typeof message.mes !== 'string' || !message.mes.trim()) return false;
+      const hidden = message.extra?.qianqianjieAutoHide;
+      return message.is_system !== true || (hidden?.schemaVersion === 1 && hidden.chatId === target.identity.chatId);
+    });
     for (let index = window.from; index < Math.min(target.chat.length, window.to ?? target.chat.length); index += 1) {
       const message = target.chat[index];
       if (message.is_user || message.extra?.type === 'narrator' || message.is_system === true && message.extra?.type) continue;
       const saved = byIndex.get(index);
+      if (index >= lastUser || saved?.sourceMessageIndexes?.some(i => i >= lastUser)) {
+        return { floors: result, reason: '等待你发送下一条聊天消息后，再处理本轮 AI 回复' };
+      }
       if (!saved) return { floors: result, reason: `第 ${index} 楼${unavailable.get(index) ?? '尚无可用记忆，等待摘要完成；旧楼可在记忆管理中补齐缺失'}` };
+      if (saved.sourceUnavailable) return { floors: result, reason: `等待第 ${index} 楼的记忆与当前回复同步` };
       const cse = cseForFloor(saved, state);
       if (!['ready', 'noChange'].includes(cse?.status) || !Array.isArray(cse.record?.endStateSubjects)) return { floors: result, reason: `第 ${index} 楼 CSE 尚未完成，请先在记忆管理中补齐人物状态` };
       result.push({ index, saved });
@@ -423,20 +435,38 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
         return;
       }
       if (!manual && !window.rechecking && !data.catchingUp && pending.length < data.interval) return;
-      const attempt = stableJson([target.key, previous.revision, target.chat.map(messageSignature)]);
+      const captured = target.chat.map(messageSignature);
+      const attempt = stableJson([target.key, previous.revision, captured]);
       if (!manual && lastAutomaticAttempt === attempt) return;
-      lastAutomaticAttempt = attempt;
       failure = '';
-      const receipt = newUpdateReceipt();
-      updateAttempt = { key: target.key, receipt }; emit();
-      await checkedHistory(target, data, guard);
       // A manual batch follows the saved size even during historical catch-up.
       // Background catch-up stays small; merged memories remain indivisible.
       let count = Math.min(pending.length, manual ? data.interval : data.catchingUp || window.rechecking ? 3 : 20);
       // Never split a single merged memory across historical batches.
       while (count < pending.length && (pending[count - 1].saved.sourceMessageIndexes ?? []).includes(pending[count].index)) count++;
       const floors = pending.slice(0, count);
-      const end = floors.at(-1).index, captured = target.chat.map(messageSignature);
+      const end = floors.at(-1).index;
+      for (const { index, saved } of floors) {
+        const sourceId = saved.sourceFloorIds?.[saved.sourceMessageIndexes?.indexOf(index)];
+        const expected = saved.memory?.sourceFloorSnapshots?.find(item => item.floorId === sourceId)?.rawFingerprint
+          ?? (index === saved.messageIndex ? saved.memory?.sourceRawFingerprint ?? saved.rawFingerprint : null);
+        if (!expected) continue;
+        const selected = selectAssistantMessage(target.chat[index]);
+        if (!selected || `sha256:${await sha256(selected.rawContent)}` !== expected) {
+          guard();
+          failure = `等待第 ${index} 楼的记忆与当前选中的回复同步`;
+          return;
+        }
+      }
+      guard();
+      lastAutomaticAttempt = attempt;
+      const receipt = newUpdateReceipt();
+      updateAttempt = { key: target.key, receipt }; emit();
+      await checkedHistory(target, data, guard);
+      const checkFrame = () => {
+        if (captured.length !== target.chat.length || captured.some((value, index) => value !== messageSignature(target.chat[index]))) throw abortError();
+      };
+      checkFrame();
       const snapshot = memoryState();
       const sourceInput = buildWorldbookSources({ pending: floors, state: snapshot, chat: target.chat, from: window.from,
         sanitize: text => sanitizeMemoryContent(text, sanitizerOptions()) });
@@ -454,6 +484,7 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       let next = data;
       const materials = writable.map(({ uid, label, segments }) => ({ uid, label, segments: segments.filter(s => s.writable).map(({ id, text }) => ({ id, text })) }));
       for (const batch of batches(materials)) {
+        checkFrame();
         receipt.calls += 1; emit();
         const response = await generateUpdate({ systemPrompt,
           promptTask: 'worldbookUpdate', promptOwnerId: target.identity.chatId,
@@ -481,7 +512,7 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
       }
       guard();
       next.updateHold = false;
-      if (captured.length !== target.chat.length || captured.some((value, index) => value !== messageSignature(target.chat[index]))) throw abortError();
+      checkFrame();
       const latest = memoryState();
       if (latest.memoryWorkBusy || latest.activeCse || latest.activeExtraction || isGenerating()) throw abortError();
       const refreshed = pendingState(target, data, window).floors.filter(f => f.index <= end);
@@ -563,6 +594,7 @@ export function createDynamicWorldbookRuntime({ client, hostAdapter, identityPro
   function bind({ eventSource, eventTypes = {} }) {
     const on = (key, callback) => { const name = eventTypes[key]; if (name && eventSource?.on) { eventSource.on(name, callback); bindings.push(() => eventSource.removeListener?.(name, callback)); } };
     on('WORLDINFO_ENTRIES_LOADED', apply);
+    on('MESSAGE_SENT', wake);
     for (const key of ['CHAT_CHANGED', 'CHAT_RENAMED', 'PERSONA_CHANGED', 'MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED', 'MESSAGE_SWIPE_DELETED', 'WORLDINFO_UPDATED']) on(key, () => { abortAll(); cached = null; failure = ''; emit(); });
     on('GENERATION_STARTED', () => { abortAll(); });
     on('GENERATION_STOPPED', abortAll);

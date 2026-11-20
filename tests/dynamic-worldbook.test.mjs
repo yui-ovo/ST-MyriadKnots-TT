@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { sha256 } from '../src/identity.js';
 import { applyChanges, bookFingerprint, createBook, createDynamicBookStore, DYNAMIC_BOOK_RECORD, overlayCandidates, protectedReason, nativeSelectionReason, classifyEntry, validateBook, stableJson, sourceEntries, verifyWitness, witness } from '../src/dynamic-worldbook.js';
 import { createDynamicWorldbookRuntime } from '../src/dynamic-worldbook-runtime.js';
 import { createCompactApiClient } from '../src/compact-api-client.js';
@@ -209,10 +210,51 @@ test('manual and paused modes avoid automatic calls; normal interval consumes fi
     f.context.chat.push({ is_user: false, mes: `变化 ${i}` });
     f.setState({ floors: [0, 2, ...Array.from({ length: i + 1 }, (_, j) => 4 + j * 2)].map(messageIndex => ({ status: 'ready', messageIndex })) });
     await f.runtime.update();
-    assert.equal(f.updates, i === 4 ? 2 : 1);
+    assert.equal(f.updates, 1);
   }
+  f.context.chat.push({ is_user: true, mes: '继续' }); await f.runtime.update();
   assert.deepEqual(f.runtime.getState().lastUpdate.floors, [4, 6, 8, 10, 12]);
   await f.runtime.update(); assert.equal(f.updates, 2);
+});
+
+test('automatic and manual updates wait for a user turn and the selected swipe’s memory', async t => {
+  const requests = [];
+  const f = await fixture(t, { update: request => { requests.push(request); return { jsonData: { changes: [] } }; } });
+  await f.runtime.update({ manual: true });
+  const message = { is_user: false, mes: '草稿', swipes: ['草稿', '定稿'], swipe_id: 0 };
+  f.context.chat.push(message);
+  const memory = async text => completedFloor({ status: 'ready', messageIndex: 4, rawFingerprint: 'sha256:' + await sha256(text),
+    summary: text + '摘要', cse: { status: 'ready', record: { endStateSubjects: [{ situational: [{ text: text + '状态' }] }] } } });
+  f.setState({ floors: [await memory('草稿')] });
+  await f.runtime.configure({ interval: 1 });
+  await f.runtime.update();
+  message.swipe_id = 1;
+  f.context.chat.push({ is_user: true, mes: ' ' }, { is_user: true, is_system: true, mes: '通知' },
+    { is_user: true, mes: '旁白', extra: { type: 'narrator' } });
+  await f.runtime.update({ manual: true });
+  assert.equal(requests.length, 1);
+  assert.equal(f.runtime.getState().data.processed.length, 3);
+  f.context.chat.push({ is_user: true, mes: '确认后的新消息' });
+  await f.runtime.update({ manual: true });
+  assert.match(f.runtime.getState().error, /当前选中的回复/);
+  assert.equal(requests.length, 1);
+  f.setState({ floors: [await memory('定稿')] });
+  await f.runtime.update();
+  assert.equal(requests.length, 2);
+  const materials = JSON.parse(requests[1].taskMessages[0].content);
+  assert.deepEqual(materials.sources.map(s => s.text).filter(s => s.includes('定稿')), ['定稿摘要', '定稿状态', '定稿']);
+  assert.doesNotMatch(JSON.stringify(materials), /草稿|确认后的新消息/);
+});
+
+test('a merged memory crossing the last user turn waits as a whole', async t => {
+  const f = await fixture(t, { update: () => ({ jsonData: { changes: [] } }) });
+  f.context.chat.pop();
+  f.setState({ floors: [{ status: 'ready', messageIndex: 2, sourceMessageIndexes: [0, 2] }] });
+  await f.runtime.update({ manual: true });
+  assert.equal(f.updates, 0);
+  f.context.chat.push({ is_user: true, mes: '继续' });
+  await f.runtime.update({ manual: true });
+  assert.deepEqual(f.runtime.getState().lastUpdate.floors, [0, 2]);
 });
 
 test('changed CSE during a request rejects late output without overwriting the copy', async t => {
@@ -383,7 +425,9 @@ test('readiness names memory gaps, batch threshold and busy state without claimi
   await f.runtime.update(); await f.runtime.configure({ interval: 3 });
   f.context.chat.push({ mes: '新的剧情', is_user: false });
   f.setState({ floors: [0, 2, 4].map(messageIndex => ({ status: 'ready', messageIndex })) });
-  await f.runtime.update(); assert.match(f.runtime.getState().updateReadiness, /已攒 1\/3/);
+  await f.runtime.update(); assert.match(f.runtime.getState().updateReadiness, /等待你发送下一条/);
+  f.context.chat.push({ is_user: true, mes: '继续' });
+  assert.match(f.runtime.getState().updateReadiness, /已攒 1\/3/);
   assert.equal(f.updates, 1);
 });
 
@@ -480,7 +524,7 @@ test('old editor confirmation cannot edit a new chat with the same entry uid', a
 });
 test('partial historical scan is not injected as current world state', async t => {
   const f = await fixture(t, { update: () => ({ jsonData: { changes: [] } }) });
-  f.context.chat.push({ mes: '更晚的剧情', is_user: false }, { mes: '继续', is_user: true }, { mes: '现在的剧情', is_user: false });
+  f.context.chat.push({ mes: '更晚的剧情', is_user: false }, { mes: '继续', is_user: true }, { mes: '现在的剧情', is_user: false }, { mes: '然后呢', is_user: true });
   f.setState({ floors: [0, 2, 4, 6].map(messageIndex => ({ status: 'ready', messageIndex })) });
   await f.runtime.update({ manual: true }); assert.equal(f.runtime.getState().data.catchingUp, true);
   await assert.rejects(f.runtime.prepare(), /追平历史/);

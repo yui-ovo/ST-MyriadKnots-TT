@@ -21901,7 +21901,7 @@ function Cv({ pending: e, state: t, chat: n, from: r, sanitize: i }) {
 	for (let e = 0; e <= a; e++) {
 		let t = n[e];
 		if (t.is_system === !0 || t.extra?.type === "narrator") continue;
-		let r = i(t.mes);
+		let r = i(ir(t)?.rawContent ?? t.mes);
 		r.trim() && o.push({
 			id: `dialogue:${e}`,
 			kind: "dialogue",
@@ -25689,7 +25689,7 @@ function Rx({ runtime: e, settings: t = null, documentRef: n = globalThis.docume
 			["paused", "暂停维护（已有副本仍可使用）"]
 		], (t) => e.configure({ updateMode: t }, o.chatId)));
 		let m = c("label", "自动触发间隔／手动每批条数（AI 回复）："), h = c("input", "", "settings-input");
-		if (h.type = "number", h.min = "1", h.max = "20", h.value = String(o.interval), m.append(h, F("保存间隔", () => e.configure({ interval: Number(h.value) }, o.chatId))), u.append(m, F("手动更新／重试", () => e.update({ manual: !0 }), o.updateMode === "paused")), u.append(c("p", `修改数字后先保存间隔。手动每批按已保存的 ${o.interval} 条处理，补历史也一样；不足时处理实际已就绪的条数，不等待攒满。这里按 AI 回复计数，不含用户消息，合并记忆整组处理。自动补历史仍每批约 3 条，追平后达到间隔且摘要、CSE 就绪才调用，每批最多 20 条。手动成功后从新进度重新计数；失败或中断会暂停自动更新，刷新页面不会自动重试。`, "settings-hint")), u.append(L("世界书选材方式", o.selectionMode ?? "ai", [["ai", "AI 按需选材（发送前可能调用召回 API）"], ["native", "沿用酒馆触发规则（不调用选材 AI）"]], (t) => e.configure({ selectionMode: t }, o.chatId))), u.append(c("p", "“保护”只禁止自动修改；“排除”让此条退出动态世界书的分类、选材、更新和正文替换。排除不关闭原书条目，也不阻止酒馆将原书内容交给聊天模型；已写进聊天正文的内容仍按聊天正文处理。", "settings-hint")), i.lastSelection) {
+		if (h.type = "number", h.min = "1", h.max = "20", h.value = String(o.interval), m.append(h, F("保存间隔", () => e.configure({ interval: Number(h.value) }, o.chatId))), u.append(m, F("手动更新／重试", () => e.update({ manual: !0 }), o.updateMode === "paused")), u.append(c("p", `你发送下一条聊天消息后，上一轮 AI 回复才计入更新。修改数字后先保存间隔。手动每批按已保存的 ${o.interval} 条 AI 回复处理，补历史也一样。不足时处理实际已就绪的条数，合并记忆整组处理。自动补历史每批约 3 条，追平后达到间隔且摘要、CSE 就绪才调用，每批最多 20 条。手动成功后从新进度重新计数。失败或中断会暂停自动更新，可点击手动更新重试。`, "settings-hint")), u.append(L("世界书选材方式", o.selectionMode ?? "ai", [["ai", "AI 按需选材（发送前可能调用召回 API）"], ["native", "沿用酒馆触发规则（不调用选材 AI）"]], (t) => e.configure({ selectionMode: t }, o.chatId))), u.append(c("p", "“保护”只禁止自动修改；“排除”让此条退出动态世界书的分类、选材、更新和正文替换。排除不关闭原书条目，也不阻止酒馆将原书内容交给聊天模型；已写进聊天正文的内容仍按聊天正文处理。", "settings-hint")), i.lastSelection) {
 			let e = i.lastSelection.selected.map((e) => o.entries.find((t) => t.uid === e)?.label ?? e);
 			u.append(c("p", `${i.lastSelection.status}${e.length ? `：${e.join("、")}` : ""}`, "settings-hint"));
 		}
@@ -77368,7 +77368,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			data: t,
 			lastSelection: y ? QW(y) : null,
 			sourceStatus: QW(e && E?.key === e.key ? E.status : null),
-			updateReadiness: ae(e, t),
+			updateReadiness: oe(e, t),
 			lastUpdate: QW(e && T?.key === e.key ? T.receipt : t?.lastUpdate ?? null)
 		};
 	}
@@ -77397,7 +77397,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 				return await t(n, i, r.controller.signal);
 			} catch (t) {
 				if (k(n) && (b = t.name === "AbortError" ? "任务已停止，已保存资料保留。" : t.message, e === "updating")) {
-					let e = T?.key === n.key && T.receipt.status === "running" ? T.receipt : oe();
+					let e = T?.key === n.key && T.receipt.status === "running" ? T.receipt : X();
 					t.taskMetadata && (e.api = {
 						model: String(t.taskMetadata.model ?? "").slice(0, 160),
 						sourceLabel: String(t.taskMetadata.sourceLabel ?? "").slice(0, 160)
@@ -77503,7 +77503,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 		return await B(t, s, i.revision, n, r), E = {
 			key: t.key,
 			status: L(s, a)
-		}, j(), Z(), A();
+		}, j(), le(), A();
 	}), U = (e, { choice: t, expectedEntry: n } = {}, r = null) => N("saving", async (i, a, o) => {
 		if (r && i.identity.chatId !== r) throw Y_("聊天已切换，请重新打开设置。");
 		if (l()) throw Y_("请等当前任务结束后处理原书冲突。");
@@ -77517,7 +77517,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 		return await B(i, d, s.revision, a, o), E = {
 			key: i.key,
 			status: L(d, c)
-		}, j(), Z(), A();
+		}, j(), le(), A();
 	});
 	async function W(e, t, n, { uid: r = null, expectedEntry: a = null } = {}) {
 		let s = await P(e, t, !0);
@@ -77556,7 +77556,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			for (let e of l.entries) r.some((t) => t.uid === e.uid) && fv(e) && q(l, e);
 			await B(e, l, s.revision, t, n), s = h;
 		}
-		return Z(), A();
+		return le(), A();
 	}
 	let G = ({ expectedChatId: e = null, uid: t = null, expectedEntry: n = null } = {}) => N("classifying", async (r, i, a) => {
 		if (e && r.identity.chatId !== e) throw Y_("聊天已切换，请重新打开设置。");
@@ -77594,7 +77594,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			o.interval = e.interval;
 		}
 		let s = await B(n, o, a.revision, r, i);
-		return Z(), s;
+		return le(), s;
 	});
 	function q(e, t) {
 		e.processed.length && (Number.isSafeInteger(t.recheckFrom) || (t.recheckBase = QW(t.segments)), t.recheckFrom = 0);
@@ -77631,7 +77631,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			if (f.some((t, n) => !t || !Object.hasOwn(r, e[n]) || !eG(t, r[e[n]]))) throw Y_("勾选条目已有新版本，请刷新后重试；本次未修改任何条目。");
 			for (let e of f) te(d, e, t);
 			let p = await B(o, d, u.revision, s, c);
-			return Z(), p;
+			return le(), p;
 		});
 	}, ne = async (e, t, n = null) => {
 		let r = O();
@@ -77669,10 +77669,10 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			}
 			(t.content !== void 0 || t.segments !== void 0) && Number.isSafeInteger(d.recheckFrom) && (d.recheckBase = QW(d.segments), d.recheckFrom = 0);
 			let f = await B(i, u, c.revision, a, o);
-			return Z(), f;
+			return le(), f;
 		});
 	};
-	function Y(e) {
+	function re(e) {
 		let t = e.entries.filter(fv), n = t.filter((t) => Number.isSafeInteger(t.recheckFrom) && t.recheckFrom < e.processed.length);
 		if (!n.length) return {
 			from: e.processed.length,
@@ -77688,7 +77688,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			rechecking: !0
 		};
 	}
-	function re(e, t, n = {
+	function ie(e, t, n = {
 		from: t.processed.length,
 		to: null
 	}) {
@@ -77700,17 +77700,29 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 		let a = /* @__PURE__ */ new Map(), o = /* @__PURE__ */ new Map();
 		for (let e of i.floors ?? []) e.frozen || e.inherited ? o.set(e.messageIndex, "属于冻结或继承记忆，当前更新流程不读取该楼") : e.status !== "ready" && o.set(e.messageIndex, "摘要尚未完成，请先在记忆管理中补齐缺失");
 		for (let e of i.floors ?? []) if (e.status === "ready" && !e.frozen && !e.inherited) for (let t of e.sourceMessageIndexes ?? [e.messageIndex]) a.set(t, e);
-		let s = [];
+		let s = [], c = e.chat.findLastIndex((t) => {
+			if (t?.is_user !== !0 || t.extra?.type === "narrator" || typeof t.mes != "string" || !t.mes.trim()) return !1;
+			let n = t.extra?.qianqianjieAutoHide;
+			return t.is_system !== !0 || n?.schemaVersion === 1 && n.chatId === e.identity.chatId;
+		});
 		for (let t = n.from; t < Math.min(e.chat.length, n.to ?? e.chat.length); t += 1) {
 			let n = e.chat[t];
 			if (n.is_user || n.extra?.type === "narrator" || n.is_system === !0 && n.extra?.type) continue;
 			let r = a.get(t);
+			if (t >= c || r?.sourceMessageIndexes?.some((e) => e >= c)) return {
+				floors: s,
+				reason: "等待你发送下一条聊天消息后，再处理本轮 AI 回复"
+			};
 			if (!r) return {
 				floors: s,
 				reason: `第 ${t} 楼${o.get(t) ?? "尚无可用记忆，等待摘要完成；旧楼可在记忆管理中补齐缺失"}`
 			};
-			let c = Sv(r, i);
-			if (!["ready", "noChange"].includes(c?.status) || !Array.isArray(c.record?.endStateSubjects)) return {
+			if (r.sourceUnavailable) return {
+				floors: s,
+				reason: `等待第 ${t} 楼的记忆与当前回复同步`
+			};
+			let l = Sv(r, i);
+			if (!["ready", "noChange"].includes(l?.status) || !Array.isArray(l.record?.endStateSubjects)) return {
 				floors: s,
 				reason: `第 ${t} 楼 CSE 尚未完成，请先在记忆管理中补齐人物状态`
 			};
@@ -77724,14 +77736,14 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			reason: ""
 		};
 	}
-	function ie(e, t) {
-		return re(e, t).floors.map(({ index: t, saved: n }) => ({
+	function ae(e, t) {
+		return ie(e, t).floors.map(({ index: t, saved: n }) => ({
 			index: t,
 			summary: n.summary ?? "",
 			text: ct(e.chat[t].mes, d())
 		}));
 	}
-	function ae(e, t) {
+	function oe(e, t) {
 		if (!e) return "等待当前聊天身份准备完成";
 		if (!t) return "尚未建立或读取动态世界书副本";
 		if (!t.enabled) return "当前聊天未启用动态世界书";
@@ -77744,10 +77756,10 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 		if (!t.entries.some(fv) && t.entries.some((e) => $_(e) && !e.sourceConflict && e.classification === "pending")) return "尚未调用：请先继续分类维护权限";
 		if (!t.entries.some(fv)) return "尚未调用：没有允许自动更新的条目或正文片段";
 		if (t.updateHold) return "上次更新失败或中断，自动更新已暂停；请点击手动更新／重试";
-		let i = Y(t), a = re(e, t, i);
+		let i = re(t), a = ie(e, t, i);
 		return i.rechecking && a.floors.length ? `正在补核 ${i.entries.length} 个条目的历史（从第 ${i.from} 楼起），其余条目的进度保留` : a.floors.length ? t.automatic ? !t.catchingUp && a.floors.length < t.interval ? `尚未调用：已攒 ${a.floors.length}/${t.interval} 条已记忆 AI 回复${a.reason ? `；${a.reason}` : ""}。可点击立即更新一批` : T?.key === e.key && ["failed", "stopped"].includes(T.receipt.status) ? "上次任务未完成，可点击立即更新一批重试" : `有 ${a.floors.length} 楼待核对，等待自动更新或点击立即更新一批` : `自动更新已关闭；有 ${a.floors.length} 楼可手动更新` : a.reason ? `尚未调用：${a.reason}` : t.processed.length ? "已检查到当前可用末尾，等待新的已记忆 AI 回复" : "尚未调用：当前没有可处理的已记忆 AI 回复";
 	}
-	function oe() {
+	function X() {
 		return {
 			version: 1,
 			status: "running",
@@ -77759,7 +77771,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			api: null
 		};
 	}
-	async function X({ manual: e = !1 } = {}) {
+	async function se({ manual: e = !1 } = {}) {
 		if (g || l()) {
 			if (j(), e) throw Y_("请等当前任务结束后更新。");
 			return;
@@ -77777,53 +77789,68 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 				if (e) throw Y_("维护已暂停，请先切换为手动或自动模式。");
 				return;
 			}
-			let f = await I(t, u, n), p = Y(u), m = p.entries;
+			let f = await I(t, u, n), p = re(u), m = p.entries;
 			if (!m.length && u.entries.some((e) => $_(e) && !e.sourceConflict && e.classification === "pending")) {
 				if (e) throw Y_("请先点击“继续分类维护权限”，完成分类后再更新资料。");
 				return;
 			}
 			if (!m.length) return;
-			let g = re(t, u, p).floors;
+			let g = ie(t, u, p).floors;
 			if (!g.length) {
-				if (p.rechecking && !re(t, u, p).reason) {
+				if (p.rechecking && !ie(t, u, p).reason) {
 					for (let e of p.entries) delete e.recheckFrom, delete e.recheckBase;
-					await B(t, u, c.revision, n, a), Z();
+					await B(t, u, c.revision, n, a), le();
 				}
 				return;
 			}
 			if (!e && !p.rechecking && !u.catchingUp && g.length < u.interval) return;
-			let _ = q_([
+			let _ = t.chat.map(cv), v = q_([
 				t.key,
 				c.revision,
-				t.chat.map(cv)
+				_
 			]);
-			if (!e && w === _) return;
-			w = _, b = "";
-			let v = oe();
-			T = {
-				key: t.key,
-				receipt: v
-			}, j(), await z(t, u, n);
+			if (!e && w === v) return;
+			b = "";
 			let y = Math.min(g.length, e ? u.interval : u.catchingUp || p.rechecking ? 3 : 20);
 			for (; y < g.length && (g[y - 1].saved.sourceMessageIndexes ?? []).includes(g[y].index);) y++;
-			let x = g.slice(0, y), S = x.at(-1).index, C = t.chat.map(cv), E = Cv({
+			let x = g.slice(0, y), S = x.at(-1).index;
+			for (let { index: e, saved: r } of x) {
+				let i = r.sourceFloorIds?.[r.sourceMessageIndexes?.indexOf(e)], a = r.memory?.sourceFloorSnapshots?.find((e) => e.floorId === i)?.rawFingerprint ?? (e === r.messageIndex ? r.memory?.sourceRawFingerprint ?? r.rawFingerprint : null);
+				if (!a) continue;
+				let o = ir(t.chat[e]);
+				if (!o || `sha256:${await Y(o.rawContent)}` !== a) {
+					n(), b = `等待第 ${e} 楼的记忆与当前选中的回复同步`;
+					return;
+				}
+			}
+			n(), w = v;
+			let C = X();
+			T = {
+				key: t.key,
+				receipt: C
+			}, j(), await z(t, u, n);
+			let E = () => {
+				if (_.length !== t.chat.length || _.some((e, n) => e !== cv(t.chat[n]))) throw $W();
+			};
+			E();
+			let D = Cv({
 				pending: x,
 				state: r(),
 				chat: t.chat,
 				from: p.from,
 				sanitize: (e) => ct(e, d())
-			}), D = bv(s(), o()), O = q_(E);
-			v.floors = x.map((e) => e.index), v.materials = {
-				memoryFloors: [...new Set(E.sources.filter((e) => e.kind === "memory").flatMap((e) => e.floors))],
-				backgroundFloors: [...new Set(E.sources.filter((e) => e.kind === "background").flatMap((e) => e.floors))],
-				dialogueFloors: E.sources.filter((e) => e.kind === "dialogue").flatMap((e) => e.floors),
+			}), O = bv(s(), o()), k = q_(D);
+			C.floors = x.map((e) => e.index), C.materials = {
+				memoryFloors: [...new Set(D.sources.filter((e) => e.kind === "memory").flatMap((e) => e.floors))],
+				backgroundFloors: [...new Set(D.sources.filter((e) => e.kind === "background").flatMap((e) => e.floors))],
+				dialogueFloors: D.sources.filter((e) => e.kind === "dialogue").flatMap((e) => e.floors),
 				cseFloor: S,
-				cseSubjects: E.cseSnapshot.subjectCount
-			}, v.decisions = [], await B(t, {
+				cseSubjects: D.cseSnapshot.subjectCount
+			}, C.decisions = [], await B(t, {
 				...u,
 				updateHold: !0
 			}, c.revision, n, a);
-			let k = h.revision, A = u, M = m.map(({ uid: e, label: t, segments: n }) => ({
+			let A = h.revision, M = u, N = m.map(({ uid: e, label: t, segments: n }) => ({
 				uid: e,
 				label: t,
 				segments: n.filter((e) => e.writable).map(({ id: e, text: t }) => ({
@@ -77831,17 +77858,17 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 					text: t
 				}))
 			}));
-			for (let e of tG(M)) {
-				v.calls += 1, j();
+			for (let e of tG(N)) {
+				E(), C.calls += 1, j();
 				let r = await i({
-					systemPrompt: D,
+					systemPrompt: O,
 					promptTask: "worldbookUpdate",
 					promptOwnerId: t.identity.chatId,
 					taskMessages: [{
 						role: "user",
 						content: JSON.stringify({
 							entries: e,
-							...E
+							...D
 						})
 					}],
 					maxTokens: 12e3,
@@ -77851,12 +77878,12 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 					worldInfoSource: "none",
 					parseMode: "semantic"
 				});
-				n(), v.responses += 1, r?.taskMetadata && (v.api = {
+				n(), C.responses += 1, r?.taskMetadata && (C.api = {
 					model: String(r.taskMetadata.model ?? "").slice(0, 160),
 					sourceLabel: String(r.taskMetadata.sourceLabel ?? "").slice(0, 160)
 				}), j();
-				let o = Tv(ZW(r), E, e);
-				v.decisions.push(...o.changes.map((e) => ({
+				let o = Tv(ZW(r), D, e);
+				C.decisions.push(...o.changes.map((e) => ({
 					kind: "changed",
 					uid: e.uid,
 					reason: e.reason,
@@ -77868,35 +77895,35 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 				}] : [], ...o.reviewNeeded.map((e) => ({
 					kind: "review",
 					...e
-				}))), A = hv(A, o, [...new Set(E.sources.flatMap((e) => e.floors))].map((e) => ({ index: e })));
+				}))), M = hv(M, o, [...new Set(D.sources.flatMap((e) => e.floors))].map((e) => ({ index: e })));
 			}
 			if (n(), (await I(t, u, n)).signature !== f.signature) throw Y_("更新期间原书发生变化，本批未保存，请同步后重试。");
-			if (p.rechecking) for (let e of A.entries) p.entries.some((t) => t.uid === e.uid) && (g.length === x.length && !re(t, u, p).reason ? (delete e.recheckFrom, delete e.recheckBase) : e.recheckFrom = S + 1);
-			else A.processed = await lv(t.chat, S), A.catchingUp = g.length > x.length;
-			if (n(), A.updateHold = !1, C.length !== t.chat.length || C.some((e, n) => e !== cv(t.chat[n]))) throw $W();
-			let N = r();
-			if (N.memoryWorkBusy || N.activeCse || N.activeExtraction || l()) throw $W();
-			let F = re(t, u, p).floors.filter((e) => e.index <= S);
-			if (F.length !== x.length || q_(Cv({
-				pending: F,
-				state: N,
+			if (p.rechecking) for (let e of M.entries) p.entries.some((t) => t.uid === e.uid) && (g.length === x.length && !ie(t, u, p).reason ? (delete e.recheckFrom, delete e.recheckBase) : e.recheckFrom = S + 1);
+			else M.processed = await lv(t.chat, S), M.catchingUp = g.length > x.length;
+			n(), M.updateHold = !1, E();
+			let F = r();
+			if (F.memoryWorkBusy || F.activeCse || F.activeExtraction || l()) throw $W();
+			let L = ie(t, u, p).floors.filter((e) => e.index <= S);
+			if (L.length !== x.length || q_(Cv({
+				pending: L,
+				state: F,
 				chat: t.chat,
 				from: p.from,
 				sanitize: (e) => ct(e, d())
-			})) !== O) throw $W();
-			let L = A.entries.filter((e, t) => e.content !== u.entries[t].content).length;
-			A.lastUpdate = {
-				...v,
+			})) !== k) throw $W();
+			let R = M.entries.filter((e, t) => e.content !== u.entries[t].content).length;
+			M.lastUpdate = {
+				...C,
 				at: (/* @__PURE__ */ new Date()).toISOString(),
-				status: L ? "updated" : "unchanged",
-				changedEntries: L
-			}, await B(t, A, k, n, a), T = {
+				status: R ? "updated" : "unchanged",
+				changedEntries: R
+			}, await B(t, M, A, n, a), T = {
 				key: t.key,
 				receipt: QW(h.data.lastUpdate)
-			}, j(), Z();
+			}, j(), le();
 		});
 	}
-	async function se(e = "normal") {
+	async function ce(e = "normal") {
 		if (v = null, y = null, !(!c() || ![
 			"normal",
 			"regenerate",
@@ -77913,7 +77940,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 				}, j();
 				return;
 			}
-			if (r.catchingUp && r.processed.length && r.entries.some(fv) && ie(e, r).length) throw Y_("动态资料正在追平历史，本轮仍使用原世界书。可在设置中立即更新。");
+			if (r.catchingUp && r.processed.length && r.entries.some(fv) && ae(e, r).length) throw Y_("动态资料正在追平历史，本轮仍使用原世界书。可在设置中立即更新。");
 			if (await z(e, r, t), r.selectionMode === "native") {
 				v = {
 					target: e,
@@ -77982,7 +78009,7 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			}, j();
 		});
 	}
-	function ce(e) {
+	function Z(e) {
 		let n = v;
 		if (!(!n || n.token !== _ || !c() || !k(n.target) || nv(t.getContext()) !== n.data.book || !u(n.data.book))) {
 			if (n.frame.length !== n.target.chat.length || n.frame.some((e, t) => e !== cv(n.target.chat[t]))) {
@@ -77992,17 +78019,17 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 			gv(e, n, n.data);
 		}
 	}
-	function Z() {
+	function le() {
 		C || S || !c() || (S = setTimeout(() => {
-			S = null, C || X().catch(() => {});
+			S = null, C || se().catch(() => {});
 		}, 600));
 	}
-	function le({ eventSource: e, eventTypes: t = {} }) {
+	function ue({ eventSource: e, eventTypes: t = {} }) {
 		let n = (n, r) => {
 			let i = t[n];
 			i && e?.on && (e.on(i, r), D.push(() => e.removeListener?.(i, r)));
 		};
-		n("WORLDINFO_ENTRIES_LOADED", ce);
+		n("WORLDINFO_ENTRIES_LOADED", Z), n("MESSAGE_SENT", le);
 		for (let e of [
 			"CHAT_CHANGED",
 			"CHAT_RENAMED",
@@ -78018,16 +78045,16 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 		n("GENERATION_STARTED", () => {
 			M();
 		}), n("GENERATION_STOPPED", M), n("GENERATION_ENDED", () => {
-			v = null, Z();
+			v = null, le();
 		});
 	}
-	async function ue(e, t, n, r, i) {
+	async function de(e, t, n, r, i) {
 		let a = !1, o = (...e) => {
 			a = !0, r(...e);
 		}, s = await e(t, n, o, i);
 		if (a) return s;
 		try {
-			await se(i);
+			await ce(i);
 		} catch (e) {
 			if (v = null, e.name === "AbortError") {
 				o(!0);
@@ -78054,12 +78081,12 @@ function nG({ client: e, hostAdapter: t, identityProvider: n, memoryState: r, ge
 		configure: ee,
 		edit: ne,
 		bulkEdit: J,
-		update: X,
-		prepare: se,
-		apply: ce,
-		intercept: ue,
-		wake: Z,
-		bind: le,
+		update: se,
+		prepare: ce,
+		apply: Z,
+		intercept: de,
+		wake: le,
+		bind: ue,
 		abortAll: M,
 		subscribe(e) {
 			return m.add(e), () => m.delete(e);

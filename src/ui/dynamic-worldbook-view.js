@@ -113,7 +113,7 @@ export function createDynamicWorldbookView({ runtime, settings = null, documentR
     interval.type = 'number'; interval.min = '1'; interval.max = '20'; interval.value = String(data.interval);
     intervalLabel.append(interval, button('保存间隔', () => runtime.configure({ interval: Number(interval.value) }, data.chatId)));
     content.append(intervalLabel, button('手动更新／重试', () => runtime.update({ manual: true }), data.updateMode === 'paused'));
-    content.append(el('p', `修改数字后先保存间隔。手动每批按已保存的 ${data.interval} 条处理，补历史也一样；不足时处理实际已就绪的条数，不等待攒满。这里按 AI 回复计数，不含用户消息，合并记忆整组处理。自动补历史仍每批约 3 条，追平后达到间隔且摘要、CSE 就绪才调用，每批最多 20 条。手动成功后从新进度重新计数；失败或中断会暂停自动更新，刷新页面不会自动重试。`, 'settings-hint'));
+    content.append(el('p', `你发送下一条聊天消息后，上一轮 AI 回复才计入更新。修改数字后先保存间隔。手动每批按已保存的 ${data.interval} 条 AI 回复处理，补历史也一样。不足时处理实际已就绪的条数，合并记忆整组处理。自动补历史每批约 3 条，追平后达到间隔且摘要、CSE 就绪才调用，每批最多 20 条。手动成功后从新进度重新计数。失败或中断会暂停自动更新，可点击手动更新重试。`, 'settings-hint'));
     content.append(select('世界书选材方式', data.selectionMode ?? 'ai', [
       ['ai', 'AI 按需选材（发送前可能调用召回 API）'], ['native', '沿用酒馆触发规则（不调用选材 AI）'],
     ], value => runtime.configure({ selectionMode: value }, data.chatId)));
