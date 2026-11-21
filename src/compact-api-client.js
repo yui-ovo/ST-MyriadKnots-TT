@@ -54,6 +54,7 @@ const safeError = (code, status = 0, details = {}) => {
     'rate-limit': 'API 请求过于频繁，请稍后再试',
     server: 'API 服务暂时异常，请稍后再试',
     network: '无法连接 API，请检查地址和网络',
+    'content-blocked': '服务商拦截了生成请求，未取得可用内容。',
     empty: '模型没有返回内容，请检查模型配置',
     'provider-error': '接口返回了错误，未生成有效回复',
     format: '模型返回的 JSON 格式无效',
@@ -202,6 +203,11 @@ async function readProviderError(response, secrets = [], signal) {
 function completionDetails(data) {
   const finishReason = normalizeFinishReason(data?.choices?.[0]?.finish_reason);
   if (truncatedFinishReason(finishReason)) throw safeError('output-truncated', 0, { finishReason });
+  if (finishReason === 'content_filter' || describeCompletionResponse(data).refusalPresent) {
+    const error = safeError('content-blocked', 0, { finishReason });
+    error.responseDiagnostic = describeCompletionResponse(data);
+    throw error;
+  }
   const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? data?.content ?? '';
   const text = typeof content === 'string' ? content.trim() : '';
   if (!text || ['none', '<none>'].includes(text.toLowerCase())) {
@@ -336,7 +342,7 @@ async function readSseResponse(response, { requireSse = false, signal, secrets =
     try { throwResponseError(value, secrets); }
     catch (error) { error.responseDiagnostic = responseDiagnostic; throw error; }
     const currentFinishReason = normalizeFinishReason(value?.choices?.[0]?.finish_reason);
-    if (currentFinishReason) finishReason = currentFinishReason;
+    if (currentFinishReason && finishReason !== 'content_filter') finishReason = currentFinishReason;
     const delta = value?.choices?.[0]?.delta?.content ?? value?.choices?.[0]?.message?.content ?? value?.choices?.[0]?.text;
     if (typeof delta === 'string') output += delta;
   };
@@ -361,6 +367,11 @@ async function readSseResponse(response, { requireSse = false, signal, secrets =
   }
   if (requireSse && !sawDataLine) throw safeError('stream-protocol');
   if (truncatedFinishReason(finishReason)) throw safeError('output-truncated', 0, { finishReason });
+  if (finishReason === 'content_filter' || responseDiagnostic.refusalPresent) {
+    const error = safeError('content-blocked', 0, { finishReason });
+    error.responseDiagnostic = responseDiagnostic;
+    throw error;
+  }
   if (!output.trim()) { const error = safeError('empty'); if (finishReason) error.finishReason = finishReason; error.responseDiagnostic = responseDiagnostic; throw error; }
   return { text: output.trim(), finishReason };
 }

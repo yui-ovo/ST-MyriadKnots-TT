@@ -1,3 +1,4 @@
+import { isBlockedFinishReason } from './v3/summary-validity.js';
 const BARE_KEY_START = /[A-Za-z_]/u;
 const BARE_KEY_PART = /[A-Za-z0-9_-]/u;
 const NUMBER = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/uy;
@@ -5,6 +6,7 @@ const MAX_REPAIRS = 64;
 
 export function normalizeFinishReason(value) {
   const reason = String(value ?? '').trim().toLowerCase();
+  if (isBlockedFinishReason(reason)) return 'content_filter';
   if (reason === 'end_turn') return 'stop';
   if (!reason) return '';
   return ['stop', 'length', 'max_tokens', 'content_filter', 'tool_calls', 'function_call'].includes(reason) ? reason : 'other';

@@ -43,6 +43,7 @@ const CODE_COPY = Object.freeze({
   V3_MEMORY_REVISION_NOTE_TOO_LONG: '修订说明超过 1000 字，请缩短后保存。',
   V3_RECALL_FAILED: '记忆召回失败，请稍后重试。',
   V3_CSE_FAILED: '人物状态分析失败，请稍后重试。',
+  QQJ_CONTENT_BLOCKED: '服务商拦截了生成请求，未取得可用内容。',
   V3_EXTRACTOR_SUMMARY_INVALID: '模型没有返回可用摘要，请重新提取本楼。',
   V3_EXTRACTOR_MULTIPLE_RESULTS: '模型返回了多份不同摘要，无法确认；请重新提取本楼。',
   V3_EXTRACTOR_LOCAL_SCOPE_INVALID: '当前楼与提取目标不一致，请刷新后重新提取本楼。',

@@ -1,3 +1,4 @@
+import { hasBlockedSummary, isProviderBlockNotice, isUsableFloorMemory } from './summary-validity.js';
 import { QIANSHI_HISTORY_INSTRUCTIONS, QIANSHI_REJUDGE_INSTRUCTIONS, QIANSHI_FOLLOWUP_SYSTEM_PROMPT,
   PLACE_INITIALIZATION_PROMPT, PLACE_ORGANIZATION_PROMPT } from './archive-maintenance-prompts.js';
 import { identityBriefFields } from './identity-brief.js';
@@ -129,7 +130,7 @@ const clone = value => structuredClone(value);
 const qianshiText = (value, maximum) => String(value ?? '').normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maximum);
 const qianshiTextEventSignature = event => { const value = clone(event); delete value.important; return JSON.stringify(value); };
 const counts = memory => Object.fromEntries(['chronology', 'locations', 'participants', 'actions', 'observations', 'informationTransfers', 'privateCognition', 'commitments', 'eventFragments', 'exactAnchors', 'openLoops', 'ambiguities', 'cseSignals'].map(field => [field, memory?.[field]?.length ?? 0]));
-const effectiveSummary = memory => memory?.summary?.effectiveSource === 'user' ? memory.summary.userText : memory?.summary?.aiText;
+const effectiveSummary = memory => memory?.summary?.effectiveSource === 'user' ? memory.summary.userText : hasBlockedSummary(memory) ? '' : memory?.summary?.aiText;
 function previousPlaceIdentityContext(source, beforeIndex, prefixFloorIds, memoryMap, entities, identityProjection, libraryThroughAssistantSeq) {
   const latestLibrary = libraryThroughAssistantSeq === Infinity;
   if (!prefixFloorIds.size && !latestLibrary) return Object.freeze({ placeNames: Object.freeze([]), placeBindings: Object.freeze([]), priorityPlaceEntityIds: Object.freeze([]), parentEntityIdsByPlaceId: new Map() });
@@ -243,7 +244,7 @@ function previousFloorContext(source, floorIndex, memoryMap, placeIdentity = nul
   for (let index = floorIndex - 1; index >= 0; index -= 1) {
     if (isMemoryExcludedFloor(source.floors[index], hostChat, source.checkpoint, { frozen: isFrozenFloorRef(source.floors[index].id, source) })) continue;
     memory = memoryMap.get(source.floors[index].id);
-    if (memory?.recordStatus !== 'active') continue;
+    if (!isUsableFloorMemory(memory)) continue;
     const edited = timeProvenance[source.floors[index].id]?.timeEdited === true;
     const lastTime = edited && Array.isArray(memory.chronology) ? memory.chronology.at(-1)?.time : null;
     const sourceText = edited ? String(lastTime?.sourceText ?? lastTime?.normalized ?? '').trim() : mainlineTimeText(memory);
@@ -308,7 +309,7 @@ function currentMemoryMap(reachable) { return new Map((reachable?.floorMemories 
 function coveredMemoryMap(reachable) {
   const result = new Map();
   for (const memory of reachable?.floorMemories ?? []) {
-    if (memory?.recordStatus !== 'active') continue;
+    if (!isUsableFloorMemory(memory)) continue;
     for (const floorId of memorySourceFloorIds(memory)) result.set(floorId, memory);
   }
   return result;
@@ -1232,7 +1233,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
   const missingSummaryCount = floorSet => {
     const memoryMap = coveredMemoryMap(reachable);
     return liveFloorsFor(reachable).filter(floor => (!floorSet || floorSet.has(floor.id))
-      && memoryMap.get(floor.id)?.recordStatus !== 'active').length;
+      && !isUsableFloorMemory(memoryMap.get(floor.id))).length;
   };
   const hasAutomaticCatchupWork = (state = getState()) => {
     const config = automation();
@@ -1247,7 +1248,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
       || (['partial', 'failed'].includes(lastAutoRun?.status) && lastAutomaticInputKey === currentInputKey())
       || state.cseFloors.some(floor => floor.status === 'pending')) return false;
     const memoryMap = coveredMemoryMap(reachable);
-    const firstPending = liveFloorsFor(reachable).find(floor => memoryMap.get(floor.id)?.recordStatus !== 'active') ?? null;
+    const firstPending = liveFloorsFor(reachable).find(floor => !isUsableFloorMemory(memoryMap.get(floor.id))) ?? null;
     return notifyOnce(`authorization:${currentInputKey()}:${firstPending?.id ?? 'unknown'}:${unfinished}`, {
       kind: 'warning',
       text: `千千结发现需要用户确认的历史摘要缺口：${summaryDebtCopy({ floor: firstPending, count: unfinished, retry: '这是历史缺口，不会自动补，请在记忆管理中点击继续。' })}`,
@@ -1335,7 +1336,8 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
     const running = active?.floorId === floor.id && active.phase !== 'analyzingCse';
     const savedFailure = failureScopeMatches(reachable?.root) ? failureScope.failures[floor.id] ?? null : null;
     const transientFailure = lastFailure?.floorId === floor.id ? lastFailure : null;
-    const status = running ? 'running' : memory?.recordStatus === 'active'
+    const blocked = memory?.recordStatus === 'active' && hasBlockedSummary(memory);
+    const status = running ? 'running' : blocked ? 'failed' : memory?.recordStatus === 'active'
       ? 'ready'
       : memory?.recordStatus === 'invalidated' ? 'error'
         : transientFailure || savedFailure ? 'failed' : 'unprocessed';
@@ -1350,7 +1352,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
       sourceFloorIds: Object.freeze([...sourceFloorIds]), sourceAssistantSeqs: Object.freeze(sourceFloors.map(item => item.assistantSeq)),
       sourceMessageIndexes: Object.freeze(sourceFloors.map(item => item.hostLocator.messageIndex)),
       ...(unconfirmedFloorIds.has(floor.id) && !frozen ? { sourceUnavailable: true } : {}),
-      canonicalFingerprint: floor.content.canonicalFingerprint, rawFingerprint: floor.content.rawFingerprint, status, memoryId: memory?.id ?? null, summary: effectiveSummary(memory) ?? '', summarySource: memory?.summary?.effectiveSource ?? null, aiSummary: memory?.summary?.aiText ?? '', revisionNote: memory?.summary?.revisionNote ?? null, extractorVersion: memory?.extractorVersion ?? EXTRACTOR_VERSION, counts: Object.freeze(counts(memory)), api: meta?.api ?? null, attempts: meta?.attempts ?? 0, runId: meta?.runId ?? null, checkpointId: reachable?.checkpoint?.id ?? null, manualTime, timeFallback: timeFallbackByFloor.get(floor.id) ?? '', error: failureError ?? (memory?.recordStatus === 'invalidated' ? '该楼记忆已标记错误，可重新提取。' : null), memory });
+      canonicalFingerprint: floor.content.canonicalFingerprint, rawFingerprint: floor.content.rawFingerprint, status, memoryId: memory?.id ?? null, summary: effectiveSummary(memory) ?? '', summarySource: memory?.summary?.effectiveSource ?? null, aiSummary: isProviderBlockNotice(memory?.summary?.aiText) ? '' : memory?.summary?.aiText ?? '', revisionNote: memory?.summary?.revisionNote ?? null, extractorVersion: memory?.extractorVersion ?? EXTRACTOR_VERSION, counts: Object.freeze(counts(memory)), api: meta?.api ?? null, attempts: meta?.attempts ?? 0, runId: meta?.runId ?? null, checkpointId: reachable?.checkpoint?.id ?? null, manualTime, timeFallback: timeFallbackByFloor.get(floor.id) ?? '', error: failureError ?? (blocked ? '服务商拦截了摘要生成，请重新提取本楼。' : null) ?? (memory?.recordStatus === 'invalidated' ? '该楼记忆已标记错误，可重新提取。' : null), memory });
   }
   function persistedCseRebuildPlan(value) {
     const saved = value?.run?.diagnostics?.cseRebuild;
@@ -2801,7 +2803,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
       if (requestedFloors?.some(item => !item || !eligibleFloorIds.has(item.id)) || requestedFloors?.length > 10) throw errorWith('V3_MEMORY_FLOOR_UNAVAILABLE', '高楼压缩只接受当前连续范围内最多 10 个稳定 AI 楼。');
       if (requestedFloors?.some((item, index) => index > 0 && source.floors.indexOf(item) !== source.floors.indexOf(requestedFloors[index - 1]) + 1)) throw errorWith('V3_MEMORY_FLOOR_UNAVAILABLE', '高楼压缩范围必须是连续的稳定 AI 楼。');
       const floor = requestedFloors?.at(-1) ?? (selectNext
-        ? liveFloors.find(item => eligibleFloorIds.has(item.id) && memoryMap.get(item.id)?.recordStatus !== 'active')
+        ? liveFloors.find(item => eligibleFloorIds.has(item.id) && !isUsableFloorMemory(memoryMap.get(item.id)))
         : source?.floors?.find(item => item.id === floorId && eligibleFloorIds.has(item.id)));
       if (!floor) return selectNext ? null : (() => { throw errorWith('V3_MEMORY_FLOOR_UNAVAILABLE', '只允许提取当前后端快照中可用的稳定 AI 楼。'); })();
       const aggregateFloors = requestedFloors ?? [floor];
@@ -3136,6 +3138,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
     }
     const floor = source?.floors?.find(item => item.id === floorId), old = currentMemoryMap(source).get(floorId);
     if (!floor || !old) throw errorWith('V3_MEMORY_REVISION_UNAVAILABLE', '该楼还没有可修订的正式记忆。');
+    if (action === 'restoreAi' && isProviderBlockNotice(old.summary?.aiText)) throw errorWith('QQJ_CONTENT_BLOCKED');
     if (expectedMemory && (old.chatId !== expectedMemory.chatId || old.id !== expectedMemory.memoryId)) {
       throw errorWith('V3_MEMORY_SUMMARY_STALE', '这份摘要或当前聊天已变化，请关闭窗口后重新对比。');
     }
@@ -3573,7 +3576,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
           const summaryPending = liveFloorsFor(reachable)
             .filter(floor => summaryPendingIds.has(floor.id) && capturedFloorSet.has(floor.id)
               && !failedSummaryFloorIds.has(floor.id)
-              && memoryMap.get(floor.id)?.recordStatus !== 'active');
+              && !isUsableFloorMemory(memoryMap.get(floor.id)));
           const targets = historical
             ? aggregateHistorical
               ? (() => {
@@ -3644,7 +3647,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
               const memory = currentMemoryMap(reachable).get(floor.id);
               let preparationError = null;
               try {
-                if (memory?.recordStatus !== 'active') await extractFloorInternal(floor.id, { analyzeState: false });
+                if (!isUsableFloorMemory(memory)) await extractFloorInternal(floor.id, { analyzeState: false });
               } catch (error) {
                 if (!allowed() || error?.name === 'AbortError' || STALE_MEMORY_CODES.has(error?.code)
                   || !['sourceSelection', 'sourceSanitization', 'timeSources', 'qianshiCandidates', 'extractorEnvelope'].includes(preparationStepFor(error))) throw error;
@@ -3678,7 +3681,7 @@ export function createV3MemoryRuntime({ foundationRuntime, store, hostAdapter, g
             const remainingIndependentSummary = liveFloorsFor(reachable)
               .some(floor => pendingSummaryIds.has(floor.id) && capturedFloorSet.has(floor.id)
                 && !failedSummaryFloorIds.has(floor.id)
-                && currentMemoryMap(reachable).get(floor.id)?.recordStatus !== 'active');
+                && !isUsableFloorMemory(currentMemoryMap(reachable).get(floor.id)));
             if (remainingIndependentSummary) continue;
           }
           if (!allowed()) return getState();

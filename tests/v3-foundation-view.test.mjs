@@ -1599,6 +1599,7 @@ test('Extractor 失败且尚无 FloorMemory 时仍可复制诊断并直接提取
   view.setPage('memories');
   const card = flatten(container).find(node => String(node.className).includes('qqj-memory-card'));
   assert.equal(card.open, false);
+  assert.ok(flatten(container).some(node => node.textContent === '有 1 条摘要需要重新提取（第 2 楼）。'));
   openDetails(card);
   assert.match(flatten(card).map(node => node.textContent).join('|'), /第 2 楼.*时间未明确.*失败可重试.*暂无摘要.*⋮.*提取摘要.*失败/);
   const extract = flatten(container).find(node => node.textContent === '提取摘要');

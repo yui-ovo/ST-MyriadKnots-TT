@@ -2003,6 +2003,58 @@ async function seedMiddleSummaryGap() {
   return seed;
 }
 
+const blockedInput = "The prompt could not be submitted. The prompt contains sensitive words that violate Google's [Generative AI Prohibited Use policy](https://example.invalid/policy).";
+const blockedOutput = 'finishReason: PROHIBITED_CONTENT finishMessage: The model output could not be generated.';
+
+test('provider block notices cannot become summaries, including structured packets and partial completions', async () => {
+  for (const response of [blockedInput, blockedOutput, { summary: blockedInput }]) {
+    await assert.rejects(direct(response, { finishReason: 'stop' }), { code: 'QQJ_CONTENT_BLOCKED' });
+  }
+  const narrative = '两人讨论了屏幕上出现的 PROHIBITED_CONTENT 提示。';
+  assert.equal((await direct(narrative)).memory.summary.aiText, narrative);
+  await assert.rejects(direct(narrative, { finishReason: 'SAFETY' }), { code: 'QQJ_CONTENT_BLOCKED' });
+
+  const h = harness({ utility: () => ({ textData: blockedInput, taskMetadata: { finishReason: 'stop' } }) });
+  await h.runtime.start();
+  await h.runtime.extractFloor(h.runtime.getState().floors[0].floorId, { analyzeState: false });
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.runtime.getState().floors[0].status, 'failed');
+  assert.equal(h.runtime.getState().floors[0].memoryId, null);
+});
+
+test('legacy provider block notices surface on load, stay out of recall and can be re-extracted', async () => {
+  const seed = harness();
+  await seed.runtime.start();
+  const id = seed.runtime.getState().floors[0].floorId;
+  await seed.runtime.extractFloor(id, { analyzeState: false });
+  const memoryId = seed.runtime.getState().floors[0].memoryId;
+  const record = seed.backend.records.get(`chat-${CHAT}/v3-floor-memory-${memoryId}`).data;
+  record.summary.aiText = blockedOutput;
+  record.summary.userText = '我手动核对过的剧情。';
+  record.summary.effectiveSource = 'user';
+  const edited = harness({ sharedBackend: seed.backend, sharedContext: seed.context });
+  await edited.runtime.start();
+  const manual = edited.runtime.getState().floors[0];
+  assert.equal(manual.status, 'ready');
+  assert.equal(manual.summary, record.summary.userText);
+  assert.equal(manual.aiSummary, '');
+  record.summary.userText = null;
+  record.summary.effectiveSource = 'ai';
+  const cold = harness({ sharedBackend: seed.backend, sharedContext: seed.context });
+  await cold.runtime.start();
+  const floor = cold.runtime.getState().floors[0];
+  assert.equal(floor.status, 'failed');
+  assert.match(floor.error, /服务商拦截/);
+  assert.equal(floor.summary, '');
+  assert.equal(cold.runtime.getState().rememberedCount, 0);
+  const recall = await readRecallSource({ store: cold.store, now: () => new Date(NOW) });
+  assert.equal(recall.floorMemories?.length ?? 0, 0);
+  assert.equal(cold.calls.length, 0);
+  await cold.runtime.extractFloor(id, { analyzeState: false });
+  assert.equal(cold.runtime.getState().floors[0].status, 'ready');
+  assert.equal(cold.runtime.getState().rememberedCount, 1);
+});
+
 async function direct(response, { content = '裴晚生提醒你带伞。', entities = [], userIdentity = { displayName: '林岚', aliases: ['林岚', '你', '{{user}}'] }, batchId = '33333333-3333-4333-8333-333333333333', preservedSummary = null, sourceUserInputSnapshot = null, storyClock = null, previousFloorContext = null, placeWorldbookSources = [], finishReason } = {}) {
   const floor = { id: '11111111-1111-4111-8111-111111111111', chatId: CHAT, narrativeGeneration: GENERATION, assistantSeq: 1, content: { canonicalContent: content } };
   const envelope = await createExtractorEnvelope({ batchId, chatId: CHAT, narrativeGeneration: GENERATION, checkpointId: null, floor, entities, userIdentity, sourceUserInputSnapshot, storyClock, previousFloorContext, placeWorldbookSources });

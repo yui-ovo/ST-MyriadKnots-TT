@@ -1,3 +1,4 @@
+import { isBlockedFinishReason, isProviderBlockNotice } from './summary-validity.js';
 import { buildExtractorSystemPrompt, buildHighFloorExtractorSystemPrompt, ENTITY_TYPES, SPATIAL_FACT_LIMIT, MENTION_KEY, NULLABLE_MENTION_KEY,
   EVIDENCE_SEGMENT_LIMIT, EVIDENCE_OCCURRENCE_LIMIT, EVIDENCE_REF_LIMIT, EVIDENCE, evidenceArray, FLOOR_PROPERTIES } from './extractor-prompts.js';
 export { QIANSHI_OUTPUT_CAPACITY_GUIDANCE, EXTRACTOR_RESPONSE_SCHEMA, EXTRACTOR_OUTPUT_CONTRACT, DEFAULT_EXTRACTOR_GUIDANCE, QIANSHI_LIFECYCLE_GUIDANCE, EXTRACTOR_FIXED_CONTRACT, buildExtractorSystemPrompt, buildHighFloorExtractorSystemPrompt, EXTRACTOR_SYSTEM_PROMPT } from './extractor-prompts.js';
@@ -25,6 +26,7 @@ export const EXTRACTOR_SCHEMA_VERSION = 3;
 export const EXTRACTOR_PROMPT_VERSION = 'qqj-v3-extractor-prompt-68';
 export const EXTRACTOR_VERSION = `${EXTRACTOR_PROMPT_VERSION}/schema-${EXTRACTOR_SCHEMA_VERSION}/semantic-compiler-37`;
 const EXTRACTOR_ERROR_COPY = Object.freeze({
+  QQJ_CONTENT_BLOCKED: '服务商拦截了生成请求，未取得可用内容。',
   V3_EXTRACTOR_SUMMARY_INVALID: '模型没有返回可用摘要，请重新提取本楼。',
   V3_EXTRACTOR_MULTIPLE_RESULTS: '模型返回了多份不同摘要，无法确认；请重新提取本楼。',
   V3_EXTRACTOR_LOCAL_SCOPE_INVALID: '当前楼与提取目标不一致，请刷新后重新提取本楼。',
@@ -494,6 +496,7 @@ async function normalizeLegacyExtractorResponse({ response, envelope, floor, exi
     return userDisplayName ? boundedText(text.replaceAll('{{user}}', userDisplayName), path, maximum) : text;
   };
   const summary = generatedText(raw.summary, 'floors[0].summary', 4000);
+  if (isProviderBlockNotice(summary)) throw extractorError('QQJ_CONTENT_BLOCKED', 'floors[0].summary');
   const isolated = [];
   const isolate = (field, index, error, fallbackPath = field) => {
     if (isolated.length >= 80) return;
@@ -1810,6 +1813,7 @@ async function compileSemanticPacket(options) {
 }
 
 export async function normalizeExtractorResponse(options) {
+  if (isBlockedFinishReason(options.finishReason) || isProviderBlockNotice(options.response)) throw extractorError('QQJ_CONTENT_BLOCKED');
   const compiled = await compileSemanticPacket(options);
   const { qianshiPacket, ...normalized } = compiled;
   let qianshiDelta;
@@ -2015,7 +2019,7 @@ export async function runExtractorRequest({ generateUtilityTask, envelope, floor
       const formatStage = error?.formatStage ?? null;
       validationErrors.push({ code: String(error?.code ?? 'V3_EXTRACTOR_REQUEST_FAILED').slice(0, 120), path: String(error?.validationPath ?? '').slice(0, 500), formatStage: formatStage ? String(formatStage).slice(0, 120) : null });
       const retryable = receivedResult || error?.retryableRecognitionFormat === true || ['QQJ_TIMEOUT', 'QQJ_EMPTY'].includes(error?.code);
-      if (retryable && attempts < (transportBudget.totalAttempts ?? 3) && transportBudget.remaining > 0) continue;
+      if (retryable && error?.code !== 'QQJ_CONTENT_BLOCKED' && attempts < (transportBudget.totalAttempts ?? 3) && transportBudget.remaining > 0) continue;
       let sessionCandidate = null;
       if (candidate !== null) {
         try { sessionCandidate = JSON.stringify(candidate).slice(0, 24000); } catch { sessionCandidate = '[候选无法序列化]'; }

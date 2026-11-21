@@ -1,3 +1,4 @@
+import { isUsableFloorMemory } from './summary-validity.js';
 import { cseQuantificationFields, isCseQuantificationOnlyChange } from './cse-quantification.js';
 import { placeWorkspaceDependency } from './place-foundation.js';
 import { deriveCseTimeline, filterReachableDeltas, projectCseDeltasForSources, replayCurrentState } from './cse-engine.js';
@@ -181,7 +182,7 @@ export function selectRecallMemories(first) {
   const activeMemories = [];
   const activeMemoryIds = new Set();
   for (const floor of floors) {
-    const active = (memoryGroups.get(floor.id) ?? []).filter(memory => memory.recordStatus === 'active');
+    const active = (memoryGroups.get(floor.id) ?? []).filter(isUsableFloorMemory);
     if (active.length === 1 && !activeMemoryIds.has(active[0].id)) {
       activeMemories.push(active[0]);
       activeMemoryIds.add(active[0].id);

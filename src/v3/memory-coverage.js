@@ -1,3 +1,4 @@
+import { isUsableFloorMemory } from './summary-validity.js';
 import { filterReachableDeltas } from './cse-engine.js';
 import { memorySourceFloorIds } from './memory-schema.js';
 import { isHostNarratorMessage, scanAssistantCandidates, selectAssistantMessage } from './foundation-domain.js';
@@ -97,7 +98,7 @@ export function coverageHostGuardCurrent(readiness, snapshot) {
 function activeMemoriesByFloor(reachable) {
   const groups = new Map();
   for (const memory of reachable?.floorMemories ?? []) {
-    if (memory?.recordStatus !== 'active') continue;
+    if (!isUsableFloorMemory(memory)) continue;
     for (const floorId of memorySourceFloorIds(memory)) groups.set(floorId, [...(groups.get(floorId) ?? []), memory]);
   }
   return new Map([...groups].filter(([, values]) => values.length === 1).map(([floorId, values]) => [floorId, values[0]]));

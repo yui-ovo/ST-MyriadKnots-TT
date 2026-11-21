@@ -1677,6 +1677,12 @@ export function createV3FoundationView({ runtime, recallRuntime = null, vectorRu
     const list = element('div', 'v3-memory-list');
     const paginationSlot = element('div', 'qqj-memory-page-slot'); paginationSlot.hidden = true;
     const floors = [...(state.floors ?? [])];
+    const failedFloors = floors.filter(floor => ['failed', 'error'].includes(floor.status) && !floor.frozen);
+    if (failedFloors.length) {
+      const labels = failedFloors.slice(0, 8).map(floor => memoryFloorTitle(state, floor)).join('、');
+      const rest = failedFloors.length > 8 ? '等' : '';
+      pageNode.append(element('p', 'qqj-inline-panel', `有 ${failedFloors.length} 条摘要需要重新提取（${labels}${rest}）。`));
+    }
     const locationLabelsByFloor = memoryLocationLabelsByFloor(state, floors);
     const registeredMessageIndexes = new Set(floors.filter(floor => floor.frozen !== true).map(floor => floor.messageIndex).filter(validMessageIndex));
     const waiting = (state.unregisteredCandidates ?? []).filter(candidate => validMessageIndex(candidate?.messageIndex) && !registeredMessageIndexes.has(candidate.messageIndex));
